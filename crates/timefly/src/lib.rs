@@ -6,6 +6,8 @@ use bevy::window::{PresentMode, WindowResolution};
 pub mod args;
 pub mod bench;
 pub mod camera;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod check_data;
 pub mod data;
 pub mod diagnostics;
 pub mod globe;

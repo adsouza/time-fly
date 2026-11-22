@@ -1,8 +1,9 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
-//! Flags: `--diagnostics-probe <mode>` (hidden), `--scrub-bench`, `--target-fps N` and
-//! `--window WxH`. A value may follow its flag as `--flag=value` or as the next argument; a next
-//! argument that starts with `--` is the next flag, never a value.
+//! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
+//! `--target-fps N` and `--window WxH`. A value may follow its flag as `--flag=value` or as the
+//! next argument; a next argument that starts with `--` is the next flag, never a value.
+//! `--check-data` takes its optional value only as `--check-data=DIR`.
 
 use crate::diagnostics::ProbeMode;
 
@@ -17,11 +18,22 @@ pub struct LaunchArgs {
     pub target_fps: Option<u32>,
     /// `--window WxH`: the window's size in physical pixels (native only).
     pub window: Option<(u32, u32)>,
+    /// Hidden `--check-data[=DIR]` (native only): load the globe data headlessly and exit.
+    pub check_data: Option<DataCheck>,
     /// Arguments this build does not understand. They are ignored, and logged as warnings once
     /// the log subscriber exists.
     pub unknown: Vec<String>,
 }
 
+/// What `--check-data[=DIR]` checks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DataCheck {
+    /// The bake's output folder (the one holding `manifest.json`), relative to the working
+    /// directory; `None` checks the game's own `assets/data/globe`.
+    pub dir: Option<String>,
+}
+
+const CHECK_DATA_FLAG: &str = "--check-data";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const TARGET_FPS_FLAG: &str = "--target-fps";
@@ -49,6 +61,23 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
     while let Some(arg) = args.next() {
         if arg == BENCH_FLAG {
             parsed.scrub_bench = true;
+            continue;
+        }
+        if arg == CHECK_DATA_FLAG {
+            parsed.check_data = Some(DataCheck::default());
+            continue;
+        }
+        if let Some(dir) = arg
+            .strip_prefix(CHECK_DATA_FLAG)
+            .and_then(|r| r.strip_prefix('='))
+        {
+            if dir.is_empty() {
+                parsed.unknown.push(arg);
+            } else {
+                parsed.check_data = Some(DataCheck {
+                    dir: Some(dir.to_string()),
+                });
+            }
             continue;
         }
         let Some(flag) = [PROBE_FLAG, TARGET_FPS_FLAG, WINDOW_FLAG]
@@ -282,6 +311,30 @@ mod tests {
         assert!(parsed.scrub_bench);
         assert_eq!(parsed.target_fps, Some(30));
         assert!(parsed.unknown.is_empty());
+    }
+
+    #[test]
+    fn check_data_flag() {
+        let parsed = parse_launch_args(args(&["--check-data"]));
+        assert_eq!(parsed.check_data, Some(DataCheck { dir: None }));
+        assert!(parsed.unknown.is_empty());
+        let parsed = parse_launch_args(args(&["--check-data=crates/timefly/assets/data/globe"]));
+        assert_eq!(
+            parsed.check_data,
+            Some(DataCheck {
+                dir: Some("crates/timefly/assets/data/globe".to_string())
+            })
+        );
+        // The value only comes with `=`: a following argument is not swallowed.
+        let parsed = parse_launch_args(args(&["--check-data", "--scrub-bench"]));
+        assert_eq!(parsed.check_data, Some(DataCheck { dir: None }));
+        assert!(parsed.scrub_bench);
+        let parsed = parse_launch_args(args(&["--check-data="]));
+        assert_eq!(parsed.check_data, None);
+        assert_eq!(parsed.unknown, args(&["--check-data="]));
+        let parsed = parse_launch_args(args(&["--check-database"]));
+        assert_eq!(parsed.check_data, None);
+        assert_eq!(parsed.unknown, args(&["--check-database"]));
     }
 
     #[test]

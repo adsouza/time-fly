@@ -167,6 +167,16 @@ pub fn finish_status(current: SessionStatus, exit: &bevy::app::AppExit) -> Sessi
     }
 }
 
+/// The status of a session the game ended on purpose before or without its `App` (no usable
+/// GPU, a failed `--check-data`): clean whatever the exit code, because the player (or CI) was
+/// told why. A crash recorded earlier is never downgraded.
+pub fn stopped_status(current: SessionStatus) -> SessionStatus {
+    match current {
+        SessionStatus::Crashed { panicked } => SessionStatus::Crashed { panicked },
+        SessionStatus::Running | SessionStatus::Clean => SessionStatus::Clean,
+    }
+}
+
 /// Calendar UTC time from milliseconds since the Unix epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UtcTime {
@@ -520,6 +530,22 @@ mod tests {
         assert_eq!(
             previous_outcome(Some(&record(S::Clean, true, true)), true, true),
             O::Nothing
+        );
+    }
+
+    #[test]
+    fn a_deliberate_stop_is_clean_whatever_the_exit_code() {
+        // No usable GPU, a failed data check: the player or CI was told why, so the next
+        // launch must not show the crash notice. A recorded crash is still never downgraded.
+        assert_eq!(stopped_status(S::Running), S::Clean);
+        assert_eq!(stopped_status(S::Clean), S::Clean);
+        assert_eq!(
+            stopped_status(S::Crashed { panicked: true }),
+            S::Crashed { panicked: true }
+        );
+        assert_eq!(
+            stopped_status(S::Crashed { panicked: false }),
+            S::Crashed { panicked: false }
         );
     }
 

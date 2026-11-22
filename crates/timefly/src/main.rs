@@ -22,6 +22,10 @@ fn main() -> AppExit {
     if let Some(mode) = session.probe().filter(|m| m.is_headless()) {
         return diagnostics::run_headless_probe(session, mode);
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(check) = session.args().check_data.clone() {
+        return timefly::check_data::run_data_check(session, &check);
+    }
     let exit = timefly::app(&session).run();
     session.finish(&exit);
     exit

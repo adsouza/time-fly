@@ -37,6 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The game crate's tests build Bevy, which links these.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
 
@@ -59,6 +66,11 @@ jobs:
       - name: Core tests
         run: cargo test --locked -p timefly_core 2>&1 | tee ci-logs/cargo-test-timefly_core.txt
 
+      # CPU-only: the data loader on the tiny bake, the crash flow, `--check-data`. The GPU
+      # globe test is #[ignore].
+      - name: Game crate tests
+        run: cargo test --locked -p timefly 2>&1 | tee ci-logs/cargo-test-timefly.txt
+
       - name: Upload test output
         if: always()
         uses: actions/upload-artifact@v7
@@ -75,9 +87,11 @@ jobs:
     outputs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
     env:
-      # Line tables stay in the binary for panic backtraces (release profile unchanged); zlib
-      # compression of the debug sections keeps the binary and packages small. Linking uses
-      # rustc's default on this target since Rust 1.90, the bundled rust-lld (mold-class speed).
+      # Line tables stay in the binary for panic backtraces (release profile unchanged). CI
+      # alone compresses the debug sections with zlib, which keeps the packages small (owner
+      # decision 2026-11-22: about 123 MB download / 230 MB installed, against 80 / 576 MB
+      # uncompressed); local builds are unaffected. Linking uses rustc's default on this target
+      # since Rust 1.90, the bundled rust-lld (mold-class speed).
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
     steps:
       - uses: actions/checkout@v7
@@ -163,6 +177,13 @@ jobs:
         run: |
           uv run --locked timefly-bake --raw ../../data/raw \
             --out ../../crates/timefly/assets/data/globe 2>&1 | tee ../../ci-logs/bake.txt
+
+      # Whether baked here or restored from the cache, the bake must load in this build's reader
+      # (window-less, no GPU): exits 1 with the loader's error otherwise.
+      - name: Load the bake with the game's reader
+        run: |
+          TIMEFLY_LOG_DIR="$RUNNER_TEMP/check-data-logs" target/release/timefly \
+            --check-data=crates/timefly/assets/data/globe 2>&1 | tee ci-logs/check-data.txt
 
       - name: Stage install tree
         run: |

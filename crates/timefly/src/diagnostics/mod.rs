@@ -258,6 +258,32 @@ impl Session {
         }
     }
 
+    /// Ends a session the game stopped on purpose ([`session::stopped_status`]): records it clean
+    /// whatever `exit` is, so the next launch shows no crash notice, and writes out the log
+    /// (on the web, saves the flight recorder to browser storage).
+    pub fn finish_clean(self, exit: &AppExit) {
+        let _ = exit;
+        self.shared
+            .update_record(|r| r.status = session::stopped_status(r.status));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut this = self;
+            this.flush_logs();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Err(e) = session::web::save_log(&self.shared) {
+                self.shared.problem(e);
+            }
+            std::mem::forget(self);
+        }
+    }
+
+    /// Prints to stderr with the home directory replaced by `~`.
+    pub fn eprint(&self, message: &str) {
+        self.shared.eprint(message);
+    }
+
     /// Drops the log worker guard, which writes out everything logged so far.
     #[cfg(not(target_arch = "wasm32"))]
     fn flush_logs(&mut self) {
