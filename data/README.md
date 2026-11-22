@@ -4,7 +4,7 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 
 | Dataset | Source | License | Notes |
 |---|---|---|---|
-| Paleo-DEM / topography | TBD | TBD | Task 5 |
+| Paleo-DEM / topography | PALEOMAP PaleoDEMs, Scotese & Wright (2018); see [PaleoDEMs](#paleodems) | CC BY 4.0 | Task 6 (`timefly_bake.paleodem`); ages in `data/paleodem_ages.csv` |
 | Plate reconstruction (rotations, polygons) | PALEOMAP plate model, Scotese & Wright (2018); see [Plate model](#plate-model) | CC BY 4.0 | Task 5 (`timefly_bake.plates`) |
 | Climate / paleo-environment | TBD | TBD | Task 7 |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
@@ -54,6 +54,71 @@ Nothing under `data/raw/` is committed.
   sizes 8 or 64 lies in two polygons (or in one plate's polygons over disjoint intervals), so in
   practice each footprint cell holds at most one entry; overlaps in the era frame come from plate
   motion.
+
+## PaleoDEMs
+
+The 1° netCDF PaleoDEMs linked from the
+[EarthByte PaleoDEM resource](https://www.earthbyte.org/paleodem-resource-scotese-and-wright-2018/)
+(Zenodo record [10.5281/zenodo.5460860](https://doi.org/10.5281/zenodo.5460860)), and the report
+whose Table 1 gives each map's reconstruction age.
+
+| File | URL | SHA-256 |
+|---|---|---|
+| `data/raw/paleodem/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip` (9,302,291 bytes) | archive linked from the EarthByte page above (Zenodo 10.5281/zenodo.5460860) | `7014767a168c28d3762f55117ebafcd0f6b6b90029a495e2d14fd23f94abc16d` |
+| `data/raw/report/Scotese_Wright2018_PALEOMAP_PaleoDEMs.pdf` (6,840,972 bytes) | https://www.earthbyte.org/webdav/ftp/Data_Collections/Scotese_Wright_2018_PaleoDEM/Scotese_Wright2018_PALEOMAP_PaleoDEMs.pdf | `8a5fca14f9860d148427a56cec241b4fc5b4108ff91bb867e8b68bde1392edac` |
+
+- **Citation:** Scotese, C.R. & Wright, N. (2018). *PALEOMAP Paleodigital Elevation Models
+  (PaleoDEMS) for the Phanerozoic.* PALEOMAP Project. https://doi.org/10.5281/zenodo.5460860
+- **Licence:** CC BY 4.0 (`License.txt` in the archive, and the Zenodo record). Baked frames may
+  ship with the game with the citation in the credits; the raw archive is not redistributed.
+- **Unpacking:** `unzip Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip -d extracted` in
+  `data/raw/paleodem`, then only parse the contents. The `.nc` files are in
+  `extracted/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc_v2/`.
+
+**Archive contents.** 109 `.nc` files (not 88: the map numbering has half steps such as 43.5 and
+84.1 and skips 2–2.5 and 4), one per 5 Myr from 0 to 540 Ma. Also GPlates raster caches
+(`*.gplates.cache`), `All_Maps.gpml` and `PaleoAtlasTimeIntervalsv22b copy.csv` (the report's
+Appendix I with the same columns as Table 1); the bake ignores all three.
+
+**netCDF schema** (identical in all 109 files, checked by script):
+
+- NETCDF4, CF-1.5/COARDS, written by GMT 5.4.1 `grdsample -I1d` from finer grids.
+- Variables `lon(lon)` float64, 361 values −180…180, and `lat(lat)` float64, 181 values −90…90
+  ascending; both grid-registered at whole degrees with ~2e-11° float noise. `z(lat, lon)` float32,
+  `_FillValue` NaN, no units attribute (the report gives metres). No NaNs in any file.
+- The 180° column duplicates the −180° column exactly in every file; `load_paleodem` drops it, so
+  grids load as 181 × 360 with longitudes −180…179.
+- Pole rows are not single-valued: 97 of the 218 vary by more than 100 m (up to 13,880 m, Map60 south
+  pole); Map01's south pole row is 0 m. Isolated spikes exist (Map88 has one 9,000 m cell at
+  58° S, 163° E). These are source artefacts; the bake samples them as published.
+
+**Age mapping.** `data/paleodem_ages.csv` has one reviewed row per file: `filename`, `map_number`,
+`label` (Table 1 stratigraphic age text, verbatim), `timeline_age_myr`, `source_rotation_age_myr`
+and `notes`. `timefly_bake.paleodem.list_paleodem_files` requires every `.nc` file in the directory
+to have exactly one row, strictly ascending timeline ages, a present-day source first and the
+540 Ma frame last.
+
+- **Source rotation age** = Table 1 "Plate Tectonic Model Age", which the report's footnote 3
+  defines as the age in the PALEOMAP Global Plate Model v2d3 to use for plate reconstructions:
+  exactly 0, 5, 10, … 540 Ma.
+- **Timeline age** = Table 1 stratigraphic age (Ogg et al. 2012), e.g. 66 Ma for the KT-boundary
+  map reconstructed at 65 Ma. Two exceptions: the present-day map sits at 0.030 Myr, the PaleoDEM
+  bridge frame of the globe timeline (plan Task 7), and the Cambrian/Precambrian map (541 Ma
+  stratigraphic) sits at 540 Ma, the slider's oldest stop. 86 of 109 frames have a timeline age
+  different from their reconstruction age.
+- **What filename ages encode:** the plate model age for 107 files (e.g. `KT_Boundary_65Ma` for a
+  66 Ma map, `540Ma` for a 541 Ma map), but the stratigraphic age for Map67.5 (`385.2Ma`, plate
+  age 385) and Map68 (`390.5Ma`, plate age 390). The bake therefore never parses them. Each file's
+  `history` attribute names the finer source grid it was resampled from; those names carry the
+  stratigraphic ages (`…KT_Boundary_66Ma.nc`, `…541Ma.nc`), with older estimates for Map03 (4.0),
+  Map13 (52.2), Map14 (55.8) and Map15 (60.6) where Table 1 now gives 4.47, 51.9, 56 and 61.
+- **Table 1 vs the files:** Table 1 lists 116 maps from 0 to 540 Ma. The 7 without a file are
+  rows 2, 2.1–2.4 (Pleistocene, plate age 0, drawn on the modern base map) and 2.5 and 4
+  (Pliocene/latest Miocene, plate age 5). So no source lies between 30 ka and 4.47 Ma other than
+  the present-day map. The PDF numbers the 315, 320 and 325 Ma maps 60, 61 and 61.5; the filenames
+  and Appendix I CSV number them 59.5, 60 and 61. All ages agree.
+- The Task 5 rotation export also samples 385.2 and 390.5 Ma; with this mapping the required
+  source rotation ages are the 5 Myr series, all already on the 1 Myr grid.
 
 Reference files:
 
