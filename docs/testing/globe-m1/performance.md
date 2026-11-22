@@ -146,15 +146,20 @@ How it was measured: `proc_pid_rusage(RUSAGE_INFO_V4)` sampled each frame by the
 Of the 100.6 MB, 30.8 MB was the wasm `name` section, which `strip = true` removes (browser
 stack traces then show function indices instead of names; panic messages keep file and line).
 Code is 59 MB at opt-level 3. opt-level "s" saves another 31% raw / 22% brotli, but its frame
-cost could not be measured here (the browser bench needs the controller, and native runs on
+cost was not measured (the browser bench above ran the opt-level 3 build, and native runs on
 this Mac are 60 Hz-paced), so the profile keeps opt-level 3. To try it in the browser bench:
 `CARGO_PROFILE_WEB_RELEASE_OPT_LEVEL=s cargo run --profile web-release -p timefly --target
 wasm32-unknown-unknown` from `crates/timefly`; adopt it if the R14 result and median hold.
 There is no `wasm-opt` pass yet.
 
-## Chrome WebGPU (to be run by the controller)
+## Chrome WebGPU
 
-Not measured by the implementer (no browser). Steps, on this Mac with the same bake:
+**Status.** Frame times are done: the controller ran the bench in the Claude desktop app's
+browser pane (Chromium 156, step 5; results below, PASS). Still to do, by the owner in desktop
+Chrome on this Mac (optional for acceptance): three cold-cache load trials with per-file
+transfer sizes (steps 2-4) and Chrome Task Manager memory (step 6), plus a Retina
+(devicePixelRatio 2) run to size the bridge cameras' MSAA memory (ruling R16). Steps, on this
+Mac with the same bake:
 
 1. Build and serve with the **`web-release`** profile, from **`crates/timefly`**
    (wasm-server-runner serves `./assets` from the current directory; from the repo root every

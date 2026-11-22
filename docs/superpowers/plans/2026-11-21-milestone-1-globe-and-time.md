@@ -12,7 +12,7 @@
 
 **Tech Stack:**
 - Rust: Bevy 0.20.1 (WESL shaders, `bevy_ui_widgets`, `trace`), `bevy_math` 0.20 (glam 0.33), `ruzstd` 0.9, `half` 2, `serde`/`serde_json`, `bytemuck`, `tracing` 0.1, `tracing-appender` 0.2; native `directories` 6, `fd-lock` 4, `opener` 0.9, `rfd` 0.18; wasm `web-sys` 0.3.
-- Python 3.12 via `uv`: `pygplates` 1.0, `numpy`, `netCDF4`, `zstandard`, `pytest`.
+- Python 3.13 via `uv` (pinned in `tools/bake/.python-version`: `pygplates` 1.0.0 wheels stop at cp313): `pygplates` 1.0, `numpy`, `netCDF4`, `zstandard`, `pytest`.
 
 **Spec:** `docs/superpowers/specs/2026-11-21-time-fly-design.md`. This plan covers **§14 step 1 (Globe + slider)**, including the crust lookup contract for later worlds, the reference-year convention for cultural data, and the architecture and diagnostics foundations of §19–20. The cultural CSV import belongs to Milestone 5.
 
@@ -582,7 +582,7 @@ Also test both footprint memberships, rejecting invalid offsets, and rejecting v
 - Test: `tools/bake/tests/{test_quaternary,test_cli}.py`
 
 **Data (ask the user before downloading):**
-- **ICE-6G_C (VM5a):** take the 27 integer-ka slices (0–26 ka) from the [PMIP4 10-arcminute series](https://pmip4.lsce.ipsl.fr/doku.php/data:ice_ice6g_c). State the total size, verify the listed MD5 sums, and inspect the netCDF attributes to confirm variable names, axes and elevation datum. Use signed `Topo` for relief and bathymetry, `sftlf` for land and `sftgif` for ice. Read masks as percentages and normalize to 0–1. Cite the papers required by PMIP4. Confirm the source BP reference or record the 1950 assumption.
+- **ICE-6G_C (VM5a):** take the 27 integer-ka slices (0–26 ka) from W.R. Peltier's 1° files, `https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.<k>.nc.gz`, k = 0…26 (15.7 MB in total). *(Owner decision 2026-11-22, ruling R4: chosen over the PMIP4 10-arcminute series, ~1 GB, because a 128-texel cube face is ~0.7° per texel anyway.)* The source publishes no checksums: record each file's SHA-256 when it is downloaded and pin it in `data/sources.json` (Task 11), which the fetcher verifies. Inspect the netCDF attributes to confirm variable names, axes and elevation datum. Use signed `Topo` for relief and bathymetry, `sftlf` for land and `sftgif` for ice. Read masks as percentages and normalize to 0–1. Cite the two papers the files' `Acknowledgement` attribute asks for. The files state no licence; the owner approved distributing the baked derivatives with citation and credit (2026-11-22). Confirm the source BP reference or record the 1950 assumption.
 - **Sea level, source 0–798 ka BP:** use Spratt & Lisiecki (2016) from [NOAA NCEI](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=noaa-ocean-19982), file `spratt2016-noaa.txt`. Use calendar ka BP and the long-PC1 sea-level anomaly in metres. Apply the game reference offset to these dates as well.
 
 **Frame list and bridge:**
@@ -757,8 +757,9 @@ The owner's Linux machine is for testing only. CI builds two installable package
 - `packaging/flatpak/io.github.adsouza.TimeFly.yml`: `runtime: org.freedesktop.Platform`, `sdk: org.freedesktop.Sdk` at the current supported freedesktop branch (verify which branch is current when implementing), `command: time-fly`, one `simple` module that copies the staged tree into `/app` (no compilation inside flatpak-builder; the binary comes from the CI build job), `finish-args`: `--share=ipc`, `--socket=wayland`, `--socket=fallback-x11`, `--device=dri`, `--talk-name=org.freedesktop.FileManager1` (for **Show log**). The bundle is made with `flatpak build-bundle … --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo` so installing it pulls the runtime from Flathub.
 - `.github/workflows/linux-package.yml`:
   - Triggers: `workflow_dispatch` and tags `v*` only, to save CI minutes. Pin third-party actions to major versions. Use no secrets.
-  - Job `build` on `ubuntu-22.04` (x86-64; older glibc so the binary runs on more distros): checkout → apt `pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev desktop-file-utils appstream` → the Rust toolchain from `rust-toolchain.toml` (via rustup) → Rust cache → `astral-sh/setup-uv` → `actions/cache` for `data/raw/` keyed on the hash of `data/sources.json` → `timefly-fetch` → `timefly-bake` (production cube size) → `cargo test -p timefly_core` and `uv run pytest -q` as gates → `cargo build --release -p timefly` (with `TIMEFLY_GIT_SHA` set) → `stage.sh` → `desktop-file-validate` and `appstreamcli validate --no-net` → `build-deb.sh` → upload the `.deb`, and the staged tree as an intermediate artifact.
-  - Job `flatpak` (needs `build`): runs in the freedesktop flatpak-builder container matching the manifest's runtime branch (e.g. the `flatpak/flatpak-github-actions` image), downloads the staged tree, builds with the manifest and produces `time-fly-<short sha>.flatpak`; uploads it.
+  - Job `build` on `ubuntu-22.04` (x86-64; older glibc so the binary runs on more distros): checkout → apt `pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev desktop-file-utils appstream` → the Rust toolchain from `rust-toolchain.toml` (via rustup) → Rust cache → `astral-sh/setup-uv` → `actions/cache` for `data/raw/` keyed on the hash of `data/sources.json` → `timefly-fetch` → `timefly-bake` (production cube size) → `cargo build --release -p timefly` (with `TIMEFLY_GIT_SHA` set) → `timefly --check-data=crates/timefly/assets/data/globe` (loads the bake through the game's reader, window-less, no GPU; exits 1 if it fails) → `stage.sh` → `desktop-file-validate` and `appstreamcli validate --no-net` → `build-deb.sh` → upload the `.deb`, and the staged tree as an intermediate artifact.
+  - Job `test`, in parallel with `build`: `uv run pytest -q`, `cargo test -p timefly_core` and `cargo test -p timefly` (CPU-only; the GPU globe test is `#[ignore]`) as gates.
+  - Job `flatpak` (needs `build` and `test`): runs in the freedesktop flatpak-builder container matching the manifest's runtime branch (e.g. the `flatpak/flatpak-github-actions` image), downloads the staged tree, builds with the manifest and produces `time-fly-<short sha>.flatpak`; uploads it.
   - Artifacts: `time-fly_<version>_amd64.deb` and `time-fly-<sha>.flatpak` (14-day retention), plus `bake.log` and test output as a separate artifact uploaded even when the run fails.
 
 - [ ] **Step 1: Write the failing fetch tests.** Serve a fixture file from a local `http.server` thread. Cover a fresh download, a skip when the checksum already matches, a checksum mismatch that leaves no file behind and exits non-zero, and a `sources.json` entry whose path escapes `data/raw/` (rejected).
@@ -775,7 +776,7 @@ The owner's Linux machine is for testing only. CI builds two installable package
   - Run the crash probe (`--diagnostics-probe=panic`, then a normal launch). Expect a notice pointing at that package's log location; send the file back.
   - Uninstall afterwards: `sudo apt remove time-fly` / `flatpak uninstall --user io.github.adsouza.TimeFly`.
 
-  Record the owner's results in `data/README.md` alongside the Mac numbers. Milestone 1 is accepted when both packages install and run on Vulkan on a hardware GPU, the visual checks pass in both, and the `.deb` run's p95 ≤ 16.7 ms (the Flatpak number is recorded too). If the target is missed, treat it as a Task 10 Step 6 strategy change and rerun.
+  Record the owner's results in `data/README.md` alongside the Mac numbers. Milestone 1 is accepted when both packages install and run on Vulkan on a hardware GPU, the visual checks pass in both, and the `.deb` bench block ends `result: PASS` at 60 fps (the Flatpak block is recorded too). Under ruling R14 the bench judges a display-paced run (frames paced by vsync or the compositor even though `AutoNoVsync` was requested) by missed frames: at most 1% longer than 1.5× the 16.67 ms interval in each direction, with each median at most 5% above the interval; only a run that is really uncapped is judged by p95 ≤ 16.67 ms. The raw p95 is always reported. If the target is missed, treat it as a Task 10 Step 6 strategy change and rerun.
 
 ---
 
@@ -789,3 +790,51 @@ The owner's Linux machine is for testing only. CI builds two installable package
 - Browser performance is measured on an Apple M4, which is faster than the spec's M1-class reference, so the 30 fps browser result is provisional.
 - A native crash that isn't a Rust panic (driver fault, abort, out-of-memory kill) is detected on the next run and its session log is kept, but there's no crash report or minidump for it, and the last buffered log lines may be lost.
 - There is no WebGL2 fallback. The plate renderer needs storage buffers, which WebGL2 lacks.
+- There's no session lock on the web. Opening the game in a second tab while the first is still open makes the first tab's session look crashed, so the second tab shows the crash notice about it.
+- The in-game **Report problem** button opens GitHub's issue form only after this branch is merged to `main`: GitHub reads issue templates from the default branch.
+- Without a usable GPU the game says so instead of starting: on native a dialog ("No compatible GPU/driver found (Vulkan/Metal)", with the log path) and exit code 1; on the web an HTML message asking for a browser with WebGPU. Either way the session is recorded as clean, so the next launch shows no crash notice. The native check asks wgpu for an adapter without the window's surface, so an adapter that exists but can't present to the window still reaches Bevy's renderer and fails there as before. A device lost after start is still recorded as a crash.
+
+---
+
+## Appendix: Rulings and deviations
+
+The execution ledger is git-ignored, so the decisions that changed what was built are recorded here. Each line gives what was decided, why, and the cost if it proves wrong.
+
+**Controller rulings**
+
+- **R1:** One launch-argument parser, `crates/timefly/src/args.rs` (`parse_launch_args` for native argv, `parse_query_args` for the web URL query), shared by the diagnostics probe, the scrub bench and later `--check-data`. Why: two parsers would diverge. Cost if wrong: moving a little code.
+- **R2:** Implementers never download data; the controller listed every file with size and licence and asked the owner once (approved 2026-11-22). Why: downloads need the owner's explicit permission. Cost if wrong: one pause.
+- **R3:** Everything automatable is automated; the controller runs web checks in a browser and non-interactive native checks; interactive native GUI checks (the rfd dialog and overlay buttons) go to `docs/testing/mac-manual-checks.md` for the owner. Why: native dialogs can't be clicked reliably from here. Cost if wrong: a 5-minute owner checklist.
+- **R4:** ICE-6G_C comes from the author's 1° files, not the PMIP4 10′ series (owner approved). Why: a 128-texel cube face is ~0.7° per texel; 15.7 MB against ~1 GB. Cost if wrong: refetch the 10′ set.
+- **R5:** One toolchain: rustup with Rust 1.98.1 pinned in `rust-toolchain.toml`, rustup's directory first on `PATH`. Why: Homebrew's and rustup's differing version strings forced full rebuilds and duplicate artifacts. Cost if wrong: one rebuild.
+- **R6:** Bevy's `basis-universal` feature is native-only. Why: its C++ transcoder doesn't build for `wasm32-unknown-unknown`, and the globe uses `.tfgrid`, not Basis. Cost if wrong: the web build can't transcode Basis textures (none in Milestone 1).
+- **R7:** The `target/` guard hook wasn't live in the execution session, so the controller ran `tools/dev/target-guard.sh` after each task and implementers after large builds. Why: `.claude/` didn't exist when the session started. Cost if wrong: none.
+- **R8:** `diagnostics/session.rs` (1,066 lines) was split into `session/{mod,store,web}.rs` plus `probe.rs`. Why: the plan asks for focused files. Cost if wrong: churn.
+- **R9:** The `system-spans` feature enables `bevy/trace` and `bevy/debug`. Why: spans need real system names for Task 10's span-cost measurement. Cost if wrong: a slightly larger build.
+- **R10:** `CrustModel::resolve` is not instrumented. Why: spec §5.2 calls it per terrain sample, and the per-sample rule beats the plan's "coarse entry point" wording. Cost if wrong: one attribute.
+- **R11:** The bridge crossfade's deep side applies the sea-level anomaly at the current age, not a fixed 30 ka. Why: it is continuous at both ends and physically closer. Cost if wrong: a one-line flip.
+- **R12:** The bake dilates plate footprints: unowned cells within k cells of an owned cell (k = 2 at cube 128, scaled with cube size; a CLI flag tunes or disables it) join the nearest plate (breadth-first, ties to the lowest plate ID) with its validity intervals. Why: cube quantization left ocean cracks through continental interiors; plate pieces hide below-sea-level samples, so dilated ocean cells still show ocean. Cost if wrong: slightly fatter plates, overlap handled by the depth rules.
+- **R13:** Each PaleoDEM frame's G channel is a plate-coverage mask; where it is 0 the ocean shell shows that frame's own land (crossfaded like elevation). Why: 7 Mkm² of land was missing at 66 Ma, and spec §7.1 makes the ocean shell the gap cover. Cost if wrong: gap land crossfades instead of drifting between frames.
+- **R14:** The scrub bench judges a display-paced run by missed frames (at most 1% longer than 1.5× the target interval) and a median at most 5% above the interval; only a truly uncapped run uses p95 ≤ the interval, and raw p95 is always reported. Why: spec "60 fps" means no missed frames, and p95 ≤ 16.67 ms is unmeetable under 60 Hz pacing. Cost if wrong: a looser gate.
+- **R15:** A `web-release` profile (release without debuginfo, `strip = true`, opt-level 3 kept). Why: the wasm shrank from 100.6 MB to 65.8 MB raw (7.7 MB brotli). Cost if wrong: browser stack traces show function indices, not names.
+- **R16:** Bridge-camera MSAA memory (about 309 MiB at 2560×1440) is left as is for now. Why: the browser-pane run at devicePixelRatio 1 was fine; revisit after a desktop-Chrome Retina run. Cost if wrong: high memory in Retina browsers while bridging.
+- **R17:** No manifest version bump for the G channel's new meaning. Why: CI and the packages always bake fresh. Cost if wrong: a stale local bake shows ghost land between frames.
+- **Unnumbered (Task 1):** The age label picks its unit from the rounded value, with a singular "1 year ago". Why: the plan's thresholds on unrounded values gave labels such as "1000 thousand years ago". Cost if wrong: trivial.
+
+**Owner decisions (2026-11-22)**
+
+- **ICE-6G_C:** use the author's 1° files (R4). They state no licence, only a request to cite two papers; the owner approved distributing the baked derivatives with both citations in the credits and package copyright file, never the raw files (recorded in `data/README.md`).
+- **Licence:** AGPL-3.0-or-later.
+- **Maintainer:** "Antonio D'souza <275832+adsouza@users.noreply.github.com>" in the package metadata.
+- **Linux packages:** both a `.deb` and a single-file Flatpak bundle (app ID `io.github.adsouza.TimeFly`) from one release build.
+- **Compressed debug sections:** CI alone links the release binary with `--compress-debug-sections=zlib` (about 123 MB download / 230 MB installed, against about 80 / 576 MB uncompressed); local builds are unaffected.
+- **Push and CI:** pushing `milestone-1` to `origin` and running `linux-package.yml`, fix-and-rerun pushes included, is approved; never push `main`, never force-push.
+- **TLS for the ICE-6G_C host:** its server omits the Sectigo intermediate, so the fetcher downloads exactly that intermediate through the leaf's AIA URL and retries with partial chains disallowed (the chain must end at a system root); hostname checks, required certificates and the SHA-256 pins are unchanged, and a self-signed AIA certificate is refused.
+- **Browser bench:** run in the Claude desktop app's browser pane, visible, on this Mac (the Chrome extension's browser was on another machine and couldn't reach localhost). Cold-cache trials and Chrome memory in desktop Chrome remain optional owner checks.
+
+**Other deviations from the plan text**
+
+- Task 7 reads the archives in place (no manual unpacking); `ages.py` and `--paleodem-ages` / `--paleodem-step-myr` were added.
+- The bake tool needs Python 3.13 (`pygplates` 1.0.0 wheels stop at cp313).
+- CI got a parallel `test` job, caches and a temporary push trigger on `milestone-1` (the workflow had to run once before it could be dispatched); the trigger was removed after the final CI verification, leaving `workflow_dispatch` and `v*` tags.
+- Final review fixes: the pre-flight GPU check (see Known limitations), hidden `--check-data[=DIR]` run in CI on the production bake, `cargo test -p timefly` in CI, the scrub bench's FAIL exit code (3, a clean session) and FAIL block when the globe fails, and per-frame time changes logged below `info`.

@@ -388,7 +388,7 @@ The goal is to debug a problem from what the session recorded, without reproduci
 
 **Where records go:**
 - The console (terminal or browser console).
-- A per-session log file on native, in the platform's log location: macOS `~/Library/Logs/Time Fly`, Linux `$XDG_STATE_HOME/time-fly`, Windows `%LOCALAPPDATA%\Time Fly\logs`. Keep the last 10 sessions.
+- A per-session log file on native, in the platform's log location: macOS `~/Library/Logs/Time Fly`, Linux `$XDG_STATE_HOME/time-fly/logs` (default `~/.local/state/time-fly/logs`), Windows `%LOCALAPPDATA%\Time Fly\logs`. Keep the last 10 sessions.
 - An in-memory **flight recorder** of the most recent detailed events. It goes into the crash report on a panic and into the session log at the first error. On the web it is saved to browser storage every few seconds and when the page hides.
 
 **Crash detection.** Each session records its build, platform, adapter and status, and holds a lock while it runs. A clean exit marks it clean. At the next launch, a session still marked running whose lock is free has crashed or been killed. Panics, aborts, driver crashes, out-of-memory kills and power loss all look the same from there, so the notice says the game "didn't close normally". A panic also writes a crash report: message, location, backtrace, build, last known game state and recent events.

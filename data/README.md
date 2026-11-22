@@ -57,7 +57,7 @@ from the GPlates plate-model registry entry `scotese_and_wright2018`, which decl
 | `data/raw/plates/Rotations.zip` | https://repo.gplates.org/webdav/pmm/scotese_and_wright2018/Rotations.zip | `73a92b7734b6e7471a15a116703886b9d030f6da7f00172e593abbdf300f2031` |
 | `data/raw/plates/StaticPolygons.zip` | https://repo.gplates.org/webdav/pmm/scotese_and_wright2018/StaticPolygons.zip | `27dbc00cbd0bff840198706d306571eecfff62781fe4dfd49d396d73463f77d2` |
 
-The checksums are also in `data/raw/SHA256SUMS`. The archives hold one file each:
+The same pins are in `data/sources.json`. The archives hold one file each:
 
 - `Rotations/Scotese_Wright_PlateModel.rot` (79,521 bytes, PLATES4 format). Header: "PALEOMAP Plate
   Model m15g60_v2d3, for use with Plate Polygons ContOCeanPolyv10u_v2d3, by CR Scotese 02/01/2016".
@@ -66,9 +66,10 @@ The checksums are also in `data/raw/SHA256SUMS`. The archives hold one file each
   polygons, 150 plate IDs. Continental polygons only: ocean floor has no plate and shows the ocean
   shell.
 
-Unpack into a fresh directory and only parse the contents:
-`unzip Rotations.zip -d extracted && unzip StaticPolygons.zip -d extracted` in `data/raw/plates`.
-Nothing under `data/raw/` is committed.
+Nothing needs unpacking: `timefly-bake` reads the archives where they are and copies only the
+members it needs (by base name, size-checked) into a temporary directory. To look inside by hand,
+unzip into a scratch directory outside `data/raw/` and only parse the contents. Nothing under
+`data/raw/` is committed.
 
 - **Citation:** Scotese, C.R. & Wright, N. (2018). *PALEOMAP Paleodigital Elevation Models
   (PaleoDEMS) for the Phanerozoic.* Zenodo. https://doi.org/10.5281/zenodo.5460860
@@ -118,9 +119,9 @@ whose Table 1 gives each map's reconstruction age.
   (PaleoDEMS) for the Phanerozoic.* PALEOMAP Project. https://doi.org/10.5281/zenodo.5460860
 - **Licence:** CC BY 4.0 (`License.txt` in the archive, and the Zenodo record). Baked frames may
   ship with the game with the citation in the credits; the raw archive is not redistributed.
-- **Unpacking:** `unzip Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip -d extracted` in
-  `data/raw/paleodem`, then only parse the contents. The `.nc` files are in
-  `extracted/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc_v2/`.
+- **Unpacking:** not needed; `timefly-bake` copies the `.nc` members (archive folder
+  `Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc_v2/`) into a temporary directory by base
+  name and only parses them.
 
 **Archive contents.** 109 `.nc` files (not 88: the map numbering has half steps such as 43.5 and
 84.1 and skips 2–2.5 and 4), one per 5 Myr from 0 to 540 Ma. Also GPlates raster caches
@@ -170,12 +171,12 @@ to have exactly one row, strictly ascending timeline ages, a present-day source 
 ## ICE-6G_C (VM5a)
 
 The author's 1° netCDF slices of the ICE-6G_C (VM5a) glacial isostatic adjustment model, one per
-integer ka from 0 to 26 ka BP (the owner chose these over the PMIP4 10′ series: 13 MB against
+integer ka from 0 to 26 ka BP (the owner chose these over the PMIP4 10′ series: 15.7 MB against
 ~1 GB, and a 128-texel cube face is ~0.7° per texel anyway).
 
 | Files | URL pattern | SHA-256 |
 |---|---|---|
-| `data/raw/ice6g/I6_C.VM5a_1deg.<k>.nc.gz`, k = 0…26 (27 files, 15,651,848 bytes) | `https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.<k>.nc.gz` | one per file in `data/raw/SHA256SUMS` (the source publishes none); e.g. k = 0 `ca6262d23cdae07e3ed286e8b3c6cabcc4327db63caec70fa4096811bb0f6f88`, k = 26 `f219b296032f0850772c3a26b90b0072a140ac307e4e0a0ebe5937ecaf401b95` |
+| `data/raw/ice6g/I6_C.VM5a_1deg.<k>.nc.gz`, k = 0…26 (27 files, 15,651,848 bytes) | `https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.<k>.nc.gz` | one per file in `data/sources.json` (the source publishes none); e.g. k = 0 `ca6262d23cdae07e3ed286e8b3c6cabcc4327db63caec70fa4096811bb0f6f88`, k = 26 `f219b296032f0850772c3a26b90b0072a140ac307e4e0a0ebe5937ecaf401b95` |
 
 - **Citation** (the files' `Acknowledgement` attribute asks for both): Argus, D.F., Peltier, W.R.,
   Drummond, R. & Moore, A.W. (2014). The Antarctica component of postglacial rebound model
