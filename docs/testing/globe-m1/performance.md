@@ -189,3 +189,30 @@ Not measured by the implementer (no browser). Steps, on this Mac with the same b
    (decoded textures and bridge targets for the canvas's physical size, which the block
    prints: the default 1280x720 canvas is 2560x1440 physical at devicePixelRatio 2).
 7. Exercise the same visual and input checks as `docs/testing/mac-manual-checks.md` 6-10.
+
+### Results: in-app browser pane (controller, 2026-11-22)
+
+Run in the Claude desktop app's built-in browser pane (Chromium 156.0.8078.100, WebGPU via
+`BrowserWebGpu`) on the Apple M4, with the pane visible (a hidden pane throttles rendering to
+~1 Hz; an earlier run in a hidden pane was discarded). Build `3e2e7d2` (web-release), bake
+`manifest v2, sha256 013f81f437f19736`, canvas 1280x720, served from `crates/timefly` on
+localhost (no throttling, warm HTTP cache: this is not a cold-cache trial).
+
+| | older (present → 540 Ma) | younger (540 Ma → present) |
+|---|---|---|
+| frames | 1195 | 1191 |
+| median | 16.67 ms | 16.67 ms |
+| p95 | 18.19 ms | 18.01 ms |
+| worst | 98.01 ms | 197.15 ms |
+| missed (> 50 ms) | 2 (0.17%) | 1 (0.08%) |
+| stalls (> 66.7 ms) | 1 | 1 |
+
+- Bridge (26–30 ka, both directions): 22 frames, median 16.68 ms, worst 19.88 ms, no stalls.
+- Result: **PASS** (display-paced missed-frame rule, R14); the page holds 60 fps.
+- Load: 0.83 s from navigation to first interactive frame (0.66 s after the wasm started),
+  warm cache.
+- Bridge render targets at 1280x720: 7.0 MiB persistent + 70.3 MiB while bridging
+  (calculated). Process memory isn't available in the browser.
+- Not yet done: three cold-cache trials, per-file transfer sizes and Chrome Task Manager memory
+  in desktop Chrome (steps 2–4 and 6). The single ~100–200 ms hitch per direction is worth a
+  look (likely first use of a pipeline or texture).
