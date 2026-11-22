@@ -381,24 +381,6 @@ pub fn read_tfplates(bytes: &[u8]) -> Result<PlateFootprints, FormatError> {
     })
 }
 
-/// Checks that every footprint entry names a plate present in the rotation table.
-pub fn check_footprints_against_rotations(
-    footprints: &PlateFootprints,
-    rotations: &RotationTable,
-) -> Result<(), FormatError> {
-    let n_plates = rotations.plate_ids.len();
-    if footprints
-        .entries
-        .iter()
-        .any(|e| e.plate_index.0 as usize >= n_plates)
-    {
-        return Err(FormatError::Invalid(
-            "footprint plate index beyond the rotation table",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,11 +543,17 @@ mod tests {
     }
 
     #[test]
-    fn footprint_indices_are_checked_against_rotations() {
-        let rot = read_tfrot(&rot_file(&[1], &[0.0], [0.0, 0.0, 0.0, 1.0])).unwrap();
+    fn decoded_files_build_a_crust_model_only_when_indices_match() {
+        use crate::geodynamics::{CrustModel, CrustModelError};
+        let rot = || read_tfrot(&rot_file(&[1], &[0.0], [0.0, 0.0, 0.0, 1.0])).unwrap();
         let fits = read_tfplates(&plates_file(&offsets_for(1, 0), &[(0, 0.0, 1.0)])).unwrap();
-        assert!(check_footprints_against_rotations(&fits, &rot).is_ok());
+        assert!(CrustModel::new(rot(), fits).is_ok());
         let beyond = read_tfplates(&plates_file(&offsets_for(1, 0), &[(1, 0.0, 1.0)])).unwrap();
-        assert!(check_footprints_against_rotations(&beyond, &rot).is_err());
+        assert_eq!(
+            CrustModel::new(rot(), beyond).err(),
+            Some(CrustModelError::MissingPlate {
+                plate_index: PlateIndex(1)
+            })
+        );
     }
 }

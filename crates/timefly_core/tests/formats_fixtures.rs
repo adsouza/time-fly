@@ -51,3 +51,21 @@ fn rejects_bad_magic_and_truncation() {
     ));
     assert!(read_tfgrid(&good[..10]).is_err());
 }
+
+#[test]
+fn python_fixtures_build_a_crust_model_and_interpolate() {
+    use timefly_core::geodynamics::CrustModel;
+    let rot = read_tfrot(include_bytes!("fixtures/rot_small.tfrot")).unwrap();
+    let fp = read_tfplates(include_bytes!("fixtures/footprints_small.tfplates")).unwrap();
+    let model = CrustModel::new(rot, fp).unwrap();
+    let t = model.rotations();
+    // Plate 303 turns 90 degrees about +Y over 1 Myr: halfway is 45 degrees.
+    let q = t
+        .rotation_at(t.index_of(PlateId(303)).unwrap(), 0.5)
+        .unwrap();
+    let z = q * bevy_math::Vec3::Z;
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    assert!((z - bevy_math::Vec3::new(h, 0.0, h)).length() < 1e-6);
+    // Plate 202's circuit is missing at 1 Myr, so nothing is interpolated towards it.
+    assert_eq!(t.rotation_at(t.index_of(PlateId(202)).unwrap(), 0.5), None);
+}

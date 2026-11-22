@@ -1,10 +1,12 @@
-//! Plate identity types shared by the bake output and the runtime. Forward and inverse lookups
-//! arrive with the plate-motion model.
+//! Plate identity types shared by the bake output and the runtime, the rotation table and the
+//! crust model that looks positions up between plate-fixed and era frames.
 
 pub mod crust;
 pub mod rotation;
 
-pub use crust::{FootprintEntry, PlateFootprints};
+pub use crust::{
+    Candidate, CrustModel, CrustModelError, FootprintEntry, PlateFootprints, ResolvedPosition,
+};
 pub use rotation::RotationTable;
 
 /// Stable source identifier of a plate, constant across bakes.
