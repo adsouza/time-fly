@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use tracing::instrument;
+
 /// Where a frame's image came from, and so how it is sampled.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum FrameSource {
@@ -223,6 +225,7 @@ pub struct Timeline {
 
 impl Timeline {
     /// Validates and builds a timeline. `sea_level_curve` holds `(age_myr, anomaly_m)` knots.
+    #[instrument(level = "debug", skip_all, fields(frames = frames.len(), knots = sea_level_curve.len()), err)]
     pub fn new(
         frames: Vec<FrameMeta>,
         sea_level_curve: Vec<(f64, f64)>,
@@ -410,6 +413,63 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records the names and levels of the spans opened, and the levels of the events, on this
+    /// thread.
+    #[derive(Default)]
+    struct Spans {
+        spans: std::sync::Mutex<Vec<(String, tracing::Level)>>,
+        events: std::sync::Mutex<Vec<tracing::Level>>,
+        next_id: std::sync::atomic::AtomicU64,
+    }
+
+    #[derive(Clone, Default)]
+    struct SpanLog(std::sync::Arc<Spans>);
+
+    impl std::ops::Deref for SpanLog {
+        type Target = Spans;
+        fn deref(&self) -> &Spans {
+            &self.0
+        }
+    }
+
+    impl tracing::Subscriber for SpanLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let meta = span.metadata();
+            self.spans
+                .lock()
+                .unwrap()
+                .push((meta.name().to_string(), *meta.level()));
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::span::Id::from_u64(id + 1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.events.lock().unwrap().push(*event.metadata().level());
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn building_a_timeline_is_a_debug_span_that_records_its_error() {
+        // Like `CrustModel::new`: the coarse entry point is traced (spec §20).
+        let log = SpanLog::default();
+        tracing::subscriber::with_default(log.clone(), || {
+            assert_eq!(Timeline::new(vec![], vec![]), Err(TimelineError::NoFrames));
+        });
+        assert_eq!(
+            *log.spans.lock().unwrap(),
+            vec![("new".to_string(), tracing::Level::DEBUG)]
+        );
+        assert_eq!(*log.events.lock().unwrap(), vec![tracing::Level::ERROR]);
+    }
 
     fn ice(age_myr: f64, image_slot: u32) -> FrameMeta {
         FrameMeta {
