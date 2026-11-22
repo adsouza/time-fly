@@ -13,3 +13,5 @@ debug = false
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# File and line in panic backtraces, for crash reports (spec §20).
+debug = "line-tables-only"

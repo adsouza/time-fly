@@ -1,0 +1,24 @@
+name: Crash report
+description: Time Fly didn't close normally. Send the log so the problem can be fixed.
+labels: [crash]
+body:
+  - type: input
+    id: session_id
+    attributes:
+      label: Session ID
+      description: Filled in by the game's Report problem button.
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What were you doing when it happened?
+  - type: input
+    id: platform
+    attributes:
+      label: OS and graphics card
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Drag the log file from **Show log** or **Download log** into this box.

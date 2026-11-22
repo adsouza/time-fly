@@ -3,18 +3,50 @@ name = "timefly"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["system-spans"]
+# Bevy's `trace` feature wraps every system and schedule in a span (spec §20). Task 10 measures
+# its cost.
+system-spans = ["bevy/trace"]
+
 [dependencies]
 bevy = { version = "0.20", features = ["ktx2", "zstd_rust", "bevy_ui_widgets"] }
 timefly_core = { path = "../timefly_core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytemuck = { version = "1.19", features = ["derive"] }
+tracing = "0.1"
 
 # basis-universal builds a C++ transcoder that needs a libc sysroot, which wasm32-unknown-unknown
 # does not have, so it is enabled on native targets only.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy = { version = "0.20", features = ["basis-universal"] }
+# The appender's non-blocking writer runs a worker thread, which wasm32 does not have; the web
+# keeps its log in localStorage instead.
+tracing-appender = "0.2"
+directories = "6"
+fd-lock = "4"
+opener = { version = "0.9", features = ["reveal"] }
+rfd = "0.18"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy = { version = "0.20", features = ["webgpu"] }
 console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+# Already in the tree via wasm-bindgen; for Date.now, Math.random and the Blob parts array.
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlAnchorElement",
+    "Storage",
+    "Location",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    # Needed for append_child/set_text_content and the pagehide listener.
+    "Node",
+    "EventTarget",
+] }
