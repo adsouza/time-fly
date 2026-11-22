@@ -17,7 +17,7 @@ fn reads_python_rot_fixture() {
     let t = read_tfrot(include_bytes!("fixtures/rot_small.tfrot")).unwrap();
     assert_eq!(t.plate_ids, vec![PlateId(101), PlateId(202), PlateId(303)]);
     assert_eq!(t.times_myr, vec![0.0, 1.0]);
-    assert!((t.quats[3 + 2][1] - 0.7071068).abs() < 1e-6);
+    assert!((t.quats[3 + 2][1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
     assert!(!t.valid[3 + 1]);
     assert!(t.valid[0] && t.valid[3 + 2]);
 }

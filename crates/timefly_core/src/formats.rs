@@ -256,14 +256,24 @@ pub fn read_tfrot(bytes: &[u8]) -> Result<RotationTable, FormatError> {
     let (times, rest) = rest.split_at(times_len);
     let (quats, valid) = rest.split_at(quats_len);
 
-    let plate_ids: Vec<PlateId> = ids.chunks_exact(4).map(|c| PlateId(le_u32(c, 0))).collect();
+    let plate_ids: Vec<PlateId> = ids
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| PlateId(u32::from_le_bytes(*c)))
+        .collect();
     let mut sorted: Vec<u32> = plate_ids.iter().map(|p| p.0).collect();
     sorted.sort_unstable();
     if sorted.windows(2).any(|w| w[0] == w[1]) {
         return Err(FormatError::Invalid("duplicate plate id"));
     }
 
-    let times_myr: Vec<f64> = times.chunks_exact(8).map(le_f64).collect();
+    let times_myr: Vec<f64> = times
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| f64::from_le_bytes(*c))
+        .collect();
     if times_myr[0] != 0.0
         || !times_myr.iter().all(|t| t.is_finite())
         || times_myr.windows(2).any(|w| w[0] >= w[1])
@@ -283,7 +293,7 @@ pub fn read_tfrot(bytes: &[u8]) -> Result<RotationTable, FormatError> {
     }
 
     let mut quat_values = Vec::with_capacity(records);
-    for (i, q) in quats.chunks_exact(16).enumerate() {
+    for (i, q) in quats.as_chunks::<16>().0.iter().enumerate() {
         let f = |k: usize| f32::from_le_bytes([q[k * 4], q[k * 4 + 1], q[k * 4 + 2], q[k * 4 + 3]]);
         let quat = [f(0), f(1), f(2), f(3)];
         if flags[i] && !quat.iter().all(|v| v.is_finite()) {
@@ -321,7 +331,12 @@ pub fn read_tfplates(bytes: &[u8]) -> Result<PlateFootprints, FormatError> {
     let data = decompress(payload, expected)?;
     let (off_bytes, ent_bytes) = data.split_at(offsets_len);
 
-    let offsets: Vec<u32> = off_bytes.chunks_exact(4).map(|c| le_u32(c, 0)).collect();
+    let offsets: Vec<u32> = off_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
     if offsets[0] != 0
         || offsets[cells] as usize != n_entries
         || offsets.windows(2).any(|w| w[0] > w[1])
@@ -332,7 +347,9 @@ pub fn read_tfplates(bytes: &[u8]) -> Result<PlateFootprints, FormatError> {
     }
 
     let entries: Vec<FootprintEntry> = ent_bytes
-        .chunks_exact(ENTRY_BYTES)
+        .as_chunks::<ENTRY_BYTES>()
+        .0
+        .iter()
         .map(|c| FootprintEntry {
             plate_index: PlateIndex(le_u32(c, 0)),
             younger_myr: le_f64(&c[4..12]),
