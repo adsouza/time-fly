@@ -150,7 +150,8 @@ integer ka from 0 to 26 ka BP (the owner chose these over the PMIP4 10′ series
   https://doi.org/10.1002/2014JB011176
 - **Licence/terms:** none stated in the files or found for the download directory; the only stated
   condition is the citation request above. Baked frames ship with both citations in the credits;
-  the raw files are not redistributed. (The author's index page could not be fetched to check for
+  the raw files are not redistributed. The project owner approved distributing the baked
+  derivatives on these terms (citation and credit only) on 2026-11-22. (The author's index page could not be fetched to check for
   further terms: its TLS certificate chain does not verify.)
 - **Unpacking:** not needed; `timefly_bake.ice6g.load_ice6g` inflates each `.nc.gz` in memory and
   only parses it.
@@ -223,6 +224,30 @@ regardless.
 has no ice overlay. The Quaternary bridge uses modern terrain (the present-day PaleoDEM) shifted by
 the sea-level curve, so glacial coastlines are approximated but Pleistocene ice sheets before
 26 ka and all pre-Quaternary ice are absent; PaleoDEMs carry their own published sea level.
+
+## Performance and memory (Task 10)
+
+Full results, method and the Chrome WebGPU steps: [`docs/testing/globe-m1/performance.md`](../docs/testing/globe-m1/performance.md).
+In-game credits (`Esc`) list every citation above (`crates/timefly/assets/credits.txt`).
+
+Native Metal, Apple M4, macOS 27.2.1, release build `c249528`, 2560x1440, this bake (137
+frames, 136 images, cube size 128, 17,177,338 bytes):
+
+- **Scrub frame times** (20 s each way, warm): median 16.6 ms, p95 18.3 ms (older) / 19.1 ms
+  (younger), worst 27.2 ms, no frame over 33.3 ms, bridge included. Presentation is paced at the
+  display's 60 Hz, so p95 is pacing jitter; the bench's strict p95 <= 16.67 ms reads FAIL on
+  this Mac. Informational; the 60 fps target is checked on Linux (Task 11).
+- **Cold load to first interactive frame:** 3.95 s and 4.30 s for the first launch right after
+  a build, 0.53 s for another first launch, 0.39-0.40 s on relaunch.
+- **GPU texels:** 61.1 MiB of decoded frame textures (as estimated, ~61 MiB), plus the bridge:
+  28.1 MiB persistent targets and 281.2 MiB of MSAA/depth/main textures for its two cameras at
+  2560x1440 (both resident from warm-up on).
+- **Process footprint** (Apple silicon, includes GPU): ~1.0-1.07 GiB at 2560x1440, 658 MiB at
+  1280x720; about 130 B per window pixel, of which the bridge is ~88 B/px.
+- **System spans:** no measurable p95 change; ~3-4% more user CPU. Kept as a default feature.
+- **Data size:** 17.2 MB on disk, already zstd-19 (~17.0 MB with HTTP compression), inside the
+  ~20 MB target; preloading every frame is affordable on desktop. Browser transfer and memory
+  numbers are pending the Chrome run.
 
 Reference files:
 
