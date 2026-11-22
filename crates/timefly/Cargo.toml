@@ -50,3 +50,7 @@ web-sys = { version = "0.3", features = [
     "Node",
     "EventTarget",
 ] }
+
+[dev-dependencies]
+# Writes a deliberately broken `.tfplates` in the data-loading failure tests.
+ruzstd = "0.9"

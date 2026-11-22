@@ -5570,6 +5570,7 @@ dependencies = [
  "js-sys",
  "opener",
  "rfd",
+ "ruzstd",
  "serde",
  "serde_json",
  "timefly_core",
