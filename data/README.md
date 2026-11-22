@@ -55,6 +55,16 @@ Nothing under `data/raw/` is committed.
   sizes 8 or 64 lies in two polygons (or in one plate's polygons over disjoint intervals), so in
   practice each footprint cell holds at most one entry; overlaps in the era frame come from plate
   motion.
+- **Footprint dilation:** after polygon assignment, every unowned cell within K cells (8-connected,
+  across cube faces) of an owned cell joins the nearest plate by breadth-first distance (ties to
+  the lowest plate ID) with that cell's interval list (`--footprint-dilate-cells`, default 2 at
+  cube size 128, scaled with the cube size, 0 at the cube-8 test fixture). This closes
+  quantisation cracks between plates; dilated cells over water still render as ocean.
+- **Coverage mask (PaleoDEM channel G):** 1 where some plate with a valid rotation at the frame's
+  source reconstruction age has a footprint cell, valid at that age, under the texel (the
+  renderer's "covered" rule, dilated footprints included), else 0. The ocean shell shows the
+  frame's own land where G is 0, which fills gaps that open between drifting polygons exactly at
+  frame ages; between frames that land morphs rather than drifts.
 
 ## PaleoDEMs
 

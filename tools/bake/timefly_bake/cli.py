@@ -72,6 +72,7 @@ class _Image:
     path: Path
     label: str
     ka: int | None = None
+    source_age_myr: float | None = None
 
 
 @dataclass(frozen=True)
@@ -182,7 +183,9 @@ def _check_inputs(raw: Path, ages_path: Path) -> list[str]:
     return problems
 
 
-def _write_images(out: Path, images: list[_Image], dirs) -> list[str]:
+def _write_images(out: Path, images: list[_Image], dirs, coverage=None) -> list[str]:
+    """Writes every image; ``coverage(age_myr)`` gives a PaleoDEM's plate-coverage mask
+    (channel G) at its source reconstruction age."""
     frames_dir = out / FRAMES_DIR
     frames_dir.mkdir(parents=True, exist_ok=True)
     names = []
@@ -193,6 +196,8 @@ def _write_images(out: Path, images: list[_Image], dirs) -> list[str]:
             data = ice6g.bake_ice_frame(dirs, *ice6g.load_ice6g(image.path, expect_ka=image.ka))
         else:
             data = paleodem.bake_paleo_frame(dirs, paleodem.load_paleodem(image.path))
+            if coverage is not None:
+                data[..., 1] = coverage(image.source_age_myr)
         formats.write_tfgrid(out / rel, "cube", data)
         size = (out / rel).stat().st_size
         total += size
@@ -212,7 +217,8 @@ def _write_images(out: Path, images: list[_Image], dirs) -> list[str]:
 
 def _write_plates(
     out: Path, dirs, rot_path: Path, gpml_path: Path, source_ages, dilate_cells: int
-) -> None:
+):
+    """Writes footprints and rotations; returns a ``coverage(age_myr)`` mask function."""
     fp = plates.dilate_footprints(plates.assign_plates(dirs, gpml_path), dilate_cells)
     plate_ids = sorted({int(p) for p in fp.plate_ids})
     times = plates.rotation_times(rot_path, plate_ids, source_ages)
@@ -251,6 +257,11 @@ def _write_plates(
         gaps,
         len(at_sources),
     )
+
+    def coverage(age_myr):
+        return plates.coverage_mask(dirs, fp, plate_ids, times, quats, valid, age_myr)
+
+    return coverage
 
 
 def _manifest_json(manifest: dict) -> str:
@@ -320,6 +331,7 @@ def bake(
                     f.path,
                     f"{f.path.name} (timeline {f.timeline_age_myr:g} Ma, "
                     f"reconstruction {f.source_rotation_age_myr:g} Ma)",
+                    source_age_myr=f.source_rotation_age_myr,
                 )
             )
             frames.append(
@@ -346,13 +358,12 @@ def bake(
         )
 
         dirs = cube.texel_center_dirs(cube_size)
-        files = _write_images(out, images, dirs)
         dilate = (
             plates.default_dilate_cells(cube_size)
             if footprint_dilate_cells is None
             else footprint_dilate_cells
         )
-        _write_plates(
+        coverage = _write_plates(
             out,
             dirs,
             rot_path,
@@ -360,6 +371,7 @@ def bake(
             [f.source_rotation_age_myr for f in all_paleo],
             dilate,
         )
+        files = _write_images(out, images, dirs, coverage)
 
     manifest = {
         "version": MANIFEST_VERSION,

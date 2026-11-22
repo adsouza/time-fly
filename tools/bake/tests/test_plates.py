@@ -274,3 +274,35 @@ def test_zero_dilation_is_identity_and_default_scales_with_cube_size():
     assert plates.default_dilate_cells(128) == 2
     assert plates.default_dilate_cells(256) == 4
     assert plates.default_dilate_cells(8) == 0
+
+
+# --- coverage mask ---------------------------------------------------------------------------
+
+
+def _quat_about_y(deg):
+    h = math.radians(deg) / 2.0
+    return [0.0, math.sin(h), 0.0, math.cos(h)]
+
+
+def test_coverage_mask_follows_rotation_and_validity():
+    n = 8
+    # Plate 101 owns +Z face cell (3, 3) for 0-100 Ma and cell (4, 4) for 0-540 Ma.
+    fp = _footprints(n, {(4, 3, 3): [(101, 0.0, 100.0)], (4, 4, 4): [(101, 0.0, 540.0)]})
+    dirs = cube.texel_center_dirs(n)
+    times = np.array([0.0, 200.0])
+    # Identity at 0 Ma; +90 deg about +Y at 200 Ma (+Z goes to +X).
+    quats = np.array([[[0.0, 0.0, 0.0, 1.0]], [_quat_about_y(90.0)]], dtype=np.float32)
+    valid = np.array([[1], [1]], dtype=np.uint8)
+    m0 = plates.coverage_mask(dirs, fp, [101], times, quats, valid, 0.0)
+    assert m0.shape == (6, n, n)
+    assert m0[4, 3, 3] == 1.0 and m0[4, 4, 4] == 1.0 and m0.sum() == 2.0
+    # At 200 Ma only the long-lived cell counts, rotated onto the +X face.
+    m200 = plates.coverage_mask(dirs, fp, [101], times, quats, valid, 200.0)
+    assert m200.sum() == 1.0
+    f, c, r = cube.dirs_to_texels(plates._rotate(np.array(_quat_about_y(90.0)), dirs[4, 4, 4][None]), n)
+    assert m200[f[0], r[0], c[0]] == 1.0 and f[0] == 0
+    # No rotation at that age: nothing is covered.
+    invalid = np.array([[1], [0]], dtype=np.uint8)
+    assert plates.coverage_mask(dirs, fp, [101], times, quats, invalid, 200.0).sum() == 0.0
+    with pytest.raises(ValueError):
+        plates.coverage_mask(dirs, fp, [101], times, quats, valid, 50.0)

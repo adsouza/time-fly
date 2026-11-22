@@ -261,6 +261,63 @@ def dilate_footprints(footprints: PlateFootprints, cells: int) -> PlateFootprint
     )
 
 
+def _rotate(q, v):
+    """Rotate vectors ``v`` ``(m, 3)`` by the unit quaternion ``q`` ``(x, y, z, w)``."""
+    u, w = q[:3], q[3]
+    t = 2.0 * np.cross(u, v)
+    return v + w * t + np.cross(u, t)
+
+
+@traced
+def coverage_mask(dirs_render, footprints: PlateFootprints, plate_ids, times_myr, quats, valid, age_myr):
+    """Which geographic texels some plate covers at ``age_myr``: float ``(6, n, n)``, 1 or 0.
+
+    The renderer's "covered" rule (``CrustModel::resolve`` at that age): a texel direction ``d``
+    is covered when a plate with a valid rotation ``q`` at ``age_myr`` has a footprint cell,
+    valid at ``age_myr``, containing ``q⁻¹ d`` under the cube tie rule. ``quats``/``valid`` are
+    ``export_rotations`` output for ``plate_ids`` at ``times_myr``, which must contain the age.
+    """
+    dirs = np.asarray(dirs_render, dtype=np.float64)
+    shape = dirs.shape[:-1]
+    flat = dirs.reshape(-1, 3)
+    n = footprints.cube_size
+    times = np.asarray(times_myr, dtype=np.float64)
+    hits = np.flatnonzero(times == age_myr)
+    if len(hits) != 1:
+        raise ValueError(f"rotation times lack the age {age_myr}")
+    t = int(hits[0])
+    fp = footprints
+    cells = np.repeat(np.arange(len(fp.offsets) - 1), np.diff(fp.offsets.astype(np.int64)))
+    live = (fp.younger_myr <= age_myr) & (age_myr <= fp.older_myr)
+    centres = cube.texel_center_dirs(n).reshape(-1, 3)
+    margin = 4.0 / n  # radians: a couple of cells around the plate's cap
+    covered = np.zeros(len(flat), dtype=bool)
+    index = {int(p): j for j, p in enumerate(plate_ids)}
+    for pid in np.unique(fp.plate_ids[live]):
+        j = index.get(int(pid))
+        if j is None or not bool(valid[t, j]):
+            continue
+        q = np.asarray(quats[t, j], dtype=np.float64)
+        q = q / np.linalg.norm(q)
+        owned = np.zeros(len(centres), dtype=bool)
+        owned[cells[live & (fp.plate_ids == pid)]] = True
+        placed = _rotate(q, centres[owned])
+        mean = placed.mean(axis=0)
+        norm = np.linalg.norm(mean)
+        if norm < 1e-6:
+            candidates = np.arange(len(flat))
+        else:
+            m = mean / norm
+            angle = float(np.arccos(np.clip((placed @ m).min(), -1.0, 1.0))) + margin
+            candidates = np.flatnonzero(flat @ m >= np.cos(min(angle, np.pi)))
+        conj = np.array([-q[0], -q[1], -q[2], q[3]])
+        back = _rotate(conj, flat[candidates])
+        f, col, row = cube.dirs_to_texels(back, n)
+        covered[candidates[owned[(f * n + row) * n + col]]] = True
+    _log.debug("coverage at %g Ma: %d of %d texels", age_myr, int(covered.sum()), covered.size)
+    return covered.reshape(shape).astype(np.float32)
+
+
 @traced
 def footprint_entries(footprints: PlateFootprints, rotation_plate_ids):
     """``(plate_index, younger_myr, older_myr)`` triples for ``formats.write_tfplates``.

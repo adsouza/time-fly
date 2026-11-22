@@ -217,7 +217,8 @@ def sample_bilinear(grid: LatLonGrid, lat, lon):
 def bake_paleo_frame(dirs_render, grid: LatLonGrid):
     """Sample ``grid`` at render-frame directions ``(..., 3)`` (usually
     ``cube.texel_center_dirs(n)``), giving float16 ``(..., 2)``: R = signed elevation in
-    metres, G reserved at zero. Every texel is filled from the geographic grid, whether or not
+    metres, G zero (the bake CLI fills it with the frame's plate-coverage mask,
+    ``plates.coverage_mask``). Every texel is filled from the geographic grid, whether or not
     any plate covers it."""
     lat, lon = geo.geo_to_latlon(geo.render_to_geo(np.asarray(dirs_render, dtype=np.float64)))
     elevation = sample_bilinear(grid, lat, lon)
