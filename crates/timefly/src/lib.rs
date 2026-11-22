@@ -4,10 +4,12 @@ use bevy::prelude::*;
 pub mod args;
 pub mod data;
 pub mod diagnostics;
+pub mod globe;
 pub mod time;
 
 use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
+use globe::GlobePlugin;
 
 /// Builds the Time Fly app. Plugins are added here as milestones land.
 pub fn app(session: &Session) -> App {
@@ -25,7 +27,10 @@ pub fn app(session: &Session) -> App {
     // Bevy's web panic handler replaces the panic hook; ours chains console_error_panic_hook.
     #[cfg(target_arch = "wasm32")]
     let plugins = plugins.disable::<bevy::app::PanicHandlerPlugin>();
-    app.add_plugins(plugins)
-        .add_plugins((time::TimePlugin, GlobeDataPlugin::default()));
+    app.add_plugins(plugins).add_plugins((
+        time::TimePlugin,
+        GlobeDataPlugin::default(),
+        GlobePlugin,
+    ));
     app
 }

@@ -23,6 +23,13 @@ pub struct FootprintEntry {
     pub older_myr: f64,
 }
 
+/// The closed-interval acceptance rule of a footprint entry: `younger_myr <= age_myr <= older_myr`.
+/// False for a NaN age. Shared by [`PlateFootprints::contains`] and the renderer's per-age
+/// validity flags, so the CPU and GPU decide boundaries identically (in f64, on the CPU).
+pub fn interval_accepts(younger_myr: f64, older_myr: f64, age_myr: f64) -> bool {
+    younger_myr <= age_myr && age_myr <= older_myr
+}
+
 /// Cube-map cell memberships in compressed-row form: cell `c` (`[face][row][col]` order) owns
 /// `entries[offsets[c]..offsets[c + 1]]`, sorted by plate index and then by younger bound.
 #[derive(Clone, Debug, PartialEq)]
@@ -60,8 +67,7 @@ impl PlateFootprints {
             .is_some_and(|cell| {
                 cell.iter().any(|e| {
                     e.plate_index == plate_index
-                        && e.younger_myr <= age_myr
-                        && age_myr <= e.older_myr
+                        && interval_accepts(e.younger_myr, e.older_myr, age_myr)
                 })
             })
     }

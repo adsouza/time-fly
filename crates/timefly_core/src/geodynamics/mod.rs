@@ -6,6 +6,7 @@ pub mod rotation;
 
 pub use crust::{
     Candidate, CrustModel, CrustModelError, FootprintEntry, PlateFootprints, ResolvedPosition,
+    interval_accepts,
 };
 pub use rotation::RotationTable;
 

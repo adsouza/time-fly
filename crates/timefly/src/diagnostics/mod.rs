@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 
-use bevy::diagnostic::FrameCount;
 use bevy::log::tracing_subscriber::{EnvFilter, Layer as _};
 use bevy::log::{BoxedFmtLayer, BoxedLayer, DEFAULT_FILTER, Level, LogPlugin};
 use bevy::platform::time::Instant;
@@ -26,6 +25,7 @@ use bevy::render::renderer::RenderAdapterInfo;
 use bevy::window::PrimaryWindow;
 
 use crate::args::LaunchArgs;
+use aspects::DiagnosticsAppExt;
 use notice::{NoticeRoute, PendingNotice};
 pub use probe::{ProbeMode, run_headless_probe};
 use recorder::{Recorder, RecorderLayer};
@@ -475,7 +475,9 @@ impl Plugin for DiagnosticsPlugin {
         if !self.windowed {
             return;
         }
-        app.add_systems(Update, (update_render_context, mark_first_frame));
+        app.add_domain_event::<FirstInteractiveFrame>()
+            .add_systems(Update, update_render_context)
+            .add_systems(PostUpdate, mark_first_frame);
         if let Some(pending) = lock(&self.shared.pending_notice).take() {
             notice::add_in_game_notice(app, pending);
         }
@@ -592,21 +594,21 @@ fn update_render_context(
     }
 }
 
-/// Records the first frame after the window opens. Task 9 moves this to the first interactive
-/// globe frame.
+/// Domain event: the first interactive globe frame was drawn (written by the globe).
+#[derive(Message, Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FirstInteractiveFrame {
+    pub frame: u32,
+}
+
+/// Records the first interactive globe frame: from then on a crash is no longer "during
+/// startup".
 fn mark_first_frame(
-    frames: Option<Res<FrameCount>>,
-    windows: Query<(), With<PrimaryWindow>>,
+    mut frames: MessageReader<FirstInteractiveFrame>,
     handle: Res<DiagnosticsHandle>,
-    mut done: Local<bool>,
 ) {
-    // Frame 2: with pipelined rendering, frame 0 has been rendered by then.
-    if *done || frames.is_none_or(|f| f.0 < 2) || windows.is_empty() {
-        return;
+    if frames.read().last().is_some() {
+        handle.0.update_record(|r| r.reached_first_frame = true);
     }
-    *done = true;
-    handle.0.update_record(|r| r.reached_first_frame = true);
-    info!("first frame reached");
 }
 
 #[cfg(test)]
@@ -653,6 +655,26 @@ mod tests {
             });
         app.update();
         lock(&shared.record).status
+    }
+
+    #[test]
+    fn the_first_interactive_globe_frame_ends_startup() {
+        let shared = test_shared();
+        shared.update_record(|r| r.reached_first_frame = false);
+        let mut app = App::new();
+        app.insert_resource(DiagnosticsHandle(shared.clone()))
+            .add_message::<FirstInteractiveFrame>()
+            .add_systems(PostUpdate, mark_first_frame);
+        app.update();
+        assert!(
+            !lock(&shared.record).reached_first_frame,
+            "frames alone do not count"
+        );
+        app.world_mut()
+            .resource_mut::<Messages<FirstInteractiveFrame>>()
+            .write(FirstInteractiveFrame { frame: 7 });
+        app.update();
+        assert!(lock(&shared.record).reached_first_frame);
     }
 
     #[test]
