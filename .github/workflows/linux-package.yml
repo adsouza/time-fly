@@ -11,10 +11,6 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
-    # GitHub only dispatches workflows it knows from the default branch, or that have run once.
-    # Until this file is on main, a push to milestone-1 that changes it registers it (and runs it).
-    branches: [milestone-1]
-    paths: [.github/workflows/linux-package.yml]
 
 permissions:
   contents: read
