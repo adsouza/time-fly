@@ -1,17 +1,29 @@
 //! Tracing as an aspect (spec §20): registering a domain event or a state also registers its
 //! logger, so no call site logs them by hand. Later tasks register events and states only
-//! through [`DiagnosticsAppExt`].
+//! through [`DiagnosticsAppExt`]. Events sent every frame during a continuous interaction pick
+//! a quieter level through [`DomainEventLevel`].
 
 use std::any::type_name;
 use std::fmt::Debug;
 
 use bevy::ecs::message::Message;
+use bevy::log::Level;
 use bevy::prelude::*;
 use bevy::state::state::FreelyMutableState;
+
+/// How loudly a domain event logs. Most events are rare and log at `info`; an event a
+/// continuous interaction sends every frame (a slider drag, a scripted scrub) logs below it, so
+/// it doesn't flood the session log or the flight recorder (4,096 events).
+pub trait DomainEventLevel {
+    fn log_level(&self) -> Level;
+}
 
 pub trait DiagnosticsAppExt {
     /// Registers message `E` and a system that logs each one at `info`.
     fn add_domain_event<E: Message + Debug>(&mut self) -> &mut Self;
+
+    /// Registers message `E` and a system that logs each one at its [`DomainEventLevel`].
+    fn add_leveled_domain_event<E: Message + Debug + DomainEventLevel>(&mut self) -> &mut Self;
 
     /// Initializes state `S` and logs every transition at `info`.
     fn add_logged_state<S: FreelyMutableState + FromWorld>(&mut self) -> &mut Self;
@@ -23,6 +35,11 @@ impl DiagnosticsAppExt for App {
             .add_systems(Last, log_domain_events::<E>)
     }
 
+    fn add_leveled_domain_event<E: Message + Debug + DomainEventLevel>(&mut self) -> &mut Self {
+        self.add_message::<E>()
+            .add_systems(Last, log_leveled_domain_events::<E>)
+    }
+
     fn add_logged_state<S: FreelyMutableState + FromWorld>(&mut self) -> &mut Self {
         self.init_state::<S>()
             .add_systems(Last, log_state_transitions::<S>)
@@ -32,6 +49,20 @@ impl DiagnosticsAppExt for App {
 fn log_domain_events<E: Message + Debug>(mut events: MessageReader<E>) {
     for event in events.read() {
         info!(event = type_name::<E>(), "{event:?}");
+    }
+}
+
+fn log_leveled_domain_events<E: Message + Debug + DomainEventLevel>(mut events: MessageReader<E>) {
+    for event in events.read() {
+        let event_type = type_name::<E>();
+        // The tracing macros need the level at compile time.
+        match event.log_level() {
+            Level::ERROR => error!(event = event_type, "{event:?}"),
+            Level::WARN => warn!(event = event_type, "{event:?}"),
+            Level::INFO => info!(event = event_type, "{event:?}"),
+            Level::DEBUG => debug!(event = event_type, "{event:?}"),
+            _ => trace!(event = event_type, "{event:?}"),
+        }
     }
 }
 
@@ -120,6 +151,40 @@ mod tests {
             "{lines}"
         );
         assert!(lines.contains("INFO"), "{lines}");
+    }
+
+    #[derive(Message, Debug)]
+    struct Tick {
+        loud: bool,
+    }
+
+    impl DomainEventLevel for Tick {
+        fn log_level(&self) -> Level {
+            if self.loud { Level::INFO } else { Level::TRACE }
+        }
+    }
+
+    #[test]
+    fn leveled_domain_events_log_at_their_own_level() {
+        let capture = Capture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut app = single_threaded_app();
+            app.add_leveled_domain_event::<Tick>();
+            app.world_mut().write_message(Tick { loud: true });
+            app.world_mut().write_message(Tick { loud: false });
+            app.update();
+        });
+        let lines = capture.0.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("INFO") && lines[0].contains("Tick { loud: true }"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("TRACE") && lines[1].contains("Tick { loud: false }"),
+            "{lines:?}"
+        );
     }
 
     #[test]

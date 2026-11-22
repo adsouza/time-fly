@@ -4,7 +4,7 @@ use bevy::prelude::*;
 use timefly_core::deep_time::{YearsBp, next_snapshot, prev_snapshot};
 
 use crate::diagnostics::DiagnosticsContext;
-use crate::diagnostics::aspects::DiagnosticsAppExt;
+use crate::diagnostics::aspects::{DiagnosticsAppExt, DomainEventLevel};
 
 /// The age the globe shows. Defaults to the present.
 #[derive(Resource, Copy, Clone, Debug, PartialEq)]
@@ -36,6 +36,19 @@ pub struct TimeChanged {
     pub cause: TimeChangeCause,
 }
 
+impl DomainEventLevel for TimeChanged {
+    /// A key step logs at `info`. A slider drag sends one per frame: `debug` (the slider logs
+    /// the drag's start and end at `info`). The scrub bench's scripted scrub sends one per frame
+    /// for 40 s: `trace`, below even the flight recorder (its phases and result log at `info`).
+    fn log_level(&self) -> bevy::log::Level {
+        match self.cause {
+            TimeChangeCause::Key => bevy::log::Level::INFO,
+            TimeChangeCause::Slider => bevy::log::Level::DEBUG,
+            TimeChangeCause::Bench => bevy::log::Level::TRACE,
+        }
+    }
+}
+
 /// `[` steps to the next older snapshot, `]` to the next younger one.
 pub const OLDER_KEY: KeyCode = KeyCode::BracketLeft;
 pub const YOUNGER_KEY: KeyCode = KeyCode::BracketRight;
@@ -45,7 +58,7 @@ pub struct TimePlugin;
 impl Plugin for TimePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GlobeTime>()
-            .add_domain_event::<TimeChanged>()
+            .add_leveled_domain_event::<TimeChanged>()
             .add_systems(Update, step_time_on_keys)
             .add_systems(
                 PostUpdate,
@@ -95,6 +108,24 @@ fn publish_time_context(time: Res<GlobeTime>, context: Option<ResMut<Diagnostics
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_time_changes_log_below_info() {
+        use crate::diagnostics::aspects::DomainEventLevel;
+        use bevy::log::Level;
+        let change = |cause| TimeChanged {
+            from: YearsBp(0.0),
+            to: YearsBp(100.0),
+            cause,
+        };
+        // A key press is one step: info.
+        assert_eq!(change(TimeChangeCause::Key).log_level(), Level::INFO);
+        // A drag changes the time every frame: debug (the slider logs its start and end at
+        // info). The scrub bench's scripted scrub (~2,400 frames) would evict the whole flight
+        // recorder even at debug: trace (its phases and result block log at info).
+        assert_eq!(change(TimeChangeCause::Slider).log_level(), Level::DEBUG);
+        assert_eq!(change(TimeChangeCause::Bench).log_level(), Level::TRACE);
+    }
 
     #[test]
     fn key_step_uses_snapshot_stepping() {

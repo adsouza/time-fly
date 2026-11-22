@@ -97,9 +97,10 @@ impl Plugin for SliderUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiIdle>()
             .init_resource::<UiOpacity>()
+            .init_resource::<SliderDrag>()
             .add_systems(Startup, spawn_slider)
             .add_observer(on_slider_change)
-            .add_systems(Update, (track_idle, hide_under_credits))
+            .add_systems(Update, (track_idle, hide_under_credits, log_slider_drags))
             .add_systems(
                 PostUpdate,
                 (sync_slider_to_time, position_thumb, apply_opacity)
@@ -232,22 +233,76 @@ fn spawn_slider(mut commands: Commands, time: Option<Res<GlobeTime>>) {
         });
 }
 
+/// The age when the current slider drag started, if one is in progress.
+#[derive(Resource, Default)]
+struct SliderDrag {
+    started: Option<YearsBp>,
+}
+
+/// A drag log line: `TimeChanged` logs each drag frame at `debug`, so the drag's ends log at
+/// `info`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum DragLog {
+    Started { from: YearsBp },
+    Ended { from: YearsBp, to: YearsBp },
+}
+
+/// The drag in progress and the line to log, given whether the slider is dragging now and the
+/// age shown.
+fn drag_transition(
+    started: Option<YearsBp>,
+    dragging: bool,
+    now: YearsBp,
+) -> (Option<YearsBp>, Option<DragLog>) {
+    match (started, dragging) {
+        (None, true) => (Some(now), Some(DragLog::Started { from: now })),
+        (Some(from), false) => (None, Some(DragLog::Ended { from, to: now })),
+        (started, _) => (started, None),
+    }
+}
+
+fn log_slider_drags(
+    sliders: Query<&SliderDragState, With<TimeSlider>>,
+    time: Res<GlobeTime>,
+    mut drag: ResMut<SliderDrag>,
+) {
+    let dragging = sliders.iter().any(|d| d.dragging);
+    let (started, log) = drag_transition(drag.started, dragging, time.years);
+    if drag.started != started {
+        drag.started = started;
+    }
+    match log {
+        Some(DragLog::Started { from }) => info!(from_years = from.0, "slider drag started"),
+        Some(DragLog::Ended { from, to }) => {
+            info!(from_years = from.0, to_years = to.0, "slider drag ended")
+        }
+        None => {}
+    }
+}
+
 /// Dragging (or clicking) the slider sets the globe time.
 fn on_slider_change(
     change: On<ValueChange<f32>>,
-    sliders: Query<(), With<TimeSlider>>,
+    sliders: Query<&SliderDragState, With<TimeSlider>>,
+    drag: Res<SliderDrag>,
     mut commands: Commands,
     mut time: ResMut<GlobeTime>,
     mut changes: MessageWriter<TimeChanged>,
 ) {
-    if !sliders.contains(change.source) {
+    let Ok(state) = sliders.get(change.source) else {
         return;
-    }
+    };
     let value = change.value.clamp(0.0, 1.0);
     commands.entity(change.source).insert(SliderValue(value));
     let from = time.years;
     let to = years_for(f64::from(value));
     if to != from {
+        // A click on the track or a key on the focused slider is one change: `info`. (A
+        // drag's final value arrives after the widget clears `dragging`, while the drag is
+        // still recorded as in progress.)
+        if !state.dragging && drag.started.is_none() {
+            info!(from_years = from.0, to_years = to.0, "slider set");
+        }
         time.years = to;
         changes.write(TimeChanged {
             from,
@@ -409,6 +464,25 @@ mod tests {
             is_final: false,
         });
         app.update();
+    }
+
+    #[test]
+    fn drags_log_their_start_and_end_once() {
+        let (a, b) = (YearsBp(100.0), YearsBp(66.0e6));
+        // Not dragging, no drag in progress: nothing.
+        assert_eq!(drag_transition(None, false, a), (None, None));
+        // The drag starts: remember where from.
+        assert_eq!(
+            drag_transition(None, true, a),
+            (Some(a), Some(DragLog::Started { from: a }))
+        );
+        // Mid-drag frames: nothing new.
+        assert_eq!(drag_transition(Some(a), true, b), (Some(a), None));
+        // The drag ends: one line with both ends.
+        assert_eq!(
+            drag_transition(Some(a), false, b),
+            (None, Some(DragLog::Ended { from: a, to: b }))
+        );
     }
 
     #[test]
