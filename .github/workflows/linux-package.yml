@@ -1,5 +1,10 @@
 # Linux x86-64 test packages: a .deb and a single-file Flatpak bundle from one release build.
 # Manual (workflow_dispatch) or on v* tags only, to save CI minutes. No secrets.
+#
+# Jobs: `test` (dev-profile gates) runs in parallel with `build` (release binary, data, .deb);
+# `flatpak` needs both. Caches: Rust targets per job (rust-cache, saved on failure too), uv
+# downloads, the raw data (keyed on data/sources.json) and the baked globe (keyed on its inputs;
+# a hit skips fetch and bake).
 name: linux-package
 
 on:
@@ -15,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-package-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -26,13 +31,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # setup-uv publishes no major-version tag, so it is pinned to a release.
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/bake/uv.lock
+
+      - name: Bake tool tests
+        working-directory: tools/bake
+        run: |
+          mkdir -p ../../ci-logs
+          uv run --locked pytest -q 2>&1 | tee ../../ci-logs/pytest.txt
+
+      - name: Core tests
+        run: cargo test --locked -p timefly_core 2>&1 | tee ci-logs/cargo-test-timefly_core.txt
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
   build:
     # 22.04 for its older glibc, so the binary runs on more distributions.
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     outputs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
-      version: ${{ steps.meta.outputs.version }}
+    env:
+      # Line tables stay in the binary for panic backtraces (release profile unchanged); zlib
+      # compression of the debug sections keeps the binary and packages small. mold links.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
     steps:
       - uses: actions/checkout@v7
 
@@ -44,21 +89,16 @@ jobs:
             desktop-file-utils appstream dpkg-dev
           mkdir -p ci-logs
 
-      - name: Validate desktop entry and AppStream metadata
-        run: |
-          desktop-file-validate packaging/linux/io.github.adsouza.TimeFly.desktop
-          appstreamcli validate --no-net packaging/linux/io.github.adsouza.TimeFly.metainfo.xml
-
       - name: Rust toolchain (rust-toolchain.toml)
-        run: |
-          rustup toolchain install
-          rustc --version
-          cargo --version
+        run: rustup toolchain install && rustc --version
 
+      - uses: rui314/setup-mold@v1
+
+      # Keyed on Cargo.lock, the toolchain file and RUST*/CARGO* env; TIMEFLY_GIT_SHA is not
+      # part of the key and only reruns the timefly build script.
       - uses: Swatinem/rust-cache@v2
-
-      # setup-uv publishes no major-version tag, so it is pinned to a release.
-      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          cache-on-failure: true
 
       - name: Version
         id: meta
@@ -70,31 +110,56 @@ jobs:
           echo "version=${cargo_version}~git${short_sha}" >>"$GITHUB_OUTPUT"
           echo "version ${cargo_version}~git${short_sha}"
 
-      - name: Bake tool tests
-        working-directory: tools/bake
-        run: uv run --locked pytest -q 2>&1 | tee ../../ci-logs/pytest.txt
+      # Before anything writes into tools/bake, so the key hashes sources only.
+      - name: Cache baked globe
+        id: bake-cache
+        uses: actions/cache@v6
+        with:
+          path: crates/timefly/assets/data/globe
+          key: baked-globe-${{ hashFiles('data/sources.json', 'data/paleodem_ages.csv', 'tools/bake/**') }}
 
-      - name: Core tests
-        run: cargo test --locked -p timefly_core 2>&1 | tee ci-logs/cargo-test-timefly_core.txt
+      - uses: astral-sh/setup-uv@v10.3.3
+        if: steps.bake-cache.outputs.cache-hit != 'true'
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/bake/uv.lock
 
       - name: Release build
         env:
           TIMEFLY_GIT_SHA: ${{ steps.meta.outputs.short_sha }}
-        run: cargo build --locked --release -p timefly 2>&1 | tee ci-logs/cargo-build.txt
+        run: |
+          cargo build --locked --release -p timefly 2>&1 | tee ci-logs/cargo-build.txt
+          ls -l target/release/timefly
+          readelf -p .comment target/release/timefly | grep -i mold
+          readelf -SW target/release/timefly | grep -E ' \.debug_(line|info) ' || true
+
+      - name: Smoke test the binary (headless probes, backtrace has file:line)
+        run: |
+          logs="$RUNNER_TEMP/probe-logs"
+          TIMEFLY_LOG_DIR="$logs" target/release/timefly --diagnostics-probe=clean
+          if TIMEFLY_LOG_DIR="$logs" target/release/timefly --diagnostics-probe=panic; then
+            echo "panic probe exited 0"; exit 1
+          fi
+          crash=$(find "$logs" -name crash.txt | head -1)
+          test -n "$crash"
+          grep -E 'diagnostics/probe\.rs:[0-9]+' "$crash"
 
       - name: Cache raw data
+        if: steps.bake-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v6
         with:
           path: data/raw
           key: raw-data-${{ hashFiles('data/sources.json') }}
 
       - name: Fetch raw data (pinned, verified)
+        if: steps.bake-cache.outputs.cache-hit != 'true'
         working-directory: tools/bake
         run: |
           uv run --locked timefly-fetch --sources ../../data/sources.json --raw ../../data/raw \
             2>&1 | tee ../../ci-logs/fetch.txt
 
       - name: Bake globe data
+        if: steps.bake-cache.outputs.cache-hit != 'true'
         working-directory: tools/bake
         run: |
           uv run --locked timefly-bake --raw ../../data/raw \
@@ -102,11 +167,13 @@ jobs:
 
       - name: Stage install tree
         run: |
+          echo "baked globe from cache: ${{ steps.bake-cache.outputs.cache-hit == 'true' }}"
           packaging/linux/stage.sh target/release/timefly crates/timefly/assets staged
           find staged -path '*/frames/f0*' -prune -o -print | sort
           test ! -e staged/lib/time-fly/assets/data/globe/bake.log
+          du -sh staged
 
-      - name: Validate staged desktop entry and AppStream metadata
+      - name: Validate desktop entry and AppStream metadata
         run: |
           desktop-file-validate staged/share/applications/io.github.adsouza.TimeFly.desktop
           appstreamcli validate --no-net staged/share/metainfo/io.github.adsouza.TimeFly.metainfo.xml
@@ -123,6 +190,7 @@ jobs:
           path: dist/time-fly_${{ steps.meta.outputs.version }}_amd64.deb
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0 # already xz
 
       - uses: actions/upload-artifact@v7
         with:
@@ -130,8 +198,9 @@ jobs:
           path: dist/staged.tar.gz
           if-no-files-found: error
           retention-days: 1
+          compression-level: 0
 
-      - name: Upload bake log and test output
+      - name: Upload bake log and build output
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -143,10 +212,13 @@ jobs:
           retention-days: 14
 
   flatpak:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # The image matches the manifest's runtime branch (org.freedesktop.Platform 26.08).
+    # The image matches the manifest's runtime branch and ships org.freedesktop.Platform and
+    # Sdk 26.08, so flatpak-builder runs without --install-deps-from (no runtime download or
+    # update; the bundle names the runtime and installing it pulls the current 26.08 from
+    # Flathub). Nothing is compiled, so flatpak-builder's state cache would not help.
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
       options: --privileged
@@ -166,13 +238,17 @@ jobs:
           tar -C packaging/flatpak/staged -xzf dist/staged.tar.gz
           ls -l packaging/flatpak/staged/bin packaging/flatpak/staged/lib/time-fly
 
-      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-        with:
-          manifest-path: packaging/flatpak/io.github.adsouza.TimeFly.yml
-          bundle: ${{ env.BUNDLE }}
-          repository-url: https://dl.flathub.org/repo/flathub.flatpakrepo
-          cache: false
-          upload-artifact: false
+      - name: Build Flatpak bundle
+        run: |
+          flatpak info org.freedesktop.Sdk//26.08 | head -5
+          flatpak-builder --repo=repo --disable-rofiles-fuse --force-clean \
+            --default-branch=master --arch=x86_64 \
+            --subject="Built from ${GITHUB_SHA}" \
+            build-dir packaging/flatpak/io.github.adsouza.TimeFly.yml
+          flatpak build-bundle repo "$BUNDLE" \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            --arch=x86_64 io.github.adsouza.TimeFly master
+          ls -l "$BUNDLE"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -180,3 +256,4 @@ jobs:
           path: ${{ env.BUNDLE }}
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0 # already compressed
