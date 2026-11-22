@@ -72,20 +72,39 @@ pub fn prev_snapshot(y: YearsBp) -> YearsBp {
 }
 
 /// Human-readable age label for the time slider.
+///
+/// The unit is chosen from the rounded value, so an age that rounds up to the next unit's
+/// threshold is promoted (999,500 reads "1 million years ago", not "1000 thousand").
 pub fn format_years_bp(y: YearsBp) -> String {
     let v = y.0;
     if v < 0.5 {
-        "Present".to_string()
-    } else if v < 10_000.0 {
-        format!("{} years ago", group_thousands(v.round() as u64))
-    } else if v < 1.0e6 {
-        format!("{} thousand years ago", (v / 1.0e3).round() as u64)
-    } else if v < 1.0e7 {
-        let one_decimal = format!("{:.1}", v / 1.0e6);
-        let trimmed = one_decimal.strip_suffix(".0").unwrap_or(&one_decimal);
-        format!("{trimmed} million years ago")
+        return "Present".to_string();
+    }
+    let years = v.round() as u64;
+    if years == 1 {
+        return "1 year ago".to_string();
+    }
+    if years < 10_000 {
+        return format!("{} years ago", group_thousands(years));
+    }
+    let thousands = (v / 1.0e3).round() as u64;
+    if thousands < 1_000 {
+        return format!("{thousands} thousand years ago");
+    }
+    // Tenths of a million, rounded.
+    let tenths = (v / 1.0e5).round() as u64;
+    if tenths < 100 {
+        let (whole, frac) = (tenths / 10, tenths % 10);
+        if frac == 0 {
+            format!("{whole} million years ago")
+        } else {
+            format!("{whole}.{frac} million years ago")
+        }
     } else {
-        format!("{} million years ago", (v / 1.0e6).round() as u64)
+        format!(
+            "{} million years ago",
+            (tenths as f64 / 10.0).round() as u64
+        )
     }
 }
 
@@ -160,5 +179,24 @@ mod tests {
         assert_eq!(format_years_bp(YearsBp(5_000_000.0)), "5 million years ago");
         assert_eq!(format_years_bp(YearsBp(66.0e6)), "66 million years ago");
         assert_eq!(format_years_bp(YearsBp(540.0e6)), "540 million years ago");
+    }
+    #[test]
+    fn label_unit_boundaries() {
+        let l = |v: f64| format_years_bp(YearsBp(v));
+        assert_eq!(l(0.49), "Present");
+        assert_eq!(l(0.5), "1 year ago");
+        assert_eq!(l(1.4), "1 year ago");
+        assert_eq!(l(9_999.4), "9,999 years ago");
+        assert_eq!(l(9_999.5), "10 thousand years ago");
+        assert_eq!(l(999_499.0), "999 thousand years ago");
+        assert_eq!(l(999_500.0), "1 million years ago");
+        assert_eq!(l(9_949_999.0), "9.9 million years ago");
+        assert_eq!(l(9_950_000.0), "10 million years ago");
+        assert_eq!(l(10_000_000.0), "10 million years ago");
+    }
+    #[test]
+    fn snapshots_ascending_and_prev_from_oldest() {
+        assert!(STANDARD_SNAPSHOTS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(prev_snapshot(YearsBp(540.0e6)).0, 400.0e6);
     }
 }
