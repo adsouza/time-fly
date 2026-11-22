@@ -2,5 +2,6 @@
 
 pub mod cube;
 pub mod deep_time;
+pub mod formats;
 pub mod geo;
 pub mod geodynamics;

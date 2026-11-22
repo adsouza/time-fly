@@ -1,6 +1,12 @@
 //! Plate identity types shared by the bake output and the runtime. Forward and inverse lookups
 //! arrive with the plate-motion model.
 
+pub mod crust;
+pub mod rotation;
+
+pub use crust::{FootprintEntry, PlateFootprints};
+pub use rotation::RotationTable;
+
 /// Stable source identifier of a plate, constant across bakes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PlateId(pub u32);
