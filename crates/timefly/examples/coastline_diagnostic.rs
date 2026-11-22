@@ -22,6 +22,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
 use bevy::math::DVec3;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use timefly::globe::capture::{CaptureSession, ParityStats, compare_with_reference};
 use timefly_core::cube::{CubeFace, dir_to_texel, texel_center_dir};
 use timefly_core::formats::{Grid, read_tfgrid, read_tfplates, read_tfrot};
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
@@ -156,6 +157,17 @@ impl Placement {
         )
     }
 
+    /// Whether a plate with a current rotation owns the cell under `d` at some other age.
+    fn owned_at_other_ages(&self, bake: &Bake, d: RenderDir) -> bool {
+        let fp = bake.crust.footprints();
+        self.rotations.iter().enumerate().any(|(plate, r)| {
+            r.current.is_some_and(|q| {
+                let p = RenderDir((q.as_dquat().inverse() * d.0).normalize());
+                (0..=54).any(|k| fp.contains(PlateIndex(plate as u32), p, f64::from(k) * 10.0))
+            })
+        })
+    }
+
     fn covered(&self, bake: &Bake, d: RenderDir) -> bool {
         matches!(
             bake.crust.resolve(d, self.sampling.age_myr, |_| None),
@@ -173,6 +185,9 @@ struct Stats {
     missing_raw_km2: f64,
     added_raw_km2: f64,
     covered_land_km2: f64,
+    /// Missing land (beyond tolerance) in cells that a plate with a current rotation owns at
+    /// other ages only (an expired or not-yet-valid footprint interval).
+    missing_expired_km2: f64,
 }
 
 fn compare(bake: &Bake, source: &Grid, grids: &[Grid; 2], placement: &Placement) -> Stats {
@@ -198,7 +213,12 @@ fn compare(bake: &Bake, source: &Grid, grids: &[Grid; 2], placement: &Placement)
                 if src != out {
                     let beyond = !near_coast(source, d.0, src);
                     match (src, beyond) {
-                        (true, true) => s.missing_km2 += area,
+                        (true, true) => {
+                            s.missing_km2 += area;
+                            if placement.owned_at_other_ages(bake, d) {
+                                s.missing_expired_km2 += area;
+                            }
+                        }
                         (false, true) => s.added_km2 += area,
                         _ => {}
                     }
@@ -267,6 +287,83 @@ fn write_map(path: &Path, bake: &Bake, source: &Grid, grids: &[Grid; 2], placeme
         .expect("write map");
 }
 
+/// The camera views used for the shader comparison: four around the equator and the poles.
+const VIEWS: [(f64, f64); 6] = [
+    (0.0, 0.0),
+    (0.0, 90.0),
+    (0.0, 180.0),
+    (0.0, -90.0),
+    (89.0, 0.0),
+    (-89.0, 0.0),
+];
+const PARITY_STEP_DEG: f64 = 1.5;
+
+/// Renders the slider output through the real shaders (verification view) from six views and
+/// compares each pixel's plate (or ocean) with the CPU reference. Returns the stats and the
+/// area (km²) of mismatches beyond the tolerance.
+fn shader_parity(
+    session: &mut CaptureSession,
+    bake: &Bake,
+    age_myr: f64,
+    grids: &[Grid; 2],
+    placement: &Placement,
+) -> Result<(ParityStats, f64), String> {
+    let cpu = |d: bevy::math::Vec3| match rendered_surface(
+        &bake.crust,
+        RenderDir(d.as_dvec3().normalize()),
+        &placement.sampling,
+        &placement.rotations,
+        &placement.ranks,
+        |e, dir| sample(&grids[e], dir),
+    ) {
+        RenderedSurface::Land { plate_id, .. } => {
+            bake.crust.rotations().index_of(plate_id).map(|i| i.0)
+        }
+        RenderedSurface::Ocean => None,
+    };
+    let views: Vec<bevy::math::Vec3> = VIEWS
+        .iter()
+        .map(|&(lat, lon)| geo_to_render(latlon_to_geo(lat, lon)).0.as_vec3())
+        .collect();
+    let mut total = ParityStats::default();
+    let mut weights = Vec::new();
+    for (v, &(lat, lon)) in views.iter().zip(&VIEWS) {
+        let shot = session.shoot(age_myr * 1e6, (lat, lon), 2.6 * EARTH_RADIUS_KM)?;
+        // Each grid direction is compared in the view that sees it most head-on.
+        let mut dirs = Vec::new();
+        let mut la = -90.0 + PARITY_STEP_DEG / 2.0;
+        while la < 90.0 {
+            let mut lo = -180.0 + PARITY_STEP_DEG / 2.0;
+            while lo < 180.0 {
+                let d = geo_to_render(latlon_to_geo(la, lo)).0.as_vec3();
+                let best = views
+                    .iter()
+                    .map(|w| d.angle_between(*w))
+                    .fold(f32::MAX, f32::min);
+                if (d.angle_between(*v) - best).abs() < 1e-6 {
+                    dirs.push(d);
+                }
+                lo += PARITY_STEP_DEG;
+            }
+            la += PARITY_STEP_DEG;
+        }
+        let stats = compare_with_reference(
+            &shot,
+            dirs,
+            cpu,
+            (TOLERANCE_DEG as f32).to_radians(),
+            60f32.to_radians(),
+        );
+        total.add(&stats);
+    }
+    let cell = PARITY_STEP_DEG.to_radians().powi(2) * EARTH_RADIUS_KM * EARTH_RADIUS_KM;
+    for (d, _, _) in &total.mismatches {
+        let lat = (d.y as f64).clamp(-1.0, 1.0).asin();
+        weights.push(cell * lat.cos());
+    }
+    Ok((total, weights.iter().sum()))
+}
+
 fn nearest_paleodem(t: &Timeline, age: f64) -> usize {
     let first = t.bridge_frame_index();
     (first..t.frames().len())
@@ -286,10 +383,17 @@ fn main() -> Result<(), String> {
     }
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let bake = load(&dir)?;
+    let asset_root = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("the globe dir must be <asset root>/data/globe")?
+        .to_path_buf();
+    let mut session = CaptureSession::new(&asset_root, (768, 768), true)?;
+    let mut parity_rows = Vec::new();
     println!(
-        "| frame | timeline Ma | source Ma | placement | source land Mkm² | rendered land Mkm² | coverage | missing Mkm² (raw) | added Mkm² (raw) |"
+        "| frame | timeline Ma | source Ma | placement | source land Mkm² | rendered land Mkm² | coverage | missing Mkm² (raw) | of which expired-footprint Mkm² | added Mkm² (raw) |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     for age in CHECK_AGES_MYR {
         let frame = nearest_paleodem(&bake.timeline, age);
         let meta = bake.timeline.frames()[frame];
@@ -318,16 +422,33 @@ fn main() -> Result<(), String> {
         for (name, sampling) in modes {
             let grids = sampling.endpoints.map(|e| grid(&bake, e.frame));
             let placement = Placement::new(&bake, sampling);
+            let fp = bake.crust.footprints();
+            let lacking: Vec<usize> = (0..placement.rotations.len())
+                .filter(|&i| placement.rotations[i].current.is_none())
+                .collect();
+            let lacking_cells = fp
+                .entries
+                .iter()
+                .filter(|e| lacking.contains(&(e.plate_index.0 as usize)))
+                .count();
+            eprintln!(
+                "{} Ma {name}: {} plates without a rotation at {} Ma, owning {} footprint entries",
+                meta.age_myr,
+                lacking.len(),
+                placement.sampling.age_myr,
+                lacking_cells
+            );
             let s = compare(&bake, &source, &grids, &placement);
             let m = |km2: f64| km2 / 1e6;
             println!(
-                "| {frame} | {} | {source_age} | {name} | {:.2} | {:.2} | {:.1}% | {:.3} ({:.2}) | {:.3} ({:.2}) |",
+                "| {frame} | {} | {source_age} | {name} | {:.2} | {:.2} | {:.1}% | {:.3} ({:.2}) | {:.3} | {:.3} ({:.2}) |",
                 meta.age_myr,
                 m(s.source_land_km2),
                 m(s.rendered_land_km2),
                 100.0 * s.covered_land_km2 / s.source_land_km2.max(1.0),
                 m(s.missing_km2),
                 m(s.missing_raw_km2),
+                m(s.missing_expired_km2),
                 m(s.added_km2),
                 m(s.added_raw_km2),
             );
@@ -336,7 +457,29 @@ fn main() -> Result<(), String> {
                 meta.age_myr.round() as u32
             ));
             write_map(&file, &bake, &source, &grids, &placement);
+            if name == "slider" {
+                let (p, area) =
+                    shader_parity(&mut session, &bake, meta.age_myr, &grids, &placement)?;
+                parity_rows.push(format!(
+                    "| {} | {} | {:.2}% | {:.2}% | {} | {} | {:.3} |",
+                    meta.age_myr,
+                    p.compared,
+                    100.0 * p.mask_agree as f64 / p.compared.max(1) as f64,
+                    100.0 * p.plate_agree as f64 / p.compared.max(1) as f64,
+                    p.near_boundary,
+                    p.mismatches.len(),
+                    area / 1e6,
+                ));
+            }
         }
+    }
+    println!();
+    println!(
+        "| shader vs CPU, timeline Ma | compared | mask agree | plate agree | near boundary (skipped) | mismatches | mismatch Mkm² |"
+    );
+    println!("|---|---|---|---|---|---|---|");
+    for row in parity_rows {
+        println!("{row}");
     }
     Ok(())
 }

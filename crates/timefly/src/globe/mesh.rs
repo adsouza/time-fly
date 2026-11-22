@@ -16,10 +16,22 @@ use std::collections::HashMap;
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, MeshVertexAttribute, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
-use bevy::render::render_resource::VertexFormat;
+use bevy::render::render_resource::{CompareFunction, VertexFormat};
 use timefly_core::cube::{CubeFace, dir_to_texel};
 use timefly_core::geo::RenderDir;
 use timefly_core::geodynamics::{PlateFootprints, PlateIndex};
+
+/// The plate pieces' depth test (reversed Z, as Bevy's opaque pass); set explicitly by
+/// `PlateMaterial` so the draw-order rule below cannot drift from it.
+pub const PIECE_DEPTH_COMPARE: CompareFunction = CompareFunction::GreaterEqual;
+
+/// Whether a later-drawn primitive wins an exact depth tie under `compare`.
+pub fn later_draw_wins_ties(compare: CompareFunction) -> bool {
+    matches!(
+        compare,
+        CompareFunction::GreaterEqual | CompareFunction::LessEqual | CompareFunction::Always
+    )
+}
 
 /// Per-vertex plate piece data: `[dense plate index, cell interval list, corner interval list]`.
 pub const ATTRIBUTE_PIECE: MeshVertexAttribute =
@@ -158,7 +170,9 @@ pub fn plate_subdivisions(cube_size: u32) -> u32 {
 
 /// Builds the plate pieces from the footprint grid, with each cell split into
 /// `subdivisions x subdivisions` quads. `ranks[plate]` is the plate's source-ID rank; triangles
-/// are ordered by rank, then by cell index, so the draw order is stable.
+/// are ordered by *descending* rank (highest source ID first), then by cell index, so the draw
+/// order is stable and the lowest source ID draws last: with [`PIECE_DEPTH_COMPARE`] a later
+/// primitive wins an exact depth tie, which matches the CPU rule (ties to the lower source ID).
 ///
 /// Corner decision: for plate `P` at a vertex, the canonical cell is the footprint cell
 /// containing the vertex direction under the cube tie rule ([`dir_to_texel`]) when that cell
@@ -241,7 +255,7 @@ pub fn build_plate_pieces(
         cell_list[&(cell, plate)]
     };
 
-    occupied.sort_by_key(|&(cell, plate, _)| (ranks[plate as usize], cell));
+    occupied.sort_by_key(|&(cell, plate, _)| (std::cmp::Reverse(ranks[plate as usize]), cell));
     let mut vertices: HashMap<(u32, u32, CornerKey), u32> = HashMap::new();
     let mut corner_lists: HashMap<(u32, CornerKey), u32> = HashMap::new();
     let mut positions = Vec::new();
@@ -545,14 +559,17 @@ mod tests {
     #[test]
     fn triangle_order_is_stable_and_by_source_id_rank() {
         let f = two_plates();
-        // Plate 1 has the lower source ID (rank 0), so its triangles come first.
+        // Plate 1 has the lower source ID (rank 0). Under the pieces' depth compare a later
+        // primitive wins exact ties, so plate 1 must draw last.
+        assert!(later_draw_wins_ties(PIECE_DEPTH_COMPARE));
+        assert!(!later_draw_wins_ties(CompareFunction::Greater));
         let p = build_plate_pieces(&f, &[1, 0], 1);
         let plates: Vec<u32> = (0..p.triangle_count())
             .map(|t| p.triangle_plate(t))
             .collect();
-        let first_plate0 = plates.iter().position(|&x| x == 0).unwrap();
-        assert!(plates[..first_plate0].iter().all(|&x| x == 1));
-        assert!(plates[first_plate0..].iter().all(|&x| x == 0));
+        let first_plate1 = plates.iter().position(|&x| x == 1).unwrap();
+        assert!(plates[..first_plate1].iter().all(|&x| x == 0));
+        assert!(plates[first_plate1..].iter().all(|&x| x == 1));
         assert_eq!(build_plate_pieces(&f, &[1, 0], 1), p, "deterministic");
     }
 }

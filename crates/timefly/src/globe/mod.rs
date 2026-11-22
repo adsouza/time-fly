@@ -190,6 +190,8 @@ pub struct RenderProbeReport {
     pub frames: u64,
     /// Consecutive frames without a queued or compiling pipeline.
     pub clean_streak: u32,
+    /// Pipelines queued, compiling or waiting for shaders in the last frame.
+    pub pending: u32,
     /// The first pipeline error (shader or pipeline creation).
     pub error: Option<String>,
 }
@@ -204,13 +206,42 @@ impl RenderProbe {
     }
 }
 
+/// Seconds without pipeline progress before GPU preparation counts as failed.
+pub const GPU_PREPARE_TIMEOUT_SECS: f64 = 30.0;
+
+/// Pipeline preparation progress: the fewest pending pipelines seen and when that last improved.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct PrepareProgress {
+    pub fewest_pending: Option<u32>,
+    pub last_progress_secs: f64,
+}
+
+/// Records progress: fewer pending pipelines than ever before (or none) counts.
+pub fn track_progress(progress: PrepareProgress, pending: u32, now_secs: f64) -> PrepareProgress {
+    if pending == 0
+        || progress
+            .fewest_pending
+            .is_none_or(|fewest| pending < fewest)
+    {
+        PrepareProgress {
+            fewest_pending: Some(pending),
+            last_progress_secs: now_secs,
+        }
+    } else {
+        progress
+    }
+}
+
 /// Decides the next render status. `spawned_at` is the render-probe frame count when the globe
 /// was spawned; interactive needs a few render frames since then without pending pipelines.
+/// Preparation that makes no progress for [`GPU_PREPARE_TIMEOUT_SECS`] (for example a shader
+/// that never loads) fails instead of leaving the loading screen up forever.
 pub fn next_render_status(
     current: &GlobeRenderStatus,
     report: &RenderProbeReport,
     spawned_at: u64,
     frame: u32,
+    stalled_secs: f64,
 ) -> GlobeRenderStatus {
     match current {
         GlobeRenderStatus::PreparingGpu => {
@@ -220,6 +251,12 @@ pub fn next_render_status(
                 && report.clean_streak >= CLEAN_FRAMES_FOR_INTERACTIVE
             {
                 GlobeRenderStatus::Interactive { first_frame: frame }
+            } else if stalled_secs > GPU_PREPARE_TIMEOUT_SECS {
+                GlobeRenderStatus::Failed(format!(
+                    "the renderer could not start: {} shader pipelines made no progress for \
+                     {GPU_PREPARE_TIMEOUT_SECS:.0} s",
+                    report.pending
+                ))
             } else {
                 current.clone()
             }
@@ -227,6 +264,11 @@ pub fn next_render_status(
         other => other.clone(),
     }
 }
+
+/// Switches the globe to the verification view: plate pieces draw their plate index and the
+/// ocean shell draws blue (see `material::decode_plate_id`). For headless checks only.
+#[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GlobeDebugView(pub bool);
 
 /// Marks the camera that shows the globe. Task 10's orbit controller drives it.
 #[derive(Component)]
@@ -254,8 +296,10 @@ struct GlobeScene {
     target_size: UVec2,
     sun: Vec3,
     applied_age_myr: Option<f64>,
+    applied_debug: bool,
     view: Option<GlobeView>,
     spawned_at: u64,
+    progress: PrepareProgress,
 }
 
 /// Spawns and drives the globe once the globe data is ready.
@@ -274,6 +318,7 @@ impl Plugin for GlobePlugin {
         ))
         .add_domain_event::<FrameSelectionChanged>()
         .init_resource::<GlobeRenderStatus>()
+        .init_resource::<GlobeDebugView>()
         .insert_resource(probe.clone())
         .add_systems(Startup, spawn_globe_camera)
         .add_systems(OnEnter(GlobeLoadState::Ready), spawn_globe)
@@ -341,6 +386,7 @@ fn spawn_globe(
     mut atmospheres_m: ResMut<Assets<AtmosphereMaterial>>,
     mut status: ResMut<GlobeRenderStatus>,
     probe: Res<RenderProbe>,
+    real_time: Res<Time<Real>>,
     camera: Query<&Camera, With<GlobeCamera>>,
 ) {
     let crust = &data.crust;
@@ -491,8 +537,13 @@ fn spawn_globe(
         target_size: size,
         sun,
         applied_age_myr: None,
+        applied_debug: false,
         view: None,
         spawned_at: probe.report().frames,
+        progress: PrepareProgress {
+            fewest_pending: None,
+            last_progress_secs: real_time.elapsed_secs_f64(),
+        },
     });
     *status = GlobeRenderStatus::PreparingGpu;
 }
@@ -516,25 +567,31 @@ fn update_globe_view(
     mut oceans_m: ResMut<Assets<OceanMaterial>>,
     mut recents_m: ResMut<Assets<RecentGlobeMaterial>>,
     mut composites_m: ResMut<Assets<CompositeMaterial>>,
+    mut atmospheres_m: ResMut<Assets<AtmosphereMaterial>>,
+    debug: Res<GlobeDebugView>,
     mut cameras: Query<&mut RenderLayers, With<GlobeCamera>>,
     mut changes: MessageWriter<FrameSelectionChanged>,
     context: Option<ResMut<DiagnosticsContext>>,
 ) {
     let age_myr = time.years.myr();
-    if scene.applied_age_myr == Some(age_myr) {
+    if scene.applied_age_myr == Some(age_myr) && scene.applied_debug == debug.0 {
         return;
     }
     let view = globe_view(&data.timeline, age_myr);
     let sun = scene.sun;
+    let dbg = debug.0;
+    if let Some(mut m) = atmospheres_m.get_mut(&scene.atmosphere) {
+        m.params = m.params.with_debug(dbg);
+    }
     if let Some(r) = view.recent
         && let Some(mut m) = recents_m.get_mut(&scene.recent)
     {
-        m.params = GlobeParams::recent(r.older_weight, data.cube_size, sun);
+        m.params = GlobeParams::recent(r.older_weight, data.cube_size, sun).with_debug(dbg);
         m.younger = data.frame_image(r.frames[0]).clone();
         m.older = data.frame_image(r.frames[1]).clone();
     }
     if let Some(deep) = view.deep {
-        let params = GlobeParams::deep(&deep, data.cube_size, sun);
+        let params = GlobeParams::deep(&deep, data.cube_size, sun).with_debug(dbg);
         let [young, old] = deep.endpoints.map(|e| data.frame_image(e.frame).clone());
         if let Some(mut m) = plates_m.get_mut(&scene.plate) {
             m.params = params;
@@ -556,7 +613,7 @@ fn update_globe_view(
         }
     }
     if let Some(mut m) = composites_m.get_mut(&scene.composite) {
-        m.params = GlobeParams::composite(view.deep_weight, sun);
+        m.params = GlobeParams::composite(view.deep_weight, sun).with_debug(dbg);
     }
     if let Some(change) = selection_change(scene.view.as_ref(), &view) {
         let layer = match view.mode {
@@ -573,6 +630,7 @@ fn update_globe_view(
         changes.write(change);
     }
     scene.applied_age_myr = Some(age_myr);
+    scene.applied_debug = dbg;
     scene.view = Some(view);
 }
 
@@ -674,14 +732,19 @@ fn sync_bridge_cameras(
 }
 
 fn track_render_status(
-    scene: Res<GlobeScene>,
+    mut scene: ResMut<GlobeScene>,
     probe: Res<RenderProbe>,
+    real_time: Res<Time<Real>>,
     frames: Option<Res<FrameCount>>,
     mut status: ResMut<GlobeRenderStatus>,
     first_frame: Option<ResMut<Messages<FirstInteractiveFrame>>>,
 ) {
     let frame = frames.map_or(0, |f| f.0);
-    let next = next_render_status(&status, &probe.report(), scene.spawned_at, frame);
+    let report = probe.report();
+    let now = real_time.elapsed_secs_f64();
+    scene.progress = track_progress(scene.progress, report.pending, now);
+    let stalled = now - scene.progress.last_progress_secs;
+    let next = next_render_status(&status, &report, scene.spawned_at, frame, stalled);
     if next == *status {
         return;
     }
@@ -721,6 +784,7 @@ fn probe_pipelines(cache: Res<PipelineCache>, probe: Res<RenderProbe>) {
         return;
     };
     report.frames += 1;
+    report.pending = pending as u32;
     report.clean_streak = if pending == 0 {
         report.clean_streak + 1
     } else {
@@ -822,32 +886,68 @@ mod tests {
     }
 
     #[test]
+    fn stalled_preparation_fails_after_the_timeout() {
+        let preparing = GlobeRenderStatus::PreparingGpu;
+        let stuck = RenderProbeReport {
+            frames: 500,
+            clean_streak: 0,
+            pending: 2,
+            error: None,
+        };
+        assert_eq!(
+            next_render_status(&preparing, &stuck, 10, 40, 29.0),
+            preparing
+        );
+        assert!(matches!(
+            next_render_status(&preparing, &stuck, 10, 40, 31.0),
+            GlobeRenderStatus::Failed(m) if m.contains("no progress")
+        ));
+        // Progress is fewer pending pipelines than ever before; a plateau is not progress.
+        let p = track_progress(PrepareProgress::default(), 5, 1.0);
+        assert_eq!(
+            p,
+            PrepareProgress {
+                fewest_pending: Some(5),
+                last_progress_secs: 1.0
+            }
+        );
+        let p = track_progress(p, 5, 9.0);
+        assert_eq!(p.last_progress_secs, 1.0);
+        let p = track_progress(p, 3, 12.0);
+        assert_eq!(p.last_progress_secs, 12.0);
+        let p = track_progress(p, 4, 20.0);
+        assert_eq!((p.fewest_pending, p.last_progress_secs), (Some(3), 12.0));
+        assert_eq!(track_progress(p, 0, 50.0).last_progress_secs, 50.0);
+    }
+
+    #[test]
     fn render_status_waits_for_clean_pipelines_and_reports_errors() {
         let preparing = GlobeRenderStatus::PreparingGpu;
         let report = |frames, clean_streak, error: Option<&str>| RenderProbeReport {
             frames,
             clean_streak,
+            pending: 0,
             error: error.map(str::to_string),
         };
         assert_eq!(
-            next_render_status(&preparing, &report(12, 5, None), 10, 40),
+            next_render_status(&preparing, &report(12, 5, None), 10, 40, 0.0),
             preparing
         );
         assert_eq!(
-            next_render_status(&preparing, &report(20, 1, None), 10, 40),
+            next_render_status(&preparing, &report(20, 1, None), 10, 40, 0.0),
             preparing
         );
         assert_eq!(
-            next_render_status(&preparing, &report(20, 3, None), 10, 40),
+            next_render_status(&preparing, &report(20, 3, None), 10, 40, 0.0),
             GlobeRenderStatus::Interactive { first_frame: 40 }
         );
         assert!(matches!(
-            next_render_status(&preparing, &report(20, 3, Some("bad shader")), 10, 40),
+            next_render_status(&preparing, &report(20, 3, Some("bad shader")), 10, 40, 0.0),
             GlobeRenderStatus::Failed(m) if m.contains("bad shader")
         ));
         let done = GlobeRenderStatus::Interactive { first_frame: 3 };
         assert_eq!(
-            next_render_status(&done, &report(99, 0, Some("x")), 10, 40),
+            next_render_status(&done, &report(99, 0, Some("x")), 10, 40, 0.0),
             done
         );
         assert_eq!(
@@ -855,7 +955,8 @@ mod tests {
                 &GlobeRenderStatus::LoadingData,
                 &report(99, 9, None),
                 10,
-                40
+                40,
+                0.0
             ),
             GlobeRenderStatus::LoadingData
         );

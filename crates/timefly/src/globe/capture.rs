@@ -19,7 +19,7 @@ use bevy::winit::WinitPlugin;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
 
-use super::{EARTH_RADIUS_KM, GlobeCamera, GlobePlugin, GlobeRenderStatus};
+use super::{EARTH_RADIUS_KM, GlobeCamera, GlobeDebugView, GlobePlugin, GlobeRenderStatus};
 use crate::data::GlobeDataPlugin;
 use crate::time::{GlobeTime, TimePlugin};
 
@@ -78,6 +78,11 @@ impl GlobeCapture {
         Some([data[i], data[i + 1], data[i + 2], data[i + 3]])
     }
 
+    /// The direction the camera looks from (unit, world frame).
+    pub fn view_dir(&self) -> Vec3 {
+        self.camera_transform.translation().normalize()
+    }
+
     /// Water is blue-dominant; land palette colours are not.
     pub fn classify(&self, dir: Vec3) -> Pixel {
         match self.pixel_at(dir) {
@@ -106,70 +111,118 @@ impl GlobeCapture {
     }
 }
 
-/// Renders the globe headless at the requested age and returns the image.
-pub fn capture_globe(request: &CaptureRequest) -> Result<GlobeCapture, String> {
-    let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            })
-            .set(RenderPlugin {
-                synchronous_pipeline_compilation: true,
-                ..default()
-            })
-            .set(AssetPlugin {
-                file_path: request.asset_root.to_string_lossy().into_owned(),
-                meta_check: AssetMetaCheck::Never,
-                ..default()
-            })
-            .disable::<WinitPlugin>()
-            .disable::<bevy::log::LogPlugin>(),
-    )
-    .add_plugins((TimePlugin, GlobeDataPlugin::default(), GlobePlugin));
-    while app.plugins_state() == PluginsState::Adding {
-        bevy::tasks::tick_global_task_pools_on_main_thread();
-    }
-    app.finish();
-    app.cleanup();
+/// One headless globe app that can render several ages and views.
+pub struct CaptureSession {
+    app: App,
+    target: Handle<Image>,
+    interactive: bool,
+}
 
-    let (width, height) = request.size;
-    let mut target = Image::new_target_texture(width, height, TextureFormat::Rgba8UnormSrgb, None);
-    target.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    let target = app.world_mut().resource_mut::<Assets<Image>>().add(target);
-    app.world_mut().resource_mut::<GlobeTime>().years = YearsBp(request.age_years);
-
-    let (lat, lon) = request.look_at_lat_lon;
-    let look = geo_to_render(latlon_to_geo(lat, lon)).0.as_vec3();
-    let eye = look * request.distance_km as f32;
-    let deadline = Instant::now() + TIMEOUT;
-    let mut placed = false;
-    let mut interactive_at: Option<u32> = None;
-    let captured: Arc<Mutex<Option<Image>>> = Arc::default();
-    let mut requested = false;
-    let mut frame = 0u32;
-    loop {
-        if Instant::now() > deadline {
-            return Err("timed out waiting for the globe".into());
+impl CaptureSession {
+    /// Builds the headless app for `asset_root`; `verification_view` switches the globe to its
+    /// plate-index view (and turns MSAA off so pixels are never blends).
+    pub fn new(
+        asset_root: &std::path::Path,
+        size: (u32, u32),
+        verification_view: bool,
+    ) -> Result<CaptureSession, String> {
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
+                .set(AssetPlugin {
+                    file_path: asset_root.to_string_lossy().into_owned(),
+                    meta_check: AssetMetaCheck::Never,
+                    ..default()
+                })
+                .disable::<WinitPlugin>()
+                .disable::<bevy::log::LogPlugin>(),
+        )
+        .add_plugins((TimePlugin, GlobeDataPlugin::default(), GlobePlugin))
+        .insert_resource(GlobeDebugView(verification_view));
+        while app.plugins_state() == PluginsState::Adding {
+            bevy::tasks::tick_global_task_pools_on_main_thread();
         }
-        app.update();
-        frame += 1;
-        if let Some(device) = app.world().get_resource::<RenderDevice>() {
+        app.finish();
+        app.cleanup();
+        let (width, height) = size;
+        let mut target =
+            Image::new_target_texture(width, height, TextureFormat::Rgba8UnormSrgb, None);
+        target.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        let target = app.world_mut().resource_mut::<Assets<Image>>().add(target);
+        let mut session = CaptureSession {
+            app,
+            target,
+            interactive: false,
+        };
+        // Spawn the camera, then aim it at the target.
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            session.step();
+            let world = session.app.world_mut();
+            let mut q = world.query_filtered::<Entity, With<GlobeCamera>>();
+            if let Some(camera) = q.iter(world).next() {
+                world
+                    .entity_mut(camera)
+                    .insert(RenderTarget::Image(session.target.clone().into()));
+                if verification_view {
+                    world.entity_mut(camera).insert(Msaa::Off);
+                }
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err("no globe camera".into());
+            }
+        }
+        Ok(session)
+    }
+
+    fn step(&mut self) {
+        self.app.update();
+        if let Some(device) = self.app.world().get_resource::<RenderDevice>() {
             let _ = device.wgpu_device().poll(PollType::Wait {
                 submission_index: None,
                 timeout: None,
             });
         }
-        let world = app.world_mut();
-        if !placed {
-            let mut q = world.query_filtered::<Entity, With<GlobeCamera>>();
-            if let Some(camera) = q.iter(world).next() {
-                world.entity_mut(camera).insert((
-                    RenderTarget::Image(target.clone().into()),
-                    Transform::from_translation(eye).looking_at(Vec3::ZERO, Vec3::Y),
-                ));
+    }
+
+    /// Renders the globe at `age_years`, looking at `(lat, lon)` from `distance_km`.
+    pub fn shoot(
+        &mut self,
+        age_years: f64,
+        look_at_lat_lon: (f64, f64),
+        distance_km: f64,
+    ) -> Result<GlobeCapture, String> {
+        let (lat, lon) = look_at_lat_lon;
+        let look = geo_to_render(latlon_to_geo(lat, lon)).0.as_vec3();
+        let eye = look * distance_km as f32;
+        let deadline = Instant::now() + TIMEOUT;
+        let mut placed = false;
+        let mut settle = 0u32;
+        let captured: Arc<Mutex<Option<Image>>> = Arc::default();
+        let mut requested = false;
+        loop {
+            if Instant::now() > deadline {
+                return Err("timed out waiting for the globe".into());
+            }
+            let world = self.app.world_mut();
+            if world.resource::<GlobeTime>().years != YearsBp(age_years) {
+                world.resource_mut::<GlobeTime>().years = YearsBp(age_years);
+            }
+            if !placed {
+                let mut q = world.query_filtered::<&mut Transform, With<GlobeCamera>>();
+                for mut t in q.iter_mut(world) {
+                    *t = Transform::from_translation(eye).looking_at(Vec3::ZERO, Vec3::Y);
+                }
                 // Light the face the camera looks at, from the upper left.
                 let sun = (Quat::from_rotation_y(-0.6) * Quat::from_rotation_x(-0.35)) * look;
                 let mut lights = world.query_filtered::<&mut Transform, With<DirectionalLight>>();
@@ -178,34 +231,170 @@ pub fn capture_globe(request: &CaptureRequest) -> Result<GlobeCapture, String> {
                 }
                 placed = lights.iter(world).next().is_some();
             }
-        }
-        match world.resource::<GlobeRenderStatus>().clone() {
-            GlobeRenderStatus::Failed(message) => return Err(message),
-            GlobeRenderStatus::Interactive { .. } if interactive_at.is_none() => {
-                interactive_at = Some(frame);
+            self.step();
+            let world = self.app.world_mut();
+            match world.resource::<GlobeRenderStatus>().clone() {
+                GlobeRenderStatus::Failed(message) => return Err(message),
+                GlobeRenderStatus::Interactive { .. } => self.interactive = true,
+                _ => {}
             }
-            _ => {}
-        }
-        if !requested && interactive_at.is_some_and(|f| frame >= f + SETTLE_FRAMES) && placed {
-            let slot = captured.clone();
-            world.spawn(Screenshot::image(target.clone())).observe(
-                move |shot: On<ScreenshotCaptured>| {
-                    if let Ok(mut slot) = slot.lock() {
-                        *slot = Some(shot.image.clone());
-                    }
-                },
-            );
-            requested = true;
-        }
-        let image = captured.lock().ok().and_then(|mut s| s.take());
-        if let Some(image) = image {
-            let mut q = world.query_filtered::<(&Camera, &GlobalTransform), With<GlobeCamera>>();
-            let (camera, transform) = q.iter(world).next().ok_or("no globe camera")?;
-            return Ok(GlobeCapture {
-                image,
-                camera: camera.clone(),
-                camera_transform: *transform,
-            });
+            if self.interactive && placed {
+                settle += 1;
+            }
+            if !requested && settle >= SETTLE_FRAMES {
+                let slot = captured.clone();
+                world.spawn(Screenshot::image(self.target.clone())).observe(
+                    move |shot: On<ScreenshotCaptured>| {
+                        if let Ok(mut slot) = slot.lock() {
+                            *slot = Some(shot.image.clone());
+                        }
+                    },
+                );
+                requested = true;
+            }
+            let image = captured.lock().ok().and_then(|mut s| s.take());
+            if let Some(image) = image {
+                let mut q =
+                    world.query_filtered::<(&Camera, &GlobalTransform), With<GlobeCamera>>();
+                let (camera, transform) = q.iter(world).next().ok_or("no globe camera")?;
+                return Ok(GlobeCapture {
+                    image,
+                    camera: camera.clone(),
+                    camera_transform: *transform,
+                });
+            }
         }
     }
+}
+
+/// Renders the globe headless at the requested age and returns the image.
+pub fn capture_globe(request: &CaptureRequest) -> Result<GlobeCapture, String> {
+    CaptureSession::new(&request.asset_root, request.size, false)?.shoot(
+        request.age_years,
+        request.look_at_lat_lon,
+        request.distance_km,
+    )
+}
+
+/// What the shader drew at a direction compared with what the CPU reference says.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParityStats {
+    /// Directions where both sides gave an answer away from any CPU boundary.
+    pub compared: usize,
+    /// Land/water agreement among those.
+    pub mask_agree: usize,
+    /// Exact agreement: ocean, or the same winning plate.
+    pub plate_agree: usize,
+    /// Skipped: the CPU answer changes within the tolerance.
+    pub near_boundary: usize,
+    /// Skipped: off the visible face, space, or an unreadable pixel.
+    pub unreadable: usize,
+    /// Mismatches beyond the tolerance: (direction, CPU, GPU).
+    pub mismatches: Vec<(Vec3, Option<u32>, Option<u32>)>,
+}
+
+impl ParityStats {
+    pub fn add(&mut self, other: &ParityStats) {
+        self.compared += other.compared;
+        self.mask_agree += other.mask_agree;
+        self.plate_agree += other.plate_agree;
+        self.near_boundary += other.near_boundary;
+        self.unreadable += other.unreadable;
+        self.mismatches.extend(other.mismatches.iter().copied());
+    }
+}
+
+/// Compares a verification-view capture with the CPU reference over `dirs`. `cpu(dir)` returns
+/// the winning plate index or `None` for ocean. A direction counts only if the CPU answer is the
+/// same at every point `tolerance_rad` around it (boundaries move with sampling and depth
+/// interpolation) and the pixel decodes cleanly; `max_view_angle_rad` keeps to the face of the
+/// globe the camera sees head-on.
+pub fn compare_with_reference(
+    capture: &GlobeCapture,
+    dirs: impl IntoIterator<Item = Vec3>,
+    cpu: impl FnMut(Vec3) -> Option<u32>,
+    tolerance_rad: f32,
+    max_view_angle_rad: f32,
+) -> ParityStats {
+    use super::material::{IdPixel, decode_plate_id};
+    compare_with(
+        capture,
+        dirs,
+        |c, d| match c.pixel_at(d).map(|[r, g, b, _]| decode_plate_id([r, g, b])) {
+            Some(IdPixel::Ocean) => Some(None),
+            Some(IdPixel::Plate(p)) => Some(Some(p)),
+            _ => None,
+        },
+        cpu,
+        tolerance_rad,
+        max_view_angle_rad,
+    )
+}
+
+/// Like [`compare_with_reference`] for a normal (painterly) capture: land/water only, read with
+/// [`GlobeCapture::classify`]. `cpu_land(dir)` is the CPU reference's land test.
+pub fn compare_mask_with_reference(
+    capture: &GlobeCapture,
+    dirs: impl IntoIterator<Item = Vec3>,
+    mut cpu_land: impl FnMut(Vec3) -> bool,
+    tolerance_rad: f32,
+    max_view_angle_rad: f32,
+) -> ParityStats {
+    compare_with(
+        capture,
+        dirs,
+        |c, d| match c.classify(d) {
+            Pixel::Land => Some(Some(0)),
+            Pixel::Water => Some(None),
+            Pixel::Other => None,
+        },
+        |d| cpu_land(d).then_some(0),
+        tolerance_rad,
+        max_view_angle_rad,
+    )
+}
+
+fn compare_with(
+    capture: &GlobeCapture,
+    dirs: impl IntoIterator<Item = Vec3>,
+    gpu: impl Fn(&GlobeCapture, Vec3) -> Option<Option<u32>>,
+    mut cpu: impl FnMut(Vec3) -> Option<u32>,
+    tolerance_rad: f32,
+    max_view_angle_rad: f32,
+) -> ParityStats {
+    let view = capture.camera_transform.translation().normalize();
+    let mut stats = ParityStats::default();
+    for d in dirs {
+        let d = d.normalize();
+        if d.angle_between(view) > max_view_angle_rad {
+            continue;
+        }
+        let Some(gpu) = gpu(capture, d) else {
+            stats.unreadable += 1;
+            continue;
+        };
+        let centre = cpu(d);
+        let up = if d.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
+        let t1 = up.cross(d).normalize();
+        let t2 = d.cross(t1);
+        let boundary = (0..8).any(|i| {
+            let a = i as f32 * std::f32::consts::TAU / 8.0;
+            let q = (d + (t1 * a.cos() + t2 * a.sin()) * tolerance_rad).normalize();
+            cpu(q) != centre
+        });
+        if boundary {
+            stats.near_boundary += 1;
+            continue;
+        }
+        stats.compared += 1;
+        if centre.is_some() == gpu.is_some() {
+            stats.mask_agree += 1;
+        }
+        if centre == gpu {
+            stats.plate_agree += 1;
+        } else {
+            stats.mismatches.push((d, centre, gpu));
+        }
+    }
+    stats
 }

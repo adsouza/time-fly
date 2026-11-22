@@ -11,6 +11,8 @@ struct GlobeParams {
     // (radius km, exaggeration, ocean fallback m, ocean shell depth km); the shell radius is
     // radius * endpoint.w.
     shape: vec4<f32>,
+    // x > 0.5: verification view; the atmosphere stays out of it.
+    debug: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: GlobeParams;
@@ -54,6 +56,6 @@ fn fragment(in: ShellOut) -> @location(0) vec4<f32> {
     let daylight = srgb(156.0, 195.0, 230.0);   // #9cc3e6
     let color = mix(terminator, daylight, smoothstep(0.0, 0.45, day));
     let lit = smoothstep(-0.3, 0.12, day);
-    let alpha = clamp(rim * 1.1, 0.0, 0.9) * lit;
+    let alpha = select(clamp(rim * 1.1, 0.0, 0.9) * lit, 0.0, params.debug.x > 0.5);
     return vec4<f32>(color, alpha);
 }

@@ -26,9 +26,25 @@ use crate::surface::{DeepBracket, FrameSource, Timeline, effective_elevation_m};
 pub const EARTH_RADIUS_KM: f64 = 6371.0;
 /// Vertical exaggeration of displaced terrain *(call)*.
 pub const ELEVATION_EXAGGERATION: f64 = 20.0;
-/// Radial bias between adjacent source-ID ranks (km). Larger than depth-buffer noise at orbit
-/// distance, small next to real relief (0.005 km is 0.25 m of unexaggerated elevation).
-pub const TIE_BIAS_KM: f64 = 0.005;
+/// Radial bias between adjacent source-ID ranks (km): 2.5 m of unexaggerated elevation. It must
+/// beat the f32 noise of the shader's per-pixel depth (about 1-2 m at orbit distance); the GPU
+/// fixture test showed 0.005 km dithering in exact-tie overlaps while 0.05 km resolves them. The
+/// CPU reference ranks with the same bias, so the two agree.
+pub const TIE_BIAS_KM: f64 = 0.05;
+
+/// Ocean-shell depth used where a source grid has land that no plate piece covers (a coverage
+/// gap or a source artefact): shallow, since such samples sit on or next to land.
+pub const OCEAN_GAP_FALLBACK_M: f64 = -200.0;
+
+/// The ocean shell's tint elevation for an effective source sample: water keeps its depth,
+/// land-valued (or NaN) samples take [`OCEAN_GAP_FALLBACK_M`]. Mirrored by `shell_elevation`.
+pub fn ocean_shell_elevation_m(effective_elevation_m: f64) -> f64 {
+    if effective_elevation_m <= 0.0 {
+        effective_elevation_m
+    } else {
+        OCEAN_GAP_FALLBACK_M
+    }
+}
 
 /// One PaleoDEM endpoint of a deep bracket, as the plate renderer samples it.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -485,6 +501,10 @@ mod tests {
         assert_eq!(visible_land_m(f64::NAN), None);
         assert_eq!(displacement_km(-50.0), 0.0);
         assert_eq!(displacement_km(1000.0), 20.0);
+        assert_eq!(ocean_shell_elevation_m(-3000.0), -3000.0);
+        assert_eq!(ocean_shell_elevation_m(0.0), 0.0);
+        assert_eq!(ocean_shell_elevation_m(450.0), OCEAN_GAP_FALLBACK_M);
+        assert_eq!(ocean_shell_elevation_m(f64::NAN), OCEAN_GAP_FALLBACK_M);
     }
 
     #[test]

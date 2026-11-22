@@ -25,13 +25,13 @@ use bevy::shader::{ShaderDefVal, ShaderRef};
 use bytemuck::{Pod, Zeroable};
 use timefly_core::geodynamics::{CrustModel, PlateIndex, interval_accepts};
 use timefly_core::globe::{
-    DeepSampling, ELEVATION_EXAGGERATION, endpoint_available, piece_visible, plate_rotations,
-    source_id_ranks, tie_bias_km,
+    DeepSampling, ELEVATION_EXAGGERATION, OCEAN_GAP_FALLBACK_M, plate_rotations, source_id_ranks,
+    tie_bias_km,
 };
 
 pub use timefly_core::globe::EARTH_RADIUS_KM;
 
-use super::mesh::{ATTRIBUTE_PIECE, IntervalList};
+use super::mesh::{ATTRIBUTE_PIECE, IntervalList, PIECE_DEPTH_COMPARE};
 
 /// `globe.wesl`, embedded so the globe renders from any asset root.
 pub const GLOBE_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e01");
@@ -53,8 +53,8 @@ pub const LIST_VALID_SOURCE1: u32 = 4;
 
 /// Below sea level the ocean shell sits this far under the land pieces (km).
 pub const OCEAN_SHELL_DEPTH_KM: f32 = 2.0;
-/// Ocean-tint depth used where a source grid has land in a deep-time gap (m).
-pub const OCEAN_FALLBACK_M: f32 = -2500.0;
+/// Ocean-tint depth where a source grid has land that no piece covers (m).
+pub const OCEAN_FALLBACK_M: f32 = OCEAN_GAP_FALLBACK_M as f32;
 /// The atmosphere shell's radius relative to the Earth's: above the highest exaggerated peak.
 pub const ATMOSPHERE_RADIUS_FACTOR: f32 = 1.045;
 
@@ -118,26 +118,47 @@ pub fn list_flags(lists: &[IntervalList], ages_myr: [f64; 3]) -> Vec<u32> {
         .collect()
 }
 
-/// The shader's piece visibility test on the uploaded flags.
-pub fn gpu_piece_visible(plate_flags: u32, list_flags: u32) -> bool {
-    piece_visible(
-        plate_flags & PLATE_CURRENT_VALID != 0,
-        list_flags & LIST_VALID_NOW != 0,
-    )
-}
-
-/// The shader's endpoint test on the uploaded flags; `endpoint` is 0 (younger) or 1 (older).
-pub fn gpu_endpoint_available(plate_flags: u32, list_flags: u32, endpoint: usize) -> bool {
-    let (plate_bit, list_bit) = [
-        (PLATE_SOURCE0_VALID, LIST_VALID_SOURCE0),
-        (PLATE_SOURCE1_VALID, LIST_VALID_SOURCE1),
-    ][endpoint];
-    endpoint_available(plate_flags & plate_bit != 0, list_flags & list_bit != 0)
-}
-
 /// Where the vertex stage puts a plate-fixed direction: rotated by the current rotation.
 pub fn piece_world_dir(plate: &PlateGpu, plate_fixed_dir: Vec3) -> Vec3 {
     Quat::from_array(plate.current) * plate_fixed_dir
+}
+
+/// What a verification-view pixel shows.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum IdPixel {
+    /// The ocean shell.
+    Ocean,
+    /// A plate piece, by plate index.
+    Plate(u32),
+    /// Anything else: space, the recent globe, or an edge blend.
+    Other,
+}
+
+/// Decodes an sRGB pixel of the verification view (`plate_id_color` in `globe.wesl`).
+pub fn decode_plate_id(rgb: [u8; 3]) -> IdPixel {
+    let linear = |b: u8| {
+        let c = f32::from(b) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [r, g, b] = rgb.map(linear);
+    if b > 0.98 && r < 0.02 && g < 0.02 {
+        return IdPixel::Ocean;
+    }
+    if b > 0.02 {
+        return IdPixel::Other;
+    }
+    let level = |v: f32| {
+        let x = v * 15.0;
+        ((x - x.round()).abs() < 0.2).then_some(x.round() as u32)
+    };
+    match (level(r), level(g)) {
+        (Some(lo), Some(hi)) if lo + 16 * hi > 0 => IdPixel::Plate(lo + 16 * hi - 1),
+        _ => IdPixel::Other,
+    }
 }
 
 /// Uniform shared by the globe surfaces (`GlobeParams` in `globe.wesl`).
@@ -150,6 +171,8 @@ pub struct GlobeParams {
     pub endpoint: Vec4,
     /// `(radius km, exaggeration, ocean fallback m, ocean shell depth km)`.
     pub shape: Vec4,
+    /// `x = 1`: verification view (pieces draw their plate index, see [`decode_plate_id`]).
+    pub debug: Vec4,
 }
 
 impl GlobeParams {
@@ -163,6 +186,7 @@ impl GlobeParams {
                 OCEAN_FALLBACK_M,
                 OCEAN_SHELL_DEPTH_KM,
             ),
+            debug: Vec4::ZERO,
         }
     }
 
@@ -196,6 +220,11 @@ impl GlobeParams {
     /// Parameters of the atmosphere shell: the sun, and the shell radius factor in `endpoint.w`.
     pub fn atmosphere(sun: Vec3) -> GlobeParams {
         GlobeParams::new(Vec4::new(0.0, 0.0, 0.0, ATMOSPHERE_RADIUS_FACTOR), sun)
+    }
+
+    pub fn with_debug(mut self, debug: bool) -> GlobeParams {
+        self.debug = Vec4::new(if debug { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
+        self
     }
 
     pub fn with_sun(mut self, sun: Vec3) -> GlobeParams {
@@ -269,6 +298,9 @@ impl Material for PlateMaterial {
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         push_def(descriptor, "PLATE_PIECES");
+        if let Some(depth) = descriptor.depth_stencil.as_mut() {
+            depth.depth_compare = Some(PIECE_DEPTH_COMPARE);
+        }
         descriptor.vertex.buffers = vec![layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
             ATTRIBUTE_PIECE.at_shader_location(1),
@@ -577,29 +609,26 @@ mod tests {
     }
 
     #[test]
-    fn piece_visibility_and_endpoints_mirror_the_core_rules() {
-        use timefly_core::globe::{endpoint_available, piece_visible};
-        for plate_flags in 0..8u32 {
-            for list in 0..8u32 {
-                assert_eq!(
-                    gpu_piece_visible(plate_flags, list),
-                    piece_visible(
-                        plate_flags & PLATE_CURRENT_VALID != 0,
-                        list & LIST_VALID_NOW != 0
-                    )
-                );
-                for e in 0..2 {
-                    let (pb, lb) = [
-                        (PLATE_SOURCE0_VALID, LIST_VALID_SOURCE0),
-                        (PLATE_SOURCE1_VALID, LIST_VALID_SOURCE1),
-                    ][e];
-                    assert_eq!(
-                        gpu_endpoint_available(plate_flags, list, e),
-                        endpoint_available(plate_flags & pb != 0, list & lb != 0)
-                    );
-                }
-            }
+    fn plate_ids_round_trip_through_srgb_bytes() {
+        let encode = |v: f32| {
+            let c = if v <= 0.0031308 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (c * 255.0).round() as u8
+        };
+        for index in [0u32, 1, 14, 15, 16, 100, 148, 254] {
+            let k = index + 1;
+            let rgb = [
+                encode((k % 16) as f32 / 15.0),
+                encode(((k / 16) % 16) as f32 / 15.0),
+                0,
+            ];
+            assert_eq!(decode_plate_id(rgb), IdPixel::Plate(index));
         }
+        assert_eq!(decode_plate_id([0, 0, 255]), IdPixel::Ocean);
+        assert_eq!(decode_plate_id([9, 10, 18]), IdPixel::Other);
     }
 
     #[test]
