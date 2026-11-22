@@ -17,13 +17,22 @@ use super::report::{redact, report_url};
 use super::session::{PreviousOutcome, PreviousSession};
 use super::{DiagnosticsHandle, Shared};
 
-/// The notice text.
-pub fn notice_text(log_location: &str) -> String {
+/// The notice text. `saved` says where the log is, with its preposition: see [`saved_phrase`].
+pub fn notice_text(saved: &str) -> String {
     format!(
-        "Time Fly didn't close normally last time. A log of that session is saved at {log_location}. \
+        "Time Fly didn't close normally last time. A log of that session is saved {saved}. \
          Please send it to the developer so the problem can be fixed. It contains game events and \
          your OS and graphics card, and no personal information."
     )
+}
+
+/// "at <path>" for a native log file, "in <place>" for the web's browser storage.
+pub fn saved_phrase(location: &str, on_web: bool) -> String {
+    if on_web {
+        format!("in {location}")
+    } else {
+        format!("at {location}")
+    }
 }
 
 /// Where the previous session's log is, as shown to the player (home directory as `~`).
@@ -73,7 +82,10 @@ impl PendingNotice {
         Self {
             session_id: record.map_or_else(|| "unknown".to_string(), |r| r.id.clone()),
             platform_summary: record.map_or_else(String::new, |r| r.platform.summary()),
-            text: notice_text(&redact(&log_display(previous), &shared.home)),
+            text: notice_text(&saved_phrase(
+                &redact(&log_display(previous), &shared.home),
+                cfg!(target_arch = "wasm32"),
+            )),
             #[cfg(not(target_arch = "wasm32"))]
             previous_dir: previous.dir.clone(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -453,9 +465,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_notice_says_in_browser_storage() {
+        let text = notice_text(&saved_phrase("your browser's storage for this site", true));
+        assert!(
+            text.contains(
+                "A log of that session is saved in your browser's storage for this site. Please"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn notice_text_is_the_spec_text() {
         assert_eq!(
-            notice_text("~/Library/Logs/Time Fly/x/crash.txt"),
+            notice_text(&saved_phrase("~/Library/Logs/Time Fly/x/crash.txt", false)),
             "Time Fly didn't close normally last time. A log of that session is saved at \
              ~/Library/Logs/Time Fly/x/crash.txt. Please send it to the developer so the problem can \
              be fixed. It contains game events and your OS and graphics card, and no personal information."

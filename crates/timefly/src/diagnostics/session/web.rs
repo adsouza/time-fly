@@ -161,10 +161,12 @@ pub fn install_pagehide(shared: Arc<Shared>) {
         };
         let id = record.id.clone();
         drop(record);
+        // Leaving the page is a successful exit: `finish_status` makes only a running session
+        // clean and keeps a recorded crash (panic or error exit) as it is.
         if let Some(mut stored) = read_record(&id)
             && stored.status == SessionStatus::Running
         {
-            stored.status = SessionStatus::Clean;
+            stored.status = finish_status(stored.status, &bevy::app::AppExit::Success);
             if let Err(e) = save_record(&stored) {
                 shared.problem(e);
             }

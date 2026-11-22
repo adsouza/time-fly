@@ -207,6 +207,39 @@ mod tests {
     }
 
     #[test]
+    fn crash_reports_never_overwrite() {
+        let dir = temp_root("crash");
+        assert_eq!(
+            write_crash_report(&dir, "first").unwrap(),
+            dir.join("crash.txt")
+        );
+        assert_eq!(
+            write_crash_report(&dir, "second").unwrap(),
+            dir.join("crash-2.txt")
+        );
+        assert_eq!(fs::read_to_string(dir.join("crash.txt")).unwrap(), "first");
+        for n in 3..=MAX_CRASH_REPORTS {
+            let path = write_crash_report(&dir, &format!("report {n}")).unwrap();
+            assert_eq!(path, dir.join(format!("crash-{n}.txt")));
+        }
+        assert_eq!(MAX_CRASH_REPORTS, 5);
+        assert!(write_crash_report(&dir, "too many").is_err());
+        // Nothing was overwritten, and no sixth file appeared.
+        assert_eq!(fs::read_to_string(dir.join("crash.txt")).unwrap(), "first");
+        assert_eq!(
+            fs::read_to_string(dir.join("crash-2.txt")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("crash-5.txt")).unwrap(),
+            "report 5"
+        );
+        assert!(!dir.join("crash-6.txt").exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn acknowledging_hides_the_crash() {
         let root = temp_root("ack");
         let dir = root.join("20261122T093300.123Z_0123abcd");

@@ -240,9 +240,8 @@ impl Session {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut this = self;
-            if let AppExit::Error(code) = exit {
-                error!(code = code.get(), "the app exited with an error");
-            }
+            // `record_app_exits` has already recorded and logged an error exit; this is the
+            // success path and a safety net (`finish_status` never downgrades a crash).
             this.shared
                 .update_record(|r| r.status = session::finish_status(r.status, exit));
             this.flush_logs();
@@ -468,7 +467,10 @@ impl Plugin for DiagnosticsPlugin {
             .add_systems(Startup, log_findings)
             .add_systems(
                 Last,
-                sync_context.run_if(resource_changed::<DiagnosticsContext>),
+                (
+                    sync_context.run_if(resource_changed::<DiagnosticsContext>),
+                    record_app_exits,
+                ),
             );
         if !self.windowed {
             return;
@@ -535,6 +537,21 @@ fn log_findings(handle: Res<DiagnosticsHandle>) {
     }
 }
 
+/// Records an error exit as a crash as soon as it is requested, without waiting for `run()` to
+/// return: on the web `run()` returns at once and `Session::finish` never sees the exit. Bevy
+/// requests `AppExit::Error` after a render-thread panic and for wgpu validation, out-of-memory
+/// and device-lost errors, on native and web alike.
+fn record_app_exits(mut exits: MessageReader<AppExit>, handle: Res<DiagnosticsHandle>) {
+    for exit in exits.read() {
+        if let AppExit::Error(code) = exit {
+            error!(code = code.get(), "the app exited with an error");
+            handle
+                .0
+                .update_record(|r| r.status = session::finish_status(r.status, exit));
+        }
+    }
+}
+
 /// Copies the context resource to the panic hook's copy, and records the adapter in the
 /// session record once the renderer reports it.
 fn sync_context(context: Res<DiagnosticsContext>, handle: Res<DiagnosticsHandle>) {
@@ -595,6 +612,81 @@ fn mark_first_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Shared` without files: `save_record` has no session directory to write to.
+    fn test_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            args: LaunchArgs::default(),
+            record: Mutex::new(SessionRecord {
+                id: "0123abcd".into(),
+                started_utc: "2026-11-22T09:33:00.123Z".into(),
+                build: BuildInfo::current(),
+                platform: PlatformInfo::current(),
+                status: SessionStatus::Running,
+                reached_first_frame: true,
+                acknowledged: false,
+            }),
+            findings: Findings::default(),
+            recorder: Mutex::new(Recorder::default()),
+            context: Mutex::new(DiagnosticsContext::default()),
+            home: Home::default(),
+            started: Instant::now(),
+            pending_notice: Mutex::new(None),
+            notice_route: Mutex::new(NoticeRoute::None),
+            problems: Mutex::new(Vec::new()),
+            logging_ready: AtomicBool::new(true),
+            #[cfg(not(target_arch = "wasm32"))]
+            log_writer: None,
+        })
+    }
+
+    /// An app whose system requests `exit` in `Update`; `run()` is never called.
+    fn status_after_exit(exit: Option<AppExit>) -> SessionStatus {
+        let shared = test_shared();
+        let mut app = App::new();
+        app.insert_resource(DiagnosticsHandle(shared.clone()))
+            .add_systems(Last, record_app_exits)
+            .add_systems(Update, move |mut writer: MessageWriter<AppExit>| {
+                if let Some(exit) = exit.clone() {
+                    writer.write(exit);
+                }
+            });
+        app.update();
+        lock(&shared.record).status
+    }
+
+    #[test]
+    fn an_error_exit_is_recorded_as_a_crash_without_run_returning() {
+        assert_eq!(
+            status_after_exit(Some(AppExit::error())),
+            SessionStatus::Crashed { panicked: false }
+        );
+    }
+
+    #[test]
+    fn a_success_exit_or_no_exit_leaves_the_session_running() {
+        // `Session::finish` (native) or `pagehide` (web) marks it clean later.
+        assert_eq!(
+            status_after_exit(Some(AppExit::Success)),
+            SessionStatus::Running
+        );
+        assert_eq!(status_after_exit(None), SessionStatus::Running);
+    }
+
+    #[test]
+    fn an_error_exit_keeps_an_earlier_panic() {
+        let shared = test_shared();
+        shared.update_record(|r| r.status = SessionStatus::Crashed { panicked: true });
+        let mut app = App::new();
+        app.insert_resource(DiagnosticsHandle(shared.clone()))
+            .add_systems(Last, record_app_exits);
+        app.world_mut().write_message(AppExit::error());
+        app.update();
+        assert_eq!(
+            lock(&shared.record).status,
+            SessionStatus::Crashed { panicked: true }
+        );
+    }
 
     #[test]
     fn try_lock_for_gives_up_on_a_lock_this_thread_holds() {
