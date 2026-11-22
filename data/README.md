@@ -22,8 +22,16 @@ listed and CI never downloads it.
 `cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`
 skips files that already match, downloads the rest to a temporary name, checks size and
 SHA-256, then renames; any mismatch deletes the download and fails naming the file. Certificate
-verification is never disabled. CI (`.github/workflows/linux-package.yml`) runs it with
-`data/raw/` cached under the hash of `sources.json`.
+verification is never disabled. The ICE-6G_C host sends only its leaf certificate, without the
+Sectigo Public Server Authentication CA OV R36 intermediate, which OpenSSL (Python, Linux CI)
+cannot complete on its own (macOS curl can). For exactly that failure ("unable to get local
+issuer certificate") the fetcher reads the leaf's AIA "CA Issuers" URL, downloads that one
+intermediate (at most 16 KB, must be a CA, not self-signed, and the leaf's issuer), and retries
+with the system roots plus it, partial chains disallowed, so the chain must still end at a
+system root (here Sectigo Public Server Authentication Root R46); hostname checks and the
+SHA-256 pins are unchanged (owner decision, 2026-11-22). CI
+(`.github/workflows/linux-package.yml`) runs it with `data/raw/` cached under the hash of
+`sources.json`.
 
 **Redistribution in the Linux packages (Task 11, checked 2026-11-22).** The `.deb` and Flatpak
 ship only the baked globe (`crates/timefly/assets/data/globe`, without `bake.log`), never the

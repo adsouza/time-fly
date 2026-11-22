@@ -3,7 +3,7 @@
 <component type="desktop-application">
   <id>io.github.adsouza.TimeFly</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>AGPL-3.0-only</project_license>
+  <project_license>AGPL-3.0-or-later</project_license>
   <name>Time Fly</name>
   <summary>Earth through deep time</summary>
   <description>
@@ -24,7 +24,11 @@
   </provides>
   <url type="homepage">https://github.com/adsouza/time-fly</url>
   <url type="bugtracker">https://github.com/adsouza/time-fly/issues</url>
-  <developer_name>adsouza</developer_name>
+  <developer id="io.github.adsouza">
+    <name>Antonio D'souza</name>
+  </developer>
+  <developer_name>Antonio D'souza</developer_name>
+  <update_contact>275832+adsouza@users.noreply.github.com</update_contact>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="0.1.0" date="2026-11-22">

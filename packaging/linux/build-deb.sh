@@ -50,7 +50,7 @@ cat >"$pkg/DEBIAN/control" <<EOF
 Package: time-fly
 Version: $version
 Architecture: amd64
-Maintainer: adsouza <adsouza@users.noreply.github.com>
+Maintainer: Antonio D'souza <275832+adsouza@users.noreply.github.com>
 Installed-Size: $installed_kb
 Depends: $shlibs, libvulkan1
 Recommends: libwayland-client0 | libx11-6, libxkbcommon0, libxcursor1, libxrandr2, libxi6, mesa-vulkan-drivers | vulkan-icd

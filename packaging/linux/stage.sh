@@ -78,8 +78,13 @@ doc="$out/share/doc/time-fly"
 Time Fly
 Source: https://github.com/adsouza/time-fly
 
-The game is licensed under the GNU Affero General Public License, version 3 (full text at
-the end of this file).
+Copyright 2026 Antonio D'souza <275832+adsouza@users.noreply.github.com>
+License: AGPL-3.0-or-later
+
+The game is free software: you can redistribute it and/or modify it under the terms of the
+GNU Affero General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version (full text at the end of
+this file).
 
 The baked globe data in assets/data/globe is derived from the datasets credited below. Each
 is redistributed in baked form only, under the terms stated with it; the original files are
