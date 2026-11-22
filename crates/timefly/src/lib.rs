@@ -20,6 +20,9 @@ use diagnostics::{DiagnosticsPlugin, Session};
 use globe::GlobePlugin;
 use ui::GameUiPlugins;
 
+/// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
+pub const APP_ID: &str = "io.github.adsouza.TimeFly";
+
 /// The primary window for the launch arguments: `--window WxH` sets its size in physical
 /// pixels, and the scrub bench turns vsync off on native so frame times show the real cost.
 pub fn primary_window(args: &LaunchArgs) -> Window {
@@ -29,6 +32,9 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
     )]
     let mut window = Window {
         title: "Time Fly".to_string(),
+        // Wayland app ID / X11 WM_CLASS: matches the Linux desktop file and Flatpak app ID, so
+        // the shell shows the packaged icon for the window.
+        name: Some(APP_ID.to_string()),
         ..default()
     };
     #[cfg(not(target_arch = "wasm32"))]

@@ -1,0 +1,31 @@
+# Flatpak for Time Fly. Nothing is compiled here: the CI `build` job makes the release binary
+# and the staged install tree (packaging/linux/stage.sh), and this manifest copies that tree
+# into /app. CI unpacks the tree into packaging/flatpak/staged/ before running flatpak-builder.
+#
+# Runtime: freedesktop 26.08, the current branch (released 2026-08, supported to 2028-09).
+id: io.github.adsouza.TimeFly
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+command: time-fly
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # "Show log" in the crash notice reveals the log through the file manager.
+  - --talk-name=org.freedesktop.FileManager1
+modules:
+  - name: time-fly
+    buildsystem: simple
+    build-options:
+      # Keep the release binary's line tables: panic reports show file and line.
+      strip: false
+      no-debuginfo: true
+    sources:
+      - type: dir
+        path: staged
+    build-commands:
+      - test -x lib/time-fly/time-fly
+      - test -f lib/time-fly/assets/data/globe/manifest.json
+      - cp -R lib bin share /app/

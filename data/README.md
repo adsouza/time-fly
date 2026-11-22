@@ -10,6 +10,34 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Global sea level (0–798 ka) | Spratt & Lisiecki (2016) via NOAA NCEI; see [Sea level](#sea-level) | NOAA NCEI public data; cite publication and dataset DOI | Task 7 (`timefly_bake.sealevel`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
+## Pinned downloads (`data/sources.json`)
+
+`data/sources.json` lists every raw file the bake reads, with its URL, path under `data/raw/`,
+SHA-256, size in bytes and licence: the PaleoDEM archive, the two plate-model archives, the 27
+ICE-6G_C slices and the sea-level file (31 files, 25,202,636 bytes). The URLs and checksums are
+the ones in the tables below (`tools/bake/tests/test_fetch.py` checks that they agree). The
+PaleoDEM report PDF is reference reading for the age table, not a bake input, so it is not
+listed and CI never downloads it.
+
+`cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`
+skips files that already match, downloads the rest to a temporary name, checks size and
+SHA-256, then renames; any mismatch deletes the download and fails naming the file. Certificate
+verification is never disabled. CI (`.github/workflows/linux-package.yml`) runs it with
+`data/raw/` cached under the hash of `sources.json`.
+
+**Redistribution in the Linux packages (Task 11, checked 2026-11-22).** The `.deb` and Flatpak
+ship only the baked globe (`crates/timefly/assets/data/globe`, without `bake.log`), never the
+raw files, with every citation in `/usr/share/doc/time-fly/copyright` and the in-game credits:
+
+- PaleoDEMs and plate model: CC BY 4.0 allows redistribution of adapted material with
+  attribution, a licence link and a note of changes; `credits.txt` carries all three.
+- ICE-6G_C: no licence stated; the project owner approved distributing the baked derivatives
+  with citation and credit on 2026-11-22 (see [ICE-6G_C](#ice-6g_c-vm5a)).
+- Spratt & Lisiecki sea level: NOAA NCEI public data, redistributable with the requested
+  citation of the publication and dataset DOI.
+
+No recorded licence forbids shipping the baked derivatives.
+
 ## Plate model
 
 The rotation and static-polygon files that accompany the Scotese & Wright (2018) PaleoDEMs, taken
@@ -254,6 +282,10 @@ frames, 136 images, cube size 128, 17,177,338 bytes):
   interval, at most 1%) and median (at most 5% over the interval), ruling R14: the re-run passes
   with 0.08-0.17% missed frames. The bench block names the bake as
   `manifest v2, sha256 013f81f437f19736`.
+
+Linux (Vulkan, `.deb` and Flatpak from CI): pending the owner's run of
+[`docs/testing/linux-vulkan.md`](../docs/testing/linux-vulkan.md); results are recorded here
+when they arrive.
 
 Reference files:
 

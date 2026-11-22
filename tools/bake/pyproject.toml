@@ -6,6 +6,7 @@ dependencies = ["numpy", "netCDF4", "zstandard", "pygplates>=1.0"]
 
 [project.scripts]
 timefly-bake = "timefly_bake.cli:main"
+timefly-fetch = "timefly_bake.fetch:main"
 
 [dependency-groups]
 dev = ["pytest"]
