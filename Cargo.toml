@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/timefly_core", "crates/timefly"]
+resolver = "3"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

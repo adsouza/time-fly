@@ -1,0 +1,9 @@
+[package]
+name = "timefly_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_math = "0.20"
+ruzstd = "0.9"
+half = "2"
