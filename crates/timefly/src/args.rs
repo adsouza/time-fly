@@ -1,6 +1,8 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
-//! Task 10 adds `--scrub-bench`, `--target-fps` and `--window` here.
+//! Flags: `--diagnostics-probe <mode>` (hidden), `--scrub-bench`, `--target-fps N` and
+//! `--window WxH`. A value may follow its flag as `--flag=value` or as the next argument; a next
+//! argument that starts with `--` is the next flag, never a value.
 
 use crate::diagnostics::ProbeMode;
 
@@ -9,39 +11,70 @@ use crate::diagnostics::ProbeMode;
 pub struct LaunchArgs {
     /// Hidden `--diagnostics-probe=<mode>` (web: `?diagnostics-probe=<mode>`).
     pub diagnostics_probe: Option<ProbeMode>,
+    /// `--scrub-bench` (web: `?scrub-bench`): run the automated scrub benchmark and report.
+    pub scrub_bench: bool,
+    /// `--target-fps N`: the frame rate the benchmark checks its 95th percentile against.
+    pub target_fps: Option<u32>,
+    /// `--window WxH`: the window's size in physical pixels (native only).
+    pub window: Option<(u32, u32)>,
     /// Arguments this build does not understand. They are ignored, and logged as warnings once
     /// the log subscriber exists.
     pub unknown: Vec<String>,
 }
 
 const PROBE_FLAG: &str = "--diagnostics-probe";
+const BENCH_FLAG: &str = "--scrub-bench";
+const TARGET_FPS_FLAG: &str = "--target-fps";
+const WINDOW_FLAG: &str = "--window";
+
+/// `WxH` with both sides at least 1, e.g. `2560x1440`.
+pub fn parse_window_size(text: &str) -> Option<(u32, u32)> {
+    let (w, h) = text.split_once(['x', 'X'])?;
+    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// A frame rate from 1 to 1000.
+fn parse_fps(text: &str) -> Option<u32> {
+    text.parse::<u32>().ok().filter(|f| (1..=1000).contains(f))
+}
 
 /// Parses native arguments, without the program name (`std::env::args().skip(1)`).
 ///
-/// Accepts `--diagnostics-probe=<mode>` and `--diagnostics-probe <mode>`; a following argument
-/// that starts with `--` is the next flag, not a value. Anything else, including a probe flag
-/// with an unknown or missing mode, lands in [`LaunchArgs::unknown`].
+/// Anything this build does not understand, including a flag with a missing or malformed value
+/// (an unknown probe mode, `--window 2560`), lands in [`LaunchArgs::unknown`] and changes nothing.
 pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs {
     let mut parsed = LaunchArgs::default();
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
-        let value = if let Some(value) = arg
-            .strip_prefix(PROBE_FLAG)
-            .and_then(|v| v.strip_prefix('='))
-        {
-            Some(value.to_string())
-        } else if arg == PROBE_FLAG {
-            args.next_if(|next| !next.starts_with("--"))
-        } else {
+        if arg == BENCH_FLAG {
+            parsed.scrub_bench = true;
+            continue;
+        }
+        let Some(flag) = [PROBE_FLAG, TARGET_FPS_FLAG, WINDOW_FLAG]
+            .into_iter()
+            .find(|f| arg == *f || arg.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
+        else {
             parsed.unknown.push(arg);
             continue;
         };
-        match value.as_deref().and_then(ProbeMode::parse) {
-            Some(mode) => parsed.diagnostics_probe = Some(mode),
-            None => parsed.unknown.push(match value {
-                Some(value) => format!("{PROBE_FLAG}={value}"),
+        let value = match arg.strip_prefix(flag).and_then(|v| v.strip_prefix('=')) {
+            Some(value) => Some(value.to_string()),
+            None => args.next_if(|next| !next.starts_with("--")),
+        };
+        let accepted = value.as_deref().is_some_and(|v| {
+            match flag {
+                PROBE_FLAG => ProbeMode::parse(v).map(|m| parsed.diagnostics_probe = Some(m)),
+                TARGET_FPS_FLAG => parse_fps(v).map(|f| parsed.target_fps = Some(f)),
+                _ => parse_window_size(v).map(|s| parsed.window = Some(s)),
+            }
+            .is_some()
+        });
+        if !accepted {
+            parsed.unknown.push(match value {
+                Some(value) => format!("{flag}={value}"),
                 None => arg,
-            }),
+            });
         }
     }
     parsed
@@ -169,10 +202,8 @@ mod tests {
     fn probe_flag_does_not_swallow_the_next_flag() {
         let parsed = parse_launch_args(args(&["--diagnostics-probe", "--target-fps=30"]));
         assert_eq!(parsed.diagnostics_probe, None);
-        assert_eq!(
-            parsed.unknown,
-            args(&["--diagnostics-probe", "--target-fps=30"])
-        );
+        assert_eq!(parsed.target_fps, Some(30));
+        assert_eq!(parsed.unknown, args(&["--diagnostics-probe"]));
         let parsed = parse_launch_args(args(&["--diagnostics-probe", "clean", "--window"]));
         assert_eq!(parsed.diagnostics_probe, Some(ProbeMode::Clean));
         assert_eq!(parsed.unknown, args(&["--window"]));
@@ -196,6 +227,61 @@ mod tests {
         // Malformed escapes stay as written.
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz%4"), "%zz%4");
+    }
+
+    #[test]
+    fn scrub_bench_flags() {
+        let parsed = parse_launch_args(args(&[
+            "--scrub-bench",
+            "--target-fps",
+            "60",
+            "--window",
+            "2560x1440",
+        ]));
+        assert!(parsed.scrub_bench);
+        assert_eq!(parsed.target_fps, Some(60));
+        assert_eq!(parsed.window, Some((2560, 1440)));
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+
+        let parsed = parse_launch_args(args(&["--window=1280x720", "--target-fps=30"]));
+        assert_eq!(parsed.window, Some((1280, 720)));
+        assert_eq!(parsed.target_fps, Some(30));
+    }
+
+    #[test]
+    fn malformed_window_and_fps_are_rejected() {
+        for bad in [
+            "2560",
+            "2560x",
+            "x1440",
+            "0x1440",
+            "2560x-1",
+            "axb",
+            "2560x1440x2",
+        ] {
+            let parsed = parse_launch_args(args(&["--window", bad]));
+            assert_eq!(parsed.window, None, "{bad}");
+            assert_eq!(parsed.unknown, vec![format!("--window={bad}")], "{bad}");
+        }
+        let parsed = parse_launch_args(args(&["--target-fps=0", "--target-fps", "fast"]));
+        assert_eq!(parsed.target_fps, None);
+        assert_eq!(
+            parsed.unknown,
+            args(&["--target-fps=0", "--target-fps=fast"])
+        );
+        // A missing value: the next flag is not swallowed.
+        let parsed = parse_launch_args(args(&["--window", "--scrub-bench"]));
+        assert_eq!(parsed.window, None);
+        assert!(parsed.scrub_bench);
+        assert_eq!(parsed.unknown, args(&["--window"]));
+    }
+
+    #[test]
+    fn web_query_scrub_bench() {
+        let parsed = parse_query_args("?scrub-bench&target-fps=30");
+        assert!(parsed.scrub_bench);
+        assert_eq!(parsed.target_fps, Some(30));
+        assert!(parsed.unknown.is_empty());
     }
 
     #[test]

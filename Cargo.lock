@@ -5569,6 +5569,7 @@ dependencies = [
  "fd-lock",
  "half",
  "js-sys",
+ "libc",
  "opener",
  "rfd",
  "ruzstd",

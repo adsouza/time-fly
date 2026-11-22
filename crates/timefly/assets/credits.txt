@@ -1,0 +1,51 @@
+TIME FLY
+
+Earth through deep time, from 540 million years ago to the present.
+
+
+DATA
+
+The globe is baked from the datasets below. The baked frames are derived works; the
+original files are not redistributed.
+
+Topography and plate model, 540 million years ago to the present
+  Scotese, C.R. & Wright, N. (2018). PALEOMAP Paleodigital Elevation Models
+  (PaleoDEMS) for the Phanerozoic. PALEOMAP Project.
+  https://doi.org/10.5281/zenodo.5460860
+  - PaleoDEMs: the 1-degree netCDF maps (Maps 1-88) and the report
+    "PALEOMAP PaleoDEMs" (Table 1 gives each map's age).
+  - Plate model: PALEOMAP Plate Model (rotations and continental polygons), GPlates
+    plate-model registry entry scotese_and_wright2018 (same Zenodo record).
+  Licence: Creative Commons Attribution 4.0 International (CC BY 4.0),
+  https://creativecommons.org/licenses/by/4.0/
+  Changes: resampled onto a cube map, plate footprints rasterised and dilated, sea
+  level and colours applied by Time Fly.
+
+Ice sheets and recent topography, 26,000 years ago to the present
+  ICE-6G_C (VM5a) glacial isostatic adjustment model, 1-degree files, W.R. Peltier,
+  University of Toronto.
+  Argus, D.F., Peltier, W.R., Drummond, R. & Moore, A.W. (2014). The Antarctica
+  component of postglacial rebound model ICE-6G_C (VM5a) based on GPS positioning,
+  exposure age dating of ice thicknesses, and relative sea level histories.
+  Geophysical Journal International 198, 537-563.
+  https://doi.org/10.1093/gji/ggu140
+  Peltier, W.R., Argus, D.F. & Drummond, R. (2015). Space geodesy constrains ice age
+  terminal deglaciation: the global ICE-6G_C (VM5a) model. Journal of Geophysical
+  Research: Solid Earth 120, 450-487. https://doi.org/10.1002/2014JB011176
+  Terms: the files state no licence and ask that both papers be cited. Distributed
+  in baked form with the citations above, as approved by the project owner.
+
+Global sea level, 798,000 years ago to the present
+  Spratt, R.M. & Lisiecki, L.E. (2016). A Late Pleistocene sea level stack.
+  Climate of the Past 12, 1079-1092. https://doi.org/10.5194/cp-12-1079-2016
+  Dataset: NOAA National Centers for Environmental Information (NCEI), World Data
+  Service for Paleoclimatology. https://doi.org/10.25921/rd66-5820
+  (https://www.ncei.noaa.gov/access/paleo-search/study/19982)
+  Terms: NOAA NCEI public data; cite the publication and the dataset DOI.
+
+
+SOFTWARE
+
+Built with the Bevy game engine (https://bevyengine.org, MIT or Apache-2.0) and the
+Rust crates listed in Cargo.lock, each under its own licence.
+Bevy's default font: Fira Mono (SIL Open Font License 1.1).

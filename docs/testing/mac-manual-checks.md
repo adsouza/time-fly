@@ -69,3 +69,54 @@ branch is pushed, so do this after Task 11's first push.
       recent events.
 - [ ] After any button, the next reload shows nothing.
 - [ ] `localStorage` holds at most three sessions (`timefly.sessions`).
+
+## Globe, time slider, camera and credits (Task 10)
+
+Already verified automatically (2026-11-22): the slider mapping, thumb sync, idle fade, Esc
+toggle, orbit step and zoom limits are unit tests; the scrub bench drove the full range both
+ways on Metal and screenshots of the UI are in `docs/testing/globe-m1/ui/`. What is left is how
+it feels with a real mouse and keyboard. Run `cargo run --release -p timefly`.
+
+### 6. Loading overlay
+
+- [ ] On launch the window shows "Loading Earth's history..." on a dark background, and it stays
+      until the globe appears (no half-drawn globe or blank frame between them).
+- [ ] With the data missing (rename `crates/timefly/assets/data/globe/manifest.json` for one
+      run, then rename it back) the overlay shows "Time Fly could not show the globe." and the
+      reason, instead of loading forever.
+
+### 7. Orbit camera
+
+- [ ] Dragging on the globe turns it: the surface follows the pointer left/right and up/down,
+      and stops short of the poles (no flip at the top or bottom).
+- [ ] Dragging that starts on the slider moves the slider, not the globe.
+- [ ] Scrolling zooms in until the globe nearly fills the window (1.15 Earth radii) and no
+      further; scrolling out stops with the globe small but clearly visible (6 radii).
+- [ ] The globe never jitters or lags behind the drag while scrubbing through 26-30 ka (the
+      bridge crossfade), i.e. both halves of the crossfade move together.
+
+### 8. Time slider and keys
+
+- [ ] The slider runs along the bottom with 16 px gutters; the left end reads "540 Ma", the right
+      end "Present", and the label above shows the age (e.g. "21 thousand years ago").
+- [ ] Drag the thumb from right to left and back: the globe changes smoothly through the ice
+      age, the bridge crossfade (26-30 ka) and deep time, in both directions, with no frozen
+      frames.
+- [ ] Clicking on the track jumps the thumb there.
+- [ ] `[` steps to the next older snapshot and `]` to the next younger one; the thumb and the
+      label follow.
+
+### 9. Idle fade
+
+- [ ] Leave the mouse and keyboard alone: after about 3 s the slider and label fade to about
+      30% opacity.
+- [ ] Hovering the slider, pressing a key, scrolling or clicking brings them back to full
+      opacity at once.
+
+### 10. Credits
+
+- [ ] `Esc` opens the credits over the globe; they list the PaleoDEMs and plate model
+      (Scotese & Wright 2018, CC BY 4.0), ICE-6G_C (Argus et al. 2014, Peltier et al. 2015) and
+      the sea-level stack (Spratt & Lisiecki 2016, NOAA NCEI).
+- [ ] The scroll wheel scrolls the credits (and does not zoom the globe while they are open).
+- [ ] `Esc` again closes them.

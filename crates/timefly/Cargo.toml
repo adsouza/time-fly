@@ -29,6 +29,10 @@ fd-lock = "4"
 opener = { version = "0.9", features = ["reveal"] }
 rfd = "0.18"
 
+# Process memory and the OS version for the scrub bench (already in the tree via winit/wgpu).
+[target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy = { version = "0.20", features = ["webgpu"] }
 console_error_panic_hook = "0.1"
@@ -42,7 +46,10 @@ web-sys = { version = "0.3", features = [
     "HtmlElement",
     "HtmlAnchorElement",
     "Storage",
+    # `?scrub-bench` and the other launch flags come from the page URL.
     "Location",
+    # The scrub bench reports the browser's user agent.
+    "Navigator",
     "Blob",
     "BlobPropertyBag",
     "Url",

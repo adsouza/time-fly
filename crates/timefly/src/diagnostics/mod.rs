@@ -223,6 +223,11 @@ impl Session {
         self.shared.args.diagnostics_probe
     }
 
+    /// The launch arguments.
+    pub fn args(&self) -> &LaunchArgs {
+        &self.shared.args
+    }
+
     pub fn previous_outcome(&self) -> PreviousOutcome {
         self.shared.previous_outcome()
     }
@@ -356,6 +361,40 @@ pub fn start(args: LaunchArgs) -> Session {
     }
 }
 
+/// This session's identity, for reports such as the scrub benchmark.
+#[derive(Resource, Clone, Debug)]
+pub struct SessionInfo {
+    pub id: String,
+    /// Where this session's log is (a path on native, browser storage on the web).
+    pub log: String,
+    /// [`BuildInfo::summary`] of the running build.
+    pub build: String,
+    /// When diagnostics started, just after launch.
+    pub started: Instant,
+}
+
+impl SessionInfo {
+    fn of(shared: &Shared) -> Self {
+        let (id, build) = {
+            let record = lock(&shared.record);
+            (record.id.clone(), record.build.summary())
+        };
+        let log = match shared.session_dir() {
+            Some(dir) => dir.join(session::LOG_FILE).display().to_string(),
+            None if cfg!(target_arch = "wasm32") => {
+                "browser localStorage (timefly.sessions; Download log saves it)".to_string()
+            }
+            None => "console only".to_string(),
+        };
+        SessionInfo {
+            id,
+            log,
+            build,
+            started: shared.started,
+        }
+    }
+}
+
 /// The handle systems and log layers use.
 #[derive(Resource, Clone)]
 pub(crate) struct DiagnosticsHandle(pub Arc<Shared>);
@@ -463,6 +502,7 @@ impl DiagnosticsPlugin {
 impl Plugin for DiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DiagnosticsHandle(self.shared.clone()))
+            .insert_resource(SessionInfo::of(&self.shared))
             .init_resource::<DiagnosticsContext>()
             .add_systems(Startup, log_findings)
             .add_systems(

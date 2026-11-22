@@ -270,9 +270,14 @@ pub fn next_render_status(
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GlobeDebugView(pub bool);
 
-/// Marks the camera that shows the globe. Task 10's orbit controller drives it.
+/// Marks the camera that shows the globe. The orbit controller (`crate::camera`) drives it.
 #[derive(Component)]
 pub struct GlobeCamera;
+
+/// The system that copies the globe camera's `Transform` and projection to the bridge cameras.
+/// Anything that moves the globe camera runs before it, so the bridge views never lag a frame.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GlobeCameraSync;
 
 /// An offscreen camera of the bridge, rendering one globe layer.
 #[derive(Component)]
@@ -328,7 +333,7 @@ impl Plugin for GlobePlugin {
             (
                 update_globe_view,
                 sync_sun,
-                sync_bridge_cameras,
+                sync_bridge_cameras.in_set(GlobeCameraSync),
                 track_render_status,
             )
                 .chain()
@@ -358,7 +363,20 @@ fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamer
         DebandDither::Disabled,
         Transform::from_xyz(0.0, 0.0, CAMERA_DISTANCE_KM).looking_at(Vec3::ZERO, Vec3::Y),
         RenderLayers::from_layers(&[ATMOSPHERE_LAYER, RECENT_LAYER]),
+        // The game UI draws over the globe (the bridge cameras render offscreen).
+        IsDefaultUiCamera,
     ));
+}
+
+/// Whether two projections are the same, so the bridge cameras' projections are written only
+/// when the globe camera's changes (a write marks them `Changed` and rebuilds their frusta).
+fn same_projection(a: &Projection, b: &Projection) -> bool {
+    match (a, b) {
+        (Projection::Perspective(a), Projection::Perspective(b)) => {
+            a.fov == b.fov && a.aspect_ratio == b.aspect_ratio && a.near == b.near && a.far == b.far
+        }
+        _ => false,
+    }
 }
 
 /// An offscreen target for one bridge view, sized like the globe camera's target.
@@ -719,7 +737,9 @@ fn sync_bridge_cameras(
         if *t != *transform {
             *t = *transform;
         }
-        *p = projection.clone();
+        if !same_projection(&p, projection) {
+            *p = projection.clone();
+        }
         let wanted = if bridge_camera.layer == RECENT_LAYER {
             &scene.recent_target
         } else {
