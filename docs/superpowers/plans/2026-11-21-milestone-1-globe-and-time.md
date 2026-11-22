@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A painterly globe that animates real continental drift as you drag a log-scaled time slider from today back to 540 Ma, with ice sheets and sea level for the last ~26 ka. Development and acceptance checks run on this Mac (Apple M4): natively on Metal and in Chrome on WebGPU. A CI-built x86-64 Linux package adds a manual Vulkan acceptance run on the owner's Linux machine, which is for testing only, not development.
+**Goal:** A painterly globe that animates real continental drift as you drag a log-scaled time slider from today back to 540 Ma, with ice sheets and sea level for the last ~26 ka. Development and acceptance checks run on this Mac (Apple M4): natively on Metal and in Chrome on WebGPU. CI-built x86-64 Linux packages (.deb and Flatpak) add a manual Vulkan acceptance run on the owner's Linux machine, which is for testing only, not development.
 
 **Architecture:**
 - **Offline:** a Python bake tool (pygplates + numpy) turns PaleoDEMs and ICE-6G_C into geographic cube maps, and exports the matching PALEOMAP plate footprints and rotation validity. Each PaleoDEM records the age of its source reconstruction independently of its timeline age.
@@ -22,7 +22,7 @@
 - All shaders are `.wesl`.
 - WebGPU baseline is the ceiling: no mesh shaders, no `MeshletMesh`, no 64-bit atomics, no unbounded `binding_array`, no `std::thread` in core loops. Use only 32-bit atomics.
 - No texture-format feature beyond baseline. Use filterable `Rg16Float` for PaleoDEM and `Rgba16Float` for ICE-6G_C. Both bind as float cube textures.
-- `cargo check --target wasm32-unknown-unknown -p timefly` must pass at the end of every task that touches `crates/`. Verify against the same production bake on Metal and Chrome WebGPU on this Mac in Task 10, and on Vulkan with the CI-built Linux package in Task 11.
+- `cargo check --target wasm32-unknown-unknown -p timefly` must pass at the end of every task that touches `crates/`. Verify against the same production bake on Metal and Chrome WebGPU on this Mac in Task 10, and on Vulkan with the CI-built Linux packages (.deb and Flatpak) in Task 11.
 - Geographic convention (pygplates): `x = cos(lat)cos(lon)`, `y = cos(lat)sin(lon)`, `z = sin(lat)`. Render frame (Bevy, Y-up): `render = (geo.y, geo.z, geo.x)`. Quaternions convert by the same permutation of `(x, y, z)`; `w` is unchanged.
 - Timeline and source reconstruction ages are **Myr (f64)** at manifest and runtime API boundaries; the time model uses `YearsBp(f64)`. `YearsBp::from_myr(m) = m * 1e6`. The game reference year is 2026 CE and source ages in 1950 BP gain 76 years on import. Preserve published PaleoDEM reconstruction times for rotation lookup. Binary formats store ages as f64. Packed GPU times may use f32 with boundary behavior checked against the CPU.
 - 1 world unit = 1 km. `EARTH_RADIUS_KM = 6371.0`. Elevation is in metres.
@@ -53,7 +53,7 @@
 
 ```
 .gitignore
-.github/workflows/linux-package.yml  CI: bake + x86-64 Linux release package
+.github/workflows/linux-package.yml  CI: bake + x86-64 Linux .deb and Flatpak
 Cargo.toml                         workspace
 .cargo/config.toml                 wasm runner
 crates/timefly_core/               functional core: pure Rust, no Bevy App, no I/O
@@ -91,7 +91,7 @@ tools/bake/                        Python bake tool (uv project)
   tests/test_*.py
 data/README.md                     sources, licences, citations, download steps
 data/sources.json                  pinned raw-data URLs + SHA-256 (used by fetch.py locally and in CI)
-tools/package_linux.sh             assembles the Linux tarball
+packaging/linux/, packaging/flatpak/  .desktop, AppStream, icon, staging + .deb scripts, Flatpak manifest
 docs/testing/linux-vulkan.md       owner's manual Linux test checklist
 data/culture/civilizations.csv     owner's CSV (copied; used in a later milestone)
 reference/draft/                   owner's draft architecture + shaders (later milestones)
@@ -734,38 +734,48 @@ The example omits intermediate frames. Files are numbered by first occurrence in
 
 ---
 
-### Task 11: Linux x86-64 CI package and manual Vulkan check
+### Task 11: Linux x86-64 CI packages (.deb and Flatpak) and manual Vulkan check
 
-The owner's Linux machine is for testing only. CI produces a self-contained package; the owner downloads it, runs a short checklist and pastes the benchmark output back.
+The owner's Linux machine is for testing only. CI builds two installable packages from the same release binary and baked data: a Debian package (`.deb`) and a single-file Flatpak bundle (`.flatpak`). The owner installs each, runs a short checklist and pastes the benchmark output back. *(Owner request, 2026-11-22: both formats.)*
 
 **Files:**
-- Create: `data/sources.json`, `tools/bake/timefly_bake/fetch.py`, `tools/bake/tests/test_fetch.py`, `tools/package_linux.sh`, `.github/workflows/linux-package.yml`, `docs/testing/linux-vulkan.md`
+- Create: `data/sources.json`, `tools/bake/timefly_bake/fetch.py`, `tools/bake/tests/test_fetch.py`, `.github/workflows/linux-package.yml`, `docs/testing/linux-vulkan.md`
+- Create (packaging): `packaging/linux/io.github.adsouza.TimeFly.desktop`, `packaging/linux/io.github.adsouza.TimeFly.metainfo.xml`, `packaging/linux/io.github.adsouza.TimeFly.svg` (a simple generated icon), `packaging/linux/stage.sh`, `packaging/linux/build-deb.sh`, `packaging/flatpak/io.github.adsouza.TimeFly.yml`
 - Modify: `data/README.md`, `tools/bake/pyproject.toml` (script `timefly-fetch`)
+
+**Shared conventions:**
+- App ID `io.github.adsouza.TimeFly` (reverse-DNS of the public GitHub repo). Command `time-fly`. Package name `time-fly`.
+- The game loads assets from the directory beside its executable. Both packages install the binary and `assets/` together in one directory and expose `time-fly` on PATH through a small wrapper script (`exec <dir>/time-fly "$@"`), so asset lookup never depends on symlink resolution. Verify Bevy 0.20's asset base-path rule before relying on it.
+- The staged tree excludes `bake.log` and anything else under the asset folder that the game doesn't load.
+- Logs: the `.deb` build writes to `~/.local/state/time-fly/logs/`; the Flatpak writes inside its sandbox, `~/.var/app/io.github.adsouza.TimeFly/.local/state/time-fly/logs/`. The crash notice shows the actual path either way.
 
 **Interfaces:**
 - `data/sources.json`: one entry per raw file approved and pinned in Tasks 5–7: `url`, `path` (relative to `data/raw/`), `sha256`, `bytes`, `licence`. It must agree with the table in `data/README.md`.
 - `fetch.main(argv=None)`: `--sources FILE --raw DIR`. It skips a file whose checksum already matches, downloads missing files to a temp name, verifies size and SHA-256, then renames. A mismatch deletes the temp file and exits non-zero naming the file. No other network access.
-- `tools/package_linux.sh BINARY OUT_DIR`: makes `timefly-linux-x86_64-<git short sha>.tar.gz` containing `timefly`, `assets/` (shaders, `credits.txt`, the baked `data/globe/`), and `README-linux.txt` (run commands from the checklist, and where logs and crash reports are written). It works on any host given a binary, so its layout can be checked on this Mac.
+- `packaging/linux/stage.sh BINARY ASSETS_DIR OUT_DIR`: builds the install tree shared by both packages: `lib/time-fly/{time-fly,assets/}`, `bin/time-fly` (wrapper), `share/applications/…desktop`, `share/icons/hicolor/scalable/apps/…svg`, `share/metainfo/…metainfo.xml`, `share/doc/time-fly/{copyright,README}` (licences and citations from `credits.txt`/`data/README.md`; README has the run commands and log locations). It works on any host, so its layout can be checked on this Mac.
+- `packaging/linux/build-deb.sh STAGED_DIR VERSION OUT_DIR`: maps the staged tree to `/opt/time-fly` (binary + assets), `/usr/bin/time-fly` (wrapper) and `/usr/share/…`, writes `DEBIAN/control` (Package `time-fly`, Architecture `amd64`, Version `<cargo version>~git<short sha>`, Depends from `dpkg-shlibdeps` on the binary plus `libvulkan1`, Recommends for the libraries winit loads at runtime: `libwayland-client0 | libx11-6`, `libxkbcommon0`, `libxcursor1`, `libxrandr2`, `libxi6`), and runs `dpkg-deb --root-owner-group --build`.
+- `packaging/flatpak/io.github.adsouza.TimeFly.yml`: `runtime: org.freedesktop.Platform`, `sdk: org.freedesktop.Sdk` at the current supported freedesktop branch (verify which branch is current when implementing), `command: time-fly`, one `simple` module that copies the staged tree into `/app` (no compilation inside flatpak-builder; the binary comes from the CI build job), `finish-args`: `--share=ipc`, `--socket=wayland`, `--socket=fallback-x11`, `--device=dri`, `--talk-name=org.freedesktop.FileManager1` (for **Show log**). The bundle is made with `flatpak build-bundle … --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo` so installing it pulls the runtime from Flathub.
 - `.github/workflows/linux-package.yml`:
-  - Triggers: `workflow_dispatch` and tags `v*` only, to save CI minutes.
-  - Runner `ubuntu-22.04` (x86-64; older glibc so the binary runs on more distros).
-  - Steps: checkout → apt `pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev` → stable Rust toolchain → Rust cache → `astral-sh/setup-uv` → `actions/cache` for `data/raw/` keyed on the hash of `data/sources.json` → `timefly-fetch` → `timefly-bake` (production cube size) → `cargo test -p timefly_core` and `uv run pytest -q` as gates → `cargo build --release -p timefly` → `tools/package_linux.sh` → `actions/upload-artifact` (14-day retention) for the package, plus `bake.log` and test output as a separate artifact uploaded even when the run fails. Set `TIMEFLY_GIT_SHA` so `BuildInfo` names the commit.
-  - Pin third-party actions to major versions. Use no secrets.
+  - Triggers: `workflow_dispatch` and tags `v*` only, to save CI minutes. Pin third-party actions to major versions. Use no secrets.
+  - Job `build` on `ubuntu-22.04` (x86-64; older glibc so the binary runs on more distros): checkout → apt `pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev desktop-file-utils appstream` → the Rust toolchain from `rust-toolchain.toml` (via rustup) → Rust cache → `astral-sh/setup-uv` → `actions/cache` for `data/raw/` keyed on the hash of `data/sources.json` → `timefly-fetch` → `timefly-bake` (production cube size) → `cargo test -p timefly_core` and `uv run pytest -q` as gates → `cargo build --release -p timefly` (with `TIMEFLY_GIT_SHA` set) → `stage.sh` → `desktop-file-validate` and `appstreamcli validate --no-net` → `build-deb.sh` → upload the `.deb`, and the staged tree as an intermediate artifact.
+  - Job `flatpak` (needs `build`): runs in the freedesktop flatpak-builder container matching the manifest's runtime branch (e.g. the `flatpak/flatpak-github-actions` image), downloads the staged tree, builds with the manifest and produces `time-fly-<short sha>.flatpak`; uploads it.
+  - Artifacts: `time-fly_<version>_amd64.deb` and `time-fly-<sha>.flatpak` (14-day retention), plus `bake.log` and test output as a separate artifact uploaded even when the run fails.
 
 - [ ] **Step 1: Write the failing fetch tests.** Serve a fixture file from a local `http.server` thread. Cover a fresh download, a skip when the checksum already matches, a checksum mismatch that leaves no file behind and exits non-zero, and a `sources.json` entry whose path escapes `data/raw/` (rejected).
 - [ ] **Step 2: Run** `uv run pytest -q tests/test_fetch.py`. Expected: fail.
 - [ ] **Step 3: Implement** `fetch.py` and write `data/sources.json` from the files already approved, downloaded and verified in Tasks 5–7. Run `uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw` locally. Expected: every file skipped as already verified.
-- [ ] **Step 4: Write the package script, workflow and checklist.** Check the tarball layout by running `tools/package_linux.sh target/release/timefly /tmp/pkgtest` with the macOS binary and listing the archive. Check that redistributing the baked derivatives is allowed by every licence recorded in `data/README.md`. If one forbids it, stop and ask the owner.
-- [ ] **Step 5: Commit** — `ci: x86-64 Linux package with pinned data fetch`.
-- [ ] **Step 6: Run CI (owner's OK required for each).** Ask the owner before pushing the branch to `origin`. Ask again before dispatching with `gh workflow run linux-package.yml --ref <branch>`. Watch the run with `gh run watch`. Expected: green, with one `timefly-linux-x86_64-*.tar.gz` artifact. Fix failures locally, commit, and ask before pushing again.
-- [ ] **Step 7: Owner's manual Vulkan check.** `docs/testing/linux-vulkan.md` tells the owner to:
-  1. Download the artifact (`gh run download <run-id>` or the Actions page) and extract it.
-  2. Run `vulkaninfo --summary` and note the GPU and driver.
-  3. Run `WGPU_BACKEND=vulkan ./timefly` and check the Task 10 Step 5 visual list (coastlines, 21 ka ice and Bering bridge, 250 Ma Pangaea, 540 Ma, bridge crossfade, orbit limits, label, credits).
-  4. Run `WGPU_BACKEND=vulkan ./timefly --scrub-bench --target-fps 60 --window 2560x1440` and paste the output block back.
-  5. Run `./timefly --diagnostics-probe=panic`, then `./timefly`. Expect a notice (a system dialog, or the in-game overlay if the desktop has no dialog portal) pointing at the crash log under `~/.local/state/time-fly/logs/`. Send that file back.
+- [ ] **Step 4: Write the packaging files, workflow and checklist.** On this Mac, run `stage.sh` with the macOS release binary and the baked assets into a temp dir and list the tree (check `bake.log` is absent and the wrapper resolves assets). `.deb` and Flatpak builds and the desktop/AppStream validators run in CI. Check that redistributing the baked derivatives is allowed by every licence recorded in `data/README.md` (the owner approved the ICE-6G_C derivatives with citation and credit on 2026-11-22; record that). If another licence forbids it, stop and ask the owner.
+- [ ] **Step 5: Commit** — `ci: Linux .deb and Flatpak packages with pinned data fetch`.
+- [ ] **Step 6: Run CI (owner's OK required for each).** Ask the owner before pushing the branch to `origin`. Ask again before dispatching with `gh workflow run linux-package.yml --ref <branch>`. Watch the run with `gh run watch`. Expected: green, with one `.deb` and one `.flatpak` artifact. Fix failures locally, commit, and ask before pushing again.
+- [ ] **Step 7: Owner's manual Vulkan check.** `docs/testing/linux-vulkan.md` tells the owner to download both artifacts (`gh run download <run-id>` or the Actions page), run `vulkaninfo --summary` and note the GPU and driver, then for each package:
+  - **`.deb`:** `sudo apt install ./time-fly_<version>_amd64.deb`; launch from the app menu once and from a terminal as `WGPU_BACKEND=vulkan time-fly`.
+  - **Flatpak:** `flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo`, `flatpak install --user ./time-fly-<sha>.flatpak`, then `flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly`. (On NVIDIA's proprietary driver, Flatpak needs the matching `org.freedesktop.Platform.GL.nvidia` extension, which Flatpak normally installs from Flathub automatically.)
+  - Check the Task 10 Step 5 visual list (coastlines, 21 ka ice and Bering bridge, 250 Ma Pangaea, 540 Ma, bridge crossfade, orbit limits, label, credits).
+  - Run the bench (`time-fly --scrub-bench --target-fps 60 --window 2560x1440`, or the `flatpak run …` equivalent) and paste the output block back.
+  - Run the crash probe (`--diagnostics-probe=panic`, then a normal launch). Expect a notice pointing at that package's log location; send the file back.
+  - Uninstall afterwards: `sudo apt remove time-fly` / `flatpak uninstall --user io.github.adsouza.TimeFly`.
 
-  Record the owner's results in `data/README.md` alongside the Mac numbers. Milestone 1 is accepted when the Linux run reports Vulkan on a hardware GPU, the visual checks pass, and p95 ≤ 16.7 ms. If the target is missed, treat it as a Task 10 Step 6 strategy change and rerun both.
+  Record the owner's results in `data/README.md` alongside the Mac numbers. Milestone 1 is accepted when both packages install and run on Vulkan on a hardware GPU, the visual checks pass in both, and the `.deb` run's p95 ≤ 16.7 ms (the Flatpak number is recorded too). If the target is missed, treat it as a Task 10 Step 6 strategy change and rerun.
 
 ---
 

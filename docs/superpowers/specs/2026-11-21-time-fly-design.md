@@ -296,7 +296,7 @@ Watercraft appear on rivers, lakes, coasts and seas **only where and when the hi
 
 ## 15. Verification (each milestone)
 
-- `cargo check --target wasm32-unknown-unknown` and the native build pass. Verify rendering natively on Metal and in Chrome WebGPU on the development Mac, and on Vulkan using a CI-built x86-64 Linux package that the owner runs manually on a test-only Linux machine. Record the adapter and backend used.
+- `cargo check --target wasm32-unknown-unknown` and the native build pass. Verify rendering natively on Metal and in Chrome WebGPU on the development Mac, and on Vulkan using CI-built x86-64 Linux packages (.deb and Flatpak) that the owner runs manually on a test-only Linux machine. Record the adapter and backend used.
 - No mesh shaders, `MeshletMesh`, `std::thread` in core loops, or 64-bit atomics.
 - The generator is deterministic (same inputs, same outputs), and overlapping worlds agree where they overlap.
 - The Rust and WESL noise golden tests pass.
