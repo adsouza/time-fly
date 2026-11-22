@@ -19,8 +19,16 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${TIMEFLY_GUARD_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 TARGET="$ROOT/target"
-BUDGET_MB="${TIMEFLY_TARGET_BUDGET_MB:-15360}"
-MIN_FREE_MB="${TIMEFLY_MIN_FREE_MB:-5120}"
+warn() { [ "$MODE" = hook ] || echo "target-guard: $*" >&2; }
+# Numeric env values only; fall back to the default otherwise (never fail).
+num_or() { # num_or <name> <value> <default>
+  case "$2" in
+    ""|*[!0-9]*) [ -z "$2" ] || warn "$1='$2' is not a number; using default $3"; echo "$3" ;;
+    *) echo "$2" ;;
+  esac
+}
+BUDGET_MB="$(num_or TIMEFLY_TARGET_BUDGET_MB "${TIMEFLY_TARGET_BUDGET_MB:-}" 15360)"
+MIN_FREE_MB="$(num_or TIMEFLY_MIN_FREE_MB "${TIMEFLY_MIN_FREE_MB:-}" 5120)"
 STALE_MIN=1440   # 24 h
 
 # One toolchain: use rustup's proxies (keg-only, not on PATH) when present.
@@ -43,15 +51,13 @@ except Exception: pass' 2>/dev/null)"
   case "$cmd" in *cargo*) ;; *) exit 0 ;; esac
 fi
 
-warn() { echo "target-guard: $*" >&2; }
-
 if [ -L "$TARGET" ]; then warn "$TARGET is a symlink; refusing to touch it."; exit 0; fi
 if [ ! -d "$TARGET" ]; then warn "$TARGET does not exist; nothing to do."; exit 0; fi
 
 # --- measurements (KB internally) -------------------------------------------
 target_kb() { du -sk "$TARGET" 2>/dev/null | awk '{print $1+0}'; }
 free_kb() {
-  if [ -n "${TIMEFLY_FAKE_FREE_MB:-}" ]; then echo $((TIMEFLY_FAKE_FREE_MB * 1024)); return; fi
+  if [ -n "${TIMEFLY_FAKE_FREE_MB:-}" ]; then echo $(($(num_or TIMEFLY_FAKE_FREE_MB "$TIMEFLY_FAKE_FREE_MB" 0) * 1024)); return; fi
   df -Pk "$ROOT" 2>/dev/null | awk 'NR==2 {print $4+0}'
 }
 mb() { echo $(($1 / 1024)); }
@@ -103,7 +109,7 @@ done
 
 # Step 2: cargo sweep, if installed.
 if ! limits_ok && command -v cargo-sweep >/dev/null 2>&1; then
-  (cd "$ROOT" && cargo sweep --time 2 >/dev/null 2>&1) && REMOVED+=("cargo sweep --time 2")
+  (cd "$ROOT" && env CARGO_TARGET_DIR="$TARGET" cargo sweep --time 2 >/dev/null 2>&1) && REMOVED+=("cargo sweep --time 2")
 fi
 
 # Step 3: whole build dirs, least recently modified first, never the newest.
@@ -136,7 +142,7 @@ if [ "$(free_kb)" -lt $((MIN_FREE_MB * 1024)) ]; then
   if build_running; then
     SKIPPED+=("cargo clean (cargo/rustc is running)")
   elif command -v cargo >/dev/null 2>&1; then
-    (cd "$ROOT" && cargo clean >/dev/null 2>&1) && REMOVED+=("cargo clean")
+    (cd "$ROOT" && env -u CARGO_TARGET_DIR cargo clean --target-dir "$TARGET" >/dev/null 2>&1) && REMOVED+=("cargo clean")
   else
     SKIPPED+=("cargo clean (cargo not found)")
   fi

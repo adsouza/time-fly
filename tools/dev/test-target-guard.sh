@@ -20,7 +20,7 @@ check() { # check <description> <command...>
 FAKEBIN="$TMP/fakebin"
 CALLS="$TMP/cargo-calls"
 mkdir -p "$FAKEBIN"
-printf '#!/bin/sh\necho "$@" >> "%s"\n' "$CALLS" > "$FAKEBIN/cargo"
+printf '#!/bin/sh\necho "$* | CTD=${CARGO_TARGET_DIR-unset}" >> "%s"\n' "$CALLS" > "$FAKEBIN/cargo"
 printf '#!/bin/sh\nexit 1\n' > "$FAKEBIN/pgrep"
 chmod +x "$FAKEBIN/cargo" "$FAKEBIN/pgrep"
 
@@ -80,6 +80,16 @@ check "fresh (non-stale) dir is never removed in step 3" bash -c '
   TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=1000 TIMEFLY_GUARD_ROOT="$0" "$1" >/dev/null 2>&1;
   test -d target/scratch-x' "$ROOT" "$GUARD"
 
+echo "3b. newest is protected even when every dir is stale"
+newroot 3b
+mkfile "$ROOT/target/release/r.bin" 2;                age "$ROOT/target/release" 202001010000
+mkfile "$ROOT/target/wasm32-unknown-unknown/w.bin" 2; age "$ROOT/target/wasm32-unknown-unknown" 202101010000
+mkfile "$ROOT/target/scratch-a/s.bin" 2;              age "$ROOT/target/scratch-a" 202201010000
+mkfile "$ROOT/target/debug/d.bin" 2;                  age "$ROOT/target/debug" 202301010000
+TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=1000 guard >/dev/null 2>&1
+check "newest stale dir (debug) survives" test -d "$ROOT/target/debug"
+check "all older dirs removed" bash -c 'cd "$1/target" && test ! -e release && test ! -e wasm32-unknown-unknown && test ! -e scratch-a' _ "$ROOT"
+
 echo "4. nothing outside target/ is touched; symlinked target is refused"
 newroot 4
 mkfile "$ROOT/keep.txt" 1
@@ -101,6 +111,37 @@ newroot 4c
 rmdir "$ROOT/target"
 out=$(guard 2>&1); rc=$?
 check "missing target: exit 0 with warning" bash -c 'test "$1" -eq 0 && test -n "$2"' _ "$rc" "$out"
+
+echo "4d. CARGO_TARGET_DIR outside the repo is never what cargo clean/sweep act on"
+newroot 4d
+mkdir -p "$TMP/outside-target"
+mkfile "$ROOT/target/debug/d.bin" 1
+CARGO_TARGET_DIR="$TMP/outside-target" TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=10 guard >/dev/null 2>&1
+check "clean called with --target-dir <root>/target" grep -qF -- "clean --target-dir $ROOT/target " "$CALLS"
+check "CARGO_TARGET_DIR not in cargo clean env" grep -q 'CTD=unset' "$CALLS"
+printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/cargo-sweep"; chmod +x "$FAKEBIN/cargo-sweep"
+mkfile "$ROOT/target/release/r.bin" 4; age "$ROOT/target/release" $OLD
+: > "$CALLS"
+CARGO_TARGET_DIR="$TMP/outside-target" TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=1000 guard >/dev/null 2>&1
+check "sweep pointed at <root>/target" grep -qF "sweep --time 2 | CTD=$ROOT/target" "$CALLS"
+rm -f "$FAKEBIN/cargo-sweep"
+
+echo "4e. hook mode is silent on warnings; bad env values never fail"
+newroot 4e
+rmdir "$ROOT/target"
+out=$(echo '{"tool_input":{"command":"cargo build"}}' | guard --hook 2>&1); rc=$?
+check "hook, missing target: silent, exit 0" bash -c 'test "$1" -eq 0 && test -z "$2"' _ "$rc" "$out"
+mkdir -p "$TMP/real"; ln -s "$TMP/real" "$ROOT/target"
+out=$(echo '{"tool_input":{"command":"cargo build"}}' | guard --hook 2>&1); rc=$?
+check "hook, symlinked target: silent, exit 0" bash -c 'test "$1" -eq 0 && test -z "$2"' _ "$rc" "$out"
+newroot 4f
+mkfile "$ROOT/target/debug/d.bin" 1
+out=$(echo '{"tool_input":{"command":"cargo build"}}' | TIMEFLY_TARGET_BUDGET_MB=abc TIMEFLY_MIN_FREE_MB=1x2 TIMEFLY_FAKE_FREE_MB=zz guard --hook 2>&1); rc=$?
+check "hook, non-numeric env: exit 0" test "$rc" -eq 0
+check "hook, non-numeric env: valid-or-empty output, no shell errors" bash -c '! grep -qi "syntax\|arithmetic\|error" <<<"$1"' _ "$out"
+out=$(TIMEFLY_TARGET_BUDGET_MB=abc TIMEFLY_MIN_FREE_MB=1x2 guard --status 2>&1); rc=$?
+check "manual, non-numeric env: exit 0 and warns" bash -c 'test "$1" -eq 0 && grep -q "not a number" <<<"$2"' _ "$rc" "$out"
+check "manual, non-numeric env: falls back to defaults" grep -q 'budget 15360 MB' <<<"$out"
 
 echo "5. --hook"
 newroot 5
