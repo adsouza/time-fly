@@ -7,6 +7,7 @@
 
 pub mod aspects;
 pub mod notice;
+pub mod probe;
 pub mod recorder;
 pub mod report;
 pub mod session;
@@ -24,6 +25,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::args::LaunchArgs;
 use notice::{NoticeRoute, PendingNotice};
+pub use probe::{ProbeMode, run_headless_probe};
 use recorder::{Recorder, RecorderLayer};
 use report::Home;
 use session::{
@@ -33,39 +35,6 @@ use session::{
 
 /// Session directories kept on native (spec §20).
 pub const KEEP_SESSIONS: usize = 10;
-
-/// Hidden `--diagnostics-probe` modes, for tests and the manual checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProbeMode {
-    /// Panics before opening a window.
-    Panic,
-    /// Opens the window, renders a frame, then panics.
-    PanicAfterFrame,
-    /// Calls `std::process::abort()`.
-    Abort,
-    /// Logs an error and exits cleanly.
-    Error,
-    /// Exits cleanly.
-    Clean,
-}
-
-impl ProbeMode {
-    pub fn parse(text: &str) -> Option<Self> {
-        Some(match text {
-            "panic" => Self::Panic,
-            "panic-after-frame" => Self::PanicAfterFrame,
-            "abort" => Self::Abort,
-            "error" => Self::Error,
-            "clean" => Self::Clean,
-            _ => return None,
-        })
-    }
-
-    /// Probes that never open a window run a headless `App`.
-    pub fn is_headless(self) -> bool {
-        self != Self::PanicAfterFrame
-    }
-}
 
 /// Last known game state, for crash reports. Systems write this resource; it is copied to the
 /// panic hook's copy only when it changes. Later tasks fill in their fields.
@@ -428,10 +397,7 @@ impl Plugin for DiagnosticsPlugin {
         if let Some(pending) = lock(&self.shared.pending_notice).take() {
             notice::add_in_game_notice(app, pending);
         }
-        if self.shared.args.diagnostics_probe == Some(ProbeMode::PanicAfterFrame) {
-            app.add_systems(Startup, || log_probe_events(ProbeMode::PanicAfterFrame))
-                .add_systems(Update, panic_after_first_frame);
-        }
+        probe::add_windowed_probe(app, self.shared.args.diagnostics_probe);
         #[cfg(target_arch = "wasm32")]
         app.add_systems(Update, session::web::save_log_periodically);
     }
@@ -542,66 +508,4 @@ fn mark_first_frame(
     *done = true;
     handle.0.update_record(|r| r.reached_first_frame = true);
     info!("first frame reached");
-}
-
-fn panic_after_first_frame(handle: Res<DiagnosticsHandle>, frames: Option<Res<FrameCount>>) {
-    let reached = lock(&handle.0.record).reached_first_frame;
-    if reached && frames.is_some_and(|f| f.0 >= 5) {
-        panic!("diagnostics probe: panic after the first frame");
-    }
-}
-
-/// A few events at each level, including a path under the home directory (redaction check).
-fn log_probe_events(mode: ProbeMode) {
-    info!(mode = ?mode, "diagnostics probe started");
-    for step in 1..=3 {
-        debug!(step, "probe step {step}");
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(dirs) = directories::BaseDirs::new() {
-        let path = dirs.home_dir().join("Time Fly probe").join("example.txt");
-        info!(path = %path.display(), "probe path under the home directory");
-    }
-}
-
-fn probe_system(mode: ProbeMode) -> impl FnMut(Local<bool>) {
-    move |mut done: Local<bool>| {
-        if std::mem::replace(&mut *done, true) {
-            return;
-        }
-        log_probe_events(mode);
-        match mode {
-            ProbeMode::Panic => panic!("diagnostics probe: panic before the window opens"),
-            ProbeMode::Error => error!("diagnostics probe: error"),
-            ProbeMode::Abort | ProbeMode::Clean | ProbeMode::PanicAfterFrame => {}
-        }
-    }
-}
-
-/// Runs a window-less probe in a headless `App` (`MinimalPlugins` plus the real log layers),
-/// then ends the process the way the probe asks.
-pub fn run_headless_probe(session: Session, mode: ProbeMode) -> AppExit {
-    let mut app = App::new();
-    app.add_plugins(DiagnosticsPlugin::headless(&session))
-        .add_plugins((MinimalPlugins, log_plugin()))
-        .add_systems(Update, probe_system(mode));
-    app.finish();
-    app.cleanup();
-    for _ in 0..3 {
-        app.update();
-    }
-    drop(app);
-    if mode == ProbeMode::Abort {
-        // Write out what was logged, then die without unwinding or marking the session clean.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut session = session;
-            session.flush_logs();
-        }
-        #[cfg(target_arch = "wasm32")]
-        session::web::save_log(&session.shared);
-        std::process::abort();
-    }
-    session.finish();
-    AppExit::Success
 }
