@@ -142,6 +142,13 @@ fn loads_tiny_bake_to_ready() {
     assert_eq!(data.frame_image(0), data.frame_image(1));
     assert_eq!(data.cube_size, 8);
     assert!(!data.attribution.is_empty());
+    // The revision names the manifest file's SHA-256, as `shasum -a 256` prints it.
+    let manifest = fs::read(tiny_root().join("data/globe/manifest.json")).unwrap();
+    assert_eq!(data.revision.manifest_version, 2);
+    assert_eq!(
+        data.revision.manifest_sha256,
+        timefly_core::sha256::sha256_hex(&manifest)
+    );
 
     let images = app.world().resource::<Assets<Image>>();
     for (frame, meta) in data.timeline.frames().iter().enumerate() {

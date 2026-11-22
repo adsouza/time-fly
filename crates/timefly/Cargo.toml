@@ -50,6 +50,8 @@ web-sys = { version = "0.3", features = [
     "Location",
     # The scrub bench reports the browser's user agent.
     "Navigator",
+    # The web scrub bench measures cold load from navigation (`performance.now()`).
+    "Performance",
     "Blob",
     "BlobPropertyBag",
     "Url",

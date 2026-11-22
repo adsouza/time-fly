@@ -61,6 +61,11 @@ branch is pushed, so do this after Task 11's first push.
 
 ### 5. Web (the controller runs these in a browser)
 
+Build and serve from `crates/timefly` (wasm-server-runner serves `./assets` from the current
+directory; from the repo root every asset 404s):
+`cd crates/timefly && cargo run --profile web-release -p timefly --target wasm32-unknown-unknown`,
+then open the printed URL (`http://127.0.0.1:1334`).
+
 - [ ] Open the `wasm-server-runner` URL with `?diagnostics-probe=panic`; the console shows the
       panic.
 - [ ] Reload without the query: an HTML overlay with **Download log**, **Report problem** and

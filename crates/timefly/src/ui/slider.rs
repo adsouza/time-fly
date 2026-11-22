@@ -17,6 +17,7 @@ use bevy::ui_widgets::{
 };
 use timefly_core::deep_time::{YearsBp, format_years_bp, slider_to_years, years_to_slider};
 
+use super::credits::CreditsOpen;
 use super::{BlocksCamera, GUTTER_PX, PANEL_COLOR, TEXT_COLOR};
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 
@@ -66,6 +67,10 @@ impl Default for UiOpacity {
     }
 }
 
+/// The slider UI's root (label, track and captions).
+#[derive(Component)]
+pub struct SliderRoot;
+
 /// The slider widget.
 #[derive(Component)]
 pub struct TimeSlider;
@@ -94,7 +99,7 @@ impl Plugin for SliderUiPlugin {
             .init_resource::<UiOpacity>()
             .add_systems(Startup, spawn_slider)
             .add_observer(on_slider_change)
-            .add_systems(Update, track_idle)
+            .add_systems(Update, (track_idle, hide_under_credits))
             .add_systems(
                 PostUpdate,
                 (sync_slider_to_time, position_thumb, apply_opacity)
@@ -120,7 +125,11 @@ fn spawn_slider(mut commands: Commands, time: Option<Res<GlobeTime>>) {
     commands
         .spawn((
             Name::new("Time slider UI"),
+            SliderRoot,
             BlocksCamera,
+            // Only the visible parts (label panel, track, captions) take the pointer; the
+            // transparent rows around them leave drags and scrolls to the globe.
+            Pickable::IGNORE,
             Node {
                 position_type: PositionType::Absolute,
                 left: px(GUTTER_PX),
@@ -133,10 +142,13 @@ fn spawn_slider(mut commands: Commands, time: Option<Res<GlobeTime>>) {
             },
         ))
         .with_children(|root| {
-            root.spawn(Node {
-                justify_content: JustifyContent::Center,
-                ..default()
-            })
+            root.spawn((
+                Node {
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
             .with_children(|row| {
                 row.spawn((
                     Node {
@@ -205,11 +217,14 @@ fn spawn_slider(mut commands: Commands, time: Option<Res<GlobeTime>>) {
                         ));
                     });
             });
-            root.spawn(Node {
-                justify_content: JustifyContent::SpaceBetween,
-                padding: UiRect::horizontal(px(4)),
-                ..default()
-            })
+            root.spawn((
+                Node {
+                    justify_content: JustifyContent::SpaceBetween,
+                    padding: UiRect::horizontal(px(4)),
+                    ..default()
+                },
+                Pickable::IGNORE,
+            ))
             .with_children(|row| {
                 row.spawn(caption("540 Ma"));
                 row.spawn(caption("Present"));
@@ -280,21 +295,22 @@ fn position_thumb(
 }
 
 /// Gathers input, advances the idle clock and decides the opacity.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn track_idle(
     time: Res<Time>,
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     scroll: Option<Res<AccumulatedMouseScroll>>,
-    sliders: Query<(&SliderDragState, &Hovered), With<TimeSlider>>,
+    sliders: Query<&SliderDragState, With<TimeSlider>>,
+    roots: Query<&Hovered, With<SliderRoot>>,
     mut idle: ResMut<UiIdle>,
     mut opacity: ResMut<UiOpacity>,
 ) {
     let key = keys.is_some_and(|k| k.get_just_pressed().next().is_some());
     let button = mouse.is_some_and(|m| m.get_pressed().next().is_some());
     let scrolled = scroll.is_some_and(|s| s.delta != Vec2::ZERO);
-    let slider = sliders
-        .iter()
-        .any(|(drag, hover)| drag.dragging || hover.get());
+    // The root's `Hovered` covers the label, track and captions (it includes descendants).
+    let slider = sliders.iter().any(|drag| drag.dragging) || roots.iter().any(Hovered::get);
     let next = if key || button || scrolled || slider {
         0.0
     } else {
@@ -306,6 +322,26 @@ fn track_idle(
     let value = ui_opacity(next);
     if opacity.0 != value {
         opacity.0 = value;
+    }
+}
+
+/// Hides the slider UI while the credits overlay is open, so it doesn't show through.
+fn hide_under_credits(
+    credits: Option<Res<CreditsOpen>>,
+    mut roots: Query<&mut Node, With<SliderRoot>>,
+) {
+    let Some(credits) = credits.filter(|c| c.is_changed()) else {
+        return;
+    };
+    let display = if credits.0 {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    for mut node in &mut roots {
+        if node.display != display {
+            node.display = display;
+        }
     }
 }
 
@@ -428,6 +464,64 @@ mod tests {
         app.update();
         let v = widget_value(&mut app);
         assert!((v - 0.6269).abs() < 1e-4, "{v}");
+    }
+
+    #[test]
+    fn hidden_while_credits_are_open() {
+        let mut app = app();
+        app.init_resource::<CreditsOpen>();
+        let display = |app: &mut App| {
+            app.world_mut()
+                .query_filtered::<&Node, With<SliderRoot>>()
+                .single(app.world())
+                .unwrap()
+                .display
+        };
+        app.update();
+        assert_eq!(display(&mut app), Display::Flex);
+        app.world_mut().resource_mut::<CreditsOpen>().0 = true;
+        app.update();
+        assert_eq!(display(&mut app), Display::None);
+        app.world_mut().resource_mut::<CreditsOpen>().0 = false;
+        app.update();
+        assert_eq!(display(&mut app), Display::Flex);
+    }
+
+    /// Only nodes that draw something take the pointer: every node without a visible
+    /// background or text ignores picking, except the slider widget's own subtree.
+    #[test]
+    fn transparent_rows_let_the_pointer_through() {
+        let mut app = app();
+        let root = app
+            .world_mut()
+            .query_filtered::<Entity, With<SliderRoot>>()
+            .single(app.world())
+            .unwrap();
+        let slider = slider(&mut app);
+        let world = app.world();
+        let mut stack = vec![root];
+        let mut transparent = 0;
+        while let Some(entity) = stack.pop() {
+            if entity == slider {
+                continue; // the track and its thumb are the widget
+            }
+            let visible_background = world
+                .get::<BackgroundColor>(entity)
+                .is_some_and(|b| b.0.alpha() > 0.0);
+            let text = world.get::<Text>(entity).is_some();
+            if !visible_background && !text {
+                transparent += 1;
+                let pickable = world.get::<Pickable>(entity);
+                assert!(
+                    pickable.is_some_and(|p| !p.is_hoverable && !p.should_block_lower),
+                    "{entity} is transparent but takes the pointer"
+                );
+            }
+            if let Some(children) = world.get::<Children>(entity) {
+                stack.extend(children.iter());
+            }
+        }
+        assert_eq!(transparent, 3, "root, label row, caption row");
     }
 
     #[test]

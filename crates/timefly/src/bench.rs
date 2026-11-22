@@ -3,14 +3,22 @@
 //! After the first interactive frame and a short settle, it drives [`GlobeTime`] through a
 //! deterministic full-range scrub in each direction ([`scrub_schedule`]: [`SCRUB_SECS`] from the
 //! present to 540 Ma, then back), crossing the bridge both ways, and records every frame time.
-//! It then logs one plain-text block (session, adapter, OS, resolution, data, cold load, memory
-//! and median / p95 / worst frame times with pass or fail against the target) that can be pasted
-//! back from any machine. On native it exits after logging.
+//! It then logs one plain-text block (session, adapter, OS, resolution, bake, cold load, memory,
+//! median / p95 / worst frame times and pass or fail) that can be pasted back from any machine.
+//! On native it exits after logging.
+//!
+//! **Pass rule (ruling R14).** When frames are paced by the display (always on the web, and on
+//! native whenever the median sits on the display's refresh interval even though an uncapped
+//! present mode was asked for), frame deltas jitter around the interval, so a run passes when
+//! at most [`MAX_MISSED_SHARE`] of frames are missed (longer than [`MISSED_INTERVALS`] target
+//! intervals) and the median is no more than [`MEDIAN_TOLERANCE`] above the target interval. When
+//! an uncapped present mode is really in effect, the run passes when p95 <= the target interval.
+//! The block says which rule decided.
 
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
-use bevy::window::PrimaryWindow;
+use bevy::window::{Monitor, PrimaryMonitor, PrimaryWindow};
 use timefly_core::deep_time::{YearsBp, slider_to_years};
 use timefly_core::surface::FrameSource;
 
@@ -29,6 +37,15 @@ pub const WEB_TARGET_FPS: u32 = 30;
 pub const BRIDGE_YEARS: (f64, f64) = (26.0e3, 30.0e3);
 /// A frame longer than this many target budgets counts as a stall.
 pub const STALL_BUDGETS: f32 = 2.0;
+/// Display-paced rule: a frame longer than this many target intervals is a missed frame...
+pub const MISSED_INTERVALS: f32 = 1.5;
+/// ...and at most this share of frames may be missed...
+pub const MAX_MISSED_SHARE: f64 = 0.01;
+/// ...and the median may exceed the target interval by at most this fraction. (A display faster
+/// than the target paces below the interval, which passes.)
+pub const MEDIAN_TOLERANCE: f32 = 0.05;
+/// Refresh rates tried when the display's own rate is unknown.
+const COMMON_REFRESH_HZ: [f32; 8] = [50.0, 60.0, 75.0, 90.0, 100.0, 120.0, 144.0, 165.0];
 
 /// The age at `elapsed_secs` into the scrub: linear in slider position, present to 540 Ma over
 /// [`SCRUB_SECS`], then back to the present; clamped outside `[0, 2 * SCRUB_SECS]`.
@@ -51,6 +68,65 @@ impl Stats {
     /// Whether the 95th percentile meets the target frame rate.
     pub fn passes(&self, target_fps: u32) -> bool {
         self.frames > 0 && self.p95_ms <= frame_budget_ms(target_fps)
+    }
+}
+
+/// How frames reached the screen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Pacing {
+    /// Paced by the display (vsync, the browser's `requestAnimationFrame`, or a compositor).
+    DisplayPaced,
+    /// Rendered as fast as possible.
+    Uncapped,
+}
+
+/// Decides the pacing actually in effect. The web and vsync present modes are display-paced;
+/// an uncapped request counts as uncapped only if the median frame time is not within
+/// [`MEDIAN_TOLERANCE`] of the display's refresh interval (or, when the rate is unknown, of a
+/// common one).
+pub fn pacing(
+    web: bool,
+    uncapped_requested: bool,
+    refresh_hz: Option<f32>,
+    median_ms: f32,
+) -> Pacing {
+    if web || !uncapped_requested {
+        return Pacing::DisplayPaced;
+    }
+    let on_interval = |hz: f32| {
+        let interval = 1000.0 / hz;
+        (median_ms - interval).abs() <= MEDIAN_TOLERANCE * interval
+    };
+    let paced = match refresh_hz.filter(|hz| *hz > 1.0) {
+        Some(hz) => on_interval(hz),
+        None => COMMON_REFRESH_HZ.into_iter().any(on_interval),
+    };
+    if paced {
+        Pacing::DisplayPaced
+    } else {
+        Pacing::Uncapped
+    }
+}
+
+/// Frames longer than [`MISSED_INTERVALS`] target intervals.
+pub fn missed_frames(frame_ms: &[f32], target_fps: u32) -> usize {
+    let limit = MISSED_INTERVALS * frame_budget_ms(target_fps);
+    frame_ms.iter().filter(|&&ms| ms > limit).count()
+}
+
+/// Whether one direction's frames pass under `pacing` (see the module docs).
+pub fn passes(frame_ms: &[f32], target_fps: u32, pacing: Pacing) -> bool {
+    let stats = frame_time_stats(frame_ms);
+    if stats.frames == 0 {
+        return false;
+    }
+    match pacing {
+        Pacing::Uncapped => stats.passes(target_fps),
+        Pacing::DisplayPaced => {
+            let missed = missed_frames(frame_ms, target_fps) as f64 / stats.frames as f64;
+            missed <= MAX_MISSED_SHARE
+                && stats.median_ms <= (1.0 + MEDIAN_TOLERANCE) * frame_budget_ms(target_fps)
+        }
     }
 }
 
@@ -135,7 +211,10 @@ pub struct ScrubBench {
     pub exit_when_done: bool,
     phase: Phase,
     phase_started: Option<Instant>,
+    /// From diagnostics start (just after the app starts) to the first interactive frame.
     cold_load_secs: Option<f64>,
+    /// Web only: from navigation (`performance.now()`) to the first interactive frame.
+    navigation_load_secs: Option<f64>,
     older_ms: Vec<f32>,
     younger_ms: Vec<f32>,
     bridge_ms: Vec<f32>,
@@ -150,6 +229,7 @@ impl ScrubBench {
             phase: Phase::WaitingForGlobe,
             phase_started: None,
             cold_load_secs: None,
+            navigation_load_secs: None,
             older_ms: Vec::new(),
             younger_ms: Vec::new(),
             bridge_ms: Vec::new(),
@@ -196,6 +276,7 @@ fn drive_scrub_bench(
     data: Option<Res<GlobeData>>,
     adapter: Option<Res<RenderAdapterInfo>>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    monitors: Query<&Monitor, With<PrimaryMonitor>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let now = Instant::now();
@@ -206,10 +287,15 @@ fn drive_scrub_bench(
                 bench.cold_load_secs = session
                     .as_ref()
                     .map(|s| now.duration_since(s.started).as_secs_f64());
+                bench.navigation_load_secs = navigation_secs();
                 bench.memory.at_interactive = memory::footprint_now();
                 bench.phase = Phase::Settling;
                 bench.phase_started = Some(now);
-                info!(cold_load_secs = ?bench.cold_load_secs, "scrub bench: globe interactive, settling");
+                info!(
+                    cold_load_secs = ?bench.cold_load_secs,
+                    navigation_load_secs = ?bench.navigation_load_secs,
+                    "scrub bench: globe interactive, settling"
+                );
             }
         }
         Phase::Settling => {
@@ -243,20 +329,26 @@ fn drive_scrub_bench(
             }
             if elapsed > 2.0 * SCRUB_SECS {
                 bench.phase = Phase::Done;
-                let size = windows
-                    .single()
-                    .ok()
-                    .map(|w| UVec2::new(w.physical_width(), w.physical_height()));
+                let window = windows.single().ok();
+                let display = DisplayInfo {
+                    size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
+                    present_mode: window.map(|w| w.present_mode),
+                    refresh_hz: monitors
+                        .iter()
+                        .next()
+                        .and_then(|m| m.refresh_rate_millihertz)
+                        .map(|mhz| mhz as f32 / 1000.0),
+                };
                 let report = report_block(
                     &bench,
                     session.as_deref(),
                     data.as_deref(),
                     adapter.as_deref(),
-                    size,
+                    &display,
                 );
-                for line in report.lines() {
-                    info!("{line}");
-                }
+                // One log call, so the block pastes back in one piece (the browser console
+                // shows it as a single message).
+                info!("{report}");
                 #[cfg(not(target_arch = "wasm32"))]
                 println!("{report}");
                 if bench.exit_when_done {
@@ -279,19 +371,54 @@ fn drive_scrub_bench(
     }
 }
 
-/// Formats one direction's line.
-fn direction_line(name: &str, frames: &[f32], target_fps: u32) -> String {
+/// Web: seconds since navigation started (`performance.now()`); `None` on native.
+fn navigation_secs() -> Option<f64> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now() / 1000.0)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    None
+}
+
+/// The window and display the run was measured on.
+struct DisplayInfo {
+    size: Option<UVec2>,
+    present_mode: Option<bevy::window::PresentMode>,
+    refresh_hz: Option<f32>,
+}
+
+/// Formats one direction's lines: the raw statistics, then the missed-frame count.
+fn direction_lines(name: &str, frames: &[f32], target_fps: u32, pacing: Pacing) -> [String; 2] {
     let s = frame_time_stats(frames);
-    format!(
-        "{name}: frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms, stalls (>{:.1} ms) {} -> {}",
-        s.frames,
-        s.median_ms,
-        s.p95_ms,
-        s.worst_ms,
-        STALL_BUDGETS * frame_budget_ms(target_fps),
-        stall_count(frames, target_fps),
-        if s.passes(target_fps) { "PASS" } else { "FAIL" }
-    )
+    let missed = missed_frames(frames, target_fps);
+    let share = if s.frames > 0 {
+        100.0 * missed as f64 / s.frames as f64
+    } else {
+        0.0
+    };
+    [
+        format!(
+            "{name}: frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms, stalls (>{:.1} ms = {STALL_BUDGETS}x interval) {} -> {}",
+            s.frames,
+            s.median_ms,
+            s.p95_ms,
+            s.worst_ms,
+            STALL_BUDGETS * frame_budget_ms(target_fps),
+            stall_count(frames, target_fps),
+            if passes(frames, target_fps, pacing) {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        ),
+        format!(
+            "  missed frames (>{:.1} ms = {MISSED_INTERVALS}x interval): {missed} ({share:.2}%)",
+            MISSED_INTERVALS * frame_budget_ms(target_fps),
+        ),
+    ]
 }
 
 fn report_block(
@@ -299,13 +426,26 @@ fn report_block(
     session: Option<&SessionInfo>,
     data: Option<&GlobeData>,
     adapter: Option<&RenderAdapterInfo>,
-    size: Option<UVec2>,
+    display: &DisplayInfo,
 ) -> String {
+    use bevy::window::PresentMode;
     let fps = bench.target_fps;
-    let older = frame_time_stats(&bench.older_ms);
-    let younger = frame_time_stats(&bench.younger_ms);
+    let all: Vec<f32> = bench
+        .older_ms
+        .iter()
+        .chain(&bench.younger_ms)
+        .copied()
+        .collect();
+    let median_all = frame_time_stats(&all).median_ms;
+    let web = cfg!(target_arch = "wasm32");
+    let uncapped_requested = matches!(
+        display.present_mode,
+        Some(PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox)
+    );
+    let pacing = pacing(web, uncapped_requested, display.refresh_hz, median_all);
     let bridge = frame_time_stats(&bench.bridge_ms);
-    let pass = older.passes(fps) && younger.passes(fps);
+    let pass = passes(&bench.older_ms, fps, pacing) && passes(&bench.younger_ms, fps, pacing);
+    let size = display.size;
     let mut out = vec!["===== Time Fly scrub bench =====".to_string()];
     if let Some(s) = session {
         out.push(format!("session: {}  log: {}", s.id, s.log));
@@ -336,6 +476,7 @@ fn report_block(
         out.push(format!("render resolution: {}x{}", size.x, size.y));
     }
     if let Some(d) = data {
+        out.push(format!("bake: {}", d.revision.summary()));
         out.push(format!(
             "data: {} frames, {} images, cube size {}, decoded textures {} (calculated)",
             d.timeline.frames().len(),
@@ -352,10 +493,22 @@ fn report_block(
             mib(transient)
         ));
     }
-    out.push(match bench.cold_load_secs {
-        Some(s) => format!("cold load to first interactive frame: {s:.2} s"),
-        None => "cold load to first interactive frame: unknown".to_string(),
-    });
+    let secs = |v: Option<f64>| v.map_or("unknown".to_string(), |s| format!("{s:.2} s"));
+    if web {
+        out.push(format!(
+            "cold load (navigation to first interactive frame): {}",
+            secs(bench.navigation_load_secs)
+        ));
+        out.push(format!(
+            "  app start (wasm running) to first interactive frame: {}",
+            secs(bench.cold_load_secs)
+        ));
+    } else {
+        out.push(format!(
+            "cold load (launch to first interactive frame): {}",
+            secs(bench.cold_load_secs)
+        ));
+    }
     let m = &bench.memory;
     let show = |v: Option<u64>| v.map_or("n/a".to_string(), mib);
     out.push(format!(
@@ -366,19 +519,48 @@ fn report_block(
         show(m.peak_scrub_bridge),
         show(memory::footprint_peak()),
     ));
+    let interval = frame_budget_ms(fps);
     out.push(format!(
-        "target: {fps} fps (p95 <= {:.2} ms)",
-        frame_budget_ms(fps)
+        "present mode: {} requested{}; display refresh {}; median {:.2} ms -> {}",
+        display
+            .present_mode
+            .map_or("unknown".to_string(), |m| format!("{m:?}")),
+        if web {
+            " (browser requestAnimationFrame)"
+        } else {
+            ""
+        },
+        display
+            .refresh_hz
+            .map_or("unknown".to_string(), |hz| format!("{hz:.1} Hz")),
+        median_all,
+        match pacing {
+            Pacing::DisplayPaced => "display-paced",
+            Pacing::Uncapped => "uncapped",
+        }
     ));
-    out.push(direction_line(
+    out.push(format!("target: {fps} fps (interval {interval:.2} ms)"));
+    out.push(match pacing {
+        Pacing::DisplayPaced => format!(
+            "pass rule (display-paced): missed frames (>{:.1} ms) <= {:.0}% and median <= {:.2} ms (interval +{:.0}%)",
+            MISSED_INTERVALS * interval,
+            MAX_MISSED_SHARE * 100.0,
+            (1.0 + MEDIAN_TOLERANCE) * interval,
+            MEDIAN_TOLERANCE * 100.0
+        ),
+        Pacing::Uncapped => format!("pass rule (uncapped): p95 <= {interval:.2} ms"),
+    });
+    out.extend(direction_lines(
         "older   (present -> 540 Ma)",
         &bench.older_ms,
         fps,
+        pacing,
     ));
-    out.push(direction_line(
+    out.extend(direction_lines(
         "younger (540 Ma -> present)",
         &bench.younger_ms,
         fps,
+        pacing,
     ));
     out.push(format!(
         "bridge (26-30 ka, both directions): frames {}, median {:.2} ms, worst {:.2} ms, stalls {}",
@@ -387,7 +569,14 @@ fn report_block(
         bridge.worst_ms,
         stall_count(&bench.bridge_ms, fps)
     ));
-    out.push(format!("result: {}", if pass { "PASS" } else { "FAIL" }));
+    out.push(format!(
+        "result: {} (decided by the {} rule)",
+        if pass { "PASS" } else { "FAIL" },
+        match pacing {
+            Pacing::DisplayPaced => "display-paced missed-frame",
+            Pacing::Uncapped => "uncapped p95",
+        }
+    ));
     out.push("===== end scrub bench =====".to_string());
     out.join("\n")
 }
@@ -544,6 +733,67 @@ mod tests {
         assert!(!s.passes(60));
         assert!(s.passes(20), "40 ms is within a 20 fps budget (50 ms)");
         assert!(!Stats::default().passes(60), "no frames never passes");
+    }
+
+    /// A 60 Hz display-paced run: deltas jitter +-2 ms around 16.67 ms, with `missed` frames
+    /// of two intervals spread through it.
+    fn paced_series(frames: usize, missed: usize) -> Vec<f32> {
+        (0..frames)
+            .map(|i| {
+                if missed > 0 && i % (frames / missed) == 0 && i / (frames / missed) < missed {
+                    33.4
+                } else {
+                    16.67 + [-2.0, 1.9, -0.5, 0.4, 2.0, -1.8][i % 6]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn display_paced_runs_pass_on_missed_frames_not_p95() {
+        let clean = paced_series(1200, 0);
+        let stats = frame_time_stats(&clean);
+        assert!(stats.p95_ms > frame_budget_ms(60), "jitter puts p95 over");
+        assert!(!stats.passes(60), "the p95 rule would fail it");
+        assert_eq!(missed_frames(&clean, 60), 0);
+        assert!(passes(&clean, 60, Pacing::DisplayPaced));
+
+        let lossy = paced_series(1200, 24); // 2% missed
+        assert_eq!(missed_frames(&lossy, 60), 24);
+        assert!(!passes(&lossy, 60, Pacing::DisplayPaced));
+        let ok = paced_series(1200, 12); // 1% missed: still passes
+        assert!(passes(&ok, 60, Pacing::DisplayPaced));
+
+        // A median more than 5% over the interval fails even without missed frames.
+        let slow = vec![17.6_f32; 100];
+        assert!(!passes(&slow, 60, Pacing::DisplayPaced));
+        // A faster display (120 Hz) at a 60 fps target passes.
+        assert!(passes(&vec![8.33_f32; 100], 60, Pacing::DisplayPaced));
+        assert!(!passes(&[], 60, Pacing::DisplayPaced));
+
+        // Uncapped runs keep the p95 rule.
+        let mut fast = vec![9.0_f32; 95];
+        fast.extend([16.0; 5]);
+        assert!(passes(&fast, 60, Pacing::Uncapped));
+        fast.extend([20.0; 10]);
+        assert!(!passes(&fast, 60, Pacing::Uncapped));
+    }
+
+    #[test]
+    fn pacing_is_detected_from_the_present_mode_and_the_median() {
+        assert_eq!(pacing(true, true, None, 5.0), Pacing::DisplayPaced, "web");
+        assert_eq!(
+            pacing(false, false, None, 5.0),
+            Pacing::DisplayPaced,
+            "vsync"
+        );
+        // Asked for uncapped, but the median sits on the display's interval.
+        assert_eq!(pacing(false, true, Some(60.0), 16.6), Pacing::DisplayPaced);
+        assert_eq!(pacing(false, true, Some(60.0), 9.0), Pacing::Uncapped);
+        assert_eq!(pacing(false, true, Some(144.0), 6.94), Pacing::DisplayPaced);
+        // Unknown refresh: common rates.
+        assert_eq!(pacing(false, true, None, 8.33), Pacing::DisplayPaced);
+        assert_eq!(pacing(false, true, None, 11.9), Pacing::Uncapped);
     }
 
     #[test]

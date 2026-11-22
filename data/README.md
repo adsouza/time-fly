@@ -235,8 +235,8 @@ frames, 136 images, cube size 128, 17,177,338 bytes):
 
 - **Scrub frame times** (20 s each way, warm): median 16.6 ms, p95 18.3 ms (older) / 19.1 ms
   (younger), worst 27.2 ms, no frame over 33.3 ms, bridge included. Presentation is paced at the
-  display's 60 Hz, so p95 is pacing jitter; the bench's strict p95 <= 16.67 ms reads FAIL on
-  this Mac. Informational; the 60 fps target is checked on Linux (Task 11).
+  display's 60 Hz, so p95 is pacing jitter (these runs predate the R14 rule below and were judged
+  by p95 alone). Informational; the 60 fps target is checked on Linux (Task 11).
 - **Cold load to first interactive frame:** 3.95 s and 4.30 s for the first launch right after
   a build, 0.53 s for another first launch, 0.39-0.40 s on relaunch.
 - **GPU texels:** 61.1 MiB of decoded frame textures (as estimated, ~61 MiB), plus the bridge:
@@ -248,6 +248,12 @@ frames, 136 images, cube size 128, 17,177,338 bytes):
 - **Data size:** 17.2 MB on disk, already zstd-19 (~17.0 MB with HTTP compression), inside the
   ~20 MB target; preloading every frame is affordable on desktop. Browser transfer and memory
   numbers are pending the Chrome run.
+- **Web app size** (`web-release` profile, no debuginfo, stripped): 65.8 MB raw, 7.7 MB
+  brotli -q 11 (was 100.6 MB / 14.6 MB with the `release` profile).
+- **Bench rule:** frames here are display-paced, so the bench judges missed frames (> 1.5x the
+  interval, at most 1%) and median (at most 5% over the interval), ruling R14: the re-run passes
+  with 0.08-0.17% missed frames. The bench block names the bake as
+  `manifest v2, sha256 013f81f437f19736`.
 
 Reference files:
 

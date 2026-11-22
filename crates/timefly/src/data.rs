@@ -46,6 +46,8 @@ pub enum GlobeLoadState {
 /// The loaded globe data, inserted on entering [`GlobeLoadState::Ready`].
 #[derive(Resource)]
 pub struct GlobeData {
+    /// Which bake this is: manifest version and `manifest.json` hash.
+    pub revision: BakeRevision,
     pub cube_size: u32,
     pub timeline: Timeline,
     /// One handle per unique frame file, indexed by [`FrameMeta::image_slot`].
@@ -204,9 +206,30 @@ fn frames_and_files(
     Ok((metas, files))
 }
 
+/// Identifies a bake: the manifest version and the SHA-256 of `manifest.json` (which lists every
+/// frame file with its own hash-relevant metadata), so reports can confirm the same bake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BakeRevision {
+    pub manifest_version: u32,
+    /// Lowercase hex SHA-256 of the manifest file (`shasum -a 256 manifest.json`).
+    pub manifest_sha256: String,
+}
+
+impl BakeRevision {
+    /// e.g. `manifest v2, sha256 013f81f437f19736`.
+    pub fn summary(&self) -> String {
+        format!(
+            "manifest v{}, sha256 {}",
+            self.manifest_version,
+            &self.manifest_sha256[..16.min(self.manifest_sha256.len())]
+        )
+    }
+}
+
 /// The manifest, with its aggregates validated and its frame images loading.
 #[derive(Asset, TypePath)]
 pub struct GlobeManifest {
+    pub revision: BakeRevision,
     pub cube_size: u32,
     pub timeline: Timeline,
     pub crust: CrustModel,
@@ -294,6 +317,10 @@ async fn load_manifest(
             got: manifest.version,
         });
     }
+    let revision = BakeRevision {
+        manifest_version: manifest.version,
+        manifest_sha256: timefly_core::sha256::sha256_hex(bytes),
+    };
     let (frames, files) = frames_and_files(&manifest.frames)?;
 
     let (path, bytes) = read_sibling(load_context, &manifest.footprints).await?;
@@ -327,6 +354,7 @@ async fn load_manifest(
         })
         .collect();
     Ok(GlobeManifest {
+        revision,
         cube_size: manifest.cube_size,
         timeline,
         crust,
@@ -614,9 +642,11 @@ fn poll_globe_load(
                 images = manifest.images.len(),
                 plates = manifest.crust.rotations().plate_ids.len(),
                 cube_size = manifest.cube_size,
+                revision = %manifest.revision.summary(),
                 "globe data loaded"
             );
             commands.insert_resource(GlobeData {
+                revision: manifest.revision,
                 cube_size: manifest.cube_size,
                 timeline: manifest.timeline,
                 images: manifest.images,
