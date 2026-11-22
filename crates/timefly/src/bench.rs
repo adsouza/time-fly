@@ -14,6 +14,10 @@
 //! intervals) and the median is no more than [`MEDIAN_TOLERANCE`] above the target interval. When
 //! an uncapped present mode is really in effect, the run passes when p95 <= the target interval.
 //! The block says which rule decided.
+//!
+//! If the globe fails instead of becoming interactive, it logs a FAIL block with the reason.
+//! On native it exits after logging: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL (a result,
+//! not a crash, so the next launch shows no crash notice).
 
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -23,7 +27,9 @@ use timefly_core::deep_time::{YearsBp, slider_to_years};
 use timefly_core::surface::FrameSource;
 
 use crate::data::GlobeData;
+use crate::diagnostics::session::FAILED_RESULT_EXIT_CODE;
 use crate::diagnostics::{FirstInteractiveFrame, SessionInfo};
+use crate::globe::GlobeRenderStatus;
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 
 /// Seconds per scrub direction.
@@ -219,6 +225,8 @@ pub struct ScrubBench {
     younger_ms: Vec<f32>,
     bridge_ms: Vec<f32>,
     memory: MemoryTrack,
+    /// The block, once logged.
+    report: Option<String>,
 }
 
 impl ScrubBench {
@@ -234,7 +242,35 @@ impl ScrubBench {
             younger_ms: Vec::new(),
             bridge_ms: Vec::new(),
             memory: MemoryTrack::default(),
+            report: None,
         }
+    }
+
+    /// The report block, once the run has ended.
+    pub fn report(&self) -> Option<&str> {
+        self.report.as_deref()
+    }
+
+    /// Logs the block (one call, so it pastes back in one piece; the browser console shows it
+    /// as a single message), prints it on native, and ends the run.
+    fn finish(&mut self, report: String, pass: bool, exit: &mut MessageWriter<AppExit>) {
+        self.phase = Phase::Done;
+        info!("{report}");
+        #[cfg(not(target_arch = "wasm32"))]
+        println!("{report}");
+        self.report = Some(report);
+        if self.exit_when_done {
+            exit.write(bench_exit(pass));
+        }
+    }
+}
+
+/// How a native run exits: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL.
+pub fn bench_exit(pass: bool) -> AppExit {
+    if pass {
+        AppExit::Success
+    } else {
+        AppExit::from_code(FAILED_RESULT_EXIT_CODE)
     }
 }
 
@@ -277,13 +313,17 @@ fn drive_scrub_bench(
     adapter: Option<Res<RenderAdapterInfo>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     monitors: Query<&Monitor, With<PrimaryMonitor>>,
+    status: Option<Res<GlobeRenderStatus>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let now = Instant::now();
     let interactive = first.read().last().is_some();
     match bench.phase {
         Phase::WaitingForGlobe => {
-            if interactive {
+            if let Some(GlobeRenderStatus::Failed(reason)) = status.as_deref() {
+                let report = failure_block(session.as_deref(), adapter.as_deref(), reason);
+                bench.finish(report, false, &mut exit);
+            } else if interactive {
                 bench.cold_load_secs = session
                     .as_ref()
                     .map(|s| now.duration_since(s.started).as_secs_f64());
@@ -328,7 +368,6 @@ fn drive_scrub_bench(
                 bench.younger_ms.push(frame_ms);
             }
             if elapsed > 2.0 * SCRUB_SECS {
-                bench.phase = Phase::Done;
                 let window = windows.single().ok();
                 let display = DisplayInfo {
                     size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
@@ -339,21 +378,14 @@ fn drive_scrub_bench(
                         .and_then(|m| m.refresh_rate_millihertz)
                         .map(|mhz| mhz as f32 / 1000.0),
                 };
-                let report = report_block(
+                let (report, pass) = report_block(
                     &bench,
                     session.as_deref(),
                     data.as_deref(),
                     adapter.as_deref(),
                     &display,
                 );
-                // One log call, so the block pastes back in one piece (the browser console
-                // shows it as a single message).
-                info!("{report}");
-                #[cfg(not(target_arch = "wasm32"))]
-                println!("{report}");
-                if bench.exit_when_done {
-                    exit.write(AppExit::Success);
-                }
+                bench.finish(report, pass, &mut exit);
                 return;
             }
             let to = scrub_schedule(elapsed);
@@ -421,31 +453,8 @@ fn direction_lines(name: &str, frames: &[f32], target_fps: u32, pacing: Pacing) 
     ]
 }
 
-fn report_block(
-    bench: &ScrubBench,
-    session: Option<&SessionInfo>,
-    data: Option<&GlobeData>,
-    adapter: Option<&RenderAdapterInfo>,
-    display: &DisplayInfo,
-) -> String {
-    use bevy::window::PresentMode;
-    let fps = bench.target_fps;
-    let all: Vec<f32> = bench
-        .older_ms
-        .iter()
-        .chain(&bench.younger_ms)
-        .copied()
-        .collect();
-    let median_all = frame_time_stats(&all).median_ms;
-    let web = cfg!(target_arch = "wasm32");
-    let uncapped_requested = matches!(
-        display.present_mode,
-        Some(PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox)
-    );
-    let pacing = pacing(web, uncapped_requested, display.refresh_hz, median_all);
-    let bridge = frame_time_stats(&bench.bridge_ms);
-    let pass = passes(&bench.older_ms, fps, pacing) && passes(&bench.younger_ms, fps, pacing);
-    let size = display.size;
+/// The block's opening lines: session, build, spans, adapter and OS.
+fn header_lines(session: Option<&SessionInfo>, adapter: Option<&RenderAdapterInfo>) -> Vec<String> {
     let mut out = vec!["===== Time Fly scrub bench =====".to_string()];
     if let Some(s) = session {
         out.push(format!("session: {}  log: {}", s.id, s.log));
@@ -472,6 +481,48 @@ fn report_block(
         None => out.push("adapter: unknown".to_string()),
     }
     out.push(format!("os: {}", memory::os_description()));
+    out
+}
+
+/// The block for a run whose globe failed before it became interactive.
+fn failure_block(
+    session: Option<&SessionInfo>,
+    adapter: Option<&RenderAdapterInfo>,
+    reason: &str,
+) -> String {
+    let mut out = header_lines(session, adapter);
+    out.push(format!("result: FAIL (the globe failed: {reason})"));
+    out.push("===== end scrub bench =====".to_string());
+    out.join("\n")
+}
+
+/// The block and whether the run passed.
+fn report_block(
+    bench: &ScrubBench,
+    session: Option<&SessionInfo>,
+    data: Option<&GlobeData>,
+    adapter: Option<&RenderAdapterInfo>,
+    display: &DisplayInfo,
+) -> (String, bool) {
+    use bevy::window::PresentMode;
+    let fps = bench.target_fps;
+    let all: Vec<f32> = bench
+        .older_ms
+        .iter()
+        .chain(&bench.younger_ms)
+        .copied()
+        .collect();
+    let median_all = frame_time_stats(&all).median_ms;
+    let web = cfg!(target_arch = "wasm32");
+    let uncapped_requested = matches!(
+        display.present_mode,
+        Some(PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox)
+    );
+    let pacing = pacing(web, uncapped_requested, display.refresh_hz, median_all);
+    let bridge = frame_time_stats(&bench.bridge_ms);
+    let pass = passes(&bench.older_ms, fps, pacing) && passes(&bench.younger_ms, fps, pacing);
+    let size = display.size;
+    let mut out = header_lines(session, adapter);
     if let Some(size) = size {
         out.push(format!("render resolution: {}x{}", size.x, size.y));
     }
@@ -578,7 +629,7 @@ fn report_block(
         }
     ));
     out.push("===== end scrub bench =====".to_string());
-    out.join("\n")
+    (out.join("\n"), pass)
 }
 
 /// Process memory and OS description, per platform.
@@ -838,6 +889,78 @@ mod tests {
             .filter(|y| (BRIDGE_YEARS.0..=BRIDGE_YEARS.1).contains(y))
             .count();
         assert!(in_bridge >= 5, "{in_bridge}");
+    }
+
+    #[test]
+    fn a_failed_run_exits_with_the_failed_result_code() {
+        assert_eq!(bench_exit(true), AppExit::Success);
+        assert_eq!(
+            bench_exit(false),
+            AppExit::from_code(crate::diagnostics::session::FAILED_RESULT_EXIT_CODE)
+        );
+    }
+
+    fn bench_app(status: GlobeRenderStatus, exit_when_done: bool) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time<Real>>()
+            .init_resource::<GlobeTime>()
+            .add_message::<FirstInteractiveFrame>()
+            .add_message::<TimeChanged>()
+            .insert_resource(status)
+            .add_plugins(ScrubBenchPlugin {
+                target_fps: 60,
+                exit_when_done,
+            });
+        app
+    }
+
+    fn exits(app: &App) -> Vec<AppExit> {
+        app.world()
+            .resource::<Messages<AppExit>>()
+            .iter_current_update_messages()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_globe_ends_the_bench_with_a_fail_block() {
+        let mut app = bench_app(
+            GlobeRenderStatus::Failed("data/globe/manifest.json: file not found".into()),
+            true,
+        );
+        app.update();
+        assert_eq!(exits(&app), vec![bench_exit(false)]);
+        let report = app.world().resource::<ScrubBench>().report().unwrap();
+        assert!(
+            report.starts_with("===== Time Fly scrub bench ====="),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "result: FAIL (the globe failed: data/globe/manifest.json: file not found)"
+            ),
+            "{report}"
+        );
+        assert!(report.ends_with("===== end scrub bench ====="), "{report}");
+        // Reported once.
+        app.update();
+        assert!(exits(&app).is_empty());
+    }
+
+    #[test]
+    fn the_web_bench_reports_a_failed_globe_without_exiting() {
+        let mut app = bench_app(GlobeRenderStatus::Failed("no adapter".into()), false);
+        app.update();
+        assert!(exits(&app).is_empty());
+        assert!(app.world().resource::<ScrubBench>().report().is_some());
+    }
+
+    #[test]
+    fn a_loading_globe_keeps_the_bench_waiting() {
+        let mut app = bench_app(GlobeRenderStatus::LoadingData, true);
+        app.update();
+        assert!(exits(&app).is_empty());
+        assert!(app.world().resource::<ScrubBench>().report().is_none());
     }
 
     #[test]

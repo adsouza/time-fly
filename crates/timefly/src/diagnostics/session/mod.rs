@@ -151,15 +151,23 @@ pub fn previous_outcome(
     }
 }
 
+/// The exit code of a run that finished its job and reports a failed result (the scrub bench's
+/// FAIL): non-zero for scripts, but a clean session, not a crash. Bevy's own error exits use 1.
+pub const FAILED_RESULT_EXIT_CODE: u8 = 3;
+
 /// The status a session ends with when the `App` returns.
 ///
-/// Only a running session that exits successfully is clean. A crash recorded earlier (a panic
+/// Only a running session that exits successfully (or with [`FAILED_RESULT_EXIT_CODE`]) is
+/// clean. A crash recorded earlier (a panic
 /// that Bevy caught, for example on the render thread) is never downgraded, and an error exit
 /// (render-thread panic, wgpu validation error, out of memory, lost device) is a crash without
 /// a panic report, so the next launch shows the notice.
 pub fn finish_status(current: SessionStatus, exit: &bevy::app::AppExit) -> SessionStatus {
     match (current, exit) {
         (SessionStatus::Crashed { panicked }, _) => SessionStatus::Crashed { panicked },
+        (_, bevy::app::AppExit::Error(code)) if code.get() == FAILED_RESULT_EXIT_CODE => {
+            SessionStatus::Clean
+        }
         (_, bevy::app::AppExit::Error(_)) => SessionStatus::Crashed { panicked: false },
         (SessionStatus::Running | SessionStatus::Clean, bevy::app::AppExit::Success) => {
             SessionStatus::Clean
@@ -565,6 +573,18 @@ mod tests {
                 S::Crashed { panicked: false }
             );
         }
+        // A check that finished and failed (the scrub bench) is a result, not a crash.
+        assert_eq!(
+            finish_status(S::Running, &AppExit::from_code(FAILED_RESULT_EXIT_CODE)),
+            S::Clean
+        );
+        assert_eq!(
+            finish_status(
+                S::Crashed { panicked: true },
+                &AppExit::from_code(FAILED_RESULT_EXIT_CODE)
+            ),
+            S::Crashed { panicked: true }
+        );
         // Render-thread panic, wgpu error: `run()` returns `AppExit::Error`.
         assert_eq!(
             finish_status(S::Running, &error),

@@ -642,7 +642,11 @@ fn log_findings(handle: Res<DiagnosticsHandle>) {
 fn record_app_exits(mut exits: MessageReader<AppExit>, handle: Res<DiagnosticsHandle>) {
     for exit in exits.read() {
         if let AppExit::Error(code) = exit {
-            error!(code = code.get(), "the app exited with an error");
+            if code.get() == session::FAILED_RESULT_EXIT_CODE {
+                info!(code = code.get(), "the app exited with a failed result");
+            } else {
+                error!(code = code.get(), "the app exited with an error");
+            }
             handle
                 .0
                 .update_record(|r| r.status = session::finish_status(r.status, exit));
