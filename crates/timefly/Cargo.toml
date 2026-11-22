@@ -28,6 +28,9 @@ directories = "6"
 fd-lock = "4"
 opener = { version = "0.9", features = ["reveal"] }
 rfd = "0.18"
+# The pre-flight adapter check (`gpu::probe_native`). The same wgpu as Bevy's (one copy in the
+# lock file), so its backend features unify with the ones Bevy enables.
+wgpu = { version = "30.0.2", default-features = false }
 
 # Process memory and the OS version for the scrub bench (already in the tree via winit/wgpu).
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
@@ -39,6 +42,8 @@ console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
 # Already in the tree via wasm-bindgen; for Date.now, Math.random and the Blob parts array.
 js-sys = "0.3"
+# Awaits `navigator.gpu.requestAdapter()` before the app starts (already in the tree via wgpu).
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "Window",
     "Document",

@@ -11,6 +11,7 @@ pub mod check_data;
 pub mod data;
 pub mod diagnostics;
 pub mod globe;
+pub mod gpu;
 pub mod time;
 pub mod ui;
 

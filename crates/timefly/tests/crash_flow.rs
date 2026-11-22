@@ -28,11 +28,16 @@ struct Output {
 }
 
 fn probe(root: &Path, mode: &str) -> Output {
+    probe_with_env(root, mode, &[])
+}
+
+fn probe_with_env(root: &Path, mode: &str, env: &[(&str, &str)]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_timefly"))
         .arg(format!("--diagnostics-probe={mode}"))
         .env("TIMEFLY_LOG_DIR", root)
         .env_remove("TIMEFLY_LOG")
         .env_remove("RUST_LOG")
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -147,6 +152,33 @@ fn error_exit_is_a_crash() {
     );
     let log = read(&only_session(&root).join("session.log"));
     assert!(log.contains("the app exited with an error"), "{log}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Without a graphics adapter the game says so and stops before Bevy (which would panic in
+/// renderer init); the session is clean, so the next launch shows no crash notice. The windowed
+/// probe makes the run reach the GPU check without showing the dialog, and `WGPU_BACKEND=dx12`
+/// (never compiled in off Windows) leaves wgpu no adapter, as on a machine without drivers.
+#[cfg(not(windows))]
+#[test]
+fn no_gpu_adapter_is_a_clean_stop_with_a_message() {
+    let root = log_root("no-gpu");
+    let out = probe_with_env(&root, "panic-after-frame", &[("WGPU_BACKEND", "dx12")]);
+    assert_eq!(out.status.code(), Some(1), "{}", describe(&out));
+    assert!(
+        out.stderr
+            .contains("No compatible GPU/driver found (Vulkan/Metal)"),
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(
+        inspect_newest_session(&root).expect("a session").outcome,
+        PreviousOutcome::Clean
+    );
+    let session = only_session(&root);
+    assert!(!session.join("crash.txt").exists());
+    let log = read(&session.join("session.log"));
+    assert!(log.contains("No suitable graphics adapter found"), "{log}");
     let _ = fs::remove_dir_all(&root);
 }
 

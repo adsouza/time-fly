@@ -347,6 +347,14 @@ fn open_report_page(shared: &Shared, url: &str) {
     }
 }
 
+/// Web: an HTML panel with `text` and no buttons, for a message instead of the game.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn show_message(shared: &Shared, text: &str) {
+    if web::message(text).is_none() {
+        shared.problem("could not show the message overlay".to_string());
+    }
+}
+
 /// The HTML overlay, built with `web-sys`.
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -418,6 +426,19 @@ mod web {
         if build(shared, pending).is_none() {
             shared.problem("could not show the crash notice overlay".to_string());
         }
+    }
+
+    /// A panel with `text` only.
+    pub(super) fn message(text: &str) -> Option<()> {
+        let document = web_sys::window()?.document()?;
+        let overlay = element(&document, "div", OVERLAY_STYLE)?;
+        let panel = element(&document, "div", PANEL_STYLE)?;
+        let paragraph = element(&document, "p", "margin:0")?;
+        paragraph.set_text_content(Some(text));
+        panel.append_child(&paragraph).ok()?;
+        overlay.append_child(&panel).ok()?;
+        document.body()?.append_child(&overlay).ok()?;
+        Some(())
     }
 
     fn build(shared: &Arc<Shared>, pending: PendingNotice) -> Option<()> {

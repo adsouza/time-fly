@@ -284,6 +284,11 @@ impl Session {
         self.shared.eprint(message);
     }
 
+    /// Where this session's log is, as shown to the player (home directory as `~`).
+    pub fn log_location(&self) -> String {
+        SessionInfo::of(&self.shared).log
+    }
+
     /// Drops the log worker guard, which writes out everything logged so far.
     #[cfg(not(target_arch = "wasm32"))]
     fn flush_logs(&mut self) {
@@ -391,7 +396,8 @@ pub fn start(args: LaunchArgs) -> Session {
 #[derive(Resource, Clone, Debug)]
 pub struct SessionInfo {
     pub id: String,
-    /// Where this session's log is (a path on native, browser storage on the web).
+    /// Where this session's log is (a path on native, home directory as `~`; browser storage
+    /// on the web).
     pub log: String,
     /// [`BuildInfo::summary`] of the running build.
     pub build: String,
@@ -406,7 +412,10 @@ impl SessionInfo {
             (record.id.clone(), record.build.summary())
         };
         let log = match shared.session_dir() {
-            Some(dir) => dir.join(session::LOG_FILE).display().to_string(),
+            Some(dir) => report::redact(
+                &dir.join(session::LOG_FILE).display().to_string(),
+                &shared.home,
+            ),
             None if cfg!(target_arch = "wasm32") => {
                 "browser localStorage (timefly.sessions; Download log saves it)".to_string()
             }
@@ -419,6 +428,27 @@ impl SessionInfo {
             started: shared.started,
         }
     }
+}
+
+/// Logs `message` as an error through the real log layers (console, session log, flight
+/// recorder) when the game's `App` will not run: a window-less `App` with the diagnostics logs
+/// the session findings and the message, then ends. Only once per process (the log subscriber
+/// is global).
+pub fn log_error_without_app(session: &Session, message: &str) {
+    let message = message.to_string();
+    let mut app = App::new();
+    app.add_plugins(DiagnosticsPlugin::headless(session))
+        .add_plugins((MinimalPlugins, log_plugin()))
+        .add_systems(Update, move || error!("{message}"));
+    app.finish();
+    app.cleanup();
+    app.update();
+}
+
+/// Web: shows `text` in an HTML panel over the page, styled like the crash notice.
+#[cfg(target_arch = "wasm32")]
+pub fn show_web_message(session: &Session, text: &str) {
+    notice::show_message(&session.shared, text);
 }
 
 /// The handle systems and log layers use.
@@ -706,6 +736,21 @@ mod tests {
             #[cfg(not(target_arch = "wasm32"))]
             log_writer: None,
         })
+    }
+
+    #[test]
+    fn session_info_redacts_the_log_path() {
+        // The scrub bench prints `SessionInfo::log` with `println!`, past the redacting
+        // writers, and the no-GPU dialog shows it.
+        let mut shared = test_shared();
+        let shared_mut = Arc::get_mut(&mut shared).unwrap();
+        shared_mut.home = Home::new("/Users/someone", None);
+        shared_mut.findings.session_dir =
+            Some(PathBuf::from("/Users/someone/Library/Logs/Time Fly/s1"));
+        assert_eq!(
+            SessionInfo::of(&shared).log,
+            format!("~/Library/Logs/Time Fly/s1/{}", session::LOG_FILE)
+        );
     }
 
     /// An app whose system requests `exit` in `Update`; `run()` is never called.

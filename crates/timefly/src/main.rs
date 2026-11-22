@@ -26,7 +26,30 @@ fn main() -> AppExit {
     if let Some(check) = session.args().check_data.clone() {
         return timefly::check_data::run_data_check(session, &check);
     }
-    let exit = timefly::app(&session).run();
-    session.finish(&exit);
-    exit
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Bevy panics without an adapter; say so instead (after the window-less modes above).
+        let gpu = timefly::gpu::probe_native();
+        if !gpu.can_start() {
+            return timefly::gpu::stop_without_gpu(session, &gpu);
+        }
+        let exit = timefly::app(&session).run();
+        session.finish(&exit);
+        exit
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // `requestAdapter()` is asynchronous; the app starts (and `run()` returns at once, the
+        // browser driving its frames) once the browser has answered.
+        wasm_bindgen_futures::spawn_local(async move {
+            let gpu = timefly::gpu::probe_browser().await;
+            if gpu.can_start() {
+                let exit = timefly::app(&session).run();
+                session.finish(&exit);
+            } else {
+                timefly::gpu::stop_without_gpu(session, &gpu);
+            }
+        });
+        AppExit::Success
+    }
 }

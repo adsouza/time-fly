@@ -5579,7 +5579,9 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
+ "wgpu",
 ]
 
 [[package]]
