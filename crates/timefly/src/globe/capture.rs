@@ -276,6 +276,9 @@ pub fn capture_globe(request: &CaptureRequest) -> Result<GlobeCapture, String> {
     )
 }
 
+/// The id [`compare_with_reference`] uses for frame land on the ocean shell.
+pub const GAP_LAND_ID: u32 = u32::MAX;
+
 /// What the shader drew at a direction compared with what the CPU reference says.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParityStats {
@@ -291,6 +294,8 @@ pub struct ParityStats {
     pub unreadable: usize,
     /// Mismatches beyond the tolerance: (direction, CPU, GPU).
     pub mismatches: Vec<(Vec3, Option<u32>, Option<u32>)>,
+    /// Every compared direction.
+    pub compared_dirs: Vec<Vec3>,
 }
 
 impl ParityStats {
@@ -301,11 +306,13 @@ impl ParityStats {
         self.near_boundary += other.near_boundary;
         self.unreadable += other.unreadable;
         self.mismatches.extend(other.mismatches.iter().copied());
+        self.compared_dirs
+            .extend(other.compared_dirs.iter().copied());
     }
 }
 
 /// Compares a verification-view capture with the CPU reference over `dirs`. `cpu(dir)` returns
-/// the winning plate index or `None` for ocean. A direction counts only if the CPU answer is the
+/// the winning plate index, [`GAP_LAND_ID`] for gap land on the shell, or `None` for ocean. A direction counts only if the CPU answer is the
 /// same at every point `tolerance_rad` around it (boundaries move with sampling and depth
 /// interpolation) and the pixel decodes cleanly; `max_view_angle_rad` keeps to the face of the
 /// globe the camera sees head-on.
@@ -323,6 +330,7 @@ pub fn compare_with_reference(
         |c, d| match c.pixel_at(d).map(|[r, g, b, _]| decode_plate_id([r, g, b])) {
             Some(IdPixel::Ocean) => Some(None),
             Some(IdPixel::Plate(p)) => Some(Some(p)),
+            Some(IdPixel::GapLand) => Some(Some(GAP_LAND_ID)),
             _ => None,
         },
         cpu,
@@ -387,6 +395,7 @@ fn compare_with(
             continue;
         }
         stats.compared += 1;
+        stats.compared_dirs.push(d);
         if centre.is_some() == gpu.is_some() {
             stats.mask_agree += 1;
         }

@@ -54,3 +54,5 @@ web-sys = { version = "0.3", features = [
 [dev-dependencies]
 # Writes a deliberately broken `.tfplates` in the data-loading failure tests.
 ruzstd = "0.9"
+# Edits f16 frame texels in the globe fixture test (already a timefly_core dependency).
+half = "2"

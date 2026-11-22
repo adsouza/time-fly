@@ -13,8 +13,13 @@
 //! - Sea level applies per endpoint as `elev − anomaly` before blending; only the modern-terrain
 //!   bridge frame ever has a nonzero anomaly (the selection decides).
 //! - A sample at or below sea level is not land, so the ocean shell shows through.
-//! - Overlapping land: the highest displaced surface wins, with a small radial bias by source-ID
-//!   rank so exact ties go to the lower source ID ([`ranking_surface_km`]).
+//! - Overlapping land: the highest displaced surface wins ([`ranking_surface_km`]); exact ties go
+//!   to the lower source ID. There is no radial bias: the shader ranks every plate at a pixel at
+//!   the same era direction, so exactly tied plates get bit-identical depths, and the draw order
+//!   (lowest source ID last under a `GreaterEqual` depth test) breaks the tie.
+//! - The ocean shell shows each endpoint frame's own land where that frame's plate-coverage mask
+//!   says no plate covered it at the frame's source age (terrain-drift gaps); elsewhere it shows
+//!   water, with land-valued samples clamped to a shallow fallback ([`shell_surface_m`]).
 
 use bevy_math::Quat;
 
@@ -26,12 +31,6 @@ use crate::surface::{DeepBracket, FrameSource, Timeline, effective_elevation_m};
 pub const EARTH_RADIUS_KM: f64 = 6371.0;
 /// Vertical exaggeration of displaced terrain *(call)*.
 pub const ELEVATION_EXAGGERATION: f64 = 20.0;
-/// Radial bias between adjacent source-ID ranks (km): 2.5 m of unexaggerated elevation. It must
-/// beat the f32 noise of the shader's per-pixel depth (about 1-2 m at orbit distance); the GPU
-/// fixture test showed 0.005 km dithering in exact-tie overlaps while 0.05 km resolves them. The
-/// CPU reference ranks with the same bias, so the two agree.
-pub const TIE_BIAS_KM: f64 = 0.05;
-
 /// Ocean-shell depth used where a source grid has land that no plate piece covers (a coverage
 /// gap or a source artefact): shallow, since such samples sit on or next to land.
 pub const OCEAN_GAP_FALLBACK_M: f64 = -200.0;
@@ -199,14 +198,47 @@ pub fn source_id_ranks(rotations: &RotationTable) -> Vec<u32> {
     ranks
 }
 
-/// The radial tie bias (km) of a rank: the lowest source ID sits highest.
-pub fn tie_bias_km(rank: u32, plate_count: u32) -> f64 {
-    f64::from(plate_count.saturating_sub(rank + 1)) * TIE_BIAS_KM
+/// The surface the depth test ranks overlapping land by: the displaced height. Exact ties fall
+/// to the lower source ID (in [`CrustModel::resolve`] and, on the GPU, by draw order).
+pub fn ranking_surface_km(land_m: f64) -> f64 {
+    displacement_km(land_m)
 }
 
-/// The surface the depth test ranks overlapping land by: displaced height plus the tie bias.
-pub fn ranking_surface_km(land_m: f64, rank: u32, plate_count: u32) -> f64 {
-    displacement_km(land_m) + tie_bias_km(rank, plate_count)
+/// The rotation taking a plate's current era frame to an endpoint's source frame,
+/// `source * current⁻¹`, computed in f64. Exactly the identity when the two are equal (a frame
+/// shown at its own source age), so plates tied there sample bit-identical texture coordinates.
+pub fn relative_rotation(source: Quat, current: Quat) -> Quat {
+    if source == current {
+        return Quat::IDENTITY;
+    }
+    let q = source.as_dquat().normalize() * current.as_dquat().normalize().conjugate();
+    q.normalize().as_quat()
+}
+
+/// One frame sample in its published geographic frame.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FrameSample {
+    pub elevation_m: f64,
+    /// The frame's plate-coverage mask: some plate covered this texel at the frame's source age.
+    pub covered: bool,
+}
+
+/// The ocean shell's elevation at an era direction from both endpoint frames' samples there:
+/// per endpoint, uncovered texels keep their own (sea-level adjusted) elevation, so a terrain
+/// gap shows the frame's land; covered texels go through [`ocean_shell_elevation_m`]. The two
+/// are mixed by the older weight. Positive means gap land.
+pub fn shell_surface_m(sampling: &DeepSampling, samples: [FrameSample; 2]) -> f64 {
+    let anomalies = sampling.anomalies_m();
+    let value = |e: usize| {
+        let effective = effective_elevation_m(samples[e].elevation_m, anomalies[e]);
+        if samples[e].covered {
+            ocean_shell_elevation_m(effective)
+        } else {
+            effective
+        }
+    };
+    let (a, b) = (value(0), value(1));
+    a + (b - a) * sampling.older_weight
 }
 
 /// The plate renderer's visible land at plate-fixed direction `p` (the fragment rule), or `None`
@@ -218,6 +250,47 @@ pub fn plate_land_m(
     rotations: &PlateRotations,
     p: RenderDir,
     sampling: &DeepSampling,
+    sample: impl FnMut(usize, RenderDir) -> f64,
+) -> Option<f64> {
+    let dirs = rotations
+        .sources
+        .map(|q| q.map(|q| RenderDir((q.as_dquat() * p.0).normalize())));
+    land_with_sample_dirs(footprints, plate, rotations, p, dirs, sampling, sample)
+}
+
+/// [`plate_land_m`] ranked as the depth test does: each endpoint is sampled at
+/// `relative_rotation(source, current) * era_dir`, which is exactly `era_dir` for a frame shown
+/// at its own source age, so plates tied there read bit-identical samples.
+fn ranking_land_m(
+    footprints: &PlateFootprints,
+    plate: PlateIndex,
+    rotations: &PlateRotations,
+    p: RenderDir,
+    era_dir: RenderDir,
+    sampling: &DeepSampling,
+    sample: impl FnMut(usize, RenderDir) -> f64,
+) -> Option<f64> {
+    let current = rotations.current?.normalize();
+    let dirs = rotations.sources.map(|q| {
+        q.map(|q| {
+            let r = relative_rotation(q.normalize(), current);
+            if r == Quat::IDENTITY {
+                era_dir
+            } else {
+                RenderDir((r.as_dquat() * era_dir.0).normalize())
+            }
+        })
+    });
+    land_with_sample_dirs(footprints, plate, rotations, p, dirs, sampling, sample)
+}
+
+fn land_with_sample_dirs(
+    footprints: &PlateFootprints,
+    plate: PlateIndex,
+    rotations: &PlateRotations,
+    p: RenderDir,
+    dirs: [Option<RenderDir>; 2],
+    sampling: &DeepSampling,
     mut sample: impl FnMut(usize, RenderDir) -> f64,
 ) -> Option<f64> {
     let ages = sampling.source_ages_myr();
@@ -228,8 +301,8 @@ pub fn plate_land_m(
         )
     });
     let weights = endpoint_weights(available, sampling.older_weight)?;
-    let elevation = [0, 1].map(|e| match rotations.sources[e] {
-        Some(q) if weights[e] != 0.0 => sample(e, RenderDir((q.as_dquat() * p.0).normalize())),
+    let elevation = [0, 1].map(|e| match dirs[e] {
+        Some(d) if weights[e] != 0.0 => sample(e, d),
         _ => 0.0,
     });
     visible_land_m(blend_endpoints_m(
@@ -244,47 +317,62 @@ pub fn plate_land_m(
 pub enum RenderedSurface {
     /// Land of the winning plate, with its effective elevation.
     Land { plate_id: PlateId, elevation_m: f64 },
+    /// Frame land on the ocean shell, where no plate covered it at the frame's source age.
+    GapLand { elevation_m: f64 },
     /// The ocean shell (a gap, an expired piece, or water on every candidate).
     Ocean,
 }
 
+impl RenderedSurface {
+    pub fn is_land(&self) -> bool {
+        !matches!(self, RenderedSurface::Ocean)
+    }
+}
+
 /// The CPU reference of the plate renderer at an era-frame direction: every candidate plate is
 /// tried through [`CrustModel::resolve`] with the depth test's ranking surface, so overlaps and
-/// ties resolve exactly as the GPU does. `rotations` and `ranks` are indexed by plate index.
+/// ties resolve exactly as the GPU does; without plate land, the ocean shell's rule applies.
+/// `rotations` is indexed by plate index; `sample(endpoint, dir)` reads a frame in its
+/// published frame.
 pub fn rendered_surface(
     crust: &CrustModel,
     era_dir: RenderDir,
     sampling: &DeepSampling,
     rotations: &[PlateRotations],
-    ranks: &[u32],
-    mut sample: impl FnMut(usize, RenderDir) -> f64,
+    mut sample: impl FnMut(usize, RenderDir) -> FrameSample,
 ) -> RenderedSurface {
-    let count = ranks.len() as u32;
     let mut lands: Vec<(PlateId, f64)> = Vec::new();
+    let era = RenderDir(era_dir.0.normalize());
     let resolved = crust.resolve(era_dir, sampling.age_myr, |c| {
         let index = c.plate_index.0 as usize;
-        let land = plate_land_m(
+        let land = ranking_land_m(
             crust.footprints(),
             c.plate_index,
             &rotations[index],
             c.plate_fixed_dir,
+            era,
             sampling,
-            &mut sample,
+            |e, d| sample(e, d).elevation_m,
         )?;
         lands.push((c.plate_id, land));
-        Some(ranking_surface_km(land, ranks[index], count))
+        Some(ranking_surface_km(land))
     });
-    match resolved {
+    let winner = match resolved {
         crate::geodynamics::ResolvedPosition::Tracked(pos) => {
-            lands.iter().find(|(id, _)| *id == pos.plate_id).map_or(
-                RenderedSurface::Ocean,
-                |&(plate_id, elevation_m)| RenderedSurface::Land {
-                    plate_id,
-                    elevation_m,
-                },
-            )
+            lands.iter().find(|(id, _)| *id == pos.plate_id).copied()
         }
-        crate::geodynamics::ResolvedPosition::EraFixed { .. } => RenderedSurface::Ocean,
+        crate::geodynamics::ResolvedPosition::EraFixed { .. } => None,
+    };
+    if let Some((plate_id, elevation_m)) = winner {
+        return RenderedSurface::Land {
+            plate_id,
+            elevation_m,
+        };
+    }
+    let shell = shell_surface_m(sampling, [sample(0, era), sample(1, era)]);
+    match visible_land_m(shell) {
+        Some(elevation_m) => RenderedSurface::GapLand { elevation_m },
+        None => RenderedSurface::Ocean,
     }
 }
 
@@ -519,10 +607,92 @@ mod tests {
         );
         let ranks = source_id_ranks(&t);
         assert_eq!(ranks, vec![2, 0, 1]);
-        let s = |plate: usize| ranking_surface_km(800.0, ranks[plate], 3);
-        assert!(s(1) > s(2) && s(2) > s(0), "lower source ID sits higher");
-        // The bias never outranks a real relief difference of 10 m.
-        assert!(ranking_surface_km(810.0, 2, 3) > ranking_surface_km(800.0, 0, 3));
+        // A true tie-break: no radial bias at all, so a metre of land always wins.
+        assert_eq!(ranking_surface_km(800.0), displacement_km(800.0));
+        assert!(ranking_surface_km(801.0) > ranking_surface_km(800.0));
+    }
+
+    #[test]
+    fn relative_rotation_is_exactly_identity_at_the_source_age() {
+        let q = Quat::from_axis_angle(Vec3::new(0.3, 0.8, -0.2).normalize(), 2.1);
+        assert_eq!(relative_rotation(q, q), Quat::IDENTITY);
+        let r = relative_rotation(about_y(30.0), about_y(10.0));
+        assert!((r * Vec3::Z - about_y(20.0) * Vec3::Z).length() < 1e-6);
+    }
+
+    #[test]
+    fn shell_shows_uncovered_frame_land_only() {
+        let s = DeepSampling {
+            age_myr: 10.0,
+            endpoints: [
+                DeepEndpoint {
+                    frame: 0,
+                    source_rotation_age_myr: 0.0,
+                    sea_level_anomaly_m: -100.0,
+                },
+                DeepEndpoint {
+                    frame: 1,
+                    source_rotation_age_myr: 20.0,
+                    sea_level_anomaly_m: 0.0,
+                },
+            ],
+            older_weight: 0.25,
+        };
+        let f = |elevation_m, covered| FrameSample {
+            elevation_m,
+            covered,
+        };
+        // Uncovered land in both: crossfaded like elevation, with the bridge sea-level rule.
+        assert_eq!(
+            shell_surface_m(&s, [f(300.0, false), f(800.0, false)]),
+            0.75 * 400.0 + 0.25 * 800.0
+        );
+        // Covered land is the ocean fallback.
+        assert_eq!(
+            shell_surface_m(&s, [f(300.0, true), f(800.0, true)]),
+            OCEAN_GAP_FALLBACK_M
+        );
+        // Covered water keeps its depth (sea level applied).
+        assert_eq!(
+            shell_surface_m(&s, [f(-3000.0, true), f(-3000.0, true)]),
+            0.75 * -2900.0 + 0.25 * -3000.0
+        );
+        // Gap land in one frame only fades in between frames.
+        assert!(shell_surface_m(&s, [f(-4000.0, false), f(500.0, false)]) < 0.0);
+    }
+
+    #[test]
+    fn a_lower_id_plate_with_lower_land_loses() {
+        // At 100 Ma plates 101 and 202 overlap over +Z. 101 (lower ID) samples 200 m, 202 samples
+        // 500 m: the higher land wins whatever the IDs, even by a few hundred metres or one.
+        // 100 plates rank between them: a rank-scaled bias would lift 101 by kilometres.
+        let (crust, s) = rift_with_ids_between(100);
+        // Placed at 100 Ma, sampling the present-day frame: 101 reads its present position.
+        let sampling = DeepSampling::single_frame(&s, 1, 100.0, 0.0);
+        let rotations: Vec<PlateRotations> = (0..crust.rotations().plate_ids.len() as u32)
+            .map(|p| plate_rotations(crust.rotations(), PlateIndex(p), &sampling))
+            .collect();
+        let dir = RenderDir(DVec3::new(0.0, -0.2, 1.0).normalize());
+        for (low, high) in [(300.0, 500.0), (499.0, 500.0)] {
+            // Plate 202 is fixed, so its samples land at the era direction itself; 101's come
+            // from its rotated source position.
+            let r = rendered_surface(&crust, dir, &sampling, &rotations, |_, d| FrameSample {
+                elevation_m: if (d.0 - dir.0).length() < 1e-9 {
+                    high
+                } else {
+                    low
+                },
+                covered: true,
+            });
+            assert_eq!(
+                r,
+                RenderedSurface::Land {
+                    plate_id: PlateId(202),
+                    elevation_m: high
+                },
+                "{low} vs {high}"
+            );
+        }
     }
 
     /// Two plates on a cube-8 footprint grid: plate 0 (id 202) fixed over `z > 0.3`, plate 1
@@ -530,13 +700,18 @@ mod tests {
     /// from -X onto +Z, over plate 0, and leaves a gap behind. Plate 1's cells with `y > 0`
     /// expire at 50 Ma.
     fn rift() -> (CrustModel, Timeline) {
-        let t = table(
-            &[0.0, 100.0],
-            &[
-                (202, vec![Some(Quat::IDENTITY), Some(Quat::IDENTITY)]),
-                (101, vec![Some(Quat::IDENTITY), Some(about_y(90.0))]),
-            ],
-        );
+        rift_with_ids_between(0)
+    }
+
+    /// [`rift`] with `extra` footprint-less plates whose IDs rank between 101 and 202, so the two
+    /// overlapping plates are far apart in source-ID rank (as in the real bake's 149 plates).
+    fn rift_with_ids_between(extra: u32) -> (CrustModel, Timeline) {
+        let mut plates = vec![
+            (202, vec![Some(Quat::IDENTITY), Some(Quat::IDENTITY)]),
+            (101, vec![Some(Quat::IDENTITY), Some(about_y(90.0))]),
+        ];
+        plates.extend((0..extra).map(|i| (102 + i, vec![Some(Quat::IDENTITY); 2])));
+        let t = table(&[0.0, 100.0], &plates);
         let f = footprints(8, |d| {
             let mut e = Vec::new();
             if d.z > 0.3 {
@@ -560,15 +735,16 @@ mod tests {
         let rotations: Vec<PlateRotations> = (0..2)
             .map(|p| plate_rotations(crust.rotations(), PlateIndex(p), &sampling))
             .collect();
-        let ranks = source_id_ranks(crust.rotations());
-        // Land everywhere in every source frame: 500 m.
+        // Land everywhere in every source frame (500 m), all of it covered by some plate.
         rendered_surface(
             crust,
             RenderDir(dir.normalize()),
             &sampling,
             &rotations,
-            &ranks,
-            |_, _| 500.0,
+            |_, _| FrameSample {
+                elevation_m: 500.0,
+                covered: true,
+            },
         )
     }
 
@@ -605,6 +781,26 @@ mod tests {
             surface_at(&crust, &s, 100.0, DVec3::new(0.0, 0.2, 1.0)),
             land(202)
         );
+        // Uncovered frame land in the gap shows on the ocean shell.
+        let deep = match s.select_frames(100.0) {
+            FrameSelection::Deep(d) => d,
+            other => panic!("{other:?}"),
+        };
+        let sampling = DeepSampling::from_bracket(&s, 100.0, &deep);
+        let rotations: Vec<PlateRotations> = (0..2)
+            .map(|p| plate_rotations(crust.rotations(), PlateIndex(p), &sampling))
+            .collect();
+        let gap = rendered_surface(
+            &crust,
+            RenderDir(-DVec3::X),
+            &sampling,
+            &rotations,
+            |_, _| FrameSample {
+                elevation_m: 500.0,
+                covered: false,
+            },
+        );
+        assert_eq!(gap, RenderedSurface::GapLand { elevation_m: 500.0 });
         // Rigid motion: plate 101's present-day -X sample now sits at +Z.
         let sampling = DeepSampling::single_frame(&s, 2, 100.0, 0.0);
         let q = plate_rotations(crust.rotations(), PlateIndex(1), &sampling)

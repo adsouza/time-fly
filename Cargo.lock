@@ -5567,6 +5567,7 @@ dependencies = [
  "console_error_panic_hook",
  "directories",
  "fd-lock",
+ "half",
  "js-sys",
  "opener",
  "rfd",

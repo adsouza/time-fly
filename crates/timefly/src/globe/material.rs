@@ -25,8 +25,7 @@ use bevy::shader::{ShaderDefVal, ShaderRef};
 use bytemuck::{Pod, Zeroable};
 use timefly_core::geodynamics::{CrustModel, PlateIndex, interval_accepts};
 use timefly_core::globe::{
-    DeepSampling, ELEVATION_EXAGGERATION, OCEAN_GAP_FALLBACK_M, plate_rotations, source_id_ranks,
-    tie_bias_km,
+    DeepSampling, ELEVATION_EXAGGERATION, OCEAN_GAP_FALLBACK_M, plate_rotations, relative_rotation,
 };
 
 pub use timefly_core::globe::EARTH_RADIUS_KM;
@@ -58,7 +57,7 @@ pub const OCEAN_FALLBACK_M: f32 = OCEAN_GAP_FALLBACK_M as f32;
 /// The atmosphere shell's radius relative to the Earth's: above the highest exaggerated peak.
 pub const ATMOSPHERE_RADIUS_FACTOR: f32 = 1.045;
 
-/// One plate as the shader reads it (`Plate` in `globe.wesl`): 64 bytes.
+/// One plate as the shader reads it (`Plate` in `globe.wesl`): 96 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct PlateGpu {
@@ -66,17 +65,17 @@ pub struct PlateGpu {
     pub current: [f32; 4],
     /// Source-frame rotations of the younger and older endpoints.
     pub sources: [[f32; 4]; 2],
+    /// `source * current⁻¹` per endpoint ([`relative_rotation`]): era frame to source frame,
+    /// exactly the identity for a frame shown at its own source age.
+    pub relative: [[f32; 4]; 2],
     pub flags: u32,
-    /// Radial tie bias by source-ID rank (km).
-    pub tie_bias_km: f32,
-    pub _pad: [u32; 2],
+    pub _pad: [u32; 3],
 }
 
 /// Every plate's GPU record for a deep sampling, indexed by plate index.
 pub fn plate_gpu_data(crust: &CrustModel, sampling: &DeepSampling) -> Vec<PlateGpu> {
     let rotations = crust.rotations();
-    let ranks = source_id_ranks(rotations);
-    let count = ranks.len() as u32;
+    let count = rotations.plate_ids.len() as u32;
     (0..count)
         .map(|plate| {
             let r = plate_rotations(rotations, PlateIndex(plate), sampling);
@@ -90,12 +89,16 @@ pub fn plate_gpu_data(crust: &CrustModel, sampling: &DeepSampling) -> Vec<PlateG
                 .filter(|(q, _)| q.is_some())
                 .fold(0, |acc, (_, bit)| acc | bit);
             let array = |q: Option<Quat>| q.unwrap_or(Quat::IDENTITY).normalize().to_array();
+            let current = r.current.unwrap_or(Quat::IDENTITY).normalize();
+            let relative = r.sources.map(|q| {
+                relative_rotation(q.unwrap_or(Quat::IDENTITY).normalize(), current).to_array()
+            });
             PlateGpu {
                 current: array(r.current),
                 sources: r.sources.map(array),
+                relative,
                 flags,
-                tie_bias_km: tie_bias_km(ranks[plate as usize], count) as f32,
-                _pad: [0; 2],
+                _pad: [0; 3],
             }
         })
         .collect()
@@ -130,6 +133,8 @@ pub enum IdPixel {
     Ocean,
     /// A plate piece, by plate index.
     Plate(u32),
+    /// Frame land on the ocean shell in a coverage gap.
+    GapLand,
     /// Anything else: space, the recent globe, or an edge blend.
     Other,
 }
@@ -147,6 +152,9 @@ pub fn decode_plate_id(rgb: [u8; 3]) -> IdPixel {
     let [r, g, b] = rgb.map(linear);
     if b > 0.98 && r < 0.02 && g < 0.02 {
         return IdPixel::Ocean;
+    }
+    if b > 0.98 && g > 0.98 && r < 0.02 {
+        return IdPixel::GapLand;
     }
     if b > 0.02 {
         return IdPixel::Other;
@@ -566,12 +574,17 @@ mod tests {
     }
 
     #[test]
-    fn plate_buffer_carries_the_tie_bias_by_source_id() {
+    fn plate_buffer_carries_exact_relative_rotations() {
         let c = crust(vec![]);
-        let data = plate_gpu_data(&c, &sampling(0.0, [0.0, 0.0]));
-        // Plate 1 (id 100) ranks first and sits higher.
-        assert!(data[1].tie_bias_km > data[0].tie_bias_km);
-        assert_eq!(data[0].tie_bias_km, 0.0);
+        // At the source age the relative rotation is exactly the identity.
+        let data = plate_gpu_data(&c, &sampling(10.0, [10.0, 0.0]));
+        assert_eq!(data[0].relative[0], Quat::IDENTITY.to_array());
+        // Otherwise it takes the current era frame to the source frame.
+        let p = &data[0];
+        let rel = Quat::from_array(p.relative[1]);
+        let via = Quat::from_array(p.sources[1]) * Quat::from_array(p.current).inverse();
+        assert!((rel * Vec3::X - via * Vec3::X).length() < 1e-5);
+        assert_eq!(std::mem::size_of::<PlateGpu>(), 96);
     }
 
     #[test]
@@ -628,6 +641,7 @@ mod tests {
             assert_eq!(decode_plate_id(rgb), IdPixel::Plate(index));
         }
         assert_eq!(decode_plate_id([0, 0, 255]), IdPixel::Ocean);
+        assert_eq!(decode_plate_id([0, 255, 255]), IdPixel::GapLand);
         assert_eq!(decode_plate_id([9, 10, 18]), IdPixel::Other);
     }
 

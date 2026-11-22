@@ -156,10 +156,14 @@ struct Plate {
     current: vec4<f32>,
     source_a: vec4<f32>,
     source_b: vec4<f32>,
+    // source * current^-1: era frame to each endpoint's source frame (exact identity at the
+    // frame's own source age).
+    relative_a: vec4<f32>,
+    relative_b: vec4<f32>,
     flags: u32,
-    tie_bias_km: f32,
     pad_a: u32,
     pad_b: u32,
+    pad_c: u32,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var<storage> plates: array<Plate>;
@@ -200,6 +204,20 @@ fn plate_elevation(plate: Plate, weights: vec2<f32>, p: vec3<f32>) -> f32 {
     if weights.y > 0.0 {
         let d = quat_rotate(plate.source_b, p);
         e += weights.y * (textureSampleLevel(frame_b, sampler_b, d, 0.0).r - params.endpoint.y);
+    }
+    return e;
+}
+
+// plate_elevation for an era-frame direction, through the relative rotations.
+fn era_elevation(plate: Plate, weights: vec2<f32>, d: vec3<f32>) -> f32 {
+    var e = 0.0;
+    if weights.x > 0.0 {
+        let q = quat_rotate(plate.relative_a, d);
+        e += weights.x * (textureSampleLevel(frame_a, sampler_a, q, 0.0).r - params.endpoint.x);
+    }
+    if weights.y > 0.0 {
+        let q = quat_rotate(plate.relative_b, d);
+        e += weights.y * (textureSampleLevel(frame_b, sampler_b, q, 0.0).r - params.endpoint.y);
     }
     return e;
 }
@@ -246,7 +264,7 @@ fn vertex(v: PieceVertex) -> PieceOut {
     if w.x + w.y > 0.0 {
         lift = lift_km(plate_elevation(plate, w, v.position));
     }
-    let radius = params.shape.x + lift + plate.tie_bias_km;
+    let radius = params.shape.x + lift;
     let world_from_local = mesh_functions::get_world_from_local(v.instance_index);
     let world = world_from_local * vec4<f32>(quat_rotate(plate.current, v.position) * radius, 1.0);
     out.world = world.xyz;
@@ -254,12 +272,17 @@ fn vertex(v: PieceVertex) -> PieceOut {
     return out;
 }
 
-// The era-frame direction where this pixel's view ray meets the sea-level sphere: the same for
-// every plate drawn at the pixel, as the CPU reference ranks candidates at one era direction.
-// Falls back to the geometry's own direction where the ray passes above the sphere.
-fn pixel_era_dir(world: vec3<f32>) -> vec3<f32> {
+// The era-frame direction where this pixel's view ray meets the sea-level sphere. The ray comes
+// from the pixel position alone, so every plate drawn at a pixel gets the bit-identical
+// direction, as the CPU reference ranks candidates at one era direction. Falls back to the
+// geometry's own direction where the ray passes above the sphere.
+fn pixel_era_dir(frag: vec4<f32>, world: vec3<f32>) -> vec3<f32> {
+    let uv = (frag.xy - view.viewport.xy) / view.viewport.zw;
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    // Through view space, so the direction never comes from subtracting two far-away points.
+    let near = view.view_from_clip * vec4<f32>(ndc, 1.0, 1.0);
+    let ray = normalize((view.world_from_view * vec4<f32>(near.xyz / near.w, 0.0)).xyz);
     let eye = view.world_position;
-    let ray = normalize(world - eye);
     let b = dot(eye, ray);
     let c = dot(eye, eye) - params.shape.x * params.shape.x;
     let disc = b * b - c;
@@ -269,14 +292,11 @@ fn pixel_era_dir(world: vec3<f32>) -> vec3<f32> {
     return normalize(eye + ray * (-b - sqrt(disc)));
 }
 
-fn quat_conjugate(q: vec4<f32>) -> vec4<f32> {
-    return vec4<f32>(-q.xyz, q.w);
-}
-
-// Reversed-Z depth of the displaced surface at plate-fixed `p` (the plate entity is untransformed).
-fn surface_depth(plate: Plate, p: vec3<f32>, elev: f32) -> f32 {
-    let radius = params.shape.x + lift_km(elev) + plate.tie_bias_km;
-    let clip = view.clip_from_world * vec4<f32>(quat_rotate(plate.current, p) * radius, 1.0);
+// Reversed-Z depth of the displaced surface along era direction `d` (the plate entity is
+// untransformed). Plates at one pixel share `d` and differ only in radius, so equal elevations
+// give equal depths (the draw order breaks the tie) and higher land is always nearer.
+fn surface_depth(d: vec3<f32>, elev: f32) -> f32 {
+    let clip = view.clip_from_world * vec4<f32>(d * (params.shape.x + lift_km(elev)), 1.0);
     return clamp(clip.z / clip.w, 0.0, 1.0);
 }
 
@@ -295,9 +315,9 @@ fn fragment(in: PieceOut) -> PieceFragment {
         discard;
     }
     // Rank overlaps by the elevation at the pixel's common era direction.
-    let p_rank = quat_rotate(quat_conjugate(plate.current), pixel_era_dir(in.world));
-    let elev_rank = plate_elevation(plate, w, p_rank);
-    out.depth = surface_depth(plate, p_rank, select(elev, elev_rank, elev_rank > 0.0));
+    let d_rank = pixel_era_dir(in.clip, in.world);
+    let elev_rank = era_elevation(plate, w, d_rank);
+    out.depth = surface_depth(d_rank, select(elev, elev_rank, elev_rank > 0.0));
     if debug_view() {
         out.color = plate_id_color(in.piece.x);
         return out;
@@ -331,15 +351,24 @@ struct SphereOut {
 }
 
 @if(OCEAN_SHELL) {
-// Geographic bathymetry from the source grids (published frames), blended like the endpoints.
+// timefly_core::globe::ocean_shell_elevation_m: land-valued (or NaN) samples take the shallow
+// gap fallback.
+fn ocean_value(e: f32) -> f32 {
+    return select(params.shape.z, e, e <= 0.0);
+}
+
+// timefly_core::globe::shell_surface_m: per endpoint, a texel the frame's coverage mask (G)
+// marks uncovered keeps its own elevation (gap land shows); a covered one is ocean. Mixed by the
+// older weight; positive is gap land.
 fn shell_elevation(d: vec3<f32>) -> f32 {
     let w = params.endpoint.z;
-    let a = textureSampleLevel(frame_a, sampler_a, d, 0.0).r - params.endpoint.x;
-    let b = textureSampleLevel(frame_b, sampler_b, d, 0.0).r - params.endpoint.y;
-    let e = mix(a, b, w);
-    // timefly_core::globe::ocean_shell_elevation_m: land-valued (or NaN) samples take the
-    // shallow gap fallback.
-    return select(params.shape.z, e, e <= 0.0);
+    let sa = textureSampleLevel(frame_a, sampler_a, d, 0.0).rg;
+    let sb = textureSampleLevel(frame_b, sampler_b, d, 0.0).rg;
+    let ea = sa.x - params.endpoint.x;
+    let eb = sb.x - params.endpoint.y;
+    let a = select(ea, ocean_value(ea), sa.y > 0.5);
+    let b = select(eb, ocean_value(eb), sb.y > 0.5);
+    return mix(a, b, w);
 }
 
 @vertex
@@ -356,11 +385,14 @@ fn vertex(v: SphereVertex) -> SphereOut {
 @fragment
 fn fragment(in: SphereOut) -> @location(0) vec4<f32> {
     let d = normalize(in.dir);
+    let e = shell_elevation(d);
+    let gap_land = e > 0.0;
     if debug_view() {
-        return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+        return select(vec4<f32>(0.0, 0.0, 1.0, 1.0), vec4<f32>(0.0, 1.0, 1.0, 1.0), gap_land);
     }
-    let color = painterly(water_albedo(shell_elevation(d)), d, sun(), d);
-    return vec4<f32>(color, 1.0);
+    // Gap land is drawn flat on the shell, in the land palette.
+    let albedo = select(water_albedo(select(e, params.shape.z, !(e <= 0.0))), land_albedo(e), gap_land);
+    return vec4<f32>(painterly(albedo, d, sun(), d), 1.0);
 }
 }
 

@@ -11,12 +11,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use bevy::math::{Quat, Vec3};
-use timefly_core::cube::dir_to_texel;
 use timefly_core::formats::{Grid, read_tfgrid, read_tfplates, read_tfrot};
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
 use timefly_core::geodynamics::{CrustModel, PlateId, PlateIndex};
 use timefly_core::globe::{
-    DeepSampling, PlateRotations, RenderedSurface, plate_rotations, rendered_surface,
+    DeepSampling, FrameSample, PlateRotations, RenderedSurface, plate_rotations, rendered_surface,
     source_id_ranks,
 };
 use timefly_core::surface::{FrameSelection, Timeline};
@@ -82,10 +81,17 @@ fn dir(lat: f64, lon: f64) -> RenderDir {
     geo_to_render(latlon_to_geo(lat, lon))
 }
 
-/// Nearest-texel elevation (channel R) of a frame grid.
-fn sample(grid: &Grid, d: RenderDir) -> f64 {
-    let (face, col, row) = dir_to_texel(d, grid.height);
-    f64::from(grid.texel_f32(face as usize, row, col, 0))
+/// Seamless bilinear elevation and coverage (channels R and G), as the GPU filters the frame.
+fn sample(grid: &Grid, d: RenderDir) -> FrameSample {
+    let (mut elevation_m, mut coverage) = (0.0, 0.0);
+    for ((face, col, row), w) in timefly_core::cube::bilinear_taps(d, grid.height) {
+        elevation_m += w * f64::from(grid.texel_f32(face as usize, row, col, 0));
+        coverage += w * f64::from(grid.texel_f32(face as usize, row, col, 1));
+    }
+    FrameSample {
+        elevation_m,
+        covered: coverage > 0.5,
+    }
 }
 
 impl Tiny {
@@ -102,9 +108,8 @@ impl Tiny {
         let rotations: Vec<PlateRotations> = (0..plates)
             .map(|p| plate_rotations(self.crust.rotations(), PlateIndex(p), &sampling))
             .collect();
-        let ranks = source_id_ranks(self.crust.rotations());
         let frames = sampling.endpoints.map(|e| e.frame);
-        rendered_surface(&self.crust, d, &sampling, &rotations, &ranks, |e, d| {
+        rendered_surface(&self.crust, d, &sampling, &rotations, |e, d| {
             sample(&self.grids[frames[e]], d)
         })
     }
@@ -117,6 +122,7 @@ impl Tiny {
 fn land_of(s: RenderedSurface) -> Option<u32> {
     match s {
         RenderedSurface::Land { plate_id, .. } => Some(plate_id.0),
+        RenderedSurface::GapLand { .. } => Some(0),
         RenderedSurface::Ocean => None,
     }
 }
@@ -210,8 +216,31 @@ fn write_tfplates(path: &std::path::Path, fp: &timefly_core::geodynamics::PlateF
     fs::write(path, out).unwrap();
 }
 
-/// A copy of the tiny bake whose plate 101 cells north of the equator expire at 250 Ma: at
-/// 200 Ma they draw but only their younger endpoint (0 Ma) is available; at 300 Ma they are hidden.
+/// Rewrites a `.tfgrid` with `edit` applied to its (R, G) texels, keeping its header.
+fn edit_tfgrid(path: &std::path::Path, edit: impl Fn(f32) -> f32) {
+    let bytes = fs::read(path).unwrap();
+    let grid = read_tfgrid(&bytes).unwrap();
+    let mut data = grid.data.clone();
+    for (i, word) in data.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        if i % usize::from(grid.channels) == 0 {
+            let v = half::f16::from_le_bytes(*word).to_f32();
+            *word = half::f16::from_f32(edit(v)).to_le_bytes();
+        }
+    }
+    let z =
+        ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest);
+    let mut out = bytes[..20].to_vec();
+    out.extend_from_slice(&(z.len() as u32).to_le_bytes());
+    out.extend_from_slice(&z);
+    fs::write(path, out).unwrap();
+}
+
+/// A variant of the tiny bake:
+/// - plate 101's cells north of the equator expire at 250 Ma, so at 200 Ma they draw with only
+///   their younger endpoint (0 Ma) available and at 300 and 400 Ma they are hidden;
+/// - plate 202's flat 300 m land (and the 540 Ma overlap, also 300 m) is raised to 1500 m, so
+///   between frames plate 202 (higher source ID) has the higher land in the overlap and must
+///   win, while at 540 Ma both plates sample the same 1500 m and tie (lower ID wins).
 fn tiny_with_expiry() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("globe_fixture-expiry-{}", std::process::id()));
@@ -242,7 +271,40 @@ fn tiny_with_expiry() -> PathBuf {
         }
     }
     write_tfplates(&globe.join("plates.tfplates"), &fp);
+    for frame in ["f0001.tfgrid", "f0002.tfgrid"] {
+        edit_tfgrid(&globe.join("frames").join(frame), |v| {
+            if (280.0..=320.0).contains(&v) {
+                v + 1200.0
+            } else {
+                v
+            }
+        });
+    }
     root
+}
+
+impl Tiny {
+    /// The plates with visible land at an era direction, as `(plate index, land m)`.
+    fn land_candidates(&self, age_myr: f64, d: RenderDir) -> Vec<(u32, f64)> {
+        let sampling = self.sampling(age_myr);
+        let frames = sampling.endpoints.map(|e| e.frame);
+        let mut out = Vec::new();
+        self.crust.resolve(d, age_myr, |c| {
+            let rotations = plate_rotations(self.crust.rotations(), c.plate_index, &sampling);
+            if let Some(land) = timefly_core::globe::plate_land_m(
+                self.crust.footprints(),
+                c.plate_index,
+                &rotations,
+                c.plate_fixed_dir,
+                &sampling,
+                |e, d| sample(&self.grids[frames[e]], d).elevation_m,
+            ) {
+                out.push((c.plate_index.0, land));
+            }
+            None
+        });
+        out
+    }
 }
 
 /// Lat/lon grid directions (render frame) over the fixture's plates.
@@ -281,21 +343,24 @@ fn shader_matches_the_cpu_reference_on_the_two_plate_fixture() {
             RenderedSurface::Land { plate_id, .. } => {
                 Some(t.crust.rotations().index_of(plate_id).unwrap().0)
             }
+            RenderedSurface::GapLand { .. } => Some(timefly::globe::capture::GAP_LAND_ID),
             RenderedSurface::Ocean => None,
         }
     };
-    // One footprint cell at cube size 8.
-    let tolerance = (90.0f32 / 8.0).to_radians();
+    // 0.6 of a footprint cell at cube size 8: covers nearest (CPU) vs bilinear (GPU) sampling,
+    // and leaves the overlaps' interiors comparable.
+    let tolerance = (0.6 * 90.0f32 / 8.0).to_radians();
     let max_angle = 60f32.to_radians();
-    let dirs = grid_dirs(2.0);
+    let dirs = grid_dirs(1.0);
     let distance = 3.0 * timefly_core::globe::EARTH_RADIUS_KM;
 
     // The cases the ages are meant to exercise hold in the CPU reference.
     let north101 = dir(20.0, -35.0).0.as_vec3();
     assert_eq!(cpu_plate(0.03)(north101), Some(p101));
-    assert_eq!(
+    // Expired: plate 101 is hidden (the shell may show frame land or ocean there).
+    assert_ne!(
         cpu_plate(300.0)(dir(20.0, -10.0).0.as_vec3()),
-        None,
+        Some(p101),
         "expired, hidden"
     );
     assert_eq!(cpu_plate(300.0)(dir(-20.0, -10.0).0.as_vec3()), Some(p101));
@@ -304,10 +369,17 @@ fn shader_matches_the_cpu_reference_on_the_two_plate_fixture() {
         Some(p101),
         "overlap tie"
     );
+    assert_eq!(
+        cpu_plate(400.0)(dir(-15.0, 8.0).0.as_vec3()),
+        Some(p202),
+        "higher land beats the lower source ID"
+    );
 
     let mut session = CaptureSession::new(&root, (480, 480), true).expect("session");
     let mut total = ParityStats::default();
-    for age_myr in [0.03, 200.0, 300.0, 540.0] {
+    let mut ties_compared = 0;
+    let mut higher_id_wins_compared = 0;
+    for age_myr in [0.03, 200.0, 300.0, 400.0, 540.0] {
         let shot = session
             .shoot(age_myr * 1e6, (0.0, -10.0), distance)
             .expect("capture");
@@ -355,11 +427,34 @@ fn shader_matches_the_cpu_reference_on_the_two_plate_fixture() {
         if age_myr != 300.0 {
             assert!(seen(Some(p202)), "{age_myr} Ma");
         }
+        for &d in &stats.compared_dirs {
+            let c = t.land_candidates(age_myr, RenderDir(d.as_dvec3().normalize()));
+            if c.len() == 2 {
+                let (a, b) = (c[0], c[1]);
+                if age_myr == 540.0 && a.1 == b.1 {
+                    ties_compared += 1;
+                }
+                let winner = if a.1 >= b.1 { a } else { b };
+                if winner.0 == p202 && a.1 != b.1 {
+                    higher_id_wins_compared += 1;
+                }
+            }
+        }
         total.add(&stats);
     }
     println!(
-        "verification view total: {} compared, {} agree",
+        "verification view total: {} compared, {} agree; exact ties compared at 540 Ma: \
+         {ties_compared}; overlaps won by the higher land of the higher source ID: \
+         {higher_id_wins_compared}",
         total.compared, total.plate_agree
+    );
+    assert!(
+        ties_compared >= 20,
+        "exact-tie overlap directions actually compared"
+    );
+    assert!(
+        higher_id_wins_compared >= 10,
+        "higher-land-wins overlap directions compared"
     );
     drop(session);
 
