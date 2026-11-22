@@ -1,0 +1,3 @@
+filename,map_number,label,timeline_age_myr,source_rotation_age_myr,notes
+Map01_tiny_0Ma.nc,1,Present-day (tiny),0.03,0,bridge frame
+Map88_tiny_540Ma.nc,88,540 Ma (tiny),540,540,terminal frame

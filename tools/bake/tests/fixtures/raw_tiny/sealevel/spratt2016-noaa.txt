@@ -1,0 +1,13 @@
+# Global Sea Level Reconstruction using Stacked Records from 0-800 ka (TINY TEST FIXTURE)
+#   Time_Unit: cal yr BP
+## age_calkaBP	age,,,calendar kiloyear before present,,paleoceanography,,,N,
+## SeaLev_shortPC1	sea level,delta 18O,,meter,,,,,N,
+## SeaLev_longPC1	sea level,delta 18O,,meter,,,,,N,meters above modern sea level
+# Missing_Value: NaN
+age_calkaBP	SeaLev_shortPC1	SeaLev_shortPC1_err_sig	SeaLev_longPC1	SeaLev_longPC1_err_sig
+2	-1.55	1.0	-1.8	2.0
+0	0.75	1.0	0.5	2.0
+1	-1.25	1.0	-1.5	2.0
+30	NaN	1.0	-80	2.0
+31	NaN	1.0	-82.5	2.0
+29	NaN	1.0	-78	2.0
