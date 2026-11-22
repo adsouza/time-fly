@@ -76,7 +76,8 @@ jobs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
     env:
       # Line tables stay in the binary for panic backtraces (release profile unchanged); zlib
-      # compression of the debug sections keeps the binary and packages small. mold links.
+      # compression of the debug sections keeps the binary and packages small. Linking uses
+      # rustc's default on this target since Rust 1.90, the bundled rust-lld (mold-class speed).
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
     steps:
       - uses: actions/checkout@v7
@@ -91,8 +92,6 @@ jobs:
 
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustc --version
-
-      - uses: rui314/setup-mold@v1
 
       # Keyed on Cargo.lock, the toolchain file and RUST*/CARGO* env; TIMEFLY_GIT_SHA is not
       # part of the key and only reruns the timefly build script.
@@ -130,8 +129,8 @@ jobs:
         run: |
           cargo build --locked --release -p timefly 2>&1 | tee ci-logs/cargo-build.txt
           ls -l target/release/timefly
-          readelf -p .comment target/release/timefly | grep -i mold
-          readelf -SW target/release/timefly | grep -E ' \.debug_(line|info) ' || true
+          readelf -p .comment target/release/timefly | grep -iE 'lld|mold|GNU ld' || true
+          readelf -SW target/release/timefly | grep -E ' \.(text|rodata|debug_[a-z]+) ' || true
 
       - name: Smoke test the binary (headless probes, backtrace has file:line)
         run: |
