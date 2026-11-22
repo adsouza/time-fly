@@ -19,6 +19,9 @@ pub enum ProbeMode {
     Error,
     /// Exits cleanly.
     Clean,
+    /// Ends the `App` with `AppExit::Error`, as Bevy does after a render-thread panic or a
+    /// wgpu error.
+    ErrorExit,
 }
 
 impl ProbeMode {
@@ -29,6 +32,7 @@ impl ProbeMode {
             "abort" => Self::Abort,
             "error" => Self::Error,
             "clean" => Self::Clean,
+            "error-exit" => Self::ErrorExit,
             _ => return None,
         })
     }
@@ -67,8 +71,8 @@ fn log_probe_events(mode: ProbeMode) {
     }
 }
 
-fn probe_system(mode: ProbeMode) -> impl FnMut(Local<bool>) {
-    move |mut done: Local<bool>| {
+fn probe_system(mode: ProbeMode) -> impl FnMut(Local<bool>, MessageWriter<AppExit>) {
+    move |mut done: Local<bool>, mut exit: MessageWriter<AppExit>| {
         if std::mem::replace(&mut *done, true) {
             return;
         }
@@ -76,6 +80,9 @@ fn probe_system(mode: ProbeMode) -> impl FnMut(Local<bool>) {
         match mode {
             ProbeMode::Panic => panic!("diagnostics probe: panic before the window opens"),
             ProbeMode::Error => error!("diagnostics probe: error"),
+            ProbeMode::ErrorExit => {
+                exit.write(AppExit::error());
+            }
             ProbeMode::Abort | ProbeMode::Clean | ProbeMode::PanicAfterFrame => {}
         }
     }
@@ -93,6 +100,7 @@ pub fn run_headless_probe(session: Session, mode: ProbeMode) -> AppExit {
     for _ in 0..3 {
         app.update();
     }
+    let exit = app.should_exit().unwrap_or(AppExit::Success);
     drop(app);
     if mode == ProbeMode::Abort {
         // Write out what was logged, then die without unwinding or marking the session clean.
@@ -102,9 +110,13 @@ pub fn run_headless_probe(session: Session, mode: ProbeMode) -> AppExit {
             session.flush_logs();
         }
         #[cfg(target_arch = "wasm32")]
-        super::session::web::save_log(&session.shared);
+        if let Err(e) = super::session::web::save_log(&session.shared) {
+            session
+                .shared
+                .eprint(&format!("Time Fly: could not save the log: {e}"));
+        }
         std::process::abort();
     }
-    session.finish();
-    AppExit::Success
+    session.finish(&exit);
+    exit
 }

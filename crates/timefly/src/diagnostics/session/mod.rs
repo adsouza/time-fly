@@ -129,7 +129,8 @@ pub enum PreviousOutcome {
 /// The crash-detection truth table (spec §20).
 ///
 /// A session still marked `Running` whose lock is free has crashed or been killed; one whose
-/// lock is held is another instance that is still running.
+/// lock is held is another instance that is still running. A crash report always means a crash,
+/// even if the record says `Clean` (defence in depth against a status written after a panic).
 pub fn previous_outcome(
     record: Option<&SessionRecord>,
     lock_free: bool,
@@ -143,12 +144,26 @@ pub fn previous_outcome(
         has_crash_report,
     };
     match record.status {
-        SessionStatus::Clean => PreviousOutcome::Clean,
+        SessionStatus::Clean if !has_crash_report => PreviousOutcome::Clean,
         SessionStatus::Running if !lock_free => PreviousOutcome::OtherInstanceRunning,
-        SessionStatus::Running | SessionStatus::Crashed { .. } if record.acknowledged => {
-            PreviousOutcome::Nothing
+        _ if record.acknowledged => PreviousOutcome::Nothing,
+        SessionStatus::Clean | SessionStatus::Running | SessionStatus::Crashed { .. } => crashed,
+    }
+}
+
+/// The status a session ends with when the `App` returns.
+///
+/// Only a running session that exits successfully is clean. A crash recorded earlier (a panic
+/// that Bevy caught, for example on the render thread) is never downgraded, and an error exit
+/// (render-thread panic, wgpu validation error, out of memory, lost device) is a crash without
+/// a panic report, so the next launch shows the notice.
+pub fn finish_status(current: SessionStatus, exit: &bevy::app::AppExit) -> SessionStatus {
+    match (current, exit) {
+        (SessionStatus::Crashed { panicked }, _) => SessionStatus::Crashed { panicked },
+        (_, bevy::app::AppExit::Error(_)) => SessionStatus::Crashed { panicked: false },
+        (SessionStatus::Running | SessionStatus::Clean, bevy::app::AppExit::Success) => {
+            SessionStatus::Clean
         }
-        SessionStatus::Running | SessionStatus::Crashed { .. } => crashed,
     }
 }
 
@@ -290,6 +305,18 @@ pub const RECORD_FILE: &str = "session.json";
 pub const LOCK_FILE: &str = "session.lock";
 pub const LOG_FILE: &str = "session.log";
 pub const CRASH_FILE: &str = "crash.txt";
+/// Crash reports kept per session: the first panic's report is the one that matters, later
+/// ones go to `crash-2.txt` and so on.
+pub const MAX_CRASH_REPORTS: usize = 5;
+
+/// `crash.txt` for the first report, `crash-<n>.txt` after that.
+pub fn crash_file_name(n: usize) -> String {
+    if n <= 1 {
+        CRASH_FILE.to_string()
+    } else {
+        format!("crash-{n}.txt")
+    }
+}
 
 /// The log that best explains a crashed session: the crash report if there is one.
 pub fn crash_log_path(session_dir: &Path, has_crash_report: bool) -> PathBuf {
@@ -478,6 +505,44 @@ mod tests {
         assert_eq!(
             previous_outcome(Some(&record(S::Running, true, true)), true, false),
             O::Nothing
+        );
+    }
+
+    #[test]
+    fn outcome_clean_with_a_crash_report_is_a_crash() {
+        assert_eq!(
+            previous_outcome(Some(&record(S::Clean, true, false)), true, true),
+            O::Crashed {
+                during_startup: false,
+                has_crash_report: true
+            }
+        );
+        assert_eq!(
+            previous_outcome(Some(&record(S::Clean, true, true)), true, true),
+            O::Nothing
+        );
+    }
+
+    #[test]
+    fn finish_status_only_cleans_a_running_success() {
+        use bevy::app::AppExit;
+        let error = AppExit::error();
+        assert_eq!(finish_status(S::Running, &AppExit::Success), S::Clean);
+        // Crashed, then `run()` returned: never downgraded.
+        for exit in [&AppExit::Success, &error] {
+            assert_eq!(
+                finish_status(S::Crashed { panicked: true }, exit),
+                S::Crashed { panicked: true }
+            );
+            assert_eq!(
+                finish_status(S::Crashed { panicked: false }, exit),
+                S::Crashed { panicked: false }
+            );
+        }
+        // Render-thread panic, wgpu error: `run()` returns `AppExit::Error`.
+        assert_eq!(
+            finish_status(S::Running, &error),
+            S::Crashed { panicked: false }
         );
     }
 

@@ -5,9 +5,9 @@ edition = "2024"
 
 [features]
 default = ["system-spans"]
-# Bevy's `trace` feature wraps every system and schedule in a span (spec §20). Task 10 measures
-# its cost.
-system-spans = ["bevy/trace"]
+# Bevy's `trace` feature wraps every system and schedule in a span (spec §20); `debug` gives the
+# spans their system names. Task 10 measures the cost.
+system-spans = ["bevy/trace", "bevy/debug"]
 
 [dependencies]
 bevy = { version = "0.20", features = ["ktx2", "zstd_rust", "bevy_ui_widgets"] }

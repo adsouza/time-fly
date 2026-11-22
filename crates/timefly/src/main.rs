@@ -23,6 +23,6 @@ fn main() -> AppExit {
         return diagnostics::run_headless_probe(session, mode);
     }
     let exit = timefly::app(&session).run();
-    session.finish();
+    session.finish(&exit);
     exit
 }

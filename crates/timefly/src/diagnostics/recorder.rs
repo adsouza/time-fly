@@ -184,7 +184,11 @@ impl RecorderLayer {
     #[cfg(target_arch = "wasm32")]
     fn dump(&self, _events: &[String]) {
         // The web saves the whole recorder to localStorage instead.
-        super::session::web::save_log(&self.shared);
+        // Not `warn!`: this runs inside a log layer.
+        if let Err(e) = super::session::web::save_log(&self.shared) {
+            self.shared
+                .eprint(&format!("Time Fly: could not save the log: {e}"));
+        }
     }
 }
 

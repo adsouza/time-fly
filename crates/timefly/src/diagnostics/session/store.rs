@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 
 use super::*;
-use crate::diagnostics::report::{Home, redact};
+use crate::diagnostics::report::{Home, RedactingWriter};
 use crate::diagnostics::{Findings, KEEP_SESSIONS};
 
 /// Names of the session directories in `root`, in no particular order.
@@ -91,23 +91,23 @@ pub fn prune(root: &Path, keep: usize, current: &str) -> (Vec<String>, Vec<Strin
     (pruned, problems)
 }
 
-/// Writes each buffer with the home directory replaced by `~`. The log worker hands it one
-/// formatted event per write.
-pub struct RedactingWriter<W> {
-    inner: W,
-    home: Home,
-}
-
-impl<W: Write> Write for RedactingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner
-            .write_all(redact(&String::from_utf8_lossy(buf), &self.home).as_bytes())?;
-        Ok(buf.len())
+/// Writes a crash report without overwriting an earlier one: `crash.txt`, then `crash-2.txt` …
+/// up to [`MAX_CRASH_REPORTS`]. `create_new` also keeps simultaneous panics from interleaving.
+pub fn write_crash_report(dir: &Path, report: &str) -> io::Result<PathBuf> {
+    for n in 1..=MAX_CRASH_REPORTS {
+        let path = dir.join(crash_file_name(n));
+        match File::options().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(report.as_bytes())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
+    Err(io::Error::other(format!(
+        "{MAX_CRASH_REPORTS} crash reports already saved"
+    )))
 }
 
 fn log_root_env() -> LogRootEnv {
@@ -178,10 +178,7 @@ pub fn open(
     let (writer, guard) = NonBlockingBuilder::default()
         .lossy(false)
         .thread_name("timefly-log")
-        .finish(RedactingWriter {
-            inner: file,
-            home: home.clone(),
-        });
+        .finish(RedactingWriter::new(file, home.clone()));
     (findings, Some(writer), Some(guard))
 }
 

@@ -11,9 +11,11 @@ use std::path::PathBuf;
 
 use bevy::prelude::*;
 
-use super::Shared;
+use std::sync::Arc;
+
 use super::report::{redact, report_url};
 use super::session::{PreviousOutcome, PreviousSession};
+use super::{DiagnosticsHandle, Shared};
 
 /// The notice text.
 pub fn notice_text(log_location: &str) -> String {
@@ -83,20 +85,25 @@ impl PendingNotice {
         report_url(&self.session_id, &self.platform_summary)
     }
 
-    /// Marks the previous session's crash as answered.
-    pub fn acknowledge(&self) {
+    /// Marks the previous session's crash as answered. Problems go to [`Shared::problem`],
+    /// which works before the log subscriber exists (the system dialog runs then).
+    pub(crate) fn acknowledge(&self, shared: &Shared) {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Err(e) = super::session::store::acknowledge(&self.previous_dir) {
-            warn!("could not mark the previous session acknowledged: {e}");
-        }
+        let result =
+            super::session::store::acknowledge(&self.previous_dir).map_err(|e| e.to_string());
         #[cfg(target_arch = "wasm32")]
-        super::session::web::acknowledge(&self.session_id);
+        let result = super::session::web::acknowledge(&self.session_id);
+        if let Err(e) = result {
+            shared.problem(format!(
+                "could not mark the previous session acknowledged: {e}"
+            ));
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn show_log(&self) {
+    fn show_log(&self, shared: &Shared) {
         if let Err(e) = opener::reveal(&self.log_path) {
-            warn!("could not show the log: {e}");
+            shared.problem(format!("could not show the log: {e}"));
         }
     }
 }
@@ -104,7 +111,7 @@ impl PendingNotice {
 /// Runs in `diagnostics::start`, before the `App` exists. Prints the notice to stderr, shows
 /// the system dialog (native, crash before the first frame) or the HTML overlay (web), and
 /// returns how it was shown plus the notice still to show in game, if any.
-pub(crate) fn before_app(shared: &Shared) -> (NoticeRoute, Option<PendingNotice>) {
+pub(crate) fn before_app(shared: &Arc<Shared>) -> (NoticeRoute, Option<PendingNotice>) {
     let Some(previous) = shared.findings.previous.as_ref() else {
         return (NoticeRoute::None, None);
     };
@@ -112,12 +119,15 @@ pub(crate) fn before_app(shared: &Shared) -> (NoticeRoute, Option<PendingNotice>
         return (NoticeRoute::None, None);
     };
     let pending = PendingNotice::new(shared, previous);
-    eprintln!("{}", pending.text);
+    shared.eprint(&pending.text);
 
     #[cfg(not(target_arch = "wasm32"))]
     {
         // Probes are for tests and manual checks; a blocking dialog would hang them.
-        if during_startup && shared.args.diagnostics_probe.is_none() && show_dialog(&pending) {
+        if during_startup
+            && shared.args.diagnostics_probe.is_none()
+            && show_dialog(shared, &pending)
+        {
             return (NoticeRoute::Dialog, None);
         }
         (NoticeRoute::InGame, Some(pending))
@@ -133,7 +143,7 @@ pub(crate) fn before_app(shared: &Shared) -> (NoticeRoute, Option<PendingNotice>
 /// The system dialog. Returns whether the player answered it; `false` means it couldn't open
 /// and the in-game notice should be shown instead.
 #[cfg(not(target_arch = "wasm32"))]
-fn show_dialog(pending: &PendingNotice) -> bool {
+fn show_dialog(shared: &Shared, pending: &PendingNotice) -> bool {
     use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
     const SHOW_LOG: &str = "Show log";
     const NOT_NOW: &str = "Not now";
@@ -148,15 +158,15 @@ fn show_dialog(pending: &PendingNotice) -> bool {
         .show();
     match result {
         MessageDialogResult::Custom(label) if label == SHOW_LOG => {
-            pending.show_log();
-            pending.acknowledge();
+            pending.show_log(shared);
+            pending.acknowledge(shared);
             true
         }
         // On Linux without a portal the dialog can fail and report `Cancel`; fall through to
         // the in-game notice there.
         MessageDialogResult::Cancel if cfg!(target_os = "linux") => false,
         _ => {
-            pending.acknowledge();
+            pending.acknowledge(shared);
             true
         }
     }
@@ -272,9 +282,10 @@ fn spawn_notice(
                                 bevy::ui_widgets::observe(
                                     move |_: On<bevy::ui_widgets::Activate>,
                                           notice: Res<InGameNotice>,
+                                          handle: Res<DiagnosticsHandle>,
                                           roots: Query<Entity, With<NoticeRoot>>,
                                           mut commands: Commands| {
-                                        on_button(kind, &notice.0, &roots, &mut commands);
+                                        on_button(kind, &notice.0, &handle.0, &roots, &mut commands);
                                     },
                                 ),
                                 children![(Text::new(kind.label()), TextColor(TEXT))],
@@ -289,15 +300,16 @@ fn spawn_notice(
 fn on_button(
     kind: NoticeButton,
     notice: &PendingNotice,
+    shared: &Shared,
     roots: &Query<Entity, With<NoticeRoot>>,
     commands: &mut Commands,
 ) {
     info!(button = ?kind, "crash notice button");
-    notice.acknowledge();
+    notice.acknowledge(shared);
     match kind {
         #[cfg(not(target_arch = "wasm32"))]
-        NoticeButton::ShowLog => notice.show_log(),
-        NoticeButton::Report => open_report_page(&notice.report_url()),
+        NoticeButton::ShowLog => notice.show_log(shared),
+        NoticeButton::Report => open_report_page(shared, &notice.report_url()),
         NoticeButton::Dismiss => {
             for entity in roots {
                 commands.entity(entity).despawn();
@@ -307,14 +319,19 @@ fn on_button(
     }
 }
 
-fn open_report_page(url: &str) {
+fn open_report_page(shared: &Shared, url: &str) {
     #[cfg(not(target_arch = "wasm32"))]
-    if let Err(e) = opener::open(url) {
-        warn!("could not open the report page: {e}");
-    }
+    let result = opener::open(url).map_err(|e| e.to_string());
     #[cfg(target_arch = "wasm32")]
-    if let Some(window) = web_sys::window() {
-        let _ = window.open_with_url_and_target(url, "_blank");
+    let result = web_sys::window()
+        .ok_or_else(|| "no window".to_string())
+        .and_then(|w| {
+            w.open_with_url_and_target(url, "_blank")
+                .map_err(|_| "blocked".to_string())
+        })
+        .map(|_| ());
+    if let Err(e) = result {
+        shared.problem(format!("could not open the report page: {e}"));
     }
 }
 
@@ -324,6 +341,8 @@ mod web {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::closure::Closure;
     use web_sys::{Document, Element, HtmlElement};
+
+    use std::sync::Arc;
 
     use super::super::Shared;
     use super::super::session::web::{crash_key, get, log_key};
@@ -382,13 +401,14 @@ mod web {
         Some(button)
     }
 
-    pub(super) fn show_overlay(_shared: &Shared, pending: PendingNotice) {
-        if build(pending).is_none() {
-            bevy::log::warn!("could not show the crash notice overlay");
+    /// Runs before the log subscriber exists, so a failure goes to [`Shared::problem`].
+    pub(super) fn show_overlay(shared: &Arc<Shared>, pending: PendingNotice) {
+        if build(shared, pending).is_none() {
+            shared.problem("could not show the crash notice overlay".to_string());
         }
     }
 
-    fn build(pending: PendingNotice) -> Option<()> {
+    fn build(shared: &Arc<Shared>, pending: PendingNotice) -> Option<()> {
         let document = web_sys::window()?.document()?;
         let overlay = element(&document, "div", OVERLAY_STYLE)?;
         let panel = element(&document, "div", PANEL_STYLE)?;
@@ -396,25 +416,24 @@ mod web {
         text.set_text_content(Some(&pending.text));
         let row = element(&document, "div", ROW_STYLE)?;
 
-        let p = pending.clone();
+        let (p, sh) = (pending.clone(), shared.clone());
         let doc = document.clone();
         let download_log = button(&document, "Download log", move || {
-            p.acknowledge();
-            let _ = download(
-                &doc,
-                &format!("timefly-{}.log", p.session_id),
-                &log_text(&p.session_id),
-            );
+            p.acknowledge(&sh);
+            let name = format!("timefly-{}.log", p.session_id);
+            if download(&doc, &name, &log_text(&p.session_id)).is_none() {
+                sh.problem("could not download the log".to_string());
+            }
         })?;
-        let p = pending.clone();
+        let (p, sh) = (pending.clone(), shared.clone());
         let report = button(&document, "Report problem", move || {
-            p.acknowledge();
-            open_report_page(&p.report_url());
+            p.acknowledge(&sh);
+            open_report_page(&sh, &p.report_url());
         })?;
-        let p = pending;
+        let (p, sh) = (pending, shared.clone());
         let o = overlay.clone();
         let dismiss = button(&document, "Dismiss", move || {
-            p.acknowledge();
+            p.acknowledge(&sh);
             o.remove();
         })?;
         for b in [&download_log, &report, &dismiss] {

@@ -133,6 +133,24 @@ fn abort_is_detected_without_report() {
 }
 
 #[test]
+fn error_exit_is_a_crash() {
+    // Bevy returns `AppExit::Error` from `run()` after a render-thread panic or a wgpu error.
+    let root = log_root("error-exit");
+    let out = probe(&root, "error-exit");
+    assert!(!out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        inspect_newest_session(&root).expect("a session").outcome,
+        PreviousOutcome::Crashed {
+            during_startup: true,
+            has_crash_report: false
+        }
+    );
+    let log = read(&only_session(&root).join("session.log"));
+    assert!(log.contains("the app exited with an error"), "{log}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn clean_exit_is_not_a_crash() {
     let root = log_root("clean");
     let out = probe(&root, "clean");

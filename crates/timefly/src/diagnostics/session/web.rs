@@ -7,7 +7,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 
 use super::*;
-use crate::diagnostics::{DiagnosticsHandle, Findings, Shared, lock};
+use crate::diagnostics::{DiagnosticsHandle, Findings, HOOK_LOCK_WAIT, Shared, try_lock_for};
 
 /// Web sessions kept.
 const KEEP_WEB_SESSIONS: usize = 3;
@@ -33,12 +33,13 @@ pub fn get(key: &str) -> Option<String> {
     storage()?.get_item(key).ok()?
 }
 
-pub fn set(key: &str, value: &str) {
-    if let Some(storage) = storage()
-        && storage.set_item(key, value).is_err()
-    {
-        warn!(key, "could not save to localStorage");
-    }
+/// Stores `value`. Errors (no storage, quota exceeded) are returned for the caller to report:
+/// some callers run before the log subscriber exists.
+pub fn set(key: &str, value: &str) -> Result<(), String> {
+    storage()
+        .ok_or_else(|| "localStorage is unavailable".to_string())?
+        .set_item(key, value)
+        .map_err(|_| format!("could not save {key} to localStorage"))
 }
 
 fn remove(key: &str) {
@@ -57,17 +58,16 @@ pub fn read_record(id: &str) -> Option<SessionRecord> {
     serde_json::from_str(&get(&record_key(id))?).ok()
 }
 
-pub fn save_record(record: &SessionRecord) {
-    if let Ok(json) = serde_json::to_string(record) {
-        set(&record_key(&record.id), &json);
-    }
+pub fn save_record(record: &SessionRecord) -> Result<(), String> {
+    let json = serde_json::to_string(record).map_err(|e| e.to_string())?;
+    set(&record_key(&record.id), &json)
 }
 
-pub fn acknowledge(id: &str) {
-    if let Some(mut record) = read_record(id) {
-        record.acknowledged = true;
-        save_record(&record);
-    }
+pub fn acknowledge(id: &str) -> Result<(), String> {
+    let mut record =
+        read_record(id).ok_or_else(|| format!("no readable record for session {id}"))?;
+    record.acknowledged = true;
+    save_record(&record)
 }
 
 /// Inspects the previous web session, registers this one and keeps the newest three.
@@ -94,10 +94,13 @@ pub fn open(record: &SessionRecord) -> Findings {
         }
         findings.pruned.push(old);
     }
-    if let Ok(json) = serde_json::to_string(&ids) {
-        set(SESSIONS_KEY, &json);
+    let saved = serde_json::to_string(&ids)
+        .map_err(|e| e.to_string())
+        .and_then(|json| set(SESSIONS_KEY, &json))
+        .and_then(|()| save_record(record));
+    if let Err(e) = saved {
+        findings.problems.push(e);
     }
-    save_record(record);
     findings
 }
 
@@ -114,16 +117,19 @@ pub fn newest_bytes(text: &str, max: usize) -> &str {
     tail.find('\n').map_or(tail, |i| &tail[i + 1..])
 }
 
-/// Saves the flight recorder (newest 1 MiB, redacted) for this session.
-pub fn save_log(shared: &Shared) {
+/// Saves the flight recorder (newest 1 MiB, redacted) for this session. Skips quietly when a
+/// lock is busy (the next save catches up); returns storage errors.
+pub fn save_log(shared: &Shared) -> Result<(), String> {
     let Ok(recorder) = shared.recorder.try_lock() else {
-        return;
+        return Ok(());
     };
     let text = recorder.snapshot().join("\n");
     drop(recorder);
-    let id = lock(&shared.record).id.clone();
+    let Some(id) = try_lock_for(&shared.record, HOOK_LOCK_WAIT).map(|r| r.id.clone()) else {
+        return Ok(());
+    };
     let text = crate::diagnostics::report::redact(&text, &shared.home);
-    set(&log_key(&id), newest_bytes(&text, MAX_LOG_BYTES));
+    set(&log_key(&id), newest_bytes(&text, MAX_LOG_BYTES))
 }
 
 /// Every 2 s while running.
@@ -133,8 +139,10 @@ pub fn save_log_periodically(
     mut timer: Local<Option<Timer>>,
 ) {
     let timer = timer.get_or_insert_with(|| Timer::from_seconds(2.0, TimerMode::Repeating));
-    if timer.tick(time.delta()).just_finished() {
-        save_log(&handle.0);
+    if timer.tick(time.delta()).just_finished()
+        && let Err(e) = save_log(&handle.0)
+    {
+        handle.0.problem(e);
     }
 }
 
@@ -145,7 +153,9 @@ pub fn install_pagehide(shared: Arc<Shared>) {
         return;
     };
     let callback = Closure::<dyn FnMut()>::new(move || {
-        save_log(&shared);
+        if let Err(e) = save_log(&shared) {
+            shared.problem(e);
+        }
         let Ok(record) = shared.record.try_lock() else {
             return;
         };
@@ -155,7 +165,9 @@ pub fn install_pagehide(shared: Arc<Shared>) {
             && stored.status == SessionStatus::Running
         {
             stored.status = SessionStatus::Clean;
-            save_record(&stored);
+            if let Err(e) = save_record(&stored) {
+                shared.problem(e);
+            }
         }
     });
     let _ = window.add_event_listener_with_callback("pagehide", callback.as_ref().unchecked_ref());

@@ -13,7 +13,9 @@ pub mod report;
 pub mod session;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::time::Duration;
 
 use bevy::diagnostic::FrameCount;
 use bevy::log::tracing_subscriber::{EnvFilter, Layer as _};
@@ -35,6 +37,9 @@ use session::{
 
 /// Session directories kept on native (spec §20).
 pub const KEEP_SESSIONS: usize = 10;
+
+/// How long the panic hook waits for a lock another thread holds.
+pub(crate) const HOOK_LOCK_WAIT: Duration = Duration::from_millis(200);
 
 /// Last known game state, for crash reports. Systems write this resource; it is copied to the
 /// panic hook's copy only when it changes. Later tasks fill in their fields.
@@ -108,6 +113,10 @@ pub(crate) struct Shared {
     /// showed a notice.
     pub pending_notice: Mutex<Option<PendingNotice>>,
     pub notice_route: Mutex<NoticeRoute>,
+    /// Problems found before the log subscriber existed; `DiagnosticsPlugin` logs them.
+    pub problems: Mutex<Vec<String>>,
+    /// Set once `DiagnosticsPlugin` has logged the findings: problems go straight to `warn!`.
+    pub logging_ready: AtomicBool,
     #[cfg(not(target_arch = "wasm32"))]
     pub log_writer: Option<tracing_appender::non_blocking::NonBlocking>,
 }
@@ -117,27 +126,81 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Tries to lock a mutex for up to `wait`, ignoring poisoning. For the panic hook: another
+/// thread holding the lock briefly is waited for, but a lock held by the panicking thread
+/// itself gives up instead of deadlocking.
+pub(crate) fn try_lock_for<T>(mutex: &Mutex<T>, wait: Duration) -> Option<MutexGuard<'_, T>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => return None,
+            Err(TryLockError::WouldBlock) => std::thread::yield_now(),
+        }
+    }
+}
+
 impl Shared {
     pub fn session_dir(&self) -> Option<&Path> {
         self.findings.session_dir.as_deref()
     }
 
-    /// Changes the session record and saves it.
+    /// Changes the session record and saves it. Problems are reported after the lock is
+    /// released, so logging never happens while holding it.
     pub fn update_record(&self, change: impl FnOnce(&mut SessionRecord)) {
-        let mut record = lock(&self.record);
-        change(&mut record);
-        self.save_record(&record);
+        let result = {
+            let mut record = lock(&self.record);
+            change(&mut record);
+            self.save_record(&record)
+        };
+        if let Err(e) = result {
+            self.problem(format!("could not save the session record: {e}"));
+        }
     }
 
-    fn save_record(&self, record: &SessionRecord) {
+    /// [`Shared::update_record`] for the panic hook: gives up rather than deadlock if the record
+    /// lock is held (possibly by the panicking thread). Returns whether it saved.
+    pub fn try_update_record(&self, change: impl FnOnce(&mut SessionRecord)) -> Result<(), String> {
+        let mut record = try_lock_for(&self.record, HOOK_LOCK_WAIT)
+            .ok_or_else(|| "the session record was locked".to_string())?;
+        change(&mut record);
+        self.save_record(&record)
+    }
+
+    fn save_record(&self, record: &SessionRecord) -> Result<(), String> {
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(dir) = self.session_dir()
-            && let Err(e) = session::store::write_record(dir, record)
-        {
-            eprintln!("Time Fly: could not save the session record: {e}");
+        if let Some(dir) = self.session_dir() {
+            session::store::write_record(dir, record).map_err(|e| e.to_string())?;
         }
         #[cfg(target_arch = "wasm32")]
-        session::web::save_record(record);
+        session::web::save_record(record)?;
+        Ok(())
+    }
+
+    /// Prints to stderr with the home directory replaced by `~`.
+    pub fn eprint(&self, message: &str) {
+        eprintln!("{}", report::redact(message, &self.home));
+    }
+
+    /// Reports a diagnostics problem: a `warn!` once logging is up; before that, stderr plus a
+    /// note that `DiagnosticsPlugin` logs once the subscriber exists.
+    pub fn problem(&self, message: String) {
+        let mut problems = lock(&self.problems);
+        if self.logging_ready.load(Ordering::Acquire) {
+            drop(problems);
+            warn!("{message}");
+        } else {
+            self.eprint(&format!("Time Fly diagnostics: {message}"));
+            problems.push(message);
+        }
+    }
+
+    /// Switches [`Shared::problem`] to `warn!` and returns the problems collected so far.
+    fn take_problems_for_logging(&self) -> Vec<String> {
+        let mut problems = lock(&self.problems);
+        self.logging_ready.store(true, Ordering::Release);
+        std::mem::take(&mut *problems)
     }
 
     pub fn previous_outcome(&self) -> PreviousOutcome {
@@ -169,18 +232,26 @@ impl Session {
         self.shared.session_dir()
     }
 
-    /// Marks the session clean and flushes the session log. On the web the page keeps running
-    /// after `main` returns, so the session stays open and `pagehide` marks it clean.
-    pub fn finish(self) {
+    /// Records how the `App` ended ([`session::finish_status`]: clean only for a successful
+    /// exit of a session that hadn't crashed) and flushes the session log. On the web the page
+    /// keeps running after `main` returns, so the session stays open and `pagehide` marks it
+    /// clean.
+    pub fn finish(self, exit: &AppExit) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut this = self;
+            if let AppExit::Error(code) = exit {
+                error!(code = code.get(), "the app exited with an error");
+            }
             this.shared
-                .update_record(|r| r.status = SessionStatus::Clean);
+                .update_record(|r| r.status = session::finish_status(r.status, exit));
             this.flush_logs();
         }
         #[cfg(target_arch = "wasm32")]
-        std::mem::forget(self);
+        {
+            let _ = exit;
+            std::mem::forget(self);
+        }
     }
 
     /// Drops the log worker guard, which writes out everything logged so far.
@@ -251,6 +322,8 @@ pub fn start(args: LaunchArgs) -> Session {
     #[cfg(target_arch = "wasm32")]
     let findings = session::web::open(&record);
 
+    let mut findings = findings;
+    let problems = std::mem::take(&mut findings.problems);
     let shared = Arc::new(Shared {
         args,
         record: Mutex::new(record),
@@ -261,11 +334,13 @@ pub fn start(args: LaunchArgs) -> Session {
         started: Instant::now(),
         pending_notice: Mutex::new(None),
         notice_route: Mutex::new(NoticeRoute::None),
+        problems: Mutex::new(Vec::new()),
+        logging_ready: AtomicBool::new(false),
         #[cfg(not(target_arch = "wasm32"))]
         log_writer,
     });
-    for problem in &shared.findings.problems {
-        eprintln!("Time Fly diagnostics: {problem}");
+    for problem in problems {
+        shared.problem(problem);
     }
     report::install_panic_hook(shared.clone());
     #[cfg(target_arch = "wasm32")]
@@ -349,10 +424,15 @@ fn diagnostics_layers(app: &mut App) -> Option<BoxedLayer> {
 }
 
 /// The console: `info`, or what `RUST_LOG` asks for.
-fn console_layer(_app: &mut App) -> Option<BoxedFmtLayer> {
+fn console_layer(app: &mut App) -> Option<BoxedFmtLayer> {
+    let home = app
+        .world()
+        .get_resource::<DiagnosticsHandle>()
+        .map(|h| h.0.home.clone())
+        .unwrap_or_default();
     Some(Box::new(
         bevy::log::tracing_subscriber::fmt::Layer::default()
-            .with_writer(std::io::stderr)
+            .with_writer(report::RedactingStderr(home))
             .with_filter(filter("info", env_directives("RUST_LOG"))),
     ))
 }
@@ -406,15 +486,17 @@ impl Plugin for DiagnosticsPlugin {
 fn log_findings(handle: Res<DiagnosticsHandle>) {
     let shared = &handle.0;
     let findings = &shared.findings;
-    {
+    // Copy values out first: never log while holding a lock the panic hook needs.
+    let (id, build, platform) = {
         let record = lock(&shared.record);
-        info!(
-            session = %record.id,
-            build = %record.build.summary(),
-            platform = %record.platform.summary(),
-            "session started"
-        );
-    }
+        (
+            record.id.clone(),
+            record.build.summary(),
+            record.platform.summary(),
+        )
+    };
+    let notice_route = *lock(&shared.notice_route);
+    info!(session = %id, build = %build, platform = %platform, "session started");
     match (&findings.session_dir, &findings.log_root) {
         (Some(dir), _) => info!(dir = %dir.display(), "session log directory"),
         (None, Some(root)) => {
@@ -425,7 +507,7 @@ fn log_findings(handle: Res<DiagnosticsHandle>) {
     for name in &findings.pruned {
         info!(session = %name, "pruned an old session");
     }
-    for problem in &findings.problems {
+    for problem in shared.take_problems_for_logging() {
         warn!("{problem}");
     }
     for arg in &shared.args.unknown {
@@ -440,7 +522,7 @@ fn log_findings(handle: Res<DiagnosticsHandle>) {
                 log = %notice::log_display(previous),
                 during_startup,
                 has_crash_report,
-                notice = ?*lock(&shared.notice_route),
+                notice = ?notice_route,
                 "the previous session didn't close normally"
             ),
             PreviousOutcome::OtherInstanceRunning => {
@@ -508,4 +590,55 @@ fn mark_first_frame(
     *done = true;
     handle.0.update_record(|r| r.reached_first_frame = true);
     info!("first frame reached");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_lock_for_gives_up_on_a_lock_this_thread_holds() {
+        let mutex = Mutex::new(1);
+        let held = lock(&mutex);
+        assert!(try_lock_for(&mutex, Duration::from_millis(20)).is_none());
+        drop(held);
+        assert_eq!(
+            try_lock_for(&mutex, Duration::from_millis(20)).map(|g| *g),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn try_lock_for_waits_for_another_thread() {
+        let mutex = Arc::new(Mutex::new(0));
+        let held = mutex.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut guard = lock(&held);
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            *guard = 7;
+        });
+        locked_rx.recv().unwrap();
+        assert_eq!(
+            try_lock_for(&mutex, Duration::from_secs(5)).map(|g| *g),
+            Some(7)
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn try_lock_for_ignores_poisoning() {
+        let mutex = Arc::new(Mutex::new(3));
+        let poisoner = mutex.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert_eq!(
+            try_lock_for(&mutex, Duration::from_millis(20)).map(|g| *g),
+            Some(3)
+        );
+    }
 }

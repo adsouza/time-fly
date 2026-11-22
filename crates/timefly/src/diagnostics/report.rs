@@ -2,11 +2,14 @@
 
 use std::backtrace::Backtrace;
 use std::cell::Cell;
+use std::io::{self, Write};
 use std::panic::PanicHookInfo;
 use std::sync::Arc;
 
+use bevy::log::tracing_subscriber::fmt::MakeWriter;
+
 use super::session::{BuildInfo, PlatformInfo, SessionStatus};
-use super::{DiagnosticsContext, Shared, lock, recorder};
+use super::{DiagnosticsContext, HOOK_LOCK_WAIT, Shared, recorder, try_lock_for};
 
 /// The issue form for crash reports. `<session-id>` is replaced by [`report_url`].
 pub const REPORT_URL: &str = "https://github.com/adsouza/time-fly/issues/new?template=crash_report.yml&title=Crash%20report%20<session-id>";
@@ -91,6 +94,42 @@ impl Home {
     }
 }
 
+/// Writes each buffer with the home directory replaced by `~`. Log layers hand it one formatted
+/// event per write, so a path is never split across buffers.
+pub struct RedactingWriter<W> {
+    inner: W,
+    home: Home,
+}
+
+impl<W> RedactingWriter<W> {
+    pub fn new(inner: W, home: Home) -> Self {
+        Self { inner, home }
+    }
+}
+
+impl<W: Write> Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner
+            .write_all(redact(&String::from_utf8_lossy(buf), &self.home).as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The console log writer: stderr through [`RedactingWriter`].
+pub struct RedactingStderr(pub Home);
+
+impl<'a> MakeWriter<'a> for RedactingStderr {
+    type Writer = RedactingWriter<io::Stderr>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter::new(io::stderr(), self.0.clone())
+    }
+}
+
 /// Replaces the home directory with `~`.
 pub fn redact(text: &str, home: &Home) -> String {
     let mut text = text.to_string();
@@ -171,21 +210,29 @@ fn record_panic(shared: &Shared, info: &PanicHookInfo<'_>) {
         thread: std::thread::current().name().map(str::to_string),
         backtrace: Backtrace::force_capture().to_string(),
     };
-    let context = lock(&shared.context).clone();
-    // If this thread panicked inside the recorder layer it holds the recorder lock.
+    // Never block on a lock the panicking thread may hold: wait briefly for other threads,
+    // then fall back to what is available.
+    let context = try_lock_for(&shared.context, HOOK_LOCK_WAIT)
+        .map(|c| c.clone())
+        .unwrap_or_default();
     let recent = if recorder::in_recorder() {
         vec!["(flight recorder unavailable: the panic happened while recording)".to_string()]
     } else {
-        lock(&shared.recorder).snapshot()
-    };
-    let (build, platform, id) = {
-        let record = lock(&shared.record);
-        (
-            record.build.clone(),
-            record.platform.clone(),
-            record.id.clone(),
+        try_lock_for(&shared.recorder, HOOK_LOCK_WAIT).map_or_else(
+            || vec!["(flight recorder unavailable: locked)".to_string()],
+            |r| r.snapshot(),
         )
     };
+    let (build, platform, id) = try_lock_for(&shared.record, HOOK_LOCK_WAIT).map_or_else(
+        || {
+            (
+                BuildInfo::current(),
+                PlatformInfo::current(),
+                "unavailable".to_string(),
+            )
+        },
+        |r| (r.build.clone(), r.platform.clone(), r.id.clone()),
+    );
     let report = redact(
         &format_crash_report(&panic, &build, &platform, &context, &recent),
         &shared.home,
@@ -193,22 +240,40 @@ fn record_panic(shared: &Shared, info: &PanicHookInfo<'_>) {
 
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(dir) = shared.session_dir() {
-        let path = dir.join(super::session::CRASH_FILE);
-        match std::fs::write(&path, &report) {
-            Ok(()) => eprintln!(
+        match super::session::store::write_crash_report(dir, &report) {
+            Ok(path) => shared.eprint(&format!(
                 "Time Fly crashed. A crash report is saved at {}",
                 path.display()
-            ),
-            Err(e) => eprintln!("Time Fly crashed, and the crash report could not be saved: {e}"),
+            )),
+            Err(e) => shared.eprint(&format!(
+                "Time Fly crashed, and the crash report could not be saved: {e}"
+            )),
         }
     }
     #[cfg(target_arch = "wasm32")]
     {
-        super::session::web::set(&super::session::web::crash_key(&id), &report);
-        super::session::web::save_log(shared);
+        use super::session::web;
+        // Keep the first report.
+        let key = web::crash_key(&id);
+        let saved = if web::get(&key).is_none() {
+            web::set(&key, &report)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = saved.and_then(|()| web::save_log(shared)) {
+            shared.eprint(&format!(
+                "Time Fly crashed, and the report could not be saved: {e}"
+            ));
+        }
     }
 
-    shared.update_record(|r| r.status = SessionStatus::Crashed { panicked: true });
+    if let Err(e) =
+        shared.try_update_record(|r| r.status = SessionStatus::Crashed { panicked: true })
+    {
+        shared.eprint(&format!(
+            "Time Fly: could not mark the session crashed: {e}"
+        ));
+    }
     if !recorder::in_recorder() {
         bevy::log::error!(
             session = %id,
