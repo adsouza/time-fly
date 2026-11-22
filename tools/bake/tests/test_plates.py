@@ -193,3 +193,84 @@ def test_export_rotations_requires_a_circuit_to_anchor_zero(tmp_path):
     rot = write_rot(tmp_path / "noanchor.rot", [(9, 0.0, 0, 0, 0, 5), (9, 50.0, 0, 0, 0, 5)])
     with pytest.raises(ValueError, match="anchor plate 0"):
         plates.export_rotations(rot, [9], [0.0])
+
+
+# --- footprint dilation ---------------------------------------------------------------------
+
+
+def _footprints(n, cells):
+    """Footprints from ``{(face, row, col): [(plate_id, younger, older), ...]}``."""
+    offsets = [0]
+    ids, young, old = [], [], []
+    for face in range(6):
+        for row in range(n):
+            for col in range(n):
+                for p, y, o in sorted(cells.get((face, row, col), [])):
+                    ids.append(p)
+                    young.append(y)
+                    old.append(o)
+                offsets.append(len(ids))
+    return plates.PlateFootprints(
+        cube_size=n,
+        offsets=np.asarray(offsets, dtype=np.uint32),
+        plate_ids=np.asarray(ids, dtype=np.uint32),
+        younger_myr=np.asarray(young, dtype=np.float64),
+        older_myr=np.asarray(old, dtype=np.float64),
+    )
+
+
+def test_neighbours_continue_across_faces():
+    n = 4
+    nb = plates.cube_neighbours(n)
+    assert nb.shape == (6 * n * n, 8)
+    # Every neighbour relation is symmetric for the 4 edge neighbours.
+    edge = [1, 3, 4, 6]  # (-1,0), (0,-1), (0,1), (1,0) in the offset order
+    for c in range(6 * n * n):
+        for k in edge:
+            assert c in nb[nb[c, k]], (c, k)
+    # The right neighbour of +X's last column lies on another face, next to it.
+    dirs = cube.texel_center_dirs(n).reshape(-1, 3)
+    c = (0 * n + 1) * n + (n - 1)
+    right = nb[c, 4]
+    assert right // (n * n) != 0
+    assert np.dot(dirs[c], dirs[right]) > math.cos(math.radians(40))
+
+
+def test_dilation_closes_a_one_cell_crack():
+    n = 8
+    a = {(4, r, c): [(101, 0.0, 300.0)] for r in range(n) for c in range(0, 3)}
+    b = {(4, r, c): [(202, 0.0, 540.0)] for r in range(n) for c in range(4, n)}
+    fp = plates.dilate_footprints(_footprints(n, a | b), 1)
+    for r in range(n):
+        cell = fp.cell(4, r, 3)
+        assert len(cell) == 1, cell
+        # Equal distance to both plates: the lower source ID wins, with its interval list.
+        assert cell == [(101, 0.0, 300.0)]
+
+
+def test_dilation_never_overrides_an_owned_cell_and_reaches_k_cells():
+    n = 8
+    cells = {(4, 3, 3): [(303, 10.0, 20.0), (303, 40.0, 50.0)], (4, 3, 4): [(505, 0.0, 540.0)]}
+    fp = plates.dilate_footprints(_footprints(n, cells), 2)
+    assert fp.cell(4, 3, 3) == [(303, 10.0, 20.0), (303, 40.0, 50.0)]
+    assert fp.cell(4, 3, 4) == [(505, 0.0, 540.0)]
+    assert fp.cell(4, 3, 1) == [(303, 10.0, 20.0), (303, 40.0, 50.0)]  # 2 cells away
+    assert fp.cell(4, 3, 6) == [(505, 0.0, 540.0)]
+    assert fp.cell(4, 3, 0) == []  # 3 cells away
+    assert fp.cell(4, 3, 7) == []
+
+
+def test_dilation_ties_pick_the_lowest_plate_id():
+    n = 8
+    cells = {(4, 2, 2): [(909, 0.0, 540.0)], (4, 2, 4): [(111, 0.0, 100.0)]}
+    fp = plates.dilate_footprints(_footprints(n, cells), 1)
+    assert fp.cell(4, 2, 3) == [(111, 0.0, 100.0)]
+    assert fp.cell(4, 2, 1) == [(909, 0.0, 540.0)]
+
+
+def test_zero_dilation_is_identity_and_default_scales_with_cube_size():
+    fp = _footprints(4, {(0, 1, 1): [(101, 0.0, 540.0)]})
+    assert plates.dilate_footprints(fp, 0) is fp
+    assert plates.default_dilate_cells(128) == 2
+    assert plates.default_dilate_cells(256) == 4
+    assert plates.default_dilate_cells(8) == 0

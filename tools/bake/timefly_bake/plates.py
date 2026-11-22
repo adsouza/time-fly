@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 import pygplates
 
-from timefly_bake import geo
+from timefly_bake import cube, geo
 from timefly_bake.log import traced
 
 MAX_AGE_MYR = 540.0
@@ -153,6 +153,105 @@ def assign_plates(dirs_render, polygons_path) -> PlateFootprints:
         len(flat),
         len(ids),
     )
+    return PlateFootprints(
+        cube_size=n,
+        offsets=offsets,
+        plate_ids=np.asarray(ids, dtype=np.uint32),
+        younger_myr=np.asarray(younger, dtype=np.float64),
+        older_myr=np.asarray(older, dtype=np.float64),
+    )
+
+
+@traced
+def default_dilate_cells(cube_size: int) -> int:
+    """The default footprint dilation: 2 cells at cube size 128, scaled to keep the same angular
+    reach (0 for small test cubes)."""
+    return int(round(2.0 * cube_size / 128.0))
+
+
+@traced
+def cube_neighbours(n: int) -> np.ndarray:
+    """The 8 neighbours of every cell, shape ``(6*n*n, 8)``, in ``[face][row][col]`` order.
+
+    A neighbour off the edge of a face is the cell containing the neighbour's texel centre
+    extended past the edge onto the cube surface (``cube.dirs_to_texels``, the Task 3 tie rule),
+    so neighbourhoods continue across faces.
+    """
+    s = 2.0 * (np.arange(n) + 0.5) / n - 1.0
+    step = 2.0 / n
+    sc, tc = np.meshgrid(s, s)  # [row, col]
+    out = np.empty((6, n, n, 8), dtype=np.int64)
+    offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+    for face in range(6):
+        for k, (dr, dc) in enumerate(offsets):
+            a, b = sc + dc * step, tc + dr * step
+            one = np.ones_like(a)
+            point = [
+                (one, -b, -a),
+                (-one, -b, a),
+                (a, one, b),
+                (a, -one, -b),
+                (a, -b, one),
+                (-a, -b, -one),
+            ][face]
+            f, col, row = cube.dirs_to_texels(np.stack(point, axis=-1), n)
+            out[face, :, :, k] = (f * n + row) * n + col
+    return out.reshape(6 * n * n, 8)
+
+
+@traced
+def dilate_footprints(footprints: PlateFootprints, cells: int) -> PlateFootprints:
+    """Closes plate-boundary cracks: every unowned cell within ``cells`` steps (8-connected,
+    across faces) of an owned cell joins the nearest plate by breadth-first distance, ties going
+    to the lowest source plate ID (then the lowest source cell), and inherits that source cell's
+    interval list for that plate. Owned cells never change; ``cells <= 0`` returns the input.
+    """
+    if cells <= 0:
+        return footprints
+    fp = footprints
+    n = fp.cube_size
+    total = 6 * n * n
+    neighbours = cube_neighbours(n)
+    owned = np.diff(fp.offsets.astype(np.int64)) > 0
+    # cell -> (plate_id, source cell); seeds are the lowest plate of each owned cell.
+    best: dict[int, tuple[int, int]] = {}
+    for c in np.flatnonzero(owned):
+        best[int(c)] = (int(fp.plate_ids[fp.offsets[c]]), int(c))
+    claimed: dict[int, tuple[int, int]] = {}
+    frontier = sorted(best)
+    for _ in range(cells):
+        offers: dict[int, tuple[int, int]] = {}
+        for c in frontier:
+            label = best[c] if c in best else claimed[c]
+            for m in neighbours[c]:
+                m = int(m)
+                if owned[m] or m in claimed:
+                    continue
+                if m not in offers or label < offers[m]:
+                    offers[m] = label
+        claimed.update(offers)
+        frontier = sorted(offers)
+        if not frontier:
+            break
+
+    offsets = np.zeros(total + 1, dtype=np.uint32)
+    ids: list[int] = []
+    younger: list[float] = []
+    older: list[float] = []
+    for c in range(total):
+        a, b = int(fp.offsets[c]), int(fp.offsets[c + 1])
+        if c in claimed:
+            plate, source = claimed[c]
+            a, b = int(fp.offsets[source]), int(fp.offsets[source + 1])
+            keep = [k for k in range(a, b) if int(fp.plate_ids[k]) == plate]
+        else:
+            keep = list(range(a, b))
+        for k in keep:
+            ids.append(int(fp.plate_ids[k]))
+            younger.append(float(fp.younger_myr[k]))
+            older.append(float(fp.older_myr[k]))
+        offsets[c + 1] = len(ids)
+    _log.info("footprint dilation: %d cells, %d cracks/margin cells filled", cells, len(claimed))
     return PlateFootprints(
         cube_size=n,
         offsets=offsets,

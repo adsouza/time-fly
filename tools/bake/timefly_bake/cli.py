@@ -112,6 +112,12 @@ def _parser() -> argparse.ArgumentParser:
         help=f"PaleoDEM age table (default: <raw>/{AGES_NAME}, else <raw>/../{AGES_NAME})",
     )
     p.add_argument(
+        "--footprint-dilate-cells",
+        type=int,
+        help="grow plate footprints into unowned cells within this many cells, closing "
+        "boundary cracks (default: 2 at cube size 128, scaled with the cube size; 0 disables)",
+    )
+    p.add_argument(
         "--paleodem-step-myr",
         type=float,
         help="bake only PaleoDEMs whose reconstruction age is a multiple of this (plus the "
@@ -204,8 +210,10 @@ def _write_images(out: Path, images: list[_Image], dirs) -> list[str]:
     return names
 
 
-def _write_plates(out: Path, dirs, rot_path: Path, gpml_path: Path, source_ages) -> None:
-    fp = plates.assign_plates(dirs, gpml_path)
+def _write_plates(
+    out: Path, dirs, rot_path: Path, gpml_path: Path, source_ages, dilate_cells: int
+) -> None:
+    fp = plates.dilate_footprints(plates.assign_plates(dirs, gpml_path), dilate_cells)
     plate_ids = sorted({int(p) for p in fp.plate_ids})
     times = plates.rotation_times(rot_path, plate_ids, source_ages)
     if times[0] != 0.0 or times[-1] != plates.MAX_AGE_MYR:
@@ -253,7 +261,14 @@ def _manifest_json(manifest: dict) -> str:
 
 
 @traced
-def bake(raw, out, cube_size: int = 128, ages_path=None, paleodem_step_myr=None) -> dict:
+def bake(
+    raw,
+    out,
+    cube_size: int = 128,
+    ages_path=None,
+    paleodem_step_myr=None,
+    footprint_dilate_cells=None,
+) -> dict:
     """Bake everything from ``raw`` into ``out`` and return the manifest written there.
 
     The manifest is written last, so a failed bake never leaves one pointing at missing files.
@@ -332,8 +347,18 @@ def bake(raw, out, cube_size: int = 128, ages_path=None, paleodem_step_myr=None)
 
         dirs = cube.texel_center_dirs(cube_size)
         files = _write_images(out, images, dirs)
+        dilate = (
+            plates.default_dilate_cells(cube_size)
+            if footprint_dilate_cells is None
+            else footprint_dilate_cells
+        )
         _write_plates(
-            out, dirs, rot_path, gpml_path, [f.source_rotation_age_myr for f in all_paleo]
+            out,
+            dirs,
+            rot_path,
+            gpml_path,
+            [f.source_rotation_age_myr for f in all_paleo],
+            dilate,
         )
 
     manifest = {
@@ -387,7 +412,14 @@ def main(argv=None) -> int:
         if problems:
             parser.error("; ".join(problems))
         try:
-            bake(args.raw, args.out, args.cube_size, ages_path, args.paleodem_step_myr)
+            bake(
+                args.raw,
+                args.out,
+                args.cube_size,
+                ages_path,
+                args.paleodem_step_myr,
+                args.footprint_dilate_cells,
+            )
         except Exception as exc:  # already logged with its traceback by @traced
             _log.error("bake failed: %s", exc)
             return 1
