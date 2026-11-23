@@ -298,6 +298,48 @@ resized (2338 × 1237 to 2567 × 1237).
 While the bench runs, a translucent banner at the top centre shows the current stop (region,
 age, `k of 8` with the pan counted), `Next: …` on the globe, and at the end the result.
 
+#### Final bench set, native M4, 2560 × 1440 (`5022c32`, 2026-11-23)
+
+The single run after the Chrome-bench round and jobs 2–7 (Himalayas, Beringia and the Rockies
+with the pan, Japan, Panama and Sundaland in the owner's order, the banner, the dry snowline,
+clustering off). Main display 4K, so the window got 2560 × 1440; `AutoNoVsync` was not paced
+for most of the run, so the uncapped rule (p95 ≤ 16.67 ms) decided.
+
+| Stop | Generation (first entry) | Tiles / frames fetched | Load worst frame | Flight median / p95 / worst | Missed (> 25 ms) | Result |
+|---|---|---|---|---|---|---|
+| Pangaea interior | 583 ms | 0 / 2 | 30.1 ms (R11 line) | 11.62 / **16.96** / 29.92 ms | 3 of 4,631 | **FAIL** (p95 0.29 ms over) |
+| Himalayas | 317 ms | 1 (123,550 B) / 1 | 18.3 ms | 11.06 / 13.05 / 21.93 ms | 0 | PASS |
+| Sundaland | 311 ms | 2 / 2 | 19.2 ms | 9.89 / 11.59 / 21.94 ms | 0 | PASS |
+| Japan | 2,108 ms | 4 / 2 | 20.1 ms | 8.21 / 11.54 / 33.10 ms | 2 | PASS |
+| Beringia | 377 ms | 2 / 1 | 20.2 ms | 8.13 / 11.37 / 23.09 ms | 0 | PASS |
+| globe pan (8 s) | — | — | — | 2.11 / 3.47 / 27.76 ms (3,345 frames) | — | PASS |
+| Rockies ice margin | 643 ms | 2 / **0** | 19.3 ms | 10.59 / 13.39 / 22.77 ms | 0 | PASS |
+| Panama | 311 ms | 0 / 1 | 17.2 ms | 6.80 / 8.24 / 19.96 ms | 0 | PASS |
+
+- **Pangaea's FAIL is a pacing switch, not a hitch.** Its low pass and climb ran display-paced
+  (medians 16.67 and 16.59 ms) and the second half uncapped (9.84 and 10.69 ms); the whole
+  flight's median (11.62 ms) put it under the uncapped rule, whose p95 then caught the paced
+  half. No stall (> 33.3 ms), 0.06% missed; under the display-paced rule it passes. Earlier
+  2560 × 1440 runs had Pangaea at p95 14.36 ms.
+- **Frame reuse:** the Rockies (after Beringia, same 21 ka) fetched no frame. Beringia fetched
+  one: Japan's two 1 Ma frames between Sundaland and Beringia pushed one 21 ka frame out of the
+  4-slot frame cache.
+- No host stall anywhere; the banner did not affect a gate.
+
+```text
+===== Time Fly region bench summary =====
+build: 0.1.0 (5022c32, release, aarch64-apple-darwin; system-spans)
+regions (R14 frame rate): Pangaea interior FAIL, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS
+first-region worst frame (R11 gate <= 250 ms, request to first path frame, overview decode included): 30.10 ms -> PASS (native: reported only, the gate applies in Chrome WebGPU)
+Himalayas load-window worst frame (cold tiles; reported only): 18.34 ms
+warm generation (10 re-entries of Himalayas, target <= 3000 ms): median 311 ms, max 318 ms -> PASS
+first entries (cold tiles; reported only natively): Pangaea interior 583 ms, Himalayas 317 ms, Sundaland 311 ms, Japan 2108 ms, Beringia 377 ms, Rockies ice margin 643 ms, Panama 311 ms
+memory cycles (phys_footprint, includes GPU allocations on Apple silicon, on the globe after each leave): 1: 1093.2 MiB, 2: 1085.9 MiB, 3: 1093.5 MiB, 4: 1094.2 MiB, 5: 1094.3 MiB, 6: 1101.8 MiB, 7: 1094.8 MiB, 8: 1102.0 MiB, 9: 1102.2 MiB, 10: 1094.9 MiB; worst of cycles 2-10 is +0.8% of cycle 1 (limit +10%) -> PASS
+  in the region: 1: 1169.8 MiB, 2: 1170.6 MiB, 3: 1170.1 MiB, 4: 1178.3 MiB, 5: 1178.7 MiB, 6: 1178.4 MiB, 7: 1178.8 MiB, 8: 1181.0 MiB, 9: 1178.6 MiB, 10: 1179.3 MiB
+result: FAIL
+===== end region bench summary =====
+```
+
 #### Bench regions since rulings R24–R26 (real bake, single-threaded)
 
 `TIMEFLY_GENERATE=1 TIMEFLY_CANDIDATES=... cargo test --release -p timefly_core --test
