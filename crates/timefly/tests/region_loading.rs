@@ -1,0 +1,713 @@
+//! Headless tests for `RegionPlugin` on the tiny globe bake (`tests/assets/data/globe`) plus
+//! four fixture tiles and a small overview (`tests/assets/data/tiles`, written by
+//! `write_region_fixtures` below; ruling R3). No window, no renderer.
+//!
+//! Rewrite the fixtures with
+//! `cargo test -p timefly --test region_loading -- --ignored write_region_fixtures`.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use bevy::asset::AssetMetaCheck;
+use bevy::log::tracing::{self, Subscriber};
+use bevy::log::tracing_subscriber::filter::LevelFilter;
+use bevy::log::tracing_subscriber::layer::{Context, SubscriberExt};
+use bevy::log::tracing_subscriber::{Layer, Registry};
+use bevy::prelude::*;
+use bevy::state::app::StatesPlugin;
+use timefly::data::{GlobeData, GlobeDataPlugin, GlobeLoadState};
+use timefly::region::frames::CpuGrid;
+use timefly::region::generate::{BudgetedRun, GenInputs, generate_parallel, tiles_needed};
+use timefly::region::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, tile_path};
+use timefly::region::{
+    ActiveRegion, GenMode, RegionEntered, RegionGenerated, RegionLeft, RegionPlugin,
+    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState,
+};
+use timefly_core::deep_time::YearsBp;
+use timefly_core::formats::{Grid, read_tfgrid};
+use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
+use timefly_core::sha256::sha256_hex;
+use timefly_core::worldgen::generate::RegionSpec;
+use timefly_core::worldgen::tiles::{TILE_SAMPLES, TileSet};
+
+/// Generation must finish within this (the brief's bound).
+const REGION_TIMEOUT: Duration = Duration::from_secs(20);
+/// The fixture tiles: the four around (0°, 0°).
+const FIXTURE_TILES: [(u8, u8); 4] = [(17, 35), (17, 36), (18, 35), (18, 36)];
+/// The fixture overview's nodes per degree (the bake uses 12).
+const OVERVIEW_PER_DEG: u32 = 1;
+/// Small grids for the tests that are not about resolution.
+const SMALL: RegionSettings = RegionSettings {
+    inner_res: 129,
+    apron_res: 65,
+    mode: GenMode::Parallel,
+};
+
+// ---------------------------------------------------------------------------------------------
+// Fixtures (ruling R3)
+
+/// The synthetic present day: a plane tilted up to the north-east, in 25 m steps (so the files
+/// compress well), coast through (0°, 0°).
+fn fixture_elevation(lat: f64, lon: f64) -> f32 {
+    let h = 150.0 * lat + 100.0 * lon;
+    (25.0 * (h / 25.0).round()) as f32
+}
+
+/// Köppen code: 0 at sea, 1 (Af) north of the equator, 2 (Am) south of it.
+fn fixture_koppen(lat: f64, lon: f64) -> f32 {
+    if fixture_elevation(lat, lon) <= 0.0 {
+        0.0
+    } else if lat >= 0.0 {
+        1.0
+    } else {
+        2.0
+    }
+}
+
+/// A 2-channel f16 lat-lon `.tfgrid` whose node `(i, j)` sits at `(lat0 − i·step, lon0 + j·step)`.
+fn latlon_tfgrid(width: u32, height: u32, lat0: f64, lon0: f64, step: f64) -> Vec<u8> {
+    let mut raw = Vec::with_capacity((width * height * 4) as usize);
+    for i in 0..height {
+        for j in 0..width {
+            let (lat, lon) = (lat0 - f64::from(i) * step, lon0 + f64::from(j) * step);
+            for v in [fixture_elevation(lat, lon), fixture_koppen(lat, lon)] {
+                raw.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+        }
+    }
+    let z =
+        ruzstd::encoding::compress_to_vec(&raw[..], ruzstd::encoding::CompressionLevel::Fastest);
+    let mut out = b"TFGRID01".to_vec();
+    out.extend_from_slice(&[1, 0, 2, 0]); // lat-lon, f16, 2 channels
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&(z.len() as u32).to_le_bytes());
+    out.extend_from_slice(&z);
+    out
+}
+
+fn fixture_tile(row: u8, col: u8) -> Vec<u8> {
+    let lat_n = 90.0 - 5.0 * f64::from(row);
+    let lon_w = -180.0 + 5.0 * f64::from(col);
+    latlon_tfgrid(TILE_SAMPLES, TILE_SAMPLES, lat_n, lon_w, 1.0 / 60.0)
+}
+
+fn fixture_overview() -> Vec<u8> {
+    let k = OVERVIEW_PER_DEG;
+    latlon_tfgrid(360 * k + 1, 180 * k + 1, 90.0, -180.0, 1.0 / f64::from(k))
+}
+
+/// Every fixture file, by path under the asset root, with the manifest last.
+fn fixture_files() -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = FIXTURE_TILES
+        .iter()
+        .map(|&(r, c)| (tile_path(r, c), fixture_tile(r, c)))
+        .collect();
+    files.push((OVERVIEW_PATH.to_string(), fixture_overview()));
+    let entry =
+        |bytes: &[u8]| serde_json::json!({"bytes": bytes.len(), "sha256": sha256_hex(bytes)});
+    let tiles: Vec<serde_json::Value> = FIXTURE_TILES
+        .iter()
+        .zip(&files)
+        .map(|(&(row, col), (_, bytes))| {
+            let mut e = entry(bytes);
+            e["row"] = row.into();
+            e["col"] = col.into();
+            e
+        })
+        .collect();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "tile_deg": 5,
+        "samples": TILE_SAMPLES,
+        "sources": {"etopo": "synthetic (tests/region_loading.rs)", "koppen": "synthetic"},
+        "overview": entry(&files[4].1),
+        "tiles": tiles,
+    });
+    let mut json = serde_json::to_string_pretty(&manifest).unwrap();
+    json.push('\n');
+    files.push((TILE_MANIFEST_PATH.to_string(), json.into_bytes()));
+    files
+}
+
+#[test]
+#[ignore = "writes the committed fixtures; run by hand after changing the generator"]
+fn write_region_fixtures() {
+    for (path, bytes) in fixture_files() {
+        let path = tiny_root().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+    }
+}
+
+#[test]
+fn region_fixtures_match_their_generator() {
+    for (path, bytes) in fixture_files() {
+        let committed = fs::read(tiny_root().join(&path))
+            .unwrap_or_else(|e| panic!("{path}: {e} (run write_region_fixtures)"));
+        if path.ends_with(".json") {
+            assert_eq!(committed, bytes, "{path} is stale");
+        } else {
+            // Compare contents, not compressed bytes.
+            assert_eq!(
+                read_tfgrid(&committed).unwrap(),
+                read_tfgrid(&bytes).unwrap(),
+                "{path} is stale"
+            );
+        }
+    }
+    // The four tiles are exactly what a present-day region at (0°, 0°) reads.
+    let frame = RegionSpec::new(dir(0.0, 0.0), YearsBp(0.0), 0).frame();
+    assert_eq!(TileSet::needed_for(&frame), FIXTURE_TILES);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Log capture
+
+/// Every `info` and louder event of this test binary, formatted. Tests run in parallel, so each
+/// asserts on lines naming its own tile.
+fn logs() -> Arc<Mutex<Vec<String>>> {
+    static LOGS: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+    LOGS.get_or_init(|| {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let layer = Capture(lines.clone()).with_filter(LevelFilter::INFO);
+        tracing::subscriber::set_global_default(Registry::default().with(layer))
+            .expect("no other global subscriber in this test binary");
+        lines
+    })
+    .clone()
+}
+
+struct Capture(Arc<Mutex<Vec<String>>>);
+
+impl<S: Subscriber> Layer<S> for Capture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut line = format!("{} ", event.metadata().level());
+        event.record(
+            &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                line.push_str(&format!("{}={value:?} ", field.name()));
+            },
+        );
+        self.0.lock().unwrap().push(line);
+    }
+}
+
+fn warnings_naming(needle: &str) -> Vec<String> {
+    logs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("WARN") && l.contains(needle))
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Harness
+
+fn tiny_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets")
+}
+
+/// A copy of the tiny bake and fixtures in a fresh asset root, to break on purpose.
+fn tiny_copy(test: &str) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("region_loading-{test}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    copy_dir(&tiny_root(), &root);
+    root
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn dir(lat: f64, lon: f64) -> RenderDir {
+    geo_to_render(latlon_to_geo(lat, lon))
+}
+
+#[derive(Resource, Default)]
+struct Seen {
+    generated: Vec<RegionGenerated>,
+    entered: Vec<RegionEntered>,
+    changed: Vec<RegionSnapshotChanged>,
+    states: Vec<RegionState>,
+}
+
+fn record(
+    mut seen: ResMut<Seen>,
+    mut generated: MessageReader<RegionGenerated>,
+    mut entered: MessageReader<RegionEntered>,
+    mut changed: MessageReader<RegionSnapshotChanged>,
+    state: Res<State<RegionState>>,
+) {
+    seen.generated.extend(generated.read().copied());
+    seen.entered.extend(entered.read().copied());
+    seen.changed.extend(changed.read().copied());
+    if seen.states.last() != Some(state.get()) {
+        seen.states.push(*state.get());
+    }
+}
+
+/// A headless app with the globe data and regions, the globe data loaded.
+fn region_app(asset_root: &Path, settings: RegionSettings) -> App {
+    logs();
+    let mut app = App::new();
+    app.add_plugins((
+        MinimalPlugins,
+        AssetPlugin {
+            file_path: asset_root.to_string_lossy().into_owned(),
+            meta_check: AssetMetaCheck::Never,
+            ..default()
+        },
+        ImagePlugin::default(),
+        StatesPlugin,
+        GlobeDataPlugin::default(),
+        RegionPlugin,
+    ))
+    .insert_resource(settings)
+    .init_resource::<Seen>()
+    .add_systems(Last, record);
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    loop {
+        app.update();
+        match *app.world().resource::<State<GlobeLoadState>>().get() {
+            GlobeLoadState::Ready => break,
+            GlobeLoadState::Failed => panic!("the tiny bake failed to load"),
+            GlobeLoadState::Loading => {}
+        }
+        assert!(Instant::now() < deadline, "globe data still loading");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    app
+}
+
+fn request(app: &mut App, lat: f64, lon: f64, years: f64) {
+    app.world_mut().write_message(RegionRequested {
+        era_dir: dir(lat, lon),
+        snapshot: YearsBp(years),
+    });
+}
+
+fn state(app: &App) -> RegionState {
+    *app.world().resource::<State<RegionState>>().get()
+}
+
+/// Updates until the region state is `target` after a `Generating` phase; returns the number of
+/// updates spent generating.
+fn run_until(app: &mut App, target: RegionState) -> u32 {
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    let mut updates = 0;
+    loop {
+        app.update();
+        updates += 1;
+        let seen = &app.world().resource::<Seen>().states;
+        if state(app) == target && seen.contains(&RegionState::Generating) {
+            return updates;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still {:?} after {REGION_TIMEOUT:?} (states {seen:?})",
+            state(app)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn generated(app: &App) -> RegionGenerated {
+    let seen = app.world().resource::<Seen>();
+    assert_eq!(seen.generated.len(), 1, "{:?}", seen.generated);
+    seen.generated[0]
+}
+
+fn active(app: &App) -> ActiveRegion {
+    app.world()
+        .get_resource::<ActiveRegion>()
+        .expect("an active region")
+        .clone()
+}
+
+fn assert_finite(region: &ActiveRegion) {
+    for field in [&region.grid.inner, &region.grid.apron] {
+        assert_eq!(field.elevation_m.len(), (field.res * field.res) as usize);
+        assert!(field.elevation_m.iter().all(|h| h.is_finite()));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tests
+
+#[test]
+fn generates_a_region_from_the_tiny_bake() {
+    let mut app = region_app(&tiny_root(), RegionSettings::default());
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+
+    let seen = app.world().resource::<Seen>();
+    assert_eq!(
+        seen.states,
+        [
+            RegionState::Globe,
+            RegionState::Generating,
+            RegionState::InRegion
+        ]
+    );
+    let event = generated(&app);
+    assert!(!event.fallback, "{event:?}");
+    assert_eq!(event.tiles_fetched, 4);
+    assert!(event.millis > 0 && event.millis < 20_000, "{event:?}");
+    assert_eq!(seen.entered.len(), 1);
+    assert_eq!(seen.entered[0].spec, event.spec);
+    assert!(seen.changed.is_empty());
+
+    let region = active(&app);
+    assert_eq!(region.grid.spec, event.spec);
+    assert_eq!(region.frame, event.spec.frame());
+    let inner = &region.grid.inner;
+    assert_eq!((inner.res, region.grid.apron.res), (1025, 513));
+    assert_finite(&region);
+    // The fixture coast runs through the centre, land to the north-east: row 0 is north and
+    // column 0 west.
+    let n = inner.res as usize;
+    let ne = inner.elevation_m[n - 1];
+    let sw = inner.elevation_m[(n - 1) * n];
+    assert!(ne > 100.0 && sw < -100.0, "NE {ne} m, SW {sw} m");
+
+    let cache = app.world().resource::<TileCache>();
+    assert_eq!(cache.len(), 4);
+    assert!(FIXTURE_TILES.iter().all(|&k| cache.contains(k)));
+    assert!(cache.overview().is_some());
+}
+
+#[test]
+fn missing_tile_falls_back_with_warning() {
+    let root = tiny_copy("missing");
+    fs::remove_file(root.join(tile_path(17, 35))).unwrap();
+    let mut app = region_app(&root, SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+
+    let event = generated(&app);
+    assert!(event.fallback, "{event:?}");
+    assert_eq!(event.tiles_fetched, 3);
+    assert_finite(&active(&app));
+    let warnings = warnings_naming("data/tiles/r17c35.tfgrid");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("terrain tile unavailable") && w.contains("file not found")),
+        "{warnings:?}"
+    );
+    // The redacted form: the asset path, never the file system path.
+    let root = root.to_string_lossy();
+    assert!(warnings.iter().all(|w| !w.contains(&*root)), "{warnings:?}");
+}
+
+#[test]
+fn corrupt_tile_falls_back_with_warning() {
+    // (tile, how it is broken, what the warning says)
+    let cases: [((u8, u8), &str, &str); 2] = [
+        ((17, 36), "truncated", "does not match the manifest's"),
+        ((18, 35), "sha", "sha256"),
+    ];
+    for ((row, col), how, says) in cases {
+        let root = tiny_copy(&format!("corrupt-{how}"));
+        let path = root.join(tile_path(row, col));
+        let mut bytes = fs::read(&path).unwrap();
+        match how {
+            "truncated" => bytes.truncate(bytes.len() - 100),
+            _ => *bytes.last_mut().unwrap() ^= 0x55, // same size, different hash
+        }
+        fs::write(&path, bytes).unwrap();
+
+        let mut app = region_app(&root, SMALL);
+        request(&mut app, 0.0, 0.0, 0.0);
+        run_until(&mut app, RegionState::InRegion);
+        let event = generated(&app);
+        assert!(event.fallback, "{how}: {event:?}");
+        assert_eq!(event.tiles_fetched, 3, "{how}");
+        assert_finite(&active(&app));
+        let warnings = warnings_naming(&tile_path(row, col));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("terrain tile unavailable") && w.contains(says)),
+            "{how}: {warnings:?}"
+        );
+        assert!(!app.world().resource::<TileCache>().contains((row, col)));
+    }
+}
+
+#[test]
+fn leaving_frees_the_region() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    let grid = Arc::downgrade(&active(&app).grid);
+
+    app.world_mut().write_message(RegionLeft);
+    app.update();
+    app.update();
+    assert_eq!(state(&app), RegionState::Globe);
+    assert!(app.world().get_resource::<ActiveRegion>().is_none());
+    assert!(grid.upgrade().is_none(), "something still holds the grid");
+    assert_eq!(app.world().resource::<Assets<CpuGrid>>().len(), 0);
+    let server = app.world().resource::<AssetServer>();
+    let data = app.world().resource::<GlobeData>();
+    let mut paths: Vec<String> = data.frame_paths.iter().map(|p| p.to_string()).collect();
+    paths.extend(FIXTURE_TILES.iter().map(|&(r, c)| tile_path(r, c)));
+    paths.push(OVERVIEW_PATH.to_string());
+    for path in paths {
+        assert!(
+            server.get_handle::<CpuGrid>(path.clone()).is_none(),
+            "{path} still has a strong handle"
+        );
+    }
+    // The tile cache stays, bounded, for the next region.
+    assert_eq!(app.world().resource::<TileCache>().len(), 4);
+}
+
+#[test]
+fn a_frame_that_will_not_load_returns_to_the_globe() {
+    let root = tiny_copy("frame");
+    let mut app = region_app(&root, SMALL);
+    // The globe has its images; the CPU copy of the 540 Ma frame now fails to decode.
+    let path = {
+        let data = app.world().resource::<GlobeData>();
+        let last = data.timeline.frames().len() - 1;
+        data.frame_path(last).to_string()
+    };
+    fs::write(root.join(&path), b"TFGRID01 truncated").unwrap();
+    request(&mut app, 0.0, 0.0, 400.0e6);
+    run_until(&mut app, RegionState::Globe);
+    assert!(app.world().get_resource::<ActiveRegion>().is_none());
+    assert!(app.world().resource::<Seen>().generated.is_empty());
+    let warnings = warnings_naming(&path);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("region generation failed")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn leaving_while_generating_cancels_the_job() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    app.update();
+    app.update();
+    assert_eq!(state(&app), RegionState::Generating);
+    app.world_mut().write_message(RegionLeft);
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        app.update();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(state(&app), RegionState::Globe);
+    assert!(app.world().get_resource::<ActiveRegion>().is_none());
+    assert!(app.world().resource::<Seen>().generated.is_empty());
+}
+
+#[test]
+fn a_new_snapshot_replaces_the_region() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    app.world_mut().resource_mut::<Seen>().states.clear();
+    request(&mut app, 0.0, 0.0, 100.0e6);
+    run_until(&mut app, RegionState::InRegion);
+    let seen = app.world().resource::<Seen>();
+    assert_eq!(seen.generated.len(), 2);
+    assert_eq!(seen.entered.len(), 1);
+    assert_eq!(seen.changed.len(), 1);
+    assert_eq!(seen.changed[0].from, YearsBp(0.0));
+    assert_eq!(seen.changed[0].to, YearsBp(100.0e6));
+    assert_eq!(active(&app).grid.spec.snapshot, YearsBp(100.0e6));
+}
+
+#[test]
+fn generates_bridge_and_deep_snapshots() {
+    // 10 ka crossfades ICE-6G into the bridge frame, 30 ka is the bridge frame (modern
+    // terrain carried by the plates), 100 Ma is a deep bracket still mostly that frame (ETOPO
+    // weight 0.81 in the tiny timeline), and 400 Ma is mostly the 540 Ma PaleoDEM (no tiles).
+    for years in [10.0e3, 30.0e3, 100.0e6, 400.0e6] {
+        let mut app = region_app(&tiny_root(), SMALL);
+        request(&mut app, 0.0, 0.0, years);
+        run_until(&mut app, RegionState::InRegion);
+        let event = generated(&app);
+        assert_eq!(event.spec.snapshot, YearsBp(years));
+        assert_finite(&active(&app));
+        if years == 400.0e6 {
+            assert_eq!(event.tiles_fetched, 0);
+            assert!(!event.fallback);
+        }
+    }
+}
+
+#[test]
+fn budgeted_generation_matches_parallel() {
+    let mut grids = Vec::new();
+    let mut updates = Vec::new();
+    for mode in [GenMode::Parallel, GenMode::web()] {
+        let mut app = region_app(&tiny_root(), RegionSettings { mode, ..SMALL });
+        request(&mut app, 0.0, 0.0, 0.0);
+        updates.push(run_until(&mut app, RegionState::InRegion));
+        grids.push(active(&app).grid);
+    }
+    assert_eq!(grids[0], grids[1]);
+    assert!(
+        updates[1] > 3,
+        "the time-boxed run should span frames ({updates:?})"
+    );
+}
+
+/// The generation inputs for a present-day region at (0°, 0°), read straight from the files.
+fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
+    let data = app.world().resource::<GlobeData>();
+    let frames: Vec<Option<Arc<Grid>>> = (0..data.timeline.frames().len())
+        .map(|f| {
+            let path = tiny_root().join(data.frame_path(f).path());
+            Some(Arc::new(read_tfgrid(&fs::read(path).unwrap()).unwrap()))
+        })
+        .collect();
+    let needed = tiles_needed(&spec, &data.timeline, &data.crust, &frames).unwrap();
+    let mut tiles = TileSet::new();
+    for &(r, c) in &needed {
+        let bytes = fs::read(tiny_root().join(tile_path(r, c))).unwrap();
+        tiles.insert(r, c, read_tfgrid(&bytes).unwrap()).unwrap();
+    }
+    let overview = fs::read(tiny_root().join(OVERVIEW_PATH)).unwrap();
+    tiles.set_overview(read_tfgrid(&overview).unwrap()).unwrap();
+    GenInputs {
+        spec,
+        timeline: data.timeline.clone(),
+        crust: data.crust.clone(),
+        fallback: !tiles.missing(&needed).is_empty(),
+        tiles,
+        frames,
+    }
+}
+
+#[test]
+fn budgeted_run_is_time_boxed() {
+    let app = region_app(&tiny_root(), SMALL);
+    let spec = RegionSpec {
+        inner_res: 257,
+        apron_res: 129,
+        ..RegionSpec::new(dir(0.0, 0.0), YearsBp(0.0), 7)
+    };
+    let inputs = inputs(&app, spec);
+    let expected = generate_parallel(&inputs).unwrap();
+    let budget = Duration::from_millis(6);
+    let mut run = BudgetedRun::new(inputs, budget);
+    let mut slices = Vec::new();
+    let grid = loop {
+        let t = Instant::now();
+        let done = run.poll_slice();
+        slices.push(t.elapsed());
+        if let Some(result) = done {
+            break result.unwrap();
+        }
+    };
+    assert_eq!(grid, expected);
+    let longest = *slices.iter().max().unwrap();
+    println!("{} slices, longest {longest:?}", slices.len());
+    assert!(slices.len() > 3, "{slices:?}");
+    // One slice overshoots its budget by at most one prep step or one row; generous for
+    // unoptimised builds.
+    assert!(longest < budget + Duration::from_millis(30), "{longest:?}");
+}
+
+/// The last "region tiles ready" log line's `bytes` and `needed` fields.
+fn last_tile_stats() -> (u64, u64) {
+    let logs = logs();
+    let lines = logs.lock().unwrap();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|l| l.contains("region tiles ready"))
+        .expect("a tile summary");
+    let field = |name: &str| -> u64 {
+        let at = line.find(&format!("{name}=")).unwrap() + name.len() + 1;
+        line[at..].split(' ').next().unwrap().parse().unwrap()
+    };
+    (field("bytes"), field("needed"))
+}
+
+#[test]
+#[ignore = "needs the real bake and tiles under assets/; prints timings for performance.md"]
+fn real_region_timing() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    if !root.join(TILE_MANIFEST_PATH).exists() {
+        eprintln!("no real tiles under {}; skipped", root.display());
+        return;
+    }
+    let mut app = region_app(&root, RegionSettings::default());
+    println!(
+        "async compute threads: {}",
+        bevy::tasks::AsyncComputeTaskPool::get().thread_num()
+    );
+    let sequential = GenMode::Budgeted {
+        budget: Duration::from_secs(3600),
+    };
+    let cases: [(&str, f64, f64, f64, GenMode); 8] = [
+        ("Alps 0 ka, cold", 46.5, 10.0, 0.0, GenMode::Parallel),
+        ("Alps 0 ka, warm", 46.5, 10.0, 0.0, GenMode::Parallel),
+        ("Alps 0 ka, warm, sequential", 46.5, 10.0, 0.0, sequential),
+        ("Scandinavia 21 ka", 63.0, 15.0, 21.0e3, GenMode::Parallel),
+        (
+            "Alps 1 Ma (deep, ETOPO)",
+            46.5,
+            10.0,
+            1.0e6,
+            GenMode::Parallel,
+        ),
+        ("Alps 1 Ma, warm", 46.5, 10.0, 1.0e6, GenMode::Parallel),
+        ("Alps 1 Ma, warm, sequential", 46.5, 10.0, 1.0e6, sequential),
+        ("Pangaea 250 Ma", 0.0, 20.0, 250.0e6, GenMode::Parallel),
+    ];
+    for (name, lat, lon, years, mode) in cases {
+        app.world_mut().resource_mut::<RegionSettings>().mode = mode;
+        app.world_mut().resource_mut::<Seen>().generated.clear();
+        request(&mut app, lat, lon, years);
+        run_until(&mut app, RegionState::InRegion);
+        let event = app.world().resource::<Seen>().generated[0];
+        let (bytes, needed) = last_tile_stats();
+        println!(
+            "{name}: {} ms, needed {needed}, fetched {} tiles ({bytes} B), fallback {}",
+            event.millis, event.tiles_fetched, event.fallback
+        );
+        if let Some(line) = logs()
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|l| l.contains("region generated"))
+        {
+            println!("    {line}");
+        }
+        if let Some(line) = logs()
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|l| l.contains("region tiles ready"))
+        {
+            println!("    {line}");
+        }
+        app.world_mut().write_message(RegionLeft);
+        app.update();
+    }
+}

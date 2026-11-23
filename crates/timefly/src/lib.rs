@@ -12,6 +12,7 @@ pub mod data;
 pub mod diagnostics;
 pub mod globe;
 pub mod gpu;
+pub mod region;
 pub mod time;
 pub mod ui;
 
@@ -21,6 +22,7 @@ use camera::OrbitCameraPlugin;
 use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
 use globe::GlobePlugin;
+use region::RegionPlugin;
 use ui::GameUiPlugins;
 
 /// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
@@ -79,6 +81,7 @@ pub fn app(session: &Session) -> App {
         time::TimePlugin,
         GlobeDataPlugin::default(),
         GlobePlugin,
+        RegionPlugin,
         OrbitCameraPlugin,
         GameUiPlugins,
     ));

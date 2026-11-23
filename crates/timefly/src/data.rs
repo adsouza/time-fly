@@ -8,6 +8,7 @@
 //! [`GlobeLoadState::Failed`].
 
 use std::fmt;
+use std::sync::Arc;
 
 use bevy::asset::io::{AssetReaderError, Reader};
 use bevy::asset::{
@@ -49,10 +50,16 @@ pub struct GlobeData {
     /// Which bake this is: manifest version and `manifest.json` hash.
     pub revision: BakeRevision,
     pub cube_size: u32,
-    pub timeline: Timeline,
+    /// Shared, so region generation can take it off the main thread without a copy.
+    pub timeline: Arc<Timeline>,
     /// One handle per unique frame file, indexed by [`FrameMeta::image_slot`].
     pub images: Vec<Handle<Image>>,
-    pub crust: CrustModel,
+    /// Each frame file's asset path, indexed like [`images`](Self::images). Region generation
+    /// loads the frames it needs again as CPU grids (`region::frames::CpuGrid`), since the
+    /// images keep no CPU bytes.
+    pub frame_paths: Vec<AssetPath<'static>>,
+    /// Shared, like [`timeline`](Self::timeline).
+    pub crust: Arc<CrustModel>,
     pub attribution: Vec<String>,
 }
 
@@ -60,6 +67,11 @@ impl GlobeData {
     /// The image of timeline frame `frame`.
     pub fn frame_image(&self, frame: usize) -> &Handle<Image> {
         &self.images[self.timeline.frames()[frame].image_slot as usize]
+    }
+
+    /// The asset path of timeline frame `frame`'s file.
+    pub fn frame_path(&self, frame: usize) -> &AssetPath<'static> {
+        &self.frame_paths[self.timeline.frames()[frame].image_slot as usize]
     }
 }
 
@@ -235,6 +247,8 @@ pub struct GlobeManifest {
     pub crust: CrustModel,
     #[dependency]
     pub images: Vec<Handle<Image>>,
+    /// The asset path of each image, in the same order.
+    pub frame_paths: Vec<AssetPath<'static>>,
     pub attribution: Vec<String>,
 }
 
@@ -352,19 +366,21 @@ async fn load_manifest(
         .map_err(GlobeDataError::Timeline)?;
 
     // Started only once the CPU data validates; repeated files already share a slot.
-    let images = files
+    let frame_paths = files
         .iter()
-        .map(|file| {
-            let path = sibling_path(load_context.path(), file)?;
-            Ok(load_context.load::<Image>(path))
-        })
-        .collect::<Result<_, GlobeDataError>>()?;
+        .map(|file| sibling_path(load_context.path(), file))
+        .collect::<Result<Vec<_>, GlobeDataError>>()?;
+    let images = frame_paths
+        .iter()
+        .map(|path| load_context.load::<Image>(path.clone()))
+        .collect();
     Ok(GlobeManifest {
         revision,
         cube_size: manifest.cube_size,
         timeline,
         crust,
         images,
+        frame_paths,
         attribution: manifest.attribution,
     })
 }
@@ -654,9 +670,10 @@ fn poll_globe_load(
             commands.insert_resource(GlobeData {
                 revision: manifest.revision,
                 cube_size: manifest.cube_size,
-                timeline: manifest.timeline,
+                timeline: Arc::new(manifest.timeline),
                 images: manifest.images,
-                crust: manifest.crust,
+                frame_paths: manifest.frame_paths,
+                crust: Arc::new(manifest.crust),
                 attribution: manifest.attribution,
             });
             GlobeLoadState::Ready

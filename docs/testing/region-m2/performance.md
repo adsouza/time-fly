@@ -74,3 +74,51 @@ above, `RegionPrep::new` takes under 0.01 ms:
 For the 6 ms web budget: loop `step(256)` until the frame's budget is spent (each call is at most
 about 1 ms deep, natively), or call `step(1024)` once per frame (at most about 4 ms deep). Wasm is
 slower than native, and real plate footprints cost more per deep node than the synthetic ones.
+
+## Region generation in the shell (Task 5)
+
+`cargo test -p timefly --test region_loading -- --ignored real_region_timing --nocapture`
+
+Measured on 2026-11-22 (Apple M4, 10 cores, dev profile: workspace crates at opt-level 1,
+dependencies at 3; rerunning with the workspace crates at opt-level 3 gave the same times within
+3%). The real bake and tiles under `crates/timefly/assets/`, headless (`MinimalPlugins`), full
+resolution (1025² inner + 513² apron). Times run from `RegionRequested` to the grid being ready
+(`RegionGenerated.millis`): frame loads, tile loads and checks, the prep, and the rows. One app
+runs the cases in order, so the tile cache and the overview carry over.
+
+Native generation runs the prep (`RegionPrep`, sequential by design) on one
+`AsyncComputeTaskPool` task, then the rows as 16-row blocks across the pool (`scope`). Bevy's
+default pool options give async compute 3 threads on this machine; the scope's calling thread
+helps too.
+
+| Region | Total | Prep | Rows (parallel) | Tiles fetched |
+|---|---|---|---|---|
+| Alps 46.5°N 10°E, present, cold (first region of the session) | 747 ms | 359 ms | 138 ms | 2 (270,951 B) + overview |
+| Alps, present, warm cache | 496 ms | 354 ms | 137 ms | 0 |
+| Alps, present, warm, sequential (one thread, for comparison) | 724 ms | — | — | 0 |
+| Scandinavia 63°N 15°E, 21 ka | 444 ms | 300 ms | 135 ms | 2 (270,945 B) |
+| Alps, 1 Ma (deep, ETOPO-dominant two-level path) | 761 ms | 608 ms | 147 ms | 0 (cached) |
+| Alps, 1 Ma, warm, sequential | 1,005 ms | — | — | 0 |
+| Pangaea interior 0°N 20°E, 250 Ma | 317 ms | 130 ms | 185 ms | 0 (needs none) |
+
+- **Parallel rows:** about 2.6× faster than one thread (360 ms → 138 ms of rows at the
+  present-day Alps). The deep field's support cache (`RwLock<HashMap>`) shows no contention at
+  this thread count: the 1 Ma rows take 147 ms against 138 ms for the present-day ones. The
+  prep stays sequential and is now most of the time (70–80%), so more row threads would gain
+  little; a parallel prep would be the next step if generation ever needs to be faster.
+- **Cold start:** the first region of a session costs about 250 ms more: the tile manifest
+  (353,054 B, 2,592 entries) and the overview (12,430,497 B, SHA-256 checked, decoded to
+  37 MB of f16) load once and stay for the session.
+- **Main thread:** finding the needed tiles (a probe field's `tiles_needed`) takes 0.1 ms for
+  recent snapshots and 2.7 ms for the 1 Ma deep one; everything else runs on the pool.
+- **Target:** ≤ 3 s native. Every case is under 0.8 s.
+
+**Tile bytes for a mid-latitude region (web):** the present-day Alps region reads 2 tiles,
+270,951 B. The first region of a session also fetches the tile manifest (353,054 B) and the
+overview (12,430,497 B), about 13.1 MB in all; later regions fetch only the tiles their inner
+field reads that are not cached (the cache keeps up to 96). Frames come on top: 1–3 globe frame
+files per region, about 0.2–0.5 MB each (already in the browser's HTTP cache from the globe).
+
+**Time-boxed web path, on native:** `budgeted_run_is_time_boxed` (257² + 129², tiny bake,
+6 ms budget) finishes in 8 slices, the longest 6.05 ms: one slice overshoots its budget by at
+most one prep step or one row. Wasm timings belong to Task 10's web benchmark.
