@@ -31,6 +31,7 @@ shots=(
   "bench-beringia-21ka      62,-175,21000"
   "bench-rockies-21ka       48.5,-113.5,21000"
   "bench-panama-3ma         9,-79.5,3000000"
+  "bench-red-sea-0ka        20,37.5,0"
 )
 
 cargo build -q -p timefly --example region_tour

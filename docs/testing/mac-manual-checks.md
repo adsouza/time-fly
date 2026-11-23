@@ -158,9 +158,9 @@ Run the game normally (`cargo run -p timefly`, or the release build). Wait for t
 ### 12b. The region bench's stops
 
 - [ ] `--region-bench` (native) or `?region-bench` (web) visits, in order: Pangaea interior
-      (250 Ma), Himalayas (present), Sundaland (21 ka), Japan (1 Ma), Beringia (21 ka), an 8 s
+      (250 Ma), Red Sea (present), Himalayas (present), Sundaland (21 ka), Japan (1 Ma), Beringia (21 ka), an 8 s
       globe pan to the Rockies ice margin (21 ka), Panama (3 Ma); then ten Himalaya re-entries
-      (rulings R24–R26). Each block ends `result: PASS`; the Rockies block has the pan's line.
+      (rulings R24–R26, R30). Each block ends `result: PASS`; the Rockies block has the pan's line.
 
 ### 13. A snapshot change keeps the place
 

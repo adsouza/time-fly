@@ -296,7 +296,7 @@ Warm generation median 486 ms, max 537 ms. Memory cycles 1,142.7–1,153.8 MiB o
 resized (2338 × 1237 to 2567 × 1237).
 
 While the bench runs, a translucent banner at the top centre shows the current stop (region,
-age, `k of 8` with the pan counted), `Next: …` on the globe, and at the end the result.
+age, `k of 9` with the pan counted), `Next: …` on the globe, and at the end the result.
 
 #### Final bench set, native M4, 2560 × 1440 (`5022c32`, 2026-11-23)
 
@@ -349,6 +349,7 @@ the inner field; coast by the bench's 36-ray search; generation single-threaded,
 | Region | Centre, age | Tiles | Land | Anomaly land | Coast | Ice | Max (inner) | Snowline | Plates | Generation |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Pangaea interior | −22, −18, 250 Ma | 0 | | | none in 1,150 km | | | | | (unchanged) |
+| Red Sea (R30) | 20, 37.5, 0 ka | 2 | 0.42 | 0.000 | 8 km | 0.00 | 1,593 m | 5,500 m | — | 0.64 s |
 | Himalayas | 28, 86.9, 0 ka | 1 | 1.00 | 0.000 | 684 km | 0.00 | 7,576 m | 4,940 m (26.5% above) | — | 0.55 s |
 | Sundaland | 5, 107, 21 ka | 2 | 0.97 | 0.948 | 40 km | 0.00 | 558 m | 4,513 m | — | 0.52 s |
 | Japan | 36, 138.5, 1 Ma | 4 | 0.74 | — | 80 km | 0.00 | 2,588 m | 3,811 m | 610 | 2.36 s |

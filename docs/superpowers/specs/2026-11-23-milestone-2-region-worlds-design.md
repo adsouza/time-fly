@@ -361,6 +361,7 @@ notes: deep-era biomes are zonal approximations, and ice-age biomes use the pres
 - **Benchmark:** `--region-bench` flies a scripted path (low pass, climb, coastline, apron) in
   fixed regions, in this order:
   - 250 Ma Pangaea interior (first: the cold-start window)
+  - present-day Red Sea (the Sudanese coast: a coast at sea level 0, and hot desert)
   - present-day Himalayas (Everest area; the memory cycles re-enter it)
   - 21 ka Sundaland (the exposed tropical shelf and its coast)
   - 1 Ma Japan (mountains and both coasts)
@@ -373,7 +374,7 @@ notes: deep-era biomes are zonal approximations, and ice-age biomes use the pres
   (sea-level anomaly land and coast) and the Rockies ice margin (ice edge and glacial snowline on
   mountains), joined by a globe pan across Canada. One continuous flight needs region streaming
   (M3 or later) (ruling R25). The Aegean is replaced by Japan and Panama, Sundaland is added,
-  and the order above is the owner's (ruling R26).
+  and the order above is the owner's (ruling R26). The Red Sea joins second (ruling R30).
 - **What the benchmark reports:**
   - frame-time stats under the R14 rule
   - region generation time (native and web)

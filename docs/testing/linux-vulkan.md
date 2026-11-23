@@ -153,7 +153,8 @@ flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly \
 ```
 
 It waits for the globe, then enters the bench regions in turn (rulings R24–R26): the Pangaea
-interior at 250 Ma (era-frame 22° S, 18° W), the Himalayas at the present (28° N, 86.9° E,
+interior at 250 Ma (era-frame 22° S, 18° W), the Red Sea at the present (20° N, 37.5° E; ruling
+R30), the Himalayas at the present (28° N, 86.9° E,
 Everest's area), Sundaland at 21 ka (5° N, 107° E), Japan at 1 Ma (era-frame 36° N,
 138.5° E), Beringia at 21 ka (62° N, 175° W), then an 8 s globe pan to the Rockies ice margin at
 21 ka (48.5° N, 113.5° W), and Panama at 3 Ma (era-frame 9° N, 79.5° W). In each it flies a 60 s path (a low pass at 300 m, a climb to 30 km, a run along or
@@ -161,13 +162,13 @@ toward the coast, a sweep toward the apron), then leaves. Then it re-enters the 
 measure warm generation and memory. It prints one block per region and a summary block, then
 exits: 0 on PASS, 3 on FAIL. A run takes about ten minutes. Leave the mouse and keyboard alone
 while it runs, and paste every block back unedited (one per region and the summary). A banner
-at the top centre shows the current stop (`Sundaland · 21 thousand years ago · 3 of 8`, the pan,
+at the top centre shows the current stop (`Sundaland · 21 thousand years ago · 4 of 9`, the pan,
 `Next: …` on the globe) and finally `Region bench finished: PASS` or `FAIL`. The
 Rockies block also has a `globe pan from Beringia` line (R14-gated) and `frames fetched 0`.
 
 - [ ] Each block shows `render resolution: 2560x1440`.
 - [ ] Each region block ends `result: PASS` (ruling R14, as in section 5). A block whose coast
-      is in the field (Japan, Sundaland, Beringia, Panama) has a `the run stays within … km of
+      is in the field (Red Sea, Japan, Sundaland, Beringia, Panama) has a `the run stays within … km of
       the coastline` line: it flew a real shore.
 - [ ] The summary: warm generation at most 3,000 ms, and memory cycles within +10% of the first.
       The first-region worst-frame line (ruling R11) is informational on native.
@@ -237,7 +238,7 @@ _Not run yet._
 | `.deb` | | | | | | | | |
 | Flatpak | | | | | | | | |
 
-| Package (regions, 2560 × 1440) | GPU / driver | Region checks | Pangaea median / p95 / missed | Himalayas | Sundaland | Japan | Beringia | Pan / Rockies | Panama | Warm generation max | Memory cycles | Summary |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `.deb` | | | | | | | | | | | | |
-| Flatpak | | | | | | | | | | | | |
+| Package (regions, 2560 × 1440) | GPU / driver | Region checks | Pangaea median / p95 / missed | Red Sea | Himalayas | Sundaland | Japan | Beringia | Pan / Rockies | Panama | Warm generation max | Memory cycles | Summary |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `.deb` | | | | | | | | | | | | | |
+| Flatpak | | | | | | | | | | | | | |

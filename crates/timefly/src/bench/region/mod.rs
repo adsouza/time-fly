@@ -101,6 +101,8 @@ pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -
 /// The bench regions, in order (M2 design §8; owner decisions, rulings R24–R26):
 /// - **Pangaea interior** (era frame, 250 Ma): inland hot desert, no tiles. First, so it holds
 ///   R11's first-region window (overview load and first pipelines; no tile fetch).
+/// - **Red Sea** (0 ka, the Sudanese coast): a present-day coast at sea level 0 and Köppen BWh
+///   desert (ruling R30).
 /// - **Himalayas** (0 ka, Everest's area): the highest relief; the memory cycles' region
 ///   ([`CYCLE_REGION`]).
 /// - **Sundaland** (21 ka): the exposed tropical shelf and its 21 ka coast.
@@ -108,13 +110,22 @@ pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -
 /// - **Beringia** (21 ka): land below today's sea level and its 21 ka coast.
 /// - a globe pan to the **Rockies ice margin** (21 ka): ice edge and the glacial snowline.
 /// - **Panama** (era frame, 3 Ma): the closing isthmus where plate pieces meet.
-pub const BENCH_REGIONS: [BenchRegion; 7] = [
+pub const BENCH_REGIONS: [BenchRegion; 8] = [
     BenchRegion {
         name: "Pangaea interior",
         arg: RegionArg {
             lat_deg: -22.0,
             lon_deg: -18.0,
             years: 250.0e6,
+        },
+        pan_from_previous: false,
+    },
+    BenchRegion {
+        name: "Red Sea",
+        arg: RegionArg {
+            lat_deg: 20.0,
+            lon_deg: 37.5,
+            years: 0.0,
         },
         pan_from_previous: false,
     },
@@ -1378,6 +1389,7 @@ mod tests {
             names,
             [
                 "Pangaea interior",
+                "Red Sea",
                 "Himalayas",
                 "Sundaland",
                 "Japan",
@@ -1396,6 +1408,8 @@ mod tests {
             args,
             [
                 arg(-22.0, -18.0, 250.0e6),
+                // Ruling R30: a present-day coast at sea level 0 and BWh desert.
+                arg(20.0, 37.5, 0.0),
                 // Ruling R24: Everest (27.99, 86.93) is in the inner field.
                 arg(28.0, 86.9, 0.0),
                 // Ruling R26: 21 ka anomaly land and coast on the tropical shelf.
@@ -1409,13 +1423,16 @@ mod tests {
         );
         // Only the Rockies are reached by a pan, from Beringia at the same snapshot.
         let pans: Vec<_> = BENCH_REGIONS.iter().map(|r| r.pan_from_previous).collect();
-        assert_eq!(pans, [false, false, false, false, false, true, false]);
-        assert_eq!(BENCH_REGIONS[4].arg.years, BENCH_REGIONS[5].arg.years);
-        assert_eq!(stop_count(), 8);
+        assert_eq!(
+            pans,
+            [false, false, false, false, false, false, true, false]
+        );
+        assert_eq!(BENCH_REGIONS[5].arg.years, BENCH_REGIONS[6].arg.years);
+        assert_eq!(stop_count(), 9);
         assert_eq!(after_region(0, 10), Next::Region(1));
-        assert_eq!(after_region(5, 10), Next::Region(6));
-        assert_eq!(after_region(6, 10), Next::Cycle(0));
-        assert_eq!(after_region(6, 0), Next::Summary);
+        assert_eq!(after_region(6, 10), Next::Region(7));
+        assert_eq!(after_region(7, 10), Next::Cycle(0));
+        assert_eq!(after_region(7, 0), Next::Summary);
     }
 
     #[test]

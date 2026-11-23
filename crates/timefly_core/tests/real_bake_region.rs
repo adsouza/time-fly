@@ -349,6 +349,7 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
         ("japan", 36.0, 138.5),
         ("panama", 9.0, -79.5),
         ("sundaland", 5.0, 107.0),
+        ("red sea", 20.0, 37.5),
     ] {
         let centre = geo_to_render(latlon_to_geo(lat, lon));
         let frame = RegionFrame { center: centre };

@@ -180,7 +180,7 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Pangaea interior PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
+        "regions (R14 frame rate): Pangaea interior PASS, Red Sea PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Himalayas",
         "first entries (cold tiles; reported only natively): Pangaea interior ",
@@ -201,11 +201,11 @@ fn region_bench_reports_all_regions() {
     // The banner followed the stops, the pan and the result, and kept the result.
     let shown = &app.world().resource::<BannerTexts>().0;
     for text in [
-        "Next: Pangaea interior · 250 million years ago · 1 of 8",
-        "Pangaea interior · 250 million years ago · 1 of 8",
-        "Sundaland · 21 thousand years ago · 3 of 8",
+        "Next: Pangaea interior · 250 million years ago · 1 of 9",
+        "Pangaea interior · 250 million years ago · 1 of 9",
+        "Sundaland · 21 thousand years ago · 4 of 9",
         "Globe · Beringia → Rockies ice margin",
-        "Panama · 3 million years ago · 8 of 8",
+        "Panama · 3 million years ago · 9 of 9",
         "Memory cycles · Himalayas · 1 of 2",
     ] {
         assert!(

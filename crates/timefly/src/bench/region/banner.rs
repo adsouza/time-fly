@@ -1,5 +1,5 @@
 //! The region bench's banner (owner request): a translucent panel at the top centre naming
-//! where the bench is: the region (`Sundaland · 21 thousand years ago · 3 of 8`), the globe pan
+//! where the bench is: the region (`Sundaland · 21 thousand years ago · 4 of 9`), the globe pan
 //! (`Globe · Beringia → Rockies ice margin`), the next stop while on the globe (`Next: …`), the
 //! memory cycles, and at the end the summary's result. A smaller second line names the path
 //! segment while flying. It exists only with the bench plugin, and its text is written only
@@ -217,18 +217,18 @@ mod tests {
 
     #[test]
     fn stops_count_the_pan() {
-        assert_eq!(stop_count(), 8);
+        assert_eq!(stop_count(), 9);
         let numbers: Vec<_> = (0..BENCH_REGIONS.len()).map(stop_number).collect();
-        // Pangaea, Himalayas, Sundaland, Japan, Beringia, (pan = 6), Rockies, Panama.
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 7, 8]);
+        // Pangaea, Red Sea, Himalayas, Sundaland, Japan, Beringia, (pan = 7), Rockies, Panama.
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 8, 9]);
     }
 
     #[test]
     fn the_banner_names_each_stop() {
         assert_eq!(
-            banner_lines(BannerKey::In(2, None)),
+            banner_lines(BannerKey::In(3, None)),
             (
-                "Sundaland · 21 thousand years ago · 3 of 8".to_string(),
+                "Sundaland · 21 thousand years ago · 4 of 9".to_string(),
                 None
             )
         );
@@ -237,14 +237,14 @@ mod tests {
             Some(Segment::Climb.label().to_string())
         );
         assert_eq!(
-            banner_lines(BannerKey::Next(1)).0,
-            "Next: Himalayas · Present · 2 of 8"
+            banner_lines(BannerKey::Next(2)).0,
+            "Next: Himalayas · Present · 3 of 9"
         );
         assert_eq!(
-            banner_lines(BannerKey::Pan(5)),
+            banner_lines(BannerKey::Pan(6)),
             (
                 "Globe · Beringia → Rockies ice margin".to_string(),
-                Some("6 of 8".to_string())
+                Some("7 of 9".to_string())
             )
         );
         assert_eq!(
