@@ -130,6 +130,17 @@ fn region_bench_reports_all_regions() {
             report.contains("first-entry generation: reported only natively"),
             "{report}"
         );
+        // Host stalls are reported for the load window and the flight, none here.
+        assert!(
+            report.contains(
+                "host stalls in the load window (frames > 1000 ms; page paused or throttled?): 0"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("host stalls in the flight (frames > 1000 ms"),
+            "{report}"
+        );
     }
 
     let summary = bench.summary().unwrap();

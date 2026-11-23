@@ -734,6 +734,31 @@ fn pacing_name(pacing: Pacing) -> &'static str {
     }
 }
 
+/// A frame longer than this is reported as a host stall: the page was paused or throttled (a
+/// browser pane can stop `requestAnimationFrame` for tens of seconds), not a game hitch.
+/// Reporting only: no pass rule reads it.
+pub const HOST_STALL_MS: f32 = 1_000.0;
+
+/// The host stalls among `frames` (ms): their count and the longest (0 without any).
+pub fn host_stalls(frames: &[f32]) -> (usize, f32) {
+    frames
+        .iter()
+        .filter(|&&ms| ms > HOST_STALL_MS)
+        .fold((0, 0.0), |(n, longest), &ms| (n + 1, f32::max(longest, ms)))
+}
+
+fn host_stall_line(window: &str, frames: &[f32]) -> String {
+    let (count, longest) = host_stalls(frames);
+    format!(
+        "  host stalls in the {window} (frames > {HOST_STALL_MS:.0} ms; page paused or throttled?): {count}{}",
+        if count > 0 {
+            format!(", longest {longest:.0} ms")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// A region's first-entry generation (`millis`) against the web's [`WEB_GEN_TARGET_MS`]: `None`
 /// natively (reported only), else whether it is within the target (no region generated fails).
 pub fn first_entry_gate(millis: Option<u32>, web: bool) -> Option<bool> {
@@ -819,6 +844,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         load.frames,
         load.worst_ms
     ));
+    out.push(host_stall_line("load window", &r.load_ms));
     if region == 0 {
         out.push(r11_line(bench));
     }
@@ -898,6 +924,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         "  missed frames (>{:.1} ms = {MISSED_INTERVALS}x interval): {missed} ({share:.2}%)",
         MISSED_INTERVALS * interval,
     ));
+    out.push(host_stall_line("flight", &r.flight_ms));
     for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
         out.push(format!("  {}", stat_line(segment.label(), frames)));
     }
@@ -1132,6 +1159,18 @@ mod tests {
         assert_eq!(memory_cycles_pass(&[]), None);
         assert_eq!(memory_cycles_pass(&[mib(800), None]), None);
         assert_eq!(memory_cycles_pass(&[None, mib(800)]), None);
+    }
+
+    #[test]
+    fn host_stalls_are_frames_over_a_second() {
+        assert_eq!(host_stalls(&[]), (0, 0.0));
+        assert_eq!(host_stalls(&[16.7, 999.0, 250.0]), (0, 0.0));
+        assert_eq!(host_stalls(&[16.7, 1_000.5, 24_000.0, 33.0]), (2, 24_000.0));
+        let line = host_stall_line("flight", &[16.7, 45_000.0]);
+        assert!(
+            line.contains("page paused or throttled?): 1, longest 45000 ms"),
+            "{line}"
+        );
     }
 
     #[test]
