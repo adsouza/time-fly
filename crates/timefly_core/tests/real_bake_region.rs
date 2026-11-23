@@ -652,3 +652,115 @@ fn everest_tile_keeps_its_peak_in_f16() {
         "{lat}, {lon}"
     );
 }
+
+/// Ruling R27 over the real bake at 0 ka: the dry Tibetan Plateau north of Everest is not snow,
+/// its crest is; and the humid Alps keep their snow within ±10% (against the latitude-only
+/// snowline, recomputed per texel). Snow is the ice byte at half or more, or an ice-cap or alpine
+/// biome.
+#[test]
+#[ignore = "reads the real bake; run in release"]
+fn dry_snowline_on_the_real_bake() {
+    use timefly_core::worldgen::biome::{BiomeClass, snowline_m};
+    let globe = data().join("globe");
+    let b = bake(&globe);
+    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
+    let grid_at = |lat: f64, lon: f64| {
+        let mut grids: Vec<Option<Grid>> = vec![None; b.files.len()];
+        for i in frames_needed(&b.timeline, 0.0) {
+            grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
+        }
+        let centre = geo_to_render(latlon_to_geo(lat, lon));
+        let frame = RegionFrame { center: centre };
+        let mut tiles = TileSet::new();
+        tiles.set_overview(overview.clone()).unwrap();
+        let probe = snapshot_field(&b.timeline, &b.crust, &tiles, false, 0.0, |i| {
+            grids[i].as_ref().unwrap()
+        })
+        .unwrap();
+        for (r, c) in probe.tiles_needed(&frame) {
+            let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
+            tiles
+                .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
+                .unwrap();
+        }
+        let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, 0.0, |i| {
+            grids[i].as_ref().unwrap()
+        })
+        .unwrap();
+        let spec = RegionSpec {
+            seed: 0x7F1E_0002,
+            ..RegionSpec::new(centre, YearsBp(0.0), 0)
+        };
+        (RegionGenerator::new(spec, &field).finish(), frame)
+    };
+    let snowy = |s: &[u8; 4]| {
+        s[2] >= 128 || s[0] == BiomeClass::IceCap as u8 || s[0] == BiomeClass::Alpine as u8
+    };
+    // The Himalayas: the plateau band and the crest.
+    let (grid, _) = grid_at(28.0, 86.9);
+    let (mut band, mut band_snow, mut crest, mut crest_snow) = (0, 0, 0, 0);
+    let mut band_before = 0;
+    for (h, s) in grid.inner.elevation_m.iter().zip(&grid.inner.surface) {
+        if (4_500.0..5_500.0).contains(h) {
+            band += 1;
+            band_snow += usize::from(snowy(s));
+            // The latitude-only line at the centre's latitude (4,940 m): what R27 replaced.
+            band_before += usize::from(f64::from(*h) > snowline_m(28.0, 0.0));
+        }
+        if *h > 7_000.0 {
+            crest += 1;
+            crest_snow += usize::from(snowy(s));
+        }
+    }
+    let band_frac = band_snow as f64 / band as f64;
+    let crest_frac = crest_snow as f64 / crest as f64;
+    println!(
+        "Himalayas 0 ka: 4,500-5,500 m land {band} texels, {:.1}% snow ({:.1}% above the latitude-only line); above 7,000 m {crest} texels, {:.1}% snow",
+        band_frac * 100.0,
+        band_before as f64 / band as f64 * 100.0,
+        crest_frac * 100.0
+    );
+    assert!(band_frac < 0.25, "{band_frac}");
+    assert!(crest_frac >= 0.90, "{crest_frac}");
+    // The Alps: snow against the latitude-only line.
+    let (grid, frame) = grid_at(46.5, 10.0);
+    let (mut before, mut after) = (0usize, 0usize);
+    let n = grid.inner.res;
+    for row in 0..n {
+        for col in 0..n {
+            let i = (row * n + col) as usize;
+            let (h, s) = (grid.inner.elevation_m[i], grid.inner.surface[i]);
+            if h <= 0.0 {
+                continue;
+            }
+            let (x, z) = grid.inner.local_of(row, col);
+            let (lat, _) = geo_to_latlon(render_to_geo(frame.local_to_dir(x, z)));
+            let cap = s[0] == BiomeClass::IceCap as u8 || s[0] == BiomeClass::Alpine as u8;
+            before += usize::from(f64::from(h) > snowline_m(lat, 0.0) || cap);
+            after += usize::from(snowy(&s));
+        }
+    }
+    let raised = grid
+        .inner
+        .surface
+        .iter()
+        .filter(|s| s[3] & 0x7F > 0)
+        .count();
+    let top = grid
+        .inner
+        .elevation_m
+        .iter()
+        .copied()
+        .fold(f32::MIN, f32::max);
+    println!(
+        "Alps 0 ka: snow texels {before} with the latitude-only line, {after} now; {raised} of {} texels raised; inner max {top:.0} m (latitude-only snowline {:.0} m)",
+        n * n,
+        snowline_m(46.5, 0.0)
+    );
+    if before == 0 {
+        assert_eq!(after, 0);
+    } else {
+        let change = after as f64 / before as f64 - 1.0;
+        assert!(change.abs() <= 0.10, "{change}");
+    }
+}

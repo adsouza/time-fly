@@ -63,9 +63,49 @@ pub const SNOWLINE_DROP_PER_ANOMALY_M: f64 = 1000.0 / 120.0;
 /// `0..=1,200 m`: no change for a positive anomaly. `sea_level_anomaly_m` is the anomaly the era's
 /// heights carry (0 from the first PaleoDEM bracket on). Mirrored by `snowline_m` in `snowline.wesl`.
 pub fn snowline_m(lat_deg: f64, sea_level_anomaly_m: f64) -> f64 {
+    snowline_with_raise_m(lat_deg, sea_level_anomaly_m, 0.0)
+}
+
+/// The most a dry Köppen class (BWh, BWk, BSh, BSk) raises the snowline (ruling R27): arid
+/// mountains carry snow only far higher than humid ones at the same latitude. The dry Andes
+/// (Atacama, Altiplano) and the Tibetan Plateau hold their snowline at about 5,800–6,000 m
+/// (Ammann et al. 2001, *Palaeogeogr. Palaeoclimatol. Palaeoecol.* 172; Shi 2002, *Quat. Int.*
+/// 97–98), about 1,000 m above the latitude rule's 4,800–5,000 m there.
+pub const DRY_KOPPEN_SNOWLINE_RAISE_M: f64 = 1000.0;
+/// The continentality raise (ruling R27; the only dryness signal in deep time): none within
+/// [`CONTINENTAL_FROM_KM`] of the coast, rising linearly to [`CONTINENTAL_SNOWLINE_RAISE_M`] at
+/// [`CONTINENTAL_FULL_KM`].
+pub const CONTINENTAL_SNOWLINE_RAISE_M: f64 = 1000.0;
+pub const CONTINENTAL_FROM_KM: f64 = 300.0;
+pub const CONTINENTAL_FULL_KM: f64 = 1500.0;
+
+/// How far dryness raises the snowline (m, never negative), ruling R27: the larger of the dry
+/// Köppen classes' raise (`koppen`, present-day code where the era reads one) and the
+/// continentality raise from the distance to the coast (km). The larger, not the sum: both
+/// measure the same dryness.
+pub fn snowline_raise_m(koppen: Option<u8>, coast_km: f64) -> f64 {
+    let dry_class = matches!(koppen, Some(4..=7));
+    let koppen_raise = if dry_class {
+        DRY_KOPPEN_SNOWLINE_RAISE_M
+    } else {
+        0.0
+    };
+    let t = (coast_km - CONTINENTAL_FROM_KM) / (CONTINENTAL_FULL_KM - CONTINENTAL_FROM_KM);
+    // NaN (no distance known) counts as no raise.
+    let continental = if t.is_nan() {
+        0.0
+    } else {
+        CONTINENTAL_SNOWLINE_RAISE_M * t.clamp(0.0, 1.0)
+    };
+    koppen_raise.max(continental)
+}
+
+/// [`snowline_m`] raised by `raise_m` of dryness ([`snowline_raise_m`]): the glacial lowering
+/// still applies on top. Mirrored by `snowline_m` in `snowline.wesl` (its third argument).
+pub fn snowline_with_raise_m(lat_deg: f64, sea_level_anomaly_m: f64, raise_m: f64) -> f64 {
     let drop = (-sea_level_anomaly_m * SNOWLINE_DROP_PER_ANOMALY_M)
         .clamp(0.0, MAX_GLACIAL_SNOWLINE_DROP_M);
-    (5500.0 - 70.0 * (lat_deg.abs() - 20.0).max(0.0) - drop).max(0.0)
+    (5500.0 - 70.0 * (lat_deg.abs() - 20.0).max(0.0) + raise_m.max(0.0) - drop).max(0.0)
 }
 
 /// The zonal rule for deep time, from paleolatitude (degrees), effective elevation (m),
@@ -79,7 +119,8 @@ pub fn zonal_biome(
     sea_level_anomaly_m: f64,
 ) -> BiomeClass {
     let lat = paleolat_deg.abs();
-    if elevation_m > snowline_m(lat, sea_level_anomaly_m) {
+    let raise = snowline_raise_m(None, coast_distance_km);
+    if elevation_m > snowline_with_raise_m(lat, sea_level_anomaly_m, raise) {
         return if lat > 60.0 {
             BiomeClass::IceCap
         } else {
@@ -488,5 +529,61 @@ mod tests {
             BiomeClass::TemperateBroadleaf
         );
         assert_eq!(zonal_biome(45.0, 3000.0, 0.0, -120.0), BiomeClass::Alpine);
+    }
+
+    #[test]
+    fn dryness_raises_the_snowline_inland_and_in_dry_climates() {
+        // Near a coast with a humid class: nothing.
+        assert_eq!(snowline_raise_m(None, 0.0), 0.0);
+        assert_eq!(snowline_raise_m(Some(15), 100.0), 0.0);
+        assert_eq!(snowline_raise_m(None, CONTINENTAL_FROM_KM), 0.0);
+        // Continentality: linear from 300 to 1,500 km, then flat.
+        assert!((snowline_raise_m(None, 900.0) - 500.0).abs() < 1e-9);
+        assert_eq!(snowline_raise_m(None, CONTINENTAL_FULL_KM), 1000.0);
+        assert_eq!(snowline_raise_m(None, 1.0e6), 1000.0);
+        // The dry classes at a coast.
+        for code in [4, 5, 6, 7] {
+            assert_eq!(
+                snowline_raise_m(Some(code), 0.0),
+                DRY_KOPPEN_SNOWLINE_RAISE_M
+            );
+        }
+        // The larger of the two, never the sum.
+        assert_eq!(snowline_raise_m(Some(5), 2000.0), 1000.0);
+        assert!((snowline_raise_m(Some(5), 900.0) - 1000.0).abs() < 1e-9);
+        // Never lowers it, wherever it is.
+        for code in [
+            None,
+            Some(0),
+            Some(1),
+            Some(5),
+            Some(29),
+            Some(30),
+            Some(99),
+        ] {
+            for km in [-50.0, 0.0, 299.0, 301.0, 800.0, 1e6, f64::NAN] {
+                let r = snowline_raise_m(code, km);
+                assert!((0.0..=1000.0).contains(&r), "{code:?} {km}: {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_raised_snowline_still_drops_in_glacial_eras() {
+        for lat in [0.0, 28.0, 46.5, 60.0] {
+            for raise in [0.0, 400.0, 1000.0] {
+                let today = snowline_with_raise_m(lat, 0.0, raise);
+                assert!(
+                    (today - (snowline_m(lat, 0.0) + raise)).abs() < 1e-9,
+                    "{lat} {raise}"
+                );
+                let glacial = snowline_with_raise_m(lat, -120.0, raise);
+                assert!((glacial - (today - 1000.0)).abs() < 1e-9, "{lat} {raise}");
+            }
+        }
+        assert_eq!(
+            snowline_with_raise_m(46.5, -50.0, 0.0),
+            snowline_m(46.5, -50.0)
+        );
     }
 }

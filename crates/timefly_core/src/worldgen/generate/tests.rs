@@ -267,7 +267,7 @@ fn overlap_agreement() {
                 let (ha, sa) = ga.sample_point_in(kind, p);
                 let (hb, sb) = gb.sample_point_in(kind, p);
                 assert_eq!(ha.to_bits(), hb.to_bits(), "1 Ma {kind:?} probe {k}");
-                assert_eq!(sa[1..], sb[1..]);
+                assert_same_surface_but_dryness(sa, sb);
             }
         }
     }
@@ -503,17 +503,27 @@ fn recent_adds_ice_delta() {
     let grid = generate(spec_at(centre, 0.021, 33, 17), &field);
     for (h, s) in grid.inner.elevation_m.iter().zip(&grid.inner.surface) {
         assert!(*h >= 1.0 && (h - 20.0).abs() < 10.0, "{h}");
-        assert_eq!(s[3], SURFACE_SHORE * u8::from((*h as f64) <= SHORE_BAND_M));
+        assert_eq!(
+            s[3] & SURFACE_SHORE,
+            SURFACE_SHORE * u8::from((*h as f64) <= SHORE_BAND_M)
+        );
     }
 }
 
 #[test]
 fn glacial_eras_lower_the_snowline() {
     // Ruling R18: 3,200 m ground at the Alps' latitude is below today's 3,645 m snowline and
-    // above the Last Glacial Maximum's 2,645 m one (sea 120 m lower).
+    // above the Last Glacial Maximum's 2,645 m one (sea 120 m lower). A sea 220 km out keeps
+    // the dryness raise (ruling R27) at zero: near a coast, humid class.
     let centre = dir(46.5, 10.0);
     let field = FnField {
-        f: |_| 3200.0,
+        f: |d: RenderDir| {
+            if d.0.dot(centre.0) > (2.0f64).to_radians().cos() {
+                3200.0
+            } else {
+                -1000.0
+            }
+        },
         spacing_m: 1000.0,
         koppen: Some(26), // Dfb: temperate broadleaf, so only the snowline decides the ice
     };
@@ -970,5 +980,32 @@ fn generation_timing() {
         print_profile(label, RegionSpec::new(centre, YearsBp(21_000.0), 1), || {
             recent
         });
+    }
+}
+
+#[test]
+fn the_snowline_raise_round_trips_through_the_surface_byte() {
+    for raise in [0.0, 3.0, 500.0, 777.7, 1000.0] {
+        let byte = encode_snowline_raise(raise);
+        assert_eq!(byte & SURFACE_SHORE, 0);
+        let back = decode_snowline_raise(byte | SURFACE_SHORE);
+        assert!(
+            (back - raise).abs() <= MAX_SNOWLINE_RAISE_M / 254.0 + 1e-9,
+            "{raise} -> {back}"
+        );
+    }
+    assert_eq!(encode_snowline_raise(-5.0), 0);
+    assert_eq!(encode_snowline_raise(5000.0), SURFACE_RAISE_STEPS);
+    assert_eq!(encode_snowline_raise(f64::NAN), 0);
+}
+
+/// Two regions' surface codes at one point agree except where they read the coast distance
+/// from their own aprons (rulings R9, R27): the biome byte, and the snowline's dryness raise,
+/// with the snow (ice byte) it moves. Where the raise agrees, the ice must agree too.
+fn assert_same_surface_but_dryness(a: [u8; 4], b: [u8; 4]) {
+    assert_eq!(a[1], b[1], "era");
+    assert_eq!(a[3] & SURFACE_SHORE, b[3] & SURFACE_SHORE, "shore");
+    if a[3] & SURFACE_RAISE_STEPS == b[3] & SURFACE_RAISE_STEPS {
+        assert_eq!(a[2], b[2], "ice with the same raise");
     }
 }

@@ -37,8 +37,8 @@ use tracing::instrument;
 use crate::deep_time::YearsBp;
 use crate::geo::RenderDir;
 use crate::worldgen::biome::{
-    BiomeClass, VegetationEra, biome_from_koppen, effective_biome, snowline_m, vegetation_era,
-    zonal_biome,
+    BiomeClass, VegetationEra, biome_from_koppen, effective_biome, snowline_raise_m,
+    snowline_with_raise_m, vegetation_era, zonal_biome,
 };
 use crate::worldgen::coarse::{CoarseField, KeyKind};
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
@@ -52,8 +52,29 @@ pub use detail::coastline_clamp;
 use detail::{Detail, octaves_for, smoothstep};
 use lattice::{Coarse, Lattice};
 
-/// Surface byte 3 for a texel in the shoreline band (Task 8 tints Barren-era shores with it).
-pub const SURFACE_SHORE: u8 = 255;
+/// Surface byte 3's top bit: the texel is in the shoreline band (Task 8 tints Barren-era shores
+/// with it).
+pub const SURFACE_SHORE: u8 = 0x80;
+/// Surface byte 3's low 7 bits: the snowline's dryness raise (ruling R27) in steps of
+/// [`MAX_SNOWLINE_RAISE_M`] / 127, so the shader paints snow at the same line as the generator.
+pub const SURFACE_RAISE_STEPS: u8 = 0x7F;
+/// The largest dryness raise either term gives.
+pub const MAX_SNOWLINE_RAISE_M: f64 = 1000.0;
+
+/// A dryness raise (m) as surface byte 3's low bits (nearest step, clamped).
+pub fn encode_snowline_raise(raise_m: f64) -> u8 {
+    let q = (raise_m / MAX_SNOWLINE_RAISE_M * f64::from(SURFACE_RAISE_STEPS)).round();
+    if q.is_nan() {
+        0
+    } else {
+        q.clamp(0.0, f64::from(SURFACE_RAISE_STEPS)) as u8
+    }
+}
+
+/// The dryness raise (m) surface byte 3 holds. Mirrored in `terrain.wesl`'s `texel_surface`.
+pub fn decode_snowline_raise(byte: u8) -> f64 {
+    f64::from(byte & SURFACE_RAISE_STEPS) / f64::from(SURFACE_RAISE_STEPS) * MAX_SNOWLINE_RAISE_M
+}
 /// Heights within this many metres of sea level count as shoreline.
 pub const SHORE_BAND_M: f64 = 15.0;
 /// Coast distance where the apron holds no coast at all.
@@ -581,18 +602,18 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
 
     fn surface(&self, dir: RenderDir, h: f64, coarse: &Coarse) -> [u8; 4] {
         let lat = self.field.paleolat(dir);
+        let coast_km = f64::from(self.coast_km_at(dir));
+        // The dryness raise (ruling R27), at the step the surface byte stores, so the generator
+        // and the shader draw the same snowline.
+        let raise_byte = encode_snowline_raise(snowline_raise_m(coarse.koppen, coast_km));
+        let raise_m = decode_snowline_raise(raise_byte);
         let biome = match coarse.koppen.and_then(biome_from_koppen) {
             Some(b) => b,
-            None => zonal_biome(
-                lat,
-                h,
-                f64::from(self.coast_km_at(dir)),
-                self.spec.sea_level_anomaly_m,
-            ),
+            None => zonal_biome(lat, h, coast_km, self.spec.sea_level_anomaly_m),
         };
         let biome = effective_biome(self.era, biome);
         let snow = if h > 0.0 {
-            let line = snowline_m(lat, self.spec.sea_level_anomaly_m);
+            let line = snowline_with_raise_m(lat, self.spec.sea_level_anomaly_m, raise_m);
             smoothstep(line - SNOW_RAMP_M, line + SNOW_RAMP_M, h)
         } else {
             0.0
@@ -612,7 +633,7 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
             biome as u8,
             self.era as u8,
             (ice * 255.0).round() as u8,
-            shore,
+            shore | raise_byte,
         ]
     }
 

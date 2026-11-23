@@ -10,8 +10,9 @@
 //!   `blended_height_m` and `curvature_drop_m`, fed through the shell's own buffer packing.
 //! - `wesl_normal_matches_rust` runs `terrain_normal` (the per-pixel lighting normal, with the
 //!   curvature tilt) against `timefly_core::terrain::surface_normal`.
-//! - `wesl_snowline_matches_rust` runs `snowline.wesl` (with ruling R18's glacial lowering)
-//!   against `timefly_core::worldgen::biome::snowline_m`.
+//! - `wesl_snowline_matches_rust` runs `snowline.wesl` (with ruling R18's glacial lowering and
+//!   ruling R27's dryness raise decoded from the surface byte) against
+//!   `timefly_core::worldgen::biome::snowline_with_raise_m`.
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -674,7 +675,7 @@ fn wesl_normal_matches_rust() {
 const SNOWLINE: &str = include_str!("../assets/shaders/snowline.wesl");
 
 const SNOWLINE_ENTRY: &str = r#"
-@group(0) @binding(0) var<storage, read> queries: array<vec2<f32>>;   // (lat, anomaly)
+@group(0) @binding(0) var<storage, read> queries: array<vec4<f32>>;   // (lat, anomaly, byte, -)
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 
 @compute @workgroup_size(64)
@@ -683,14 +684,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (n >= arrayLength(&out)) {
         return;
     }
-    out[n] = snowline_m(queries[n].x, queries[n].y);
+    let q = queries[n];
+    out[n] = snowline_m(q.x, q.y, snowline_raise_from_byte(u32(q.z)));
 }
 "#;
 
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn wesl_snowline_matches_rust() {
-    use timefly_core::worldgen::biome::snowline_m;
+    use timefly_core::worldgen::biome::snowline_with_raise_m;
+    use timefly_core::worldgen::generate::{SURFACE_SHORE, decode_snowline_raise};
     let lats = [
         -90.0f32, -63.0, -46.5, -20.0, 0.0, 10.0, 20.0, 20.5, 30.0, 46.5, 60.0, 63.0, 80.0, 85.0,
         90.0,
@@ -698,9 +701,12 @@ fn wesl_snowline_matches_rust() {
     let anomalies = [
         50.0f32, 8.96, 0.0, -10.0, -60.0, -120.0, -125.0, -144.0, -150.0, -400.0,
     ];
-    let queries: Vec<[f32; 2]> = lats
+    // Surface byte 3 values: no raise, steps through the range, the shore bit set (ruling R27).
+    let bytes = [0u8, 1, 37, 64, 126, 127, SURFACE_SHORE | 90, 255];
+    let queries: Vec<[f32; 4]> = lats
         .iter()
-        .flat_map(|&lat| anomalies.iter().map(move |&a| [lat, a]))
+        .flat_map(|&lat| anomalies.iter().map(move |&a| (lat, a)))
+        .flat_map(|(lat, a)| bytes.iter().map(move |&b| [lat, a, f32::from(b), 0.0]))
         .collect();
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -776,17 +782,22 @@ fn wesl_snowline_matches_rust() {
         bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
             .to_vec();
 
-    // f32 against f64 on values up to 5,500 m: a few thousandths of a metre.
+    // f32 against f64 on values up to 6,500 m: a few thousandths of a metre.
     let mut worst = 0.0f64;
     for (q, g) in queries.iter().zip(&got) {
-        let want = snowline_m(f64::from(q[0]), f64::from(q[1]));
+        let want = snowline_with_raise_m(
+            f64::from(q[0]),
+            f64::from(q[1]),
+            decode_snowline_raise(q[2] as u8),
+        );
         let diff = (f64::from(*g) - want).abs();
         worst = worst.max(diff);
         assert!(
             diff < 0.01,
-            "lat {} anomaly {}: gpu {g} vs rust {want}",
+            "lat {} anomaly {} byte {}: gpu {g} vs rust {want}",
             q[0],
-            q[1]
+            q[1],
+            q[2]
         );
     }
     println!("{} snowlines: worst diff {worst:.2e} m", queries.len());

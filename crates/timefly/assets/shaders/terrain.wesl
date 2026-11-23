@@ -19,7 +19,7 @@ import package::terrain_cdlod::{
     TerrainBuffer, TerrainParams, cdlod_vertex, grid_index_of, terrain_normal,
 };
 import package::noise::gradient_noise3;
-import package::snowline::snowline_m;
+import package::snowline::{snowline_m, snowline_raise_from_byte};
 import bevy_pbr::render::mesh_functions::get_tag;
 import bevy_pbr::render::view_transformations::position_world_to_clip;
 import bevy_pbr::render::pbr_fragment::pbr_input_from_standard_material;
@@ -89,6 +89,8 @@ struct Surface {
     rock: vec3<f32>,
     // Canopy cover (0..1), ice (0..1), shore flag (0 or 1), Barren era (0 or 1).
     flags: vec4<f32>,
+    // The snowline's dryness raise (m, ruling R27).
+    snow_raise: f32,
 }
 
 fn texel_surface(code: vec4<f32>) -> Surface {
@@ -100,7 +102,11 @@ fn texel_surface(code: vec4<f32>) -> Surface {
     s.ground = textureLoad(palette, at, 0).rgb;
     s.canopy = canopy.rgb;
     s.rock = textureLoad(palette, at + vec2<i32>(2, 0), 0).rgb;
-    s.flags = vec4<f32>(canopy.a, code.z, code.w, select(0.0, 1.0, era == 0u));
+    // The fourth byte: the shore flag in its top bit, the snowline's dryness raise below it.
+    let byte3 = u32(round(code.w * 255.0));
+    let shore = select(0.0, 1.0, byte3 >= 128u);
+    s.flags = vec4<f32>(canopy.a, code.z, shore, select(0.0, 1.0, era == 0u));
+    s.snow_raise = snowline_raise_from_byte(byte3);
     return s;
 }
 
@@ -110,6 +116,7 @@ fn mix_surface(a: Surface, b: Surface, t: f32) -> Surface {
     s.canopy = mix(a.canopy, b.canopy, t);
     s.rock = mix(a.rock, b.rock, t);
     s.flags = mix(a.flags, b.flags, t);
+    s.snow_raise = mix(a.snow_raise, b.snow_raise, t);
     return s;
 }
 
@@ -202,7 +209,7 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     // Snow: the ice byte, sharpened per pixel by the snowline at the pixel's latitude (north is
     // -z), shed by cliffs, with a painted edge.
     let lat = look.light.w - xz.y / METRES_PER_DEGREE;
-    let line = snowline_m(lat, look.relief.y);
+    let line = snowline_m(lat, look.relief.y, surf.snow_raise);
     let above = smoothstep(line - 150.0, line + 150.0, height + 140.0 * n400 + 40.0 * n60);
     let cliff = smoothstep(0.9, 1.4, slope);
     let snow_amount = max(ice * (1.0 - 0.6 * cliff), above * step(0.0, height) * (1.0 - cliff));
