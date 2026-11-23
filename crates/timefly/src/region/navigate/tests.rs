@@ -8,7 +8,7 @@ use bevy::time::TimeUpdateStrategy;
 use timefly_core::cube::{CubeFace, texel_center_dir};
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
 use timefly_core::geodynamics::{
-    FootprintEntry, PlateFootprints, PlateId, PlateIndex, RotationTable,
+    Candidate, FootprintEntry, PlateFootprints, PlateId, PlateIndex, RotationTable,
 };
 use timefly_core::surface::{FrameMeta, FrameSource, Timeline};
 use timefly_core::worldgen::frame::RegionFrame;
@@ -18,8 +18,10 @@ use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 use super::*;
 use crate::data::BakeRevision;
 use crate::diagnostics::aspects::DiagnosticsAppExt;
-use crate::region::RegionPlugin;
+use crate::fly_camera::CAMERA_CLEARANCE_M;
+use crate::region::{RegionGenerated, RegionPlugin, RegionSnapshotChanged};
 use crate::time::TimePlugin;
+use timefly_core::terrain::blended_height_m;
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -141,7 +143,13 @@ fn globe_hit_returns_the_front_surface() {
 fn snapshot_change_keeps_crust_position() {
     let crust = crust();
     // Present (geographic) → 100 Ma: plate 101 has turned +90° about +Y.
-    let to_100 = carry_crust_position(&crust, RenderDir(ON_PLATE), YearsBp(0.0), YearsBp(100e6));
+    let to_100 = carry_crust_position(
+        &crust,
+        RenderDir(ON_PLATE),
+        YearsBp(0.0),
+        YearsBp(100e6),
+        |_| None,
+    );
     assert!(
         close(to_100.unwrap(), about_y(90.0) * ON_PLATE),
         "{to_100:?}"
@@ -149,17 +157,37 @@ fn snapshot_change_keeps_crust_position() {
     assert!(close(to_100.unwrap(), DVec3::Z));
     // Deep → deep: from where the crust is at 4.47 Ma to where it is at 100 Ma.
     let at_447 = about_y(4.0) * ON_PLATE;
-    let deep = carry_crust_position(&crust, RenderDir(at_447), YearsBp(4.47e6), YearsBp(100e6));
+    let deep = carry_crust_position(
+        &crust,
+        RenderDir(at_447),
+        YearsBp(4.47e6),
+        YearsBp(100e6),
+        |_| None,
+    );
     assert!(close(deep.unwrap(), about_y(90.0) * ON_PLATE), "{deep:?}");
     // And back again.
-    let back = carry_crust_position(&crust, deep.unwrap(), YearsBp(100e6), YearsBp(4.47e6));
+    let back = carry_crust_position(
+        &crust,
+        deep.unwrap(),
+        YearsBp(100e6),
+        YearsBp(4.47e6),
+        |_| None,
+    );
     assert!(close(back.unwrap(), at_447), "{back:?}");
     // Between recent snapshots the frame is geographic: the place stays put.
-    let recent = carry_crust_position(&crust, RenderDir(ON_PLATE), YearsBp(0.0), YearsBp(21e3));
+    let recent = carry_crust_position(
+        &crust,
+        RenderDir(ON_PLATE),
+        YearsBp(0.0),
+        YearsBp(21e3),
+        |_| None,
+    );
     assert!(close(recent.unwrap(), ON_PLATE), "{recent:?}");
     // A point off the plate's centre keeps its offset as the plate turns.
     let off = geo_to_render(latlon_to_geo(20.0, -85.0)).0;
-    let moved = carry_crust_position(&crust, RenderDir(off), YearsBp(0.0), YearsBp(100e6));
+    let moved = carry_crust_position(&crust, RenderDir(off), YearsBp(0.0), YearsBp(100e6), |_| {
+        None
+    });
     assert!(close(moved.unwrap(), about_y(90.0) * off), "{moved:?}");
 }
 
@@ -168,12 +196,24 @@ fn missing_crust_carries_nowhere() {
     let crust = crust();
     // Newly invalid: plate 101's footprint ends at 200 Ma.
     assert_eq!(
-        carry_crust_position(&crust, RenderDir(ON_PLATE), YearsBp(0.0), YearsBp(250e6)),
+        carry_crust_position(
+            &crust,
+            RenderDir(ON_PLATE),
+            YearsBp(0.0),
+            YearsBp(250e6),
+            |_| None
+        ),
         None
     );
     // Era-fixed: no plate covers the north pole.
     assert_eq!(
-        carry_crust_position(&crust, RenderDir(DVec3::Y), YearsBp(0.0), YearsBp(100e6)),
+        carry_crust_position(
+            &crust,
+            RenderDir(DVec3::Y),
+            YearsBp(0.0),
+            YearsBp(100e6),
+            |_| None
+        ),
         None
     );
 }
@@ -234,8 +274,9 @@ fn inputs() -> NavInputs {
         double_click: None,
         backspace: false,
         entered: false,
-        replaced: false,
+        generated: None,
         region_centre: None,
+        region_snapshot: None,
         time_change: None,
     }
 }
@@ -343,6 +384,7 @@ fn snapshot_change_holds_until_the_region_is_ready() {
     let flying = NavInputs {
         region_state: RegionState::InRegion,
         region_centre: Some(centre),
+        region_snapshot: Some(YearsBp(0.0)),
         time: YearsBp(100e6),
         ..inputs()
     };
@@ -377,11 +419,26 @@ fn snapshot_change_holds_until_the_region_is_ready() {
     }
     assert!(phase.region_shown());
     assert!((phase.overlay_alpha() - 1.0).abs() < 1e-6, "held covered");
+    // Back in `InRegion` with the old region still active: not ready.
+    let (still, actions) = step_nav(phase, &flying);
+    assert!(actions.is_empty(), "{actions:?}");
+    phase = still;
+    // The requested region is active but its `RegionGenerated` has not been seen (an equal
+    // region left from before): still not ready.
+    let ready = NavInputs {
+        region_centre: Some(carried),
+        region_snapshot: Some(YearsBp(100e6)),
+        ..flying
+    };
+    let (still, actions) = step_nav(phase, &ready);
+    assert!(actions.is_empty(), "{actions:?}");
+    phase = still;
+    // Generated and active: the camera moves, under full cover.
     let (next, actions) = step_nav(
         phase,
         &NavInputs {
-            replaced: true,
-            ..flying
+            generated: Some((carried, YearsBp(100e6))),
+            ..ready
         },
     );
     assert_eq!(
@@ -390,9 +447,86 @@ fn snapshot_change_holds_until_the_region_is_ready() {
     );
     phase = next;
     for _ in 0..5 {
-        phase = step_nav(phase, &flying).0;
+        phase = step_nav(phase, &ready).0;
     }
     assert_eq!(phase, NavPhase::Flying);
+}
+
+/// Ruling R19: at an overlap the carry follows the plate the globe draws. Plates 202 and 101
+/// overlap where `x < −0.3` and `z > 0.3`; the lowest ID (101) turns 90° by 100 Ma, but here
+/// 202 (fixed) has the higher land, so the camera stays with 202.
+#[test]
+fn carry_follows_the_drawn_plate_at_an_overlap() {
+    let crust = crust();
+    let at = RenderDir(DVec3::new(-0.7, 0.0, 0.7).normalize());
+    let (from, to) = (YearsBp(4.47e6), YearsBp(100e6));
+    // Both plates are candidates there at 4.47 Ma.
+    let mut candidates = Vec::new();
+    crust.resolve(at, from.myr(), |c| {
+        candidates.push(c.plate_id);
+        None
+    });
+    assert_eq!(candidates, vec![PlateId(101), PlateId(202)]);
+    // The lowest ID without ranking: plate 101's turn.
+    let lowest = carry_crust_position(&crust, at, from, to, |_| None).unwrap();
+    let on_101 = about_y(90.0) * (about_y(-4.0) * at.0);
+    assert!(close(lowest, on_101), "{lowest:?}");
+    // Higher land on 202: the camera stays where it is (202 is fixed).
+    let land = |c: &Candidate| Some(if c.plate_id == PlateId(202) { 2.0 } else { 1.0 });
+    let drawn = carry_crust_position(&crust, at, from, to, land).unwrap();
+    assert!(close(drawn, at.0), "{drawn:?}");
+    // And higher land on 101 goes with 101.
+    let land = |c: &Candidate| Some(if c.plate_id == PlateId(101) { 2.0 } else { 1.0 });
+    assert!(close(
+        carry_crust_position(&crust, at, from, to, land).unwrap(),
+        on_101
+    ));
+}
+
+/// The shell's ranker reads the snapshot's cube frames as the renderer does: on the synthetic
+/// crust with a frame bracket where plate 202's frame land is higher at the overlap, it ranks
+/// 202 above 101; with no frames at hand, or in the geographic frame, there is no ranker.
+#[test]
+fn surface_ranker_ranks_like_the_renderer() {
+    use timefly_core::formats::{DType, Grid, GridKind};
+    use timefly_core::geodynamics::Candidate;
+    let crust = crust();
+    let timeline = timeline();
+    // One constant frame per image slot: elevation 1,000 m (2,000 m in slot 3, 100 Ma) and full
+    // coverage, two f16 channels on a cube of 8.
+    let frame = |elevation: f32| {
+        let n = 8u32;
+        let mut data = Vec::new();
+        for _ in 0..(6 * n * n) {
+            for v in [elevation, 1.0] {
+                data.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+        }
+        Arc::new(Grid {
+            kind: GridKind::Cube,
+            dtype: DType::F16,
+            channels: 2,
+            width: n,
+            height: n,
+            data,
+        })
+    };
+    assert!(SurfaceRanker::new(&timeline, &crust, YearsBp(0.0), |_| Some(frame(0.0))).is_none());
+    assert!(SurfaceRanker::new(&timeline, &crust, YearsBp(100e6), |_| None).is_none());
+    let ranker =
+        SurfaceRanker::new(&timeline, &crust, YearsBp(100e6), |_| Some(frame(1_000.0))).unwrap();
+    let at = RenderDir(DVec3::new(-0.7, 0.0, 0.7).normalize());
+    let mut ranks = Vec::new();
+    crust.resolve(at, 100.0, |c: &Candidate| {
+        let r = ranker.rank(&crust, c, at);
+        ranks.push((c.plate_id, r));
+        r
+    });
+    // Both plates are land at 1,000 m in the frame, ranked by the displaced surface.
+    assert!(
+        ranks.iter().all(|(_, r)| r.is_some_and(|r| r > 0.0)),
+        "{ranks:?}"
+    );
 }
 
 #[test]
@@ -527,7 +661,8 @@ fn nav_app(region_plugin: bool) -> App {
             .add_domain_event::<RegionRequested>()
             .add_domain_event::<RegionEntered>()
             .add_domain_event::<RegionLeft>()
-            .add_domain_event::<RegionSnapshotChanged>();
+            .add_domain_event::<RegionSnapshotChanged>()
+            .add_domain_event::<RegionGenerated>();
     }
     app.init_resource::<ButtonInput<KeyCode>>()
         .add_plugins((TimePlugin, RegionNavigationPlugin))
@@ -672,6 +807,12 @@ fn snapshot_change_regenerates_around_the_carried_position() {
     app.world_mut()
         .resource_mut::<NextState<RegionState>>()
         .set(RegionState::InRegion);
+    app.world_mut().write_message(RegionGenerated {
+        spec: second.spec,
+        millis: 1,
+        tiles_fetched: 0,
+        fallback: false,
+    });
     app.world_mut().write_message(RegionSnapshotChanged {
         from: YearsBp(0.0),
         to: YearsBp(100e6),
@@ -741,4 +882,142 @@ fn the_overlay_follows_the_fade() {
     }
     assert!(peak > 0.99, "{peak}");
     assert_eq!(alpha(&mut app), (Display::None, 0.0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The camera against the terrain being shown, through a snapshot change
+
+/// A stand-in for the region job: on a request it enters `Generating`, and `after` updates later
+/// inserts the region through `Commands` and sends `RegionSnapshotChanged`, as `poll_generation`
+/// does, from inside [`RegionSystems`].
+#[derive(Resource)]
+struct FakeJob {
+    after: u32,
+    ground_m: f32,
+    pending: Option<(RegionRequested, u32)>,
+}
+
+fn fake_job(
+    mut job: ResMut<FakeJob>,
+    mut requests: MessageReader<RegionRequested>,
+    active: Option<Res<ActiveRegion>>,
+    mut commands: Commands,
+    mut changed: MessageWriter<RegionSnapshotChanged>,
+    mut generated: MessageWriter<RegionGenerated>,
+    mut next: ResMut<NextState<RegionState>>,
+) {
+    if let Some(&r) = requests.read().last() {
+        job.pending = Some((r, job.after));
+        next.set(RegionState::Generating);
+    }
+    let ground = job.ground_m;
+    let Some((r, left)) = job.pending.as_mut() else {
+        return;
+    };
+    if *left > 0 {
+        *left -= 1;
+        return;
+    }
+    let g = grid(r.era_dir, r.snapshot, ground);
+    commands.insert_resource(ActiveRegion {
+        grid: g.clone(),
+        frame: RegionFrame {
+            center: g.spec.center,
+        },
+    });
+    generated.write(RegionGenerated {
+        spec: g.spec,
+        millis: 1,
+        tiles_fetched: 0,
+        fallback: false,
+    });
+    changed.write(RegionSnapshotChanged {
+        from: active.map_or(YearsBp(0.0), |a| a.grid.spec.snapshot),
+        to: r.snapshot,
+        spec: g.spec,
+    });
+    next.set(RegionState::InRegion);
+    job.pending = None;
+}
+
+/// Frames where the region camera sat below the clearance over the terrain on screen.
+#[derive(Resource, Default)]
+struct Clearance {
+    checked: u32,
+    violations: Vec<String>,
+}
+
+fn check_clearance(
+    scene: Option<Res<crate::terrain::TerrainScene>>,
+    cameras: Query<&Transform>,
+    nav: Res<Navigation>,
+    mut seen: ResMut<Clearance>,
+) {
+    let Some(scene) = scene else { return };
+    let Ok(t) = cameras.get(scene.camera) else {
+        return;
+    };
+    let p = t.translation;
+    let ground = blended_height_m(&scene.grid, f64::from(p.x), f64::from(p.z)).max(0.0);
+    seen.checked += 1;
+    if p.y < ground + CAMERA_CLEARANCE_M - 1e-3 {
+        seen.violations.push(format!(
+            "camera {p} under {} over the {} m grid ({:?})",
+            ground + CAMERA_CLEARANCE_M,
+            scene.grid.spec.snapshot.0,
+            nav.phase
+        ));
+    }
+}
+
+/// Fix round 1, important 2: the new region's ground is 1.9 km higher (Scandinavia onto the
+/// ice). Whether it is ready before the fade's midpoint or long after, the camera is never
+/// below the clearance over the terrain being drawn, on any frame.
+#[test]
+fn the_camera_clears_the_terrain_shown_through_a_snapshot_change() {
+    for after in [0, 1, 3, 12] {
+        let mut app = nav_app(false);
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<bevy::render::storage::ShaderBuffer>()
+            .init_asset::<crate::terrain::material::TerrainMaterial>()
+            .add_plugins(crate::fly_camera::FlyCameraPlugin)
+            .insert_resource(FakeJob {
+                after,
+                ground_m: 288.0 + 1_862.0,
+                pending: None,
+            })
+            .init_resource::<Clearance>()
+            .add_systems(Update, fake_job.in_set(crate::region::RegionSystems))
+            .add_systems(Last, check_clearance);
+        crate::terrain::add_terrain_systems(&mut app);
+        app.world_mut().spawn((
+            crate::globe::GlobeCamera,
+            Camera::default(),
+            IsDefaultUiCamera,
+        ));
+        enter(&mut app, &grid(RenderDir(ON_PLATE), YearsBp(0.0), 288.0));
+        // 274 m above the ground, 5 km north.
+        app.world_mut().resource_mut::<FlyState>().pos_m = Vec3::new(0.0, 562.0, -5_000.0);
+        app.update();
+        set_time(&mut app, 100e6);
+        for _ in 0..40 {
+            app.update();
+        }
+        assert_eq!(phase(&app), NavPhase::Flying, "after {after}");
+        let fly = *app.world().resource::<FlyState>();
+        assert_eq!(
+            fly.pos_m,
+            Vec3::new(0.0, 2_150.0 + 274.0, 0.0),
+            "after {after}"
+        );
+        let seen = app.world().resource::<Clearance>();
+        assert!(seen.checked > 40, "after {after}: {}", seen.checked);
+        assert!(
+            seen.violations.is_empty(),
+            "after {after}: {:#?}",
+            seen.violations
+        );
+    }
 }

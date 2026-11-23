@@ -23,8 +23,12 @@
 
 use bevy_math::Quat;
 
+use crate::cube::bilinear_taps;
+use crate::formats::Grid;
 use crate::geo::RenderDir;
-use crate::geodynamics::{CrustModel, PlateFootprints, PlateId, PlateIndex, RotationTable};
+use crate::geodynamics::{
+    Candidate, CrustModel, PlateFootprints, PlateId, PlateIndex, RotationTable,
+};
 use crate::surface::{DeepBracket, FrameSource, Timeline, effective_elevation_m};
 
 /// Mean Earth radius; 1 world unit = 1 km.
@@ -312,6 +316,47 @@ fn land_with_sample_dirs(
     ))
 }
 
+/// A cube frame's sample at a direction, as the plate renderer reads it: bilinear elevation
+/// (channel 0) and the coverage mask (channel 1, covered above 0.5).
+pub fn cube_frame_sample(frame: &Grid, dir: RenderDir) -> FrameSample {
+    let (mut elevation_m, mut coverage) = (0.0, 0.0);
+    for ((face, col, row), w) in bilinear_taps(dir, frame.height) {
+        if w == 0.0 {
+            continue;
+        }
+        elevation_m += w * f64::from(frame.texel_f32(face as usize, row, col, 0));
+        coverage += w * f64::from(frame.texel_f32(face as usize, row, col, 1));
+    }
+    FrameSample {
+        elevation_m,
+        covered: coverage > 0.5,
+    }
+}
+
+/// A [`CrustModel::resolve`] candidate's visible land at era direction `era_dir`, as the depth
+/// test ranks it (`None` where its ocean shell shows). [`ranking_surface_km`] of it is what the
+/// resolve callback returns to rank overlaps exactly as [`rendered_surface`] does. `rotations`
+/// is indexed by plate index; `sample(endpoint, dir)` reads a frame in its published frame.
+pub fn candidate_land_m(
+    crust: &CrustModel,
+    candidate: &Candidate,
+    era_dir: RenderDir,
+    sampling: &DeepSampling,
+    rotations: &[PlateRotations],
+    sample: impl FnMut(usize, RenderDir) -> f64,
+) -> Option<f64> {
+    let index = candidate.plate_index.0 as usize;
+    ranking_land_m(
+        crust.footprints(),
+        candidate.plate_index,
+        rotations.get(index)?,
+        candidate.plate_fixed_dir,
+        RenderDir(era_dir.0.normalize()),
+        sampling,
+        sample,
+    )
+}
+
 /// What the plate renderer shows at an era-frame direction.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum RenderedSurface {
@@ -344,16 +389,9 @@ pub fn rendered_surface(
     let mut lands: Vec<(PlateId, f64)> = Vec::new();
     let era = RenderDir(era_dir.0.normalize());
     let resolved = crust.resolve(era_dir, sampling.age_myr, |c| {
-        let index = c.plate_index.0 as usize;
-        let land = ranking_land_m(
-            crust.footprints(),
-            c.plate_index,
-            &rotations[index],
-            c.plate_fixed_dir,
-            era,
-            sampling,
-            |e, d| sample(e, d).elevation_m,
-        )?;
+        let land = candidate_land_m(crust, c, era, sampling, rotations, |e, d| {
+            sample(e, d).elevation_m
+        })?;
         lands.push((c.plate_id, land));
         Some(ranking_surface_km(land))
     });

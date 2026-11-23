@@ -168,6 +168,12 @@ impl Default for RegionSettings {
     }
 }
 
+/// The region job's systems (requests, loading, generation). They insert [`ActiveRegion`] and
+/// send the region events; region navigation orders itself after them, so it sees a new region
+/// in the same frame it is inserted.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionSystems;
+
 pub struct RegionPlugin;
 
 impl Plugin for RegionPlugin {
@@ -197,7 +203,8 @@ impl Plugin for RegionPlugin {
                     advance_tiles,
                     poll_generation,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(RegionSystems),
             )
             .add_systems(
                 OnEnter(GlobeLoadState::Ready),

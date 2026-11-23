@@ -80,6 +80,11 @@ pub fn look_for(grid: &RegionGrid) -> TerrainLook {
 pub struct TerrainSettings {
     pub visible: bool,
     pub wireframe: bool,
+    /// While set, a replaced [`ActiveRegion`] waits: the scene keeps drawing the grid it has.
+    /// Region navigation holds a snapshot change's new region until the fade fully covers the
+    /// view, then releases it in the frame it moves the camera, so terrain and camera change
+    /// together.
+    pub hold_swap: bool,
 }
 
 impl Default for TerrainSettings {
@@ -87,6 +92,7 @@ impl Default for TerrainSettings {
         TerrainSettings {
             visible: true,
             wireframe: false,
+            hold_swap: false,
         }
     }
 }
@@ -246,7 +252,7 @@ impl Plugin for TerrainCdlodPlugin {
 }
 
 /// Everything but the render plugin and the shaders, so the pool runs in headless tests.
-fn add_terrain_systems(app: &mut App) {
+pub(crate) fn add_terrain_systems(app: &mut App) {
     app.init_resource::<TerrainSettings>()
         .add_systems(
             Update,
@@ -312,19 +318,24 @@ fn upload_fields(grid: &RegionGrid, images: &mut Assets<Image>) -> FieldImages {
 
 /// Gathers the region, decides with [`scene_action`], and builds, replaces or tears down the
 /// terrain scene.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn sync_terrain_scene(
     mut commands: Commands,
     region: Option<Res<ActiveRegion>>,
+    terrain: Res<TerrainSettings>,
     scene: Option<ResMut<TerrainScene>>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
 ) {
-    let action = scene_action(
+    let action = match scene_action(
         region.as_ref().map(|r| &r.grid),
         scene.as_ref().map(|s| &s.grid),
-    );
+    ) {
+        SceneAction::Replace if terrain.hold_swap => SceneAction::Keep,
+        action => action,
+    };
     match (action, region, scene) {
         (SceneAction::Build, Some(region), _) => {
             let scene = build_scene(

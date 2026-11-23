@@ -166,6 +166,15 @@ impl FrameCache {
         })
     }
 
+    /// The cached grid of image slot `slot`, without marking it used (a read that must not
+    /// change what the region job keeps).
+    pub fn peek(&self, slot: u32) -> Option<Arc<Grid>> {
+        self.frames
+            .iter()
+            .find(|f| f.slot == slot)
+            .map(|f| f.grid.clone())
+    }
+
     /// Adds a slot's grid, then evicts the least recently used slots outside `keep` (the current
     /// request's slots) down to [`FRAME_CACHE_SLOTS`].
     pub fn insert(&mut self, slot: u32, grid: Arc<Grid>, keep: &[u32]) {

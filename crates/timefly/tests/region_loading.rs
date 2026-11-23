@@ -649,6 +649,90 @@ fn a_new_snapshot_replaces_the_region() {
     assert_eq!(active(&app).grid.spec.snapshot, YearsBp(100.0e6));
 }
 
+/// Fix round 1, critical 1: `[` then `]` while the first region is still generating. The
+/// second request is back at the snapshot already shown, so the job sends `RegionEntered`, not
+/// `RegionSnapshotChanged` (Task 5's semantics). Navigation must still finish the fade and fly
+/// on at the original snapshot, never hold the haze forever.
+#[test]
+fn stepping_back_mid_generation_finishes_the_fade() {
+    use timefly::fly_camera::{FlyCameraPlugin, FlyState};
+    use timefly::region::navigate::{NavPhase, Navigation, RegionNavigationPlugin};
+    use timefly::time::{GlobeTime, OLDER_KEY, TimePlugin, YOUNGER_KEY};
+
+    let budgeted = RegionSettings {
+        mode: GenMode::Budgeted {
+            budget: Duration::from_micros(500),
+        },
+        ..SMALL
+    };
+    let mut app = region_app(&tiny_root(), budgeted);
+    app.init_resource::<ButtonInput<KeyCode>>().add_plugins((
+        TimePlugin,
+        RegionNavigationPlugin,
+        FlyCameraPlugin,
+    ));
+    let phase = |app: &App| app.world().resource::<Navigation>().phase;
+    let press = |app: &mut App, key: KeyCode| {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+        app.update();
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.release(key);
+        keys.clear();
+    };
+    let run = |app: &mut App, done: &dyn Fn(&App) -> bool, what: &str| {
+        let deadline = Instant::now() + REGION_TIMEOUT;
+        while !done(app) {
+            app.update();
+            assert!(
+                Instant::now() < deadline,
+                "{what}: still {:?} in {:?}",
+                phase(app),
+                state(app)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+
+    request(&mut app, 0.0, 0.0, 0.0);
+    run(&mut app, &|a| phase(a) == NavPhase::Flying, "entering");
+    // Fly 20 km east, so the carried centre is not the region's own.
+    app.world_mut().resource_mut::<FlyState>().pos_m.x = 20_000.0;
+    app.update();
+
+    press(&mut app, OLDER_KEY);
+    assert!(
+        matches!(phase(&app), NavPhase::ChangingSnapshot { .. }),
+        "{:?}",
+        phase(&app)
+    );
+    run(
+        &mut app,
+        &|a| state(a) == RegionState::Generating,
+        "the 100-year region starting",
+    );
+    press(&mut app, YOUNGER_KEY);
+    assert_eq!(app.world().resource::<GlobeTime>().years, YearsBp(0.0));
+    run(
+        &mut app,
+        &|a| phase(a) == NavPhase::Flying,
+        "back at the present",
+    );
+    assert_eq!(state(&app), RegionState::InRegion);
+    let region = active(&app);
+    assert_eq!(region.grid.spec.snapshot, YearsBp(0.0));
+    // Recentred on the camera's crust position (geographic frame: the camera's direction).
+    let camera_dir = RegionSpec::new(dir(0.0, 0.0), YearsBp(0.0), 0)
+        .frame()
+        .local_to_dir(20_000.0, 0.0);
+    assert!(region.grid.spec.center.0.distance(camera_dir.0) < 1e-9);
+    let fly = *app.world().resource::<FlyState>();
+    assert_eq!((fly.pos_m.x, fly.pos_m.z), (0.0, 0.0));
+    let seen = app.world().resource::<Seen>();
+    assert!(seen.entered.len() >= 2, "{:?}", seen.entered);
+}
+
 #[test]
 fn generates_bridge_and_deep_snapshots() {
     // 10 ka crossfades ICE-6G into the bridge frame, 30 ka is the bridge frame (modern

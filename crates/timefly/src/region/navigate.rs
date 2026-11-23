@@ -26,19 +26,29 @@
 //! The systems gather → decide → apply: [`step_nav`] is the decision, a pure function of
 //! [`NavInputs`] that returns the next [`NavPhase`] and the [`NavAction`]s to apply.
 
+use std::sync::Arc;
+
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseButton;
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use timefly_core::deep_time::YearsBp;
+use timefly_core::formats::Grid;
 use timefly_core::geo::{RenderDir, geo_to_latlon, render_to_geo};
-use timefly_core::geodynamics::{CrustModel, ResolvedPosition};
+use timefly_core::geodynamics::{Candidate, CrustModel, PlateIndex, ResolvedPosition};
+use timefly_core::globe::{
+    DeepSampling, PlateRotations, candidate_land_m, cube_frame_sample, plate_rotations,
+    ranking_surface_km,
+};
+use timefly_core::surface::{FrameSelection, Timeline};
 use timefly_core::terrain::blended_height_m;
 use tracing::instrument;
 
+use super::frames::FrameCache;
 use super::{
-    ActiveRegion, RegionEntered, RegionLeft, RegionRequested, RegionSnapshotChanged, RegionState,
+    ActiveRegion, RegionEntered, RegionGenerated, RegionLeft, RegionRequested, RegionState,
+    RegionSystems,
 };
 use crate::camera::{
     MAX_LATITUDE_DEG, MIN_DISTANCE_KM, OrbitCameraSystems, OrbitState, ease_toward,
@@ -115,18 +125,25 @@ fn geographic(age: YearsBp) -> bool {
 /// the new region on, or `None` when the point is era-fixed at `from` (no valid plate) or that
 /// crust is not valid at `to` (parent spec §5.2: the traveller returns to the globe).
 ///
-/// Overlapping plates resolve to the lowest valid plate ID, the generator's rule where there is
-/// no visible land.
+/// `surface_for_candidate` ranks overlapping plates, as [`CrustModel::resolve`] takes it. Pass
+/// the renderer's ranking at `from` ([`SurfaceRanker`]) so the camera is carried with the plate
+/// drawn under it (ruling R19, a deliberate change from the plan's signature); `|_| None` falls
+/// back to the lowest valid plate ID. Within the geographic frame (both ages up to
+/// [`GEOGRAPHIC_FRAME_MAX_YEARS`]) the place stays put: the carry is the identity.
 pub fn carry_crust_position(
     crust: &CrustModel,
     era_dir: RenderDir,
     from: YearsBp,
     to: YearsBp,
+    surface_for_candidate: impl FnMut(&Candidate) -> Option<f64>,
 ) -> Option<RenderDir> {
+    if geographic(from) && geographic(to) {
+        return Some(RenderDir(era_dir.0.normalize()));
+    }
     let resolved = if geographic(from) {
-        crust.resolve_recent(era_dir, from.myr(), |_| None)
+        crust.resolve_recent(era_dir, from.myr(), surface_for_candidate)
     } else {
-        crust.resolve(era_dir, from.myr(), |_| None)
+        crust.resolve(era_dir, from.myr(), surface_for_candidate)
     };
     let ResolvedPosition::Tracked(pos) = resolved else {
         return None;
@@ -229,13 +246,17 @@ pub enum NavPhase {
     },
     /// The fly camera has the controls.
     Flying,
-    /// A snapshot change: fading out, held while the region regenerates at `to` (`ready` once
-    /// it has), then fading in with the camera `agl_m` above the new ground.
+    /// A snapshot change: fading out, held at full cover until the region centred on
+    /// `requested` at `to` is generated and active, then fading in with the camera `agl_m`
+    /// above the new ground. `generated` once [`RegionGenerated`] arrived for the current
+    /// request; `placed` once the camera (and, released in the same frame, the terrain) moved
+    /// to the new region.
     ChangingSnapshot {
         fade: Fade,
         to: YearsBp,
+        requested: RenderDir,
         agl_m: f32,
-        ready: bool,
+        generated: bool,
         placed: bool,
     },
     /// Fading back to the globe, centred on `centre`; `left` once `RegionLeft` is written.
@@ -289,10 +310,12 @@ pub struct NavInputs {
     pub backspace: bool,
     /// [`RegionEntered`] arrived.
     pub entered: bool,
-    /// [`RegionSnapshotChanged`] arrived.
-    pub replaced: bool,
-    /// The active region's centre.
+    /// The spec (centre, snapshot) of a [`RegionGenerated`] that arrived: the job finished a
+    /// region, whichever event (entered or snapshot changed) it also sent.
+    pub generated: Option<(RenderDir, YearsBp)>,
+    /// The active region's centre and snapshot.
     pub region_centre: Option<RenderDir>,
+    pub region_snapshot: Option<YearsBp>,
     /// A time change to act on (gathered only while flying or waiting for a new snapshot).
     pub time_change: Option<TimeChange>,
 }
@@ -312,6 +335,19 @@ pub enum NavAction {
     },
     /// Centre the orbit camera over a direction, close in.
     CentreGlobe(RenderDir),
+}
+
+/// Whether the active region is the one centred on `requested` at `to` (centres within about
+/// 10 m: the region plugin normalizes the request's direction).
+fn region_is(i: &NavInputs, requested: RenderDir, to: YearsBp) -> bool {
+    match (i.region_centre, i.region_snapshot) {
+        (Some(centre), Some(snapshot)) => same_region(centre, snapshot, requested, to),
+        _ => false,
+    }
+}
+
+fn same_region(centre: RenderDir, snapshot: YearsBp, requested: RenderDir, to: YearsBp) -> bool {
+    snapshot == to && centre.0.normalize().dot(requested.0.normalize()) > 1.0 - 1e-12
 }
 
 /// The next phase and the actions to apply, from this frame's inputs.
@@ -410,8 +446,9 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                         NavPhase::ChangingSnapshot {
                             fade: Fade::new(SNAPSHOT_FADE_S),
                             to: change.to,
+                            requested: era_dir,
                             agl_m: change.agl_m,
-                            ready: false,
+                            generated: false,
                             placed: false,
                         }
                     }
@@ -424,11 +461,11 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
         NavPhase::ChangingSnapshot {
             fade,
             mut to,
+            mut requested,
             agl_m,
-            ready,
+            generated,
             placed,
         } => {
-            let ready = ready || i.replaced;
             if i.region_state == RegionState::Globe {
                 // The generation failed; the region plugin removed the region.
                 return (NavPhase::Globe, actions);
@@ -436,12 +473,22 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             if i.backspace {
                 return (leave(i.region_centre), actions);
             }
-            if !ready && let Some(change) = i.time_change {
+            let mut generated = generated
+                || i.generated
+                    .is_some_and(|(centre, snapshot)| same_region(centre, snapshot, requested, to));
+            if !placed
+                && !region_is(i, requested, to)
+                && let Some(change) = i.time_change
+            {
                 // The time moved again before the region was ready: carry from the region
                 // still shown, which supersedes the request in flight.
                 match change.carried {
                     Some(era_dir) => {
                         to = change.to;
+                        requested = era_dir;
+                        generated = i.generated.is_some_and(|(centre, snapshot)| {
+                            same_region(centre, snapshot, requested, to)
+                        });
                         actions.push(NavAction::Request(RegionRequested {
                             era_dir,
                             snapshot: to,
@@ -450,7 +497,13 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                     None => return (leave(i.region_centre), actions),
                 }
             }
-            let fade = fade.advance(i.dt_s, !ready);
+            // Ready once the job has generated the region asked for and it is the active one.
+            // `RegionGenerated` comes with every finished region: a request back at the
+            // snapshot shown ends in `RegionEntered`, not `RegionSnapshotChanged` (Task 5's
+            // semantics, kept), so neither of those alone will do.
+            let ready = generated && region_is(i, requested, to);
+            // Held at full cover until the camera moves; it moves at the midpoint once ready.
+            let fade = fade.advance(i.dt_s, !placed);
             let placed = placed || {
                 let swap = ready && fade.swapped();
                 if swap {
@@ -464,8 +517,9 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 NavPhase::ChangingSnapshot {
                     fade,
                     to,
+                    requested,
                     agl_m,
-                    ready,
+                    generated,
                     placed,
                 }
             }
@@ -542,6 +596,9 @@ impl Plugin for RegionNavigationPlugin {
                 Update,
                 navigate
                     .in_set(NavigationSystems)
+                    // After the region job, so a region it inserts (through commands) is seen
+                    // in the same frame; before the terrain, so camera and terrain move together.
+                    .after(RegionSystems)
                     .before(TerrainSceneSystems)
                     .before(OrbitCameraSystems),
             );
@@ -600,6 +657,65 @@ fn cursor_globe_dir(
     globe_hit(ray)
 }
 
+/// Ranks [`CrustModel::resolve`] candidates at a deep snapshot exactly as the globe draws them
+/// (ruling R19): the renderer's ranking ([`candidate_land_m`]) over that snapshot's PaleoDEM
+/// bracket, read from its cube frames.
+pub struct SurfaceRanker {
+    sampling: DeepSampling,
+    rotations: Vec<PlateRotations>,
+    frames: [Arc<Grid>; 2],
+}
+
+impl SurfaceRanker {
+    /// The ranker at `age`, or `None` in the geographic frame (no ranking: the carry is the
+    /// identity there, or the geographic surface is common to every candidate) or when a frame
+    /// is not at hand. `frame(slot)` gives a decoded frame file by image slot.
+    pub fn new(
+        timeline: &Timeline,
+        crust: &CrustModel,
+        age: YearsBp,
+        mut frame: impl FnMut(u32) -> Option<Arc<Grid>>,
+    ) -> Option<SurfaceRanker> {
+        if geographic(age) {
+            return None;
+        }
+        let bracket = match timeline.select_frames(age.myr()) {
+            FrameSelection::Recent(_) => return None,
+            FrameSelection::Deep(deep) | FrameSelection::Bridge { deep, .. } => deep,
+        };
+        let sampling = DeepSampling::from_bracket(timeline, age.myr(), &bracket);
+        let slot = |e: usize| timeline.frames()[sampling.endpoints[e].frame].image_slot;
+        let frames = [frame(slot(0))?, frame(slot(1))?];
+        let table = crust.rotations();
+        let rotations = (0..table.plate_ids.len() as u32)
+            .map(|p| plate_rotations(table, PlateIndex(p), &sampling))
+            .collect();
+        Some(SurfaceRanker {
+            sampling,
+            rotations,
+            frames,
+        })
+    }
+
+    /// The ranking surface of `candidate` at `era_dir`: what the resolve callback returns.
+    pub fn rank(
+        &self,
+        crust: &CrustModel,
+        candidate: &Candidate,
+        era_dir: RenderDir,
+    ) -> Option<f64> {
+        candidate_land_m(
+            crust,
+            candidate,
+            era_dir,
+            &self.sampling,
+            &self.rotations,
+            |e, d| cube_frame_sample(&self.frames[e], d).elevation_m,
+        )
+        .map(ranking_surface_km)
+    }
+}
+
 /// The time change to act on, if the time differs from the snapshot the view expects.
 fn gather_time_change(
     phase: &NavPhase,
@@ -607,13 +723,20 @@ fn gather_time_change(
     region: Option<&ActiveRegion>,
     fly: &FlyState,
     globe: Option<&GlobeData>,
+    frames: Option<&FrameCache>,
 ) -> Option<TimeChange> {
     let region = region?;
+    let snapshot = region.grid.spec.snapshot;
     let expected = match *phase {
-        NavPhase::Flying => region.grid.spec.snapshot,
+        NavPhase::Flying => snapshot,
+        // Only while the region shown is still the old one: the camera's position is in its
+        // frame.
         NavPhase::ChangingSnapshot {
-            to, ready: false, ..
-        } => to,
+            to,
+            requested,
+            placed: false,
+            ..
+        } if !same_region(region.frame.center, snapshot, requested, to) => to,
         _ => return None,
     };
     if time == expected {
@@ -622,8 +745,22 @@ fn gather_time_change(
     let (x, z) = (f64::from(fly.pos_m.x), f64::from(fly.pos_m.z));
     let ground = blended_height_m(&region.grid, x, z).max(0.0);
     let camera_dir = region.frame.local_to_dir(x, z);
-    let carried = globe
-        .and_then(|g| carry_crust_position(&g.crust, camera_dir, region.grid.spec.snapshot, time));
+    let carried = globe.and_then(|g| {
+        let ranker = SurfaceRanker::new(&g.timeline, &g.crust, snapshot, |slot| {
+            frames.and_then(|f| f.peek(slot))
+        });
+        if ranker.is_none() && !geographic(snapshot) {
+            debug!(
+                snapshot_years = snapshot.0,
+                "the snapshot's frames are not cached; overlaps carry with the lowest plate ID"
+            );
+        }
+        carry_crust_position(&g.crust, camera_dir, snapshot, time, |c| {
+            ranker
+                .as_ref()
+                .and_then(|r| r.rank(&g.crust, c, camera_dir))
+        })
+    });
     Some(TimeChange {
         to: time,
         carried,
@@ -631,8 +768,6 @@ fn gather_time_change(
     })
 }
 
-/// Gathers input, events and the region; decides with [`step_nav`]; applies the actions and
-/// the phase's view (which camera, the overlay, the caption, the orbit ease).
 /// The pointer and keys navigation reads.
 #[derive(SystemParam)]
 struct NavInput<'w, 's> {
@@ -668,10 +803,8 @@ fn navigate(
     input: NavInput,
     globe: Option<Res<GlobeData>>,
     region: Option<Res<ActiveRegion>>,
-    mut events: (
-        MessageReader<RegionEntered>,
-        MessageReader<RegionSnapshotChanged>,
-    ),
+    frames: Option<Res<FrameCache>>,
+    mut events: (MessageReader<RegionEntered>, MessageReader<RegionGenerated>),
     mut writers: (
         MessageWriter<RegionRequested>,
         MessageWriter<RegionLeft>,
@@ -717,14 +850,20 @@ fn navigate(
             .as_ref()
             .is_some_and(|k| k.just_pressed(LEAVE_KEY)),
         entered: events.0.read().count() > 0,
-        replaced: events.1.read().count() > 0,
+        generated: events
+            .1
+            .read()
+            .last()
+            .map(|g| (g.spec.center, g.spec.snapshot)),
         region_centre: region.as_ref().map(|r| r.frame.center),
+        region_snapshot: region.as_ref().map(|r| r.grid.spec.snapshot),
         time_change: gather_time_change(
             &nav.phase,
             time.years,
             region.as_deref(),
             &fly,
             globe.as_deref(),
+            frames.as_deref(),
         ),
     };
     nav.generating_since = match (state, nav.generating_since) {
@@ -770,6 +909,10 @@ fn navigate(
     let shown = phase.region_shown();
     if terrain.visible != shown {
         terrain.visible = shown;
+    }
+    let hold = matches!(phase, NavPhase::ChangingSnapshot { placed: false, .. });
+    if terrain.hold_swap != hold {
+        terrain.hold_swap = hold;
     }
     let alpha = phase.overlay_alpha();
     for (mut node, mut color) in &mut ui.overlay {
