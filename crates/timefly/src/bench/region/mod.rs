@@ -21,6 +21,9 @@
 //!   number is reported and does not decide the result.
 //! - **Warm generation**, over the memory cycles' re-entries: at most
 //!   [`NATIVE_GEN_TARGET_MS`] natively, [`WEB_GEN_TARGET_MS`] on the web.
+//! - **First-entry generation** on the web ([`first_entry_gate`]): every region's first entry
+//!   (cold tiles, the Aegean's deep coastal generation included) within [`WEB_GEN_TARGET_MS`];
+//!   a region over it fails. Natively the numbers are reported only.
 //! - **Memory cycles**: after each leave the memory returns within
 //!   [`CYCLE_MEMORY_TOLERANCE`] of the first cycle's. Natively the process footprint; on the web
 //!   the wasm linear memory (it only grows, so the check is that it stops growing).
@@ -731,6 +734,16 @@ fn pacing_name(pacing: Pacing) -> &'static str {
     }
 }
 
+/// A region's first-entry generation (`millis`) against the web's [`WEB_GEN_TARGET_MS`]: `None`
+/// natively (reported only), else whether it is within the target (no region generated fails).
+pub fn first_entry_gate(millis: Option<u32>, web: bool) -> Option<bool> {
+    web.then(|| millis.is_some_and(|m| m <= WEB_GEN_TARGET_MS))
+}
+
+fn gate_word(pass: bool) -> &'static str {
+    if pass { "PASS" } else { "FAIL" }
+}
+
 /// The first-region worst frame against the R11 limit.
 fn first_region_gate(bench: &RegionBench) -> Option<(f32, bool)> {
     let first = &bench.runs[0];
@@ -786,6 +799,19 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         )),
         None => out.push("generation: no region generated".to_string()),
     }
+    let web = cfg!(target_arch = "wasm32");
+    let millis = r.generated.map(|g| g.millis);
+    let gen_gate = first_entry_gate(millis, web);
+    out.push(match gen_gate {
+        Some(ok) => format!(
+            "first-entry generation (web gate <= {WEB_GEN_TARGET_MS} ms): {} -> {}",
+            millis.map_or("none".to_string(), |m| format!("{m} ms")),
+            gate_word(ok)
+        ),
+        None => format!(
+            "first-entry generation: reported only natively (the web gates it at <= {WEB_GEN_TARGET_MS} ms)"
+        ),
+    });
     let load = frame_time_stats(&r.load_ms);
     out.push(format!(
         "load (request to first path frame, {SETTLE_SECS:.0} s settle included): {}, frames {}, worst {:.2} ms",
@@ -875,15 +901,20 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
         out.push(format!("  {}", stat_line(segment.label(), frames)));
     }
-    let pass = r.failure.is_none() && flight_pass;
+    let pass = r.failure.is_none() && flight_pass && gen_gate.unwrap_or(true);
     out.push(match &r.failure {
         Some(reason) => format!("result: FAIL ({reason})"),
         None => format!(
-            "result: {} (decided by the {} rule)",
+            "result: {} (decided by the {} rule{})",
             if pass { "PASS" } else { "FAIL" },
             match pacing {
                 Pacing::DisplayPaced => "display-paced missed-frame",
                 Pacing::Uncapped => "uncapped p95",
+            },
+            if gen_gate.is_some() {
+                " and the first-entry generation gate"
+            } else {
+                ""
             }
         ),
     });
@@ -960,15 +991,36 @@ fn finish(
             if ok { "PASS" } else { "FAIL" }
         ));
     }
+    let mut cold_pass = true;
     let cold: Vec<String> = BENCH_REGIONS
         .iter()
         .zip(&bench.runs)
-        .filter_map(|(spec, run)| {
-            run.generated
-                .map(|g| format!("{} {} ms", spec.name, g.millis))
+        .filter(|(_, run)| run.generated.is_some() || run.failure.is_some())
+        .map(|(spec, run)| {
+            let millis = run.generated.map(|g| g.millis);
+            let shown = millis.map_or("none".to_string(), |m| format!("{m} ms"));
+            match first_entry_gate(millis, web) {
+                Some(ok) => {
+                    cold_pass &= ok;
+                    format!("{} {shown} {}", spec.name, gate_word(ok))
+                }
+                None => format!("{} {shown}", spec.name),
+            }
         })
         .collect();
-    out.push(format!("first entries (cold tiles): {}", cold.join(", ")));
+    if web {
+        pass &= cold_pass;
+        out.push(format!(
+            "first entries (cold tiles, web gate <= {WEB_GEN_TARGET_MS} ms each): {} -> {}",
+            cold.join(", "),
+            gate_word(cold_pass)
+        ));
+    } else {
+        out.push(format!(
+            "first entries (cold tiles; reported only natively): {}",
+            cold.join(", ")
+        ));
+    }
 
     let on_globe: Vec<Option<u64>> = bench.cycles.iter().map(|c| c.on_globe).collect();
     let listed = |pick: fn(&CycleRun) -> Option<u64>| {
@@ -1080,6 +1132,19 @@ mod tests {
         assert_eq!(memory_cycles_pass(&[]), None);
         assert_eq!(memory_cycles_pass(&[mib(800), None]), None);
         assert_eq!(memory_cycles_pass(&[None, mib(800)]), None);
+    }
+
+    #[test]
+    fn first_entries_are_gated_on_the_web_only() {
+        assert_eq!(first_entry_gate(Some(683), true), Some(true));
+        assert_eq!(first_entry_gate(Some(WEB_GEN_TARGET_MS), true), Some(true));
+        assert_eq!(
+            first_entry_gate(Some(WEB_GEN_TARGET_MS + 1), true),
+            Some(false)
+        );
+        assert_eq!(first_entry_gate(None, true), Some(false));
+        assert_eq!(first_entry_gate(Some(9_000), false), None);
+        assert_eq!(first_entry_gate(None, false), None);
     }
 
     #[test]

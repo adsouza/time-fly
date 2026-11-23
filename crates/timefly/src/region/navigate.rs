@@ -16,6 +16,10 @@
 //!   the view returns to the globe instead.
 //! - **"Descending..."** shows only after a region has been generating for
 //!   [`CAPTION_DELAY_S`].
+//! - **"terrain detail unavailable here"** ([`FALLBACK_NOTICE_TEXT`]) shows for
+//!   [`FALLBACK_NOTICE_S`] after a region appears ([`RegionEntered`] or
+//!   [`RegionSnapshotChanged`]) whose [`RegionGenerated`] says it fell back (a tile it needs is
+//!   missing or corrupt, so part of it uses globe-resolution data; the job logged a `warn`).
 //!
 //! **The crossfade** is a fade through a full-screen overlay ([`FadeOverlay`], [`FADE_COLOR`])
 //! drawn under the rest of the UI: the old view fades out to a pale haze over the first half,
@@ -47,8 +51,8 @@ use tracing::instrument;
 
 use super::frames::FrameCache;
 use super::{
-    ActiveRegion, RegionEntered, RegionGenerated, RegionLeft, RegionRequested, RegionState,
-    RegionSystems,
+    ActiveRegion, RegionEntered, RegionGenerated, RegionLeft, RegionRequested,
+    RegionSnapshotChanged, RegionState, RegionSystems, RegionViewCovered,
 };
 use crate::camera::{
     MAX_LATITUDE_DEG, MIN_DISTANCE_KM, OrbitCameraSystems, OrbitState, ease_toward,
@@ -72,6 +76,10 @@ pub const DOUBLE_CLICK_PX: f32 = 6.0;
 pub const CAPTION_DELAY_S: f64 = 1.0;
 /// The caption's text (the built-in font has no ellipsis glyph).
 pub const CAPTION_TEXT: &str = "Descending...";
+/// The notice for a region that fell back to globe-resolution data (Review Focus 2).
+pub const FALLBACK_NOTICE_TEXT: &str = "terrain detail unavailable here";
+/// How long the fallback notice shows after the region appears.
+pub const FALLBACK_NOTICE_S: f64 = 3.0;
 /// A request the region plugin never starts on (it ignores requests it cannot serve, with a
 /// `warn`) stops the descent after this long.
 pub const START_TIMEOUT_S: f64 = 2.0;
@@ -228,6 +236,23 @@ pub fn caption_shown(generating_for_s: Option<f64>) -> bool {
     generating_for_s.is_some_and(|s| s > CAPTION_DELAY_S)
 }
 
+/// When the fallback notice started, after a frame in which a region appeared
+/// (`appeared = Some(fallback)`) or none did (`None`): a region that fell back restarts it at
+/// `now_s`, one that did not clears it.
+pub fn fallback_since(prev: Option<f64>, appeared: Option<bool>, now_s: f64) -> Option<f64> {
+    match appeared {
+        Some(true) => Some(now_s),
+        Some(false) => None,
+        None => prev,
+    }
+}
+
+/// Whether the fallback notice shows at `now_s`, for a notice started at `since_s`, while the
+/// region is up (`region_up`: not leaving, not back on the globe).
+pub fn fallback_notice_shown(since_s: Option<f64>, now_s: f64, region_up: bool) -> bool {
+    region_up && since_s.is_some_and(|since| (0.0..FALLBACK_NOTICE_S).contains(&(now_s - since)))
+}
+
 /// Where the player is in the enter → fly → leave cycle.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum NavPhase {
@@ -286,6 +311,13 @@ impl NavPhase {
             | NavPhase::Leaving { fade, .. } => fade.alpha(),
             NavPhase::Globe | NavPhase::Descending { .. } | NavPhase::Flying => 0.0,
         }
+    }
+
+    /// Whether the overlay fully covers the view (a fade at its midpoint, such as a snapshot
+    /// change held until its region is ready): a time-boxed generation may then take a larger
+    /// slice of the frame (`crate::region::gen_budget`).
+    pub fn covers_view(&self) -> bool {
+        self.overlay_alpha() >= 1.0 - 1e-3
     }
 }
 
@@ -549,13 +581,14 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
 // ---------------------------------------------------------------------------------------------
 // The shell
 
-/// The navigation state: the phase, the last press (for double-clicks) and when the current
-/// generation started (for the caption).
+/// The navigation state: the phase, the last press (for double-clicks), when the current
+/// generation started (for the caption) and when the fallback notice started.
 #[derive(Resource, Clone, Debug, PartialEq)]
 pub struct Navigation {
     pub phase: NavPhase,
     pub last_press: Option<(f64, Vec2)>,
     pub generating_since: Option<f64>,
+    pub fallback_since: Option<f64>,
 }
 
 impl Default for Navigation {
@@ -564,6 +597,7 @@ impl Default for Navigation {
             phase: NavPhase::Globe,
             last_press: None,
             generating_since: None,
+            fallback_since: None,
         }
     }
 }
@@ -579,6 +613,10 @@ pub struct FadeOverlay;
 /// The "Descending..." caption.
 #[derive(Component)]
 pub struct DescendingCaption;
+
+/// The "terrain detail unavailable here" notice.
+#[derive(Component)]
+pub struct FallbackNotice;
 
 /// `Backspace` leaves a region.
 pub const LEAVE_KEY: KeyCode = KeyCode::Backspace;
@@ -642,6 +680,28 @@ fn spawn_overlay(mut commands: Commands) {
             Text::new(CAPTION_TEXT),
             TextFont::from_font_size(24.0),
             TextColor(TEXT_COLOR.with_alpha(0.85)),
+            Pickable::IGNORE,
+        ));
+    // Short and out of the way: near the top, smaller and fainter than the caption.
+    commands
+        .spawn((
+            Name::new("Fallback notice"),
+            FallbackNotice,
+            Pickable::IGNORE,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                right: px(0),
+                top: percent(8),
+                justify_content: JustifyContent::Center,
+                display: Display::None,
+                ..default()
+            },
+        ))
+        .with_child((
+            Text::new(FALLBACK_NOTICE_TEXT),
+            TextFont::from_font_size(16.0),
+            TextColor(TEXT_COLOR.with_alpha(0.7)),
             Pickable::IGNORE,
         ));
 }
@@ -786,11 +846,32 @@ type OverlayQuery<'w, 's> = Query<
     (With<FadeOverlay>, Without<DescendingCaption>),
 >;
 
-/// The overlay and caption nodes.
+/// The fallback notice's node.
+type NoticeQuery<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Node,
+    (
+        With<FallbackNotice>,
+        Without<FadeOverlay>,
+        Without<DescendingCaption>,
+    ),
+>;
+
+/// The overlay, caption and notice nodes.
 #[derive(SystemParam)]
 struct NavUi<'w, 's> {
     overlay: OverlayQuery<'w, 's>,
     caption: Query<'w, 's, &'static mut Node, (With<DescendingCaption>, Without<FadeOverlay>)>,
+    notice: NoticeQuery<'w, 's>,
+}
+
+/// Shows or hides a UI node.
+fn show_node(node: &mut Mut<Node>, shown: bool) {
+    let display = if shown { Display::Flex } else { Display::None };
+    if node.display != display {
+        node.display = display;
+    }
 }
 
 /// Gathers input, events and the region; decides with [`step_nav`]; applies the actions and
@@ -804,7 +885,11 @@ fn navigate(
     globe: Option<Res<GlobeData>>,
     region: Option<Res<ActiveRegion>>,
     frames: Option<Res<FrameCache>>,
-    mut events: (MessageReader<RegionEntered>, MessageReader<RegionGenerated>),
+    mut events: (
+        MessageReader<RegionEntered>,
+        MessageReader<RegionGenerated>,
+        MessageReader<RegionSnapshotChanged>,
+    ),
     mut writers: (
         MessageWriter<RegionRequested>,
         MessageWriter<RegionLeft>,
@@ -815,6 +900,7 @@ fn navigate(
     mut orbit: ResMut<OrbitState>,
     mut terrain: ResMut<TerrainSettings>,
     mut ui: NavUi,
+    covered: Option<ResMut<RegionViewCovered>>,
 ) {
     let now_s = real.elapsed_secs_f64();
     let dt_s = real.delta_secs();
@@ -839,6 +925,9 @@ fn navigate(
             nav.last_press = Some((now_s, pos));
         }
     }
+    let entered = events.0.read().count() > 0;
+    let generated = events.1.read().last().copied();
+    let changed = events.2.read().count() > 0;
     let inputs = NavInputs {
         now_s,
         dt_s,
@@ -849,12 +938,8 @@ fn navigate(
             .keys
             .as_ref()
             .is_some_and(|k| k.just_pressed(LEAVE_KEY)),
-        entered: events.0.read().count() > 0,
-        generated: events
-            .1
-            .read()
-            .last()
-            .map(|g| (g.spec.center, g.spec.snapshot)),
+        entered,
+        generated: generated.map(|g| (g.spec.center, g.spec.snapshot)),
         region_centre: region.as_ref().map(|r| r.frame.center),
         region_snapshot: region.as_ref().map(|r| r.grid.spec.snapshot),
         time_change: gather_time_change(
@@ -871,6 +956,8 @@ fn navigate(
         (RegionState::Generating, since) => since,
         _ => None,
     };
+    let appeared = (entered || changed).then(|| generated.is_some_and(|g| g.fallback));
+    nav.fallback_since = fallback_since(nav.fallback_since, appeared, now_s);
 
     // Decide.
     let before = nav.phase;
@@ -910,6 +997,11 @@ fn navigate(
     if terrain.visible != shown {
         terrain.visible = shown;
     }
+    if let Some(mut covered) = covered
+        && covered.0 != phase.covers_view()
+    {
+        covered.0 = phase.covers_view();
+    }
     let hold = matches!(phase, NavPhase::ChangingSnapshot { placed: false, .. });
     if terrain.hold_swap != hold {
         terrain.hold_swap = hold;
@@ -932,14 +1024,12 @@ fn navigate(
     let leaving = matches!(phase, NavPhase::Leaving { .. });
     let show_caption = !leaving && caption_shown(nav.generating_since.map(|since| now_s - since));
     for mut node in &mut ui.caption {
-        let display = if show_caption {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        if node.display != display {
-            node.display = display;
-        }
+        show_node(&mut node, show_caption);
+    }
+    let region_up = !leaving && phase != NavPhase::Globe;
+    let show_notice = fallback_notice_shown(nav.fallback_since, now_s, region_up);
+    for mut node in &mut ui.notice {
+        show_node(&mut node, show_notice);
     }
 }
 

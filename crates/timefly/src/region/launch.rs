@@ -1,5 +1,5 @@
 //! `--region=LAT,LON,AGE_YEARS` (web: `?region=…`): enter a region at launch, once the globe
-//! data is ready, by sending the same [`RegionRequested`] a click on the globe will. The
+//! is interactive ([`GlobeRenderStatus::Interactive`]), by sending the same [`RegionRequested`] a click on the globe will. The
 //! latitude and longitude are in the era's frame (where the globe draws that place at that age).
 //! The age is used as given, without snapping to a snapshot, so any age can be inspected; the
 //! globe's time follows it, so the slider shows the region's age.
@@ -10,6 +10,7 @@ use timefly_core::geo::{geo_to_render, latlon_to_geo};
 
 use super::RegionRequested;
 use crate::args::RegionArg;
+use crate::globe::GlobeRenderStatus;
 use crate::time::GlobeTime;
 
 /// The launch region, inserted by `crate::app` when `--region` was given.
@@ -24,8 +25,28 @@ pub fn launch_request(arg: &RegionArg) -> RegionRequested {
     }
 }
 
-/// Sends the launch region's request (on entering `GlobeLoadState::Ready`), once: the resource
-/// is removed, so the launch region is never requested again.
+/// Registers [`request_launch_region`].
+pub(super) fn add_launch_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        request_launch_region
+            .run_if(resource_exists::<LaunchRegion>)
+            .run_if(globe_interactive),
+    );
+}
+
+/// Whether the globe is interactive: its data loaded and its shaders compiled (on the web they
+/// compile first), as the region bench waits for, so a launch region never starts under the
+/// loading screen.
+fn globe_interactive(status: Option<Res<GlobeRenderStatus>>) -> bool {
+    matches!(
+        status.as_deref(),
+        Some(GlobeRenderStatus::Interactive { .. })
+    )
+}
+
+/// Sends the launch region's request, once: the resource is removed, so the launch region is
+/// never requested again.
 pub(super) fn request_launch_region(
     launch: Res<LaunchRegion>,
     mut commands: Commands,
@@ -49,13 +70,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launch_request_is_sent_once() {
+    fn launch_request_waits_for_the_interactive_globe_and_is_sent_once() {
         #[derive(Resource, Default)]
         struct Sent(usize);
         let mut app = App::new();
         app.add_message::<RegionRequested>()
             .init_resource::<GlobeTime>()
             .init_resource::<Sent>()
+            .insert_resource(GlobeRenderStatus::LoadingData)
             .add_systems(
                 Last,
                 |mut sent: ResMut<Sent>, mut r: MessageReader<RegionRequested>| {
@@ -66,17 +88,46 @@ mod tests {
                 lat_deg: 46.5,
                 lon_deg: 10.0,
                 years: 21_000.0,
-            }))
-            .add_systems(
-                Update,
-                request_launch_region.run_if(resource_exists::<LaunchRegion>),
-            );
+            }));
+        add_launch_systems(&mut app);
+        // Not while the data loads or the globe's pipelines compile (the region bench's rule).
+        for status in [
+            GlobeRenderStatus::LoadingData,
+            GlobeRenderStatus::PreparingGpu,
+        ] {
+            *app.world_mut().resource_mut::<GlobeRenderStatus>() = status;
+            app.update();
+            app.update();
+        }
+        assert_eq!(app.world().resource::<Sent>().0, 0);
+        assert!(app.world().get_resource::<LaunchRegion>().is_some());
+        assert_eq!(app.world().resource::<GlobeTime>().years, YearsBp(0.0));
+        // Once interactive: sent once.
+        *app.world_mut().resource_mut::<GlobeRenderStatus>() =
+            GlobeRenderStatus::Interactive { first_frame: 5 };
         app.update();
         app.update();
         app.update();
         assert_eq!(app.world().resource::<Sent>().0, 1);
         assert!(app.world().get_resource::<LaunchRegion>().is_none());
         assert_eq!(app.world().resource::<GlobeTime>().years, YearsBp(21_000.0));
+    }
+
+    #[test]
+    fn a_failed_globe_never_launches_a_region() {
+        let mut app = App::new();
+        app.add_message::<RegionRequested>()
+            .init_resource::<GlobeTime>()
+            .insert_resource(GlobeRenderStatus::Failed("no GPU".into()))
+            .insert_resource(LaunchRegion(RegionArg {
+                lat_deg: 46.5,
+                lon_deg: 10.0,
+                years: 21_000.0,
+            }));
+        add_launch_systems(&mut app);
+        app.update();
+        app.update();
+        assert!(app.world().get_resource::<LaunchRegion>().is_some());
     }
 
     #[test]

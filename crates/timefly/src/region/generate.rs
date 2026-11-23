@@ -9,6 +9,7 @@
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -172,16 +173,38 @@ impl Future for YieldOnce {
     }
 }
 
+/// A slice budget the run reads at every check and its owner may change between slices
+/// ([`BudgetedRun::set_budget`]), in nanoseconds.
+#[derive(Clone, Debug)]
+struct SharedBudget(Arc<AtomicU64>);
+
+impl SharedBudget {
+    fn new(budget: Duration) -> SharedBudget {
+        let b = SharedBudget(Arc::new(AtomicU64::new(0)));
+        b.set(budget);
+        b
+    }
+
+    fn set(&self, budget: Duration) {
+        let nanos = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
+        self.0.store(nanos, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Duration {
+        Duration::from_nanos(self.0.load(Ordering::Relaxed))
+    }
+}
+
 /// The time spent in the current slice, and the slices so far.
 struct Slice {
-    budget: Duration,
+    budget: SharedBudget,
     started: Instant,
     count: u32,
     longest: Duration,
 }
 
 impl Slice {
-    fn new(budget: Duration) -> Slice {
+    fn new(budget: SharedBudget) -> Slice {
         Slice {
             budget,
             started: Instant::now(),
@@ -199,7 +222,7 @@ impl Slice {
 
     /// Yields when the slice's budget is spent and starts the next slice on resuming.
     async fn yield_if_spent(&mut self) {
-        if self.record() >= self.budget {
+        if self.record() >= self.budget.get() {
             YieldOnce(false).await;
             self.started = Instant::now();
             self.count += 1;
@@ -211,7 +234,7 @@ impl Slice {
 /// counts as a slice of its own.
 async fn run_budgeted(
     inputs: GenInputs,
-    budget: Duration,
+    budget: SharedBudget,
     earlier: Duration,
 ) -> Result<RegionGrid, GenError> {
     let started = Instant::now();
@@ -248,23 +271,45 @@ async fn run_budgeted(
 
 type RunFuture = Pin<Box<dyn Future<Output = Result<RegionGrid, GenError>> + Send>>;
 
-/// A time-boxed run: each [`poll_slice`](Self::poll_slice) works until about `budget` has
-/// passed (plus at most one prep step, one row, or the final assembly), then returns. Built for
+/// A time-boxed run: each [`poll_slice`](Self::poll_slice) works until about its budget has
+/// passed (plus at most one prep step, one row, or the final assembly), then returns. The budget
+/// can change between slices ([`set_budget`](Self::set_budget)). Built for
 /// the web, where it is polled once per frame; it runs the same on native (and is tested
 /// there). Its closing log line's `longest_ms` covers every slice, the field build,
 /// `prep.finish()`, `assemble` and the tile probe that preceded the run.
 pub struct BudgetedRun {
     // A `Mutex` only to make the run `Sync` for a Bevy resource; it is never contended.
     future: Mutex<RunFuture>,
+    /// The budget it was started with.
+    base: Duration,
+    budget: SharedBudget,
 }
 
 impl BudgetedRun {
     /// `earlier` is main-thread time already spent on this region in an earlier frame (the tile
     /// probe), reported with the slices.
     pub fn new(inputs: GenInputs, budget: Duration, earlier: Duration) -> BudgetedRun {
+        let shared = SharedBudget::new(budget);
         BudgetedRun {
-            future: Mutex::new(Box::pin(run_budgeted(inputs, budget, earlier))),
+            future: Mutex::new(Box::pin(run_budgeted(inputs, shared.clone(), earlier))),
+            base: budget,
+            budget: shared,
         }
+    }
+
+    /// The budget the run was started with.
+    pub fn base_budget(&self) -> Duration {
+        self.base
+    }
+
+    /// The budget of the slices from the next [`poll_slice`](Self::poll_slice) on.
+    pub fn set_budget(&self, budget: Duration) {
+        self.budget.set(budget);
+    }
+
+    /// The budget the next slice gets.
+    pub fn budget(&self) -> Duration {
+        self.budget.get()
     }
 
     /// Runs one slice; `Some` when the run has finished.
@@ -295,6 +340,17 @@ mod tests {
         assert_eq!(blocks.first().unwrap().start, 0);
         assert_eq!(blocks.last().unwrap().end, 1025);
         assert!(blocks.windows(2).all(|w| w[0].end == w[1].start));
+    }
+
+    #[test]
+    fn a_shared_budget_changes_between_slices() {
+        let budget = SharedBudget::new(Duration::from_millis(6));
+        let seen_by_run = budget.clone();
+        assert_eq!(seen_by_run.get(), Duration::from_millis(6));
+        budget.set(Duration::from_millis(12));
+        assert_eq!(seen_by_run.get(), Duration::from_millis(12));
+        budget.set(Duration::from_secs(u64::MAX));
+        assert_eq!(seen_by_run.get(), Duration::from_nanos(u64::MAX));
     }
 
     #[test]

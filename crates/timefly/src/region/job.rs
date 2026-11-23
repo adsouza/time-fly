@@ -29,16 +29,44 @@ use super::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, TileManifest, t
 use super::web_budget;
 use super::{
     ActiveRegion, GenMode, REGION_SEED, RegionEntered, RegionGenerated, RegionLeft,
-    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState,
+    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState, RegionViewCovered,
+    gen_budget,
 };
 use crate::data::{GlobeData, describe_load_error};
+
+/// A load that has not finished after this long (real seconds) is abandoned, so a stalled fetch
+/// (not a 404, which fails at once) never leaves "Descending..." up: a tile or the overview
+/// counts as missing, the manifest as unavailable, and a frame fails the request.
+pub const LOAD_TIMEOUT_S: f64 = 20.0;
+/// The slowest transfer a large file is allowed before it times out (bytes per second, about
+/// 4 Mbit/s): the 12.4 MB overview gets about 25 s, the tiles (about 100 kB) the plain
+/// [`LOAD_TIMEOUT_S`].
+pub const MIN_LOAD_RATE_BYTES_PER_S: f64 = 500_000.0;
+
+/// How long a load of a `bytes`-long file may take (unknown size: [`LOAD_TIMEOUT_S`]).
+pub fn load_timeout_s(bytes: Option<u64>) -> f64 {
+    bytes.map_or(LOAD_TIMEOUT_S, |b| {
+        LOAD_TIMEOUT_S.max(b as f64 / MIN_LOAD_RATE_BYTES_PER_S)
+    })
+}
+
+/// Whether a load started at `started_s` has timed out at `now_s` (real seconds).
+pub fn load_timed_out(started_s: f64, now_s: f64, bytes: Option<u64>) -> bool {
+    now_s - started_s >= load_timeout_s(bytes)
+}
+
+/// A load in flight: its handle and when it started (real seconds).
+struct Loading<A: Asset> {
+    handle: Handle<A>,
+    started_s: f64,
+}
 
 /// The tile manifest, loaded on the first request and kept.
 #[derive(Default)]
 enum ManifestState {
     #[default]
     Idle,
-    Loading(Handle<TileManifest>),
+    Loading(Loading<TileManifest>),
     Ready(Arc<TileManifest>),
     /// Unavailable this session: every region falls back.
     Failed,
@@ -49,7 +77,8 @@ enum ManifestState {
 enum OverviewState {
     #[default]
     Idle,
-    Loading(Handle<CpuGrid>),
+    /// With the file's size from the manifest.
+    Loading(Loading<CpuGrid>, u64),
     /// In the [`TileCache`].
     Ready,
     /// Unavailable this session (missing, corrupt, or not in the manifest): aprons use the
@@ -90,6 +119,7 @@ struct PendingFrame {
     slot: u32,
     frames: Vec<usize>,
     handle: Handle<CpuGrid>,
+    started_s: f64,
 }
 
 /// A tile loading.
@@ -98,6 +128,7 @@ struct PendingTile {
     path: String,
     bytes: u64,
     handle: Handle<CpuGrid>,
+    started_s: f64,
 }
 
 enum Running {
@@ -142,8 +173,9 @@ pub(super) struct RegionJob {
 }
 
 /// The spec a request asks for, or `None` for a direction that is not one. Its sea-level
-/// anomaly (for the glacial snowline, ruling R18) is the timeline's at the snapshot
-/// ([`snapshot_sea_level_anomaly_m`]: 0 in deep eras).
+/// anomaly (for the glacial snowline, ruling R18) is the one its heights carry
+/// ([`snapshot_sea_level_anomaly_m`]: weighted by the bridge endpoint in deep brackets that
+/// read it, 0 from the first PaleoDEM bracket on).
 pub(super) fn spec_for(
     request: &RegionRequested,
     settings: &RegionSettings,
@@ -197,7 +229,9 @@ pub(super) fn start_region_request(
     mut frame_cache: ResMut<FrameCache>,
     active: Option<Res<ActiveRegion>>,
     mut next: ResMut<NextState<RegionState>>,
+    real: Res<Time<Real>>,
 ) {
+    let now_s = real.elapsed_secs_f64();
     let Some(request) = requests.read().last().copied() else {
         return;
     };
@@ -216,7 +250,10 @@ pub(super) fn start_region_request(
         return;
     };
     if matches!(index.manifest, ManifestState::Idle) {
-        index.manifest = ManifestState::Loading(server.load(TILE_MANIFEST_PATH));
+        index.manifest = ManifestState::Loading(Loading {
+            handle: server.load(TILE_MANIFEST_PATH),
+            started_s: now_s,
+        });
     }
     let timeline = &globe.timeline;
     let mut frames = vec![None; timeline.frames().len()];
@@ -234,6 +271,7 @@ pub(super) fn start_region_request(
                 slot,
                 handle: server.load::<CpuGrid>(globe.frame_path(served[0]).clone()),
                 frames: served,
+                started_s: now_s,
             }),
         }
     }
@@ -257,8 +295,9 @@ pub(super) fn poll_tile_manifest(
     mut index: ResMut<TileIndex>,
     server: Res<AssetServer>,
     mut manifests: ResMut<Assets<TileManifest>>,
+    real: Res<Time<Real>>,
 ) {
-    let ManifestState::Loading(handle) = &index.manifest else {
+    let ManifestState::Loading(Loading { handle, started_s }) = &index.manifest else {
         return;
     };
     index.manifest = match server.load_state(handle) {
@@ -282,6 +321,14 @@ pub(super) fn poll_tile_manifest(
             );
             ManifestState::Failed
         }
+        _ if load_timed_out(*started_s, real.elapsed_secs_f64(), None) => {
+            warn!(
+                path = TILE_MANIFEST_PATH,
+                timeout_s = LOAD_TIMEOUT_S,
+                "tile manifest load timed out; regions use globe-resolution data"
+            );
+            ManifestState::Failed
+        }
         _ => return,
     };
 }
@@ -298,13 +345,19 @@ pub(super) fn poll_overview(
     server: Res<AssetServer>,
     mut grids: ResMut<Assets<CpuGrid>>,
     mut cache: ResMut<TileCache>,
+    real: Res<Time<Real>>,
 ) {
+    let now_s = real.elapsed_secs_f64();
     let next = match &index.overview {
         OverviewState::Idle => match &index.manifest {
             ManifestState::Ready(manifest) => match &manifest.overview {
-                Some(entry) => {
-                    OverviewState::Loading(load_checked(&server, OVERVIEW_PATH, entry.settings()))
-                }
+                Some(entry) => OverviewState::Loading(
+                    Loading {
+                        handle: load_checked(&server, OVERVIEW_PATH, entry.settings()),
+                        started_s: now_s,
+                    },
+                    entry.bytes,
+                ),
                 None => {
                     warn!(
                         "the tile manifest lists no overview; region aprons use the globe frames"
@@ -315,7 +368,7 @@ pub(super) fn poll_overview(
             ManifestState::Failed => OverviewState::Failed,
             _ => return,
         },
-        OverviewState::Loading(handle) => {
+        OverviewState::Loading(Loading { handle, started_s }, bytes) => {
             let problem = match server.load_state(handle) {
                 LoadState::Loaded => match take_grid(&mut grids, handle) {
                     Some(grid) => match cache.set_overview(grid) {
@@ -329,6 +382,10 @@ pub(super) fn poll_overview(
                         .trim_end()
                         .to_string(),
                 ),
+                _ if load_timed_out(*started_s, now_s, Some(*bytes)) => Some(format!(
+                    "the load timed out after {:.0} s",
+                    load_timeout_s(Some(*bytes))
+                )),
                 _ => return,
             };
             match problem {
@@ -380,7 +437,9 @@ pub(super) fn advance_frames(
     index: Res<TileIndex>,
     cache: Res<TileCache>,
     mut next: ResMut<NextState<RegionState>>,
+    real: Res<Time<Real>>,
 ) {
+    let now_s = real.elapsed_secs_f64();
     let Some(mut job) = job else { return };
     let spec = job.spec;
     let Stage::Frames {
@@ -409,6 +468,14 @@ pub(super) fn advance_frames(
         LoadState::Failed(e) => {
             let path = server.get_path(&p.handle).map(|p| p.to_string());
             failure = Some(describe_load_error(path.as_deref().unwrap_or("?"), &e));
+            false
+        }
+        _ if load_timed_out(p.started_s, now_s, None) => {
+            let path = server.get_path(&p.handle).map(|p| p.to_string());
+            failure = Some(format!(
+                "{}: the load timed out after {LOAD_TIMEOUT_S:.0} s",
+                path.as_deref().unwrap_or("?")
+            ));
             false
         }
         _ => true,
@@ -442,6 +509,7 @@ pub(super) fn advance_frames(
                     handle: load_checked(&server, &path, entry.settings()),
                     path,
                     bytes: entry.bytes,
+                    started_s: now_s,
                 }),
                 None => warn!(
                     tile = path,
@@ -461,16 +529,21 @@ pub(super) fn advance_frames(
     };
 }
 
-/// Takes in one finished tile load; `true` if the tile is now in the cache.
-#[instrument(level = "debug", skip_all, fields(path = %tile.path), ret)]
+/// Takes in one finished (or timed-out) tile load; `true` if the tile is now in the cache.
+#[instrument(level = "debug", skip_all, fields(path = %tile.path, timed_out = timed_out), ret)]
 fn receive_tile(
     tile: &PendingTile,
     state: LoadState,
+    timed_out: bool,
     grids: &mut Assets<CpuGrid>,
     cache: &mut TileCache,
     needed: &[(u8, u8)],
 ) -> bool {
     let problem = match state {
+        _ if timed_out => format!(
+            "the load timed out after {:.0} s",
+            load_timeout_s(Some(tile.bytes))
+        ),
         LoadState::Loaded => match take_grid(grids, &tile.handle) {
             None => "the grid vanished after loading".to_string(),
             Some(grid) => match cache.insert(tile.key, grid, needed) {
@@ -479,7 +552,7 @@ fn receive_tile(
             },
         },
         LoadState::Failed(e) => describe_load_error(&tile.path, &e).trim_end().to_string(),
-        _ => unreachable!("called only for finished loads"),
+        _ => unreachable!("called only for finished or timed-out loads"),
     };
     warn!(
         tile = tile.path,
@@ -500,7 +573,9 @@ pub(super) fn advance_tiles(
     settings: Res<RegionSettings>,
     mut commands: Commands,
     mut next: ResMut<NextState<RegionState>>,
+    real: Res<Time<Real>>,
 ) {
+    let now_s = real.elapsed_secs_f64();
     let Some(mut job) = job else { return };
     let spec = job.spec;
     let Stage::Tiles {
@@ -516,10 +591,12 @@ pub(super) fn advance_tiles(
     };
     pending.retain(|tile| {
         let state = server.load_state(&tile.handle);
-        if !matches!(state, LoadState::Loaded | LoadState::Failed(_)) {
+        let finished = matches!(state, LoadState::Loaded | LoadState::Failed(_));
+        let timed_out = !finished && load_timed_out(tile.started_s, now_s, Some(tile.bytes));
+        if !finished && !timed_out {
             return true;
         }
-        if receive_tile(tile, state, &mut grids, &mut cache, needed) {
+        if receive_tile(tile, state, timed_out, &mut grids, &mut cache, needed) {
             *fetched += 1;
             *bytes += tile.bytes;
         }
@@ -577,6 +654,7 @@ pub(super) fn poll_generation(
     mut entered: MessageWriter<RegionEntered>,
     mut changed: MessageWriter<RegionSnapshotChanged>,
     mut next: ResMut<NextState<RegionState>>,
+    covered: Option<Res<RegionViewCovered>>,
 ) {
     let Some(mut job) = job else { return };
     let job = &mut *job;
@@ -592,7 +670,18 @@ pub(super) fn poll_generation(
     let result = match run {
         #[cfg(not(target_arch = "wasm32"))]
         Running::Task(task) => bevy::tasks::futures::check_ready(task),
-        Running::Budgeted(run) => run.poll_slice(),
+        Running::Budgeted(run) => {
+            let covered = covered.is_some_and(|c| c.0);
+            let budget = gen_budget(run.base_budget(), covered);
+            if run.budget() != budget {
+                debug!(
+                    budget_ms = budget.as_secs_f64() * 1e3,
+                    covered, "region generation budget"
+                );
+                run.set_budget(budget);
+            }
+            run.poll_slice()
+        }
     };
     let Some(result) = result else { return };
     let grid = match result {
@@ -659,6 +748,20 @@ mod tests {
     }
 
     #[test]
+    fn loads_time_out_after_their_limit() {
+        assert_eq!(load_timeout_s(None), LOAD_TIMEOUT_S);
+        assert_eq!(load_timeout_s(Some(100_000)), LOAD_TIMEOUT_S);
+        // The 12.4 MB overview: 24.8 s at 4 Mbit/s.
+        assert!((load_timeout_s(Some(12_400_000)) - 24.8).abs() < 1e-9);
+        assert!(!load_timed_out(10.0, 10.0 + LOAD_TIMEOUT_S - 0.01, None));
+        assert!(load_timed_out(10.0, 10.0 + LOAD_TIMEOUT_S, None));
+        assert!(!load_timed_out(0.0, 24.0, Some(12_400_000)));
+        assert!(load_timed_out(0.0, 25.0, Some(12_400_000)));
+        // A clock that went backwards (it cannot) never times out.
+        assert!(!load_timed_out(30.0, 0.0, None));
+    }
+
+    #[test]
     fn requests_become_specs_only_at_real_directions() {
         let settings = RegionSettings::default();
         let timeline = timeline();
@@ -671,7 +774,7 @@ mod tests {
         assert_eq!(spec.snapshot, YearsBp(21.0e3));
         assert_eq!(spec.seed, REGION_SEED);
         assert_eq!((spec.inner_res, spec.apron_res), (1025, 513));
-        // The glacial snowline's anomaly: the timeline's at 21 ka, none in deep time.
+        // The glacial snowline's anomaly: the timeline's at 21 ka, none at 100 Ma.
         assert_eq!(spec.sea_level_anomaly_m, -120.0);
         let deep = RegionRequested {
             snapshot: YearsBp(100.0e6),

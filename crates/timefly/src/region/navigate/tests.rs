@@ -265,6 +265,61 @@ fn caption_waits_a_second() {
     assert!(caption_shown(Some(1.01)));
 }
 
+#[test]
+fn only_a_fade_at_its_midpoint_covers_the_view() {
+    let changing = |fade: Fade| NavPhase::ChangingSnapshot {
+        fade,
+        to: YearsBp(1e3),
+        requested: RenderDir(DVec3::Z),
+        agl_m: 100.0,
+        generated: false,
+        placed: false,
+    };
+    // Held at the midpoint while the new region generates: covered.
+    let held = Fade::new(SNAPSHOT_FADE_S).advance(2.0, true);
+    assert!(changing(held).covers_view());
+    // On the way down or up again, flying, on the globe or descending: not covered.
+    assert!(!changing(Fade::new(SNAPSHOT_FADE_S).advance(0.3, true)).covers_view());
+    assert!(!changing(Fade::new(SNAPSHOT_FADE_S).advance(0.8, false)).covers_view());
+    assert!(!NavPhase::Flying.covers_view());
+    assert!(!NavPhase::Globe.covers_view());
+    assert!(
+        !NavPhase::Descending {
+            target: RenderDir(DVec3::Z),
+            since_s: 0.0,
+            started: true,
+        }
+        .covers_view()
+    );
+}
+
+#[test]
+fn the_fallback_notice_shows_for_three_seconds_after_a_fallback_region() {
+    // A region that fell back starts it; one that did not clears it; no region keeps it.
+    assert_eq!(fallback_since(None, Some(true), 5.0), Some(5.0));
+    assert_eq!(fallback_since(Some(5.0), None, 6.0), Some(5.0));
+    assert_eq!(fallback_since(Some(5.0), Some(true), 7.0), Some(7.0));
+    assert_eq!(fallback_since(Some(5.0), Some(false), 7.0), None);
+    assert_eq!(fallback_since(None, Some(false), 7.0), None);
+    assert_eq!(fallback_since(None, None, 7.0), None);
+    // Shown from the start for FALLBACK_NOTICE_S, while the region is up.
+    assert!(!fallback_notice_shown(None, 5.0, true));
+    assert!(fallback_notice_shown(Some(5.0), 5.0, true));
+    assert!(fallback_notice_shown(
+        Some(5.0),
+        5.0 + FALLBACK_NOTICE_S - 0.01,
+        true
+    ));
+    assert!(!fallback_notice_shown(
+        Some(5.0),
+        5.0 + FALLBACK_NOTICE_S,
+        true
+    ));
+    assert!(!fallback_notice_shown(Some(5.0), 6.0, false));
+    assert!((2.5..=3.5).contains(&FALLBACK_NOTICE_S));
+    assert_eq!(FALLBACK_NOTICE_TEXT, "terrain detail unavailable here");
+}
+
 fn inputs() -> NavInputs {
     NavInputs {
         now_s: 10.0,

@@ -11,12 +11,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bevy::asset::AssetMetaCheck;
+use bevy::asset::io::file::FileAssetReader;
+use bevy::asset::io::{
+    AssetReader, AssetReaderError, AssetSourceBuilder, AssetSourceId, PathStream, Reader,
+};
 use bevy::log::tracing::{self, Subscriber};
 use bevy::log::tracing_subscriber::filter::LevelFilter;
 use bevy::log::tracing_subscriber::layer::{Context, SubscriberExt};
 use bevy::log::tracing_subscriber::{Layer, Registry};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
+use bevy::time::TimeUpdateStrategy;
 use timefly::data::{GlobeData, GlobeDataPlugin, GlobeLoadState};
 use timefly::region::frames::{CpuGrid, FRAME_CACHE_SLOTS, FrameCache};
 use timefly::region::generate::{BudgetedRun, GenInputs, generate_parallel, tiles_needed};
@@ -260,10 +265,74 @@ fn record(
     }
 }
 
+/// Asset paths (relative to the asset root) whose reads never finish: a stalled fetch, not a
+/// 404. Shared with the reader, so a test can stall a path after the globe has loaded.
+type Stalls = Arc<Mutex<Vec<PathBuf>>>;
+
+/// The file reader, except that reads of the [`Stalls`] paths hang forever.
+struct StallingReader {
+    inner: FileAssetReader,
+    stalls: Stalls,
+}
+
+impl AssetReader for StallingReader {
+    async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+        let stalled = self.stalls.lock().unwrap().iter().any(|p| p == path);
+        if stalled {
+            std::future::pending::<()>().await;
+        }
+        self.inner.read(path).await
+    }
+
+    async fn read_meta<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
+        self.inner.read_meta(path).await
+    }
+
+    async fn read_directory<'a>(
+        &'a self,
+        path: &'a Path,
+    ) -> Result<Box<PathStream>, AssetReaderError> {
+        self.inner.read_directory(path).await
+    }
+
+    async fn is_directory<'a>(&'a self, path: &'a Path) -> Result<bool, AssetReaderError> {
+        self.inner.is_directory(path).await
+    }
+}
+
 /// A headless app with the globe data and regions, the globe data loaded.
 fn region_app(asset_root: &Path, settings: RegionSettings) -> App {
+    region_app_with(asset_root, settings, None, |_| {})
+}
+
+/// [`region_app`] reading through a [`StallingReader`]; returns the paths to stall.
+fn stalling_region_app(asset_root: &Path, settings: RegionSettings) -> (App, Stalls) {
+    let stalls = Stalls::default();
+    let app = region_app_with(asset_root, settings, Some(stalls.clone()), |_| {});
+    (app, stalls)
+}
+
+/// `more` adds plugins before the first update (so their startup systems run).
+fn region_app_with(
+    asset_root: &Path,
+    settings: RegionSettings,
+    stalls: Option<Stalls>,
+    more: impl FnOnce(&mut App),
+) -> App {
     logs();
     let mut app = App::new();
+    if let Some(stalls) = stalls {
+        let root = asset_root.to_path_buf();
+        app.register_asset_source(
+            AssetSourceId::Default,
+            AssetSourceBuilder::new(move || {
+                Box::new(StallingReader {
+                    inner: FileAssetReader::new(root.clone()),
+                    stalls: stalls.clone(),
+                })
+            }),
+        );
+    }
     app.add_plugins((
         MinimalPlugins,
         AssetPlugin {
@@ -279,6 +348,7 @@ fn region_app(asset_root: &Path, settings: RegionSettings) -> App {
     .insert_resource(settings)
     .init_resource::<Seen>()
     .add_systems(Last, record);
+    more(&mut app);
     let deadline = Instant::now() + REGION_TIMEOUT;
     loop {
         app.update();
@@ -424,6 +494,125 @@ fn missing_tile_falls_back_with_warning() {
     // The redacted form: the asset path, never the file system path.
     let root = root.to_string_lossy();
     assert!(warnings.iter().all(|w| !w.contains(&*root)), "{warnings:?}");
+}
+
+/// Each update advances `Time<Real>` by a second, so the loads' 20 s timeout passes in about
+/// 20 updates.
+fn one_second_per_update(app: &mut App) {
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(1)));
+}
+
+#[test]
+fn a_stalled_tile_times_out_and_falls_back() {
+    let (mut app, stalls) = stalling_region_app(&tiny_root(), SMALL);
+    stalls.lock().unwrap().push(tile_path(18, 36).into());
+    one_second_per_update(&mut app);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    let event = generated(&app);
+    assert!(event.fallback, "{event:?}");
+    assert_eq!(event.tiles_fetched, 3);
+    assert_finite(&active(&app));
+    let warnings = warnings_naming(&tile_path(18, 36));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("terrain tile unavailable") && w.contains("timed out")),
+        "{warnings:?}"
+    );
+    assert!(!app.world().resource::<TileCache>().contains((18, 36)));
+}
+
+#[test]
+fn a_stalled_overview_times_out_and_the_region_still_loads() {
+    let (mut app, stalls) = stalling_region_app(&tiny_root(), SMALL);
+    stalls.lock().unwrap().push(OVERVIEW_PATH.into());
+    one_second_per_update(&mut app);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    // The tiles all loaded: the inner field has its detail; the apron uses the globe frames.
+    let event = generated(&app);
+    assert!(!event.fallback, "{event:?}");
+    assert_finite(&active(&app));
+    assert!(app.world().resource::<TileCache>().overview().is_none());
+    let warnings = warnings_naming(OVERVIEW_PATH);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("terrain overview unavailable") && w.contains("timed out")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_stalled_frame_times_out_back_to_the_globe() {
+    let (mut app, stalls) = stalling_region_app(&tiny_root(), SMALL);
+    // The globe has its images; the CPU copy of the 540 Ma frame now never arrives.
+    let path = {
+        let data = app.world().resource::<GlobeData>();
+        let last = data.timeline.frames().len() - 1;
+        data.frame_path(last).to_string()
+    };
+    stalls.lock().unwrap().push(path.clone().into());
+    one_second_per_update(&mut app);
+    request(&mut app, 0.0, 0.0, 400.0e6);
+    run_until(&mut app, RegionState::Globe);
+    assert!(app.world().get_resource::<ActiveRegion>().is_none());
+    assert!(app.world().resource::<Seen>().generated.is_empty());
+    let warnings = warnings_naming(&path);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("region generation failed") && w.contains("timed out")),
+        "{warnings:?}"
+    );
+}
+
+/// Review Focus 2: a region that falls back shows "terrain detail unavailable here" for about
+/// 3 s after it appears; a complete one never does.
+#[test]
+fn the_fallback_notice_shows_only_when_a_tile_is_missing() {
+    use timefly::fly_camera::FlyCameraPlugin;
+    use timefly::region::navigate::{FALLBACK_NOTICE_S, FallbackNotice, RegionNavigationPlugin};
+    use timefly::time::TimePlugin;
+
+    for missing in [true, false] {
+        let root = tiny_copy(if missing {
+            "notice-missing"
+        } else {
+            "notice-complete"
+        });
+        if missing {
+            fs::remove_file(root.join(tile_path(18, 35))).unwrap();
+        }
+        let mut app = region_app_with(&root, SMALL, None, |app| {
+            app.init_resource::<ButtonInput<KeyCode>>().add_plugins((
+                TimePlugin,
+                RegionNavigationPlugin,
+                FlyCameraPlugin,
+            ));
+        });
+        let shown = |app: &mut App| {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<&Node, With<FallbackNotice>>();
+            q.single(app.world()).unwrap().display == Display::Flex
+        };
+        app.update();
+        assert!(!shown(&mut app), "before any region");
+        request(&mut app, 0.0, 0.0, 0.0);
+        run_until(&mut app, RegionState::InRegion);
+        assert_eq!(generated(&app).fallback, missing);
+        assert_eq!(shown(&mut app), missing, "missing tile: {missing}");
+        // About three seconds later it is gone.
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            250,
+        )));
+        for _ in 0..(FALLBACK_NOTICE_S / 0.25) as usize + 2 {
+            app.update();
+        }
+        assert!(!shown(&mut app), "after {FALLBACK_NOTICE_S} s");
+    }
 }
 
 #[test]
