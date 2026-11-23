@@ -133,6 +133,10 @@ most one prep step or one row. Wasm timings belong to Task 10's web benchmark.
 
 ## Region bench (Task 10)
 
+The runs below through the final fix wave bench the **Alps** as region 1: they are the
+pre-swap baseline. Since ruling R24 region 1 is the Himalayas (see the latest run at the end of
+this section).
+
 `--region-bench` (web `?region-bench`) waits for the interactive globe, then enters the Alps
 (46.5° N, 10° E, present), Scandinavia (63° N, 15° E, 21 ka), the Pangaea interior (era-frame
 22° S, 18° W, 250 Ma) and, since ruling R22, the Aegean (era-frame 38° N, 24.5° E, 1 Ma) in

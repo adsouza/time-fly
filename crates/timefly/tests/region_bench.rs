@@ -149,10 +149,10 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Alps PASS, Scandinavia PASS, Pangaea interior PASS, Aegean PASS",
+        "regions (R14 frame rate): Himalayas PASS, Scandinavia PASS, Pangaea interior PASS, Aegean PASS",
         "first-region worst frame (R11",
-        "warm generation (2 re-entries of Alps",
-        "first entries (cold tiles; reported only natively): Alps ",
+        "warm generation (2 re-entries of Himalayas",
+        "first entries (cold tiles; reported only natively): Himalayas ",
         "memory cycles",
         "result: ",
     ] {

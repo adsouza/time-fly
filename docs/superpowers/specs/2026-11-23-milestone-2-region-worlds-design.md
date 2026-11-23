@@ -360,9 +360,12 @@ notes: deep-era biomes are zonal approximations, and ice-age biomes use the pres
   golden check of the shader morph runs where a GPU exists.
 - **Benchmark:** `--region-bench` flies a scripted path (low pass, climb, coastline, apron) in
   three fixed regions:
-  - present-day Alps
+  - present-day Himalayas (Everest area)
   - 21 ka Scandinavia (ice)
   - 250 Ma Pangaea interior
+
+  Owner decision 2026-11-23: the Himalayas replace the Alps, to stress relief, f16 height
+  precision, and sky and fog at altitude (plan ruling R24).
 - **What the benchmark reports:**
   - frame-time stats under the R14 rule
   - region generation time (native and web)

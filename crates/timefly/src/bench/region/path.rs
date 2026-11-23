@@ -513,11 +513,22 @@ mod tests {
         }
     }
 
+    /// The Himalayas (ruling R24): ridges to 8.8 km over a 4–5 km plateau, every peak steep.
+    fn himalaya(x: f32, z: f32) -> f32 {
+        let ridges = (x / 9_000.0).sin().abs() * (z / 13_000.0).cos().abs();
+        4_200.0 + 4_600.0 * ridges.powi(3) + 300.0 * (x / 2_100.0 + z / 1_700.0).sin()
+    }
+
     /// Every frame of the path, over each kind of region: inside the field, clear of the
     /// ground, under the ceiling, a sane pitch, and no jumps between frames.
     #[test]
     fn the_path_stays_in_the_field_and_above_the_ground() {
-        for ground in [coastal as fn(f32, f32) -> f32, inland, far_coast] {
+        let top = (0..400)
+            .flat_map(|i| (0..400).map(move |k| (i, k)))
+            .map(|(i, k)| himalaya(i as f32 * 750.0 - 150_000.0, k as f32 * 750.0 - 150_000.0))
+            .fold(f32::MIN, f32::max);
+        assert!(top > 8_700.0, "the himalaya ground reaches 8.7 km: {top}");
+        for ground in [coastal as fn(f32, f32) -> f32, inland, far_coast, himalaya] {
             let path = BenchPath::plan(ground);
             let frames = samples(&path, ground);
             for (i, f) in frames.iter().enumerate() {

@@ -67,16 +67,18 @@ pub struct BenchRegion {
     pub arg: RegionArg,
 }
 
-/// The bench regions: the design's three (M2 design §8) and the Aegean (ruling R22). The Pangaea
-/// centre is pinned in the era's frame at 250 Ma: inland, a hot desert (Task 8). The Aegean at
-/// 1 Ma (era frame) has coastlines throughout the inner field, so its coast run flies a real
-/// shore up close, and it is Task 4's slowest real generation (about 2.9 s single-threaded).
+/// The bench regions: the design's (M2 design §8), with the Himalayas (Everest area) in the
+/// Alps' place (ruling R24: highest relief, sky and fog high up; first, so it is the cold-start
+/// region and the memory cycles' re-entry), and the Aegean (ruling R22). The Pangaea centre is
+/// pinned in the era's frame at 250 Ma: inland, a hot desert (Task 8). The Aegean at 1 Ma (era
+/// frame) has coastlines throughout the inner field, so its coast run flies a real shore up
+/// close, and it is Task 4's slowest real generation (about 3 s single-threaded).
 pub const BENCH_REGIONS: [BenchRegion; 4] = [
     BenchRegion {
-        name: "Alps",
+        name: "Himalayas",
         arg: RegionArg {
-            lat_deg: 46.5,
-            lon_deg: 10.0,
+            lat_deg: 28.0,
+            lon_deg: 86.9,
             years: 0.0,
         },
     },
@@ -1189,13 +1191,17 @@ mod tests {
     #[test]
     fn the_bench_regions_are_pinned() {
         let names: Vec<_> = BENCH_REGIONS.iter().map(|r| r.name).collect();
-        assert_eq!(names, ["Alps", "Scandinavia", "Pangaea interior", "Aegean"]);
+        assert_eq!(
+            names,
+            ["Himalayas", "Scandinavia", "Pangaea interior", "Aegean"]
+        );
         let arg = |lat_deg, lon_deg, years| RegionArg {
             lat_deg,
             lon_deg,
             years,
         };
-        assert_eq!(BENCH_REGIONS[0].arg, arg(46.5, 10.0, 0.0));
+        // Ruling R24: Everest (27.99, 86.93) is in the inner field.
+        assert_eq!(BENCH_REGIONS[0].arg, arg(28.0, 86.9, 0.0));
         assert_eq!(BENCH_REGIONS[1].arg, arg(63.0, 15.0, 21_000.0));
         assert_eq!(BENCH_REGIONS[2].arg, arg(-22.0, -18.0, 250.0e6));
         // Ruling R22: coastlines throughout the inner field, Task 4's slowest real region.

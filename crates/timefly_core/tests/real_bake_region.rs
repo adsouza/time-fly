@@ -341,6 +341,7 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
         ("alps", 46.5, 10.0),
         ("scandinavia", 63.0, 15.0),
         ("aegean", 38.5, 25.0),
+        ("himalayas", 28.0, 86.9),
     ] {
         let centre = geo_to_render(latlon_to_geo(lat, lon));
         let frame = RegionFrame { center: centre };
@@ -425,4 +426,222 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
         }
     }
     total
+}
+
+/// One bench-region candidate's numbers over the real bake.
+#[derive(Debug, Default)]
+struct CandidateStats {
+    tiles: usize,
+    land: f64,
+    anomaly_land: Option<f64>,
+    coast_km: Option<f64>,
+    ice: f64,
+    max_m: f64,
+    snowline_m: f64,
+    above_snowline: f64,
+    plates: Vec<u32>,
+    sliver_points: usize,
+    gen_secs: Option<f64>,
+    grid_max_m: Option<f32>,
+    biomes: Vec<(u8, usize)>,
+}
+
+/// The coarse field around a centre (era-frame lat/lon) at `years`, with its tiles loaded, and
+/// its stats: land, anomaly land (land at the age, below sea level today: recent ages only),
+/// ice, heights against the R18 snowline, the nearest coast (36 rays, 2 km steps, as the bench
+/// looks), plates under the inner field and R17 sliver land (deep ages), and, with `generate`,
+/// the single-threaded generation time and the inner field's biome classes.
+fn candidate_stats(
+    b: &Bake,
+    globe: &Path,
+    overview: &Grid,
+    lat: f64,
+    lon: f64,
+    years: f64,
+    generate: bool,
+) -> CandidateStats {
+    use timefly_core::worldgen::biome::snowline_m;
+    use timefly_core::worldgen::coarse::LatticeKey;
+    use timefly_core::worldgen::coarse::{SnapshotField, snapshot_sea_level_anomaly_m};
+    let age = years / 1.0e6;
+    let mut grids: Vec<Option<Grid>> = vec![None; b.files.len()];
+    for i in frames_needed(&b.timeline, age) {
+        grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
+    }
+    let centre = geo_to_render(latlon_to_geo(lat, lon));
+    let frame = RegionFrame { center: centre };
+    let mut tiles = TileSet::new();
+    tiles.set_overview(overview.clone()).unwrap();
+    let needed = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+        grids[i].as_ref().unwrap()
+    })
+    .unwrap()
+    .tiles_needed(&frame);
+    for &(r, c) in &needed {
+        let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
+        tiles
+            .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
+            .unwrap();
+    }
+    let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+        grids[i].as_ref().unwrap()
+    })
+    .unwrap();
+    let anomaly = snapshot_sea_level_anomaly_m(&b.timeline, age);
+    let recent = age <= 0.026076;
+    let half = 150_000.0;
+    let n = 61;
+    let mut s = CandidateStats {
+        tiles: needed.len(),
+        snowline_m: snowline_m(lat, anomaly),
+        max_m: f64::MIN,
+        ..Default::default()
+    };
+    let (mut land, mut anomaly_land, mut ice, mut above) = (0usize, 0usize, 0usize, 0usize);
+    let mut plates = std::collections::BTreeSet::new();
+    for a in 0..n {
+        for k in 0..n {
+            let x = -half + 2.0 * half * f64::from(a) / f64::from(n - 1);
+            let z = -half + 2.0 * half * f64::from(k) / f64::from(n - 1);
+            let d = frame.local_to_dir(x, z);
+            let c = field.sample(d);
+            s.max_m = s.max_m.max(c.elevation_m);
+            if c.elevation_m > 0.0 {
+                land += 1;
+                if recent {
+                    let (la, lo) = geo_to_latlon(render_to_geo(d));
+                    if tiles.sample(la, lo).is_some_and(|(h, _)| h < 0.0) {
+                        anomaly_land += 1;
+                    }
+                }
+            }
+            if c.ice > 0.5 {
+                ice += 1;
+            }
+            if c.elevation_m > s.snowline_m {
+                above += 1;
+            }
+            if let LatticeKey::Tracked { plate_id, .. } = c.lattice {
+                plates.insert(plate_id.0);
+            }
+            if let SnapshotField::Deep(df) = &field
+                && df.sliver_land_m(d).is_some()
+            {
+                s.sliver_points += 1;
+            }
+        }
+    }
+    let total = (n * n) as f64;
+    s.land = land as f64 / total;
+    s.anomaly_land = recent.then(|| anomaly_land as f64 / total);
+    s.ice = ice as f64 / total;
+    s.above_snowline = above as f64 / total;
+    s.plates = plates.into_iter().collect();
+    // The nearest coast along 36 rays, as the bench's search.
+    let sign = |x: f64, z: f64| field.sample(frame.local_to_dir(x, z)).elevation_m > 0.0;
+    let centre_land = sign(0.0, 0.0);
+    for ray in 0..36 {
+        let t = f64::from(ray) * std::f64::consts::TAU / 36.0;
+        let mut r = 2_000.0;
+        while r <= 1_150_000.0 {
+            if sign(r * t.sin(), -r * t.cos()) != centre_land {
+                let km = r / 1000.0;
+                s.coast_km = Some(s.coast_km.map_or(km, |c: f64| c.min(km)));
+                break;
+            }
+            r += 2_000.0;
+        }
+    }
+    if generate {
+        let spec = RegionSpec {
+            seed: 0x7F1E_0002,
+            sea_level_anomaly_m: anomaly,
+            ..RegionSpec::new(centre, YearsBp(years), 0)
+        };
+        let t0 = std::time::Instant::now();
+        let grid = RegionGenerator::new(spec, &field).finish();
+        s.gen_secs = Some(t0.elapsed().as_secs_f64());
+        s.grid_max_m = grid.inner.elevation_m.iter().copied().reduce(f32::max);
+        let mut counts = std::collections::BTreeMap::new();
+        for (h, surf) in grid.inner.elevation_m.iter().zip(&grid.inner.surface) {
+            if *h > 0.0 {
+                *counts.entry(surf[0]).or_insert(0usize) += 1;
+            }
+        }
+        s.biomes = counts.into_iter().collect();
+    }
+    s
+}
+
+/// Bench-region candidates over the real bake: `TIMEFLY_CANDIDATES="name:lat,lon,years;..."`
+/// (defaults to the bench regions), `TIMEFLY_GENERATE=1` to time a single-threaded generation.
+#[test]
+#[ignore = "reads the real bake; run in release"]
+fn bench_region_candidates() {
+    let globe = data().join("globe");
+    let b = bake(&globe);
+    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
+    let list = std::env::var("TIMEFLY_CANDIDATES")
+        .unwrap_or_else(|_| "Himalayas:28,86.9,0;Aegean:38,24.5,1000000".to_string());
+    let generate = std::env::var("TIMEFLY_GENERATE").is_ok_and(|v| v == "1");
+    for item in list.split(';').filter(|s| !s.is_empty()) {
+        let (name, rest) = item.split_once(':').unwrap();
+        let v: Vec<f64> = rest.split(',').map(|x| x.trim().parse().unwrap()).collect();
+        let s = candidate_stats(&b, &globe, &overview, v[0], v[1], v[2], generate);
+        println!(
+            "{name} {:.2},{:.2} @ {} y: tiles {}, land {:.2}, anomaly land {}, coast {}, ice {:.2}, max {:.0} m, snowline {:.0} m (above {:.3}), plates {:?}, sliver pts {}, gen {} (inner max {}), biomes {:?}",
+            v[0],
+            v[1],
+            v[2],
+            s.tiles,
+            s.land,
+            s.anomaly_land.map_or("-".into(), |f| format!("{f:.3}")),
+            s.coast_km.map_or("none".into(), |k| format!("{k:.0} km")),
+            s.ice,
+            s.max_m,
+            s.snowline_m,
+            s.above_snowline,
+            s.plates,
+            s.sliver_points,
+            s.gen_secs.map_or("-".into(), |g| format!("{g:.2} s")),
+            s.grid_max_m.map_or("-".into(), |m| format!("{m:.0} m")),
+            s.biomes,
+        );
+    }
+}
+
+/// The Himalaya bench region's tile (r12c53, 25–30° N, 85–90° E) keeps Everest's area peak
+/// unclipped and on the f16 lattice of its height band (4 m steps from 4,096 m, 8 m from 8,192 m),
+/// near Everest (27.99° N, 86.93° E). The bake averages ETOPO's 60″ cells onto nodes, so the
+/// node sits well under the 8,849 m summit (7,640 m in the current bake): the region's relief tops
+/// out there, below the f16 8 m band.
+#[test]
+#[ignore = "reads the real bake"]
+fn everest_tile_keeps_its_peak_in_f16() {
+    let tile = read_tfgrid(&fs::read(data().join("tiles/r12c53.tfgrid")).unwrap()).unwrap();
+    let (mut best, mut at) = (f32::MIN, (0, 0));
+    for row in 0..tile.height {
+        for col in 0..tile.width {
+            let h = tile.texel_f32(0, row, col, 0);
+            if h > best {
+                best = h;
+                at = (row, col);
+            }
+        }
+    }
+    let lat = 30.0 - f64::from(at.0) / 60.0;
+    let lon = 85.0 + f64::from(at.1) / 60.0;
+    println!("peak {best} m at {lat:.3}, {lon:.3}");
+    assert!(
+        best.is_finite() && (7_000.0..=8_850.0).contains(&best),
+        "{best}"
+    );
+    // On the f16 lattice of its band, and decoded exactly from it.
+    let step = if best >= 8_192.0 { 8.0 } else { 4.0 };
+    assert_eq!(best % step, 0.0, "{best}");
+    assert_eq!(f32::from(half::f16::from_f32(best)), best);
+    assert!(
+        (lat - 27.99).abs() < 0.1 && (lon - 86.93).abs() < 0.1,
+        "{lat}, {lon}"
+    );
 }

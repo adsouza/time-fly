@@ -158,3 +158,24 @@ def test_manifest_lists_the_overview(tmp_path):
     header, data = formats.read_tfgrid(tmp_path / "overview.tfgrid")
     assert header["kind"] == "latlon" and header["channels"] == 2
     assert data.shape == (180 // 5 + 1, 360 // 5 + 1, 2)
+
+
+def test_everest_survives_the_f16_tile_without_clipping():
+    # The Himalaya bench region's highest node: f16 has 8 m steps from 8,192 m, so the peak
+    # decodes to within half a step and lands in the Everest tile (r12c53) where it belongs.
+    per_deg = 1
+    rows, cols = 180 * per_deg + 1, 360 * per_deg
+    elev = np.zeros((rows, cols), np.float32)
+    kop = np.zeros((rows, cols), np.uint8)
+    lat_row = 90 - 28  # node row of 28 N (north first after the band flip)
+    lon_col = 180 + 87  # node column of 87 E
+    elev[rows - 1 - lat_row, lon_col] = 8848.86
+    found = []
+    for r, c, t in tiles.split_tiles(elev, kop, per_deg=per_deg):
+        peak = float(t[..., 0].astype(np.float64).max())
+        if peak > 0:
+            found.append((r, c, peak))
+    assert any((r, c) == (12, 53) for r, c, _ in found), found
+    for _, _, peak in found:
+        assert abs(peak - 8848.86) <= 4.0
+        assert np.isfinite(peak) and peak < 65504.0
