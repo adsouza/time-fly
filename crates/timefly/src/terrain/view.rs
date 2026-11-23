@@ -85,37 +85,72 @@ pub fn debug_camera_transform(grid: &RegionGrid) -> Transform {
         .with_rotation(Quat::from_rotation_x(-DEBUG_PITCH_DEG.to_radians()))
 }
 
+/// The region camera's `Camera`: inactive until the view switches to it.
+pub(super) fn region_camera() -> Camera {
+    Camera {
+        is_active: false,
+        order: REGION_CAMERA_ORDER,
+        clear_color: ClearColorConfig::Custom(REGION_SKY),
+        ..default()
+    }
+}
+
+/// Everything on the region camera but its `Camera`, marker and layers: what decides its
+/// render pipelines' keys (with the window it draws to), so the pipeline warm-up
+/// (`super::warmup`) builds its camera from the same parts.
+pub(super) fn region_camera_parts(grid: &RegionGrid) -> impl Bundle {
+    (
+        Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection {
+            fov: REGION_FOV_DEG.to_radians(),
+            near: REGION_NEAR_M,
+            far: REGION_FAR_M,
+            near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -REGION_NEAR_M),
+            ..default()
+        }),
+        // A LUT-free tonemapper: the LUT ones need a feature this build may not carry.
+        Tonemapping::AcesFitted,
+        Exposure {
+            ev100: REGION_EV100,
+        },
+        AmbientLight {
+            color: REGION_SKY,
+            brightness: REGION_AMBIENT,
+            ..default()
+        },
+        debug_camera_transform(grid),
+    )
+}
+
+/// The region's sun without its marker and layers (shared with the pipeline warm-up).
+pub(super) fn region_sun_parts() -> impl Bundle {
+    (
+        DirectionalLight {
+            illuminance: REGION_SUN_LUX,
+            color: REGION_SUN_COLOR,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        CascadeShadowConfigBuilder {
+            num_cascades: SHADOW_CASCADES,
+            first_cascade_far_bound: FIRST_CASCADE_M,
+            maximum_distance: SHADOW_DISTANCE_M,
+            ..default()
+        }
+        .build(),
+        Transform::from_translation(REGION_SUN_DIRECTION.normalize())
+            .looking_at(Vec3::ZERO, Vec3::Y),
+    )
+}
+
 /// Spawns the region camera (inactive) and the region's sun; returns `(camera, sun)`.
 pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (Entity, Entity) {
     let camera = commands
         .spawn((
             Name::new("Region camera"),
             RegionCamera,
-            Camera3d::default(),
-            Camera {
-                is_active: false,
-                order: REGION_CAMERA_ORDER,
-                clear_color: ClearColorConfig::Custom(REGION_SKY),
-                ..default()
-            },
-            Projection::Perspective(PerspectiveProjection {
-                fov: REGION_FOV_DEG.to_radians(),
-                near: REGION_NEAR_M,
-                far: REGION_FAR_M,
-                near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -REGION_NEAR_M),
-                ..default()
-            }),
-            // A LUT-free tonemapper: the LUT ones need a feature this build may not carry.
-            Tonemapping::AcesFitted,
-            Exposure {
-                ev100: REGION_EV100,
-            },
-            AmbientLight {
-                color: REGION_SKY,
-                brightness: REGION_AMBIENT,
-                ..default()
-            },
-            debug_camera_transform(grid),
+            region_camera(),
+            region_camera_parts(grid),
             RenderLayers::layer(TERRAIN_LAYER),
         ))
         .id();
@@ -123,21 +158,7 @@ pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (
         .spawn((
             Name::new("Region sun"),
             TerrainSun,
-            DirectionalLight {
-                illuminance: REGION_SUN_LUX,
-                color: REGION_SUN_COLOR,
-                shadow_maps_enabled: true,
-                ..default()
-            },
-            CascadeShadowConfigBuilder {
-                num_cascades: SHADOW_CASCADES,
-                first_cascade_far_bound: FIRST_CASCADE_M,
-                maximum_distance: SHADOW_DISTANCE_M,
-                ..default()
-            }
-            .build(),
-            Transform::from_translation(REGION_SUN_DIRECTION.normalize())
-                .looking_at(Vec3::ZERO, Vec3::Y),
+            region_sun_parts(),
             RenderLayers::layer(TERRAIN_LAYER),
         ))
         .id();

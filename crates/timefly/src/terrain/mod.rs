@@ -17,6 +17,7 @@
 
 pub mod material;
 pub mod view;
+pub mod warmup;
 
 use std::sync::Arc;
 
@@ -377,30 +378,8 @@ fn build_scene(
     let params = TerrainParams::new(grid, &settings);
     let fields = upload_fields(grid, images);
     let palette = images.add(palette_image());
-    let mut buffer = ShaderBuffer::new(
-        terrain_buffer_bytes(&params, &[], MAX_TERRAIN_PATCHES),
-        RenderAssetUsages::default(),
-    );
-    buffer.buffer_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
-    buffer.label = "terrain patches".into();
-    let buffer = buffers.add(buffer);
-    let material = materials.add(TerrainMaterial {
-        base: StandardMaterial {
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.95,
-            reflectance: 0.2,
-            ..default()
-        },
-        extension: TerrainExtension {
-            patches: buffer.clone(),
-            inner_height: fields.inner_height.clone(),
-            apron_height: fields.apron_height.clone(),
-            inner_surface: fields.inner_surface.clone(),
-            apron_surface: fields.apron_surface.clone(),
-            palette: palette.clone(),
-            look: look_for(grid),
-        },
-    });
+    let buffer = buffers.add(patch_buffer(&params, &[]));
+    let material = materials.add(terrain_material(&fields, &palette, &buffer, look_for(grid)));
     let (camera, sun) = spawn_region_view(commands, grid);
     let height_range_m = height_range_m(grid);
     info!(
@@ -425,6 +404,44 @@ fn build_scene(
         camera,
         sun,
         overflow_reported: false,
+    }
+}
+
+/// The patch buffer: the header and up to [`MAX_TERRAIN_PATCHES`] instances.
+fn patch_buffer(params: &TerrainParams, instances: &[PatchInstance]) -> ShaderBuffer {
+    let mut buffer = ShaderBuffer::new(
+        terrain_buffer_bytes(params, instances, MAX_TERRAIN_PATCHES),
+        RenderAssetUsages::default(),
+    );
+    buffer.buffer_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+    buffer.label = "terrain patches".into();
+    buffer
+}
+
+/// The terrain's material over a region's textures (shared with the pipeline warm-up, so its
+/// pipeline keys match).
+fn terrain_material(
+    fields: &FieldImages,
+    palette: &Handle<Image>,
+    buffer: &Handle<ShaderBuffer>,
+    look: TerrainLook,
+) -> TerrainMaterial {
+    TerrainMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.95,
+            reflectance: 0.2,
+            ..default()
+        },
+        extension: TerrainExtension {
+            patches: buffer.clone(),
+            inner_height: fields.inner_height.clone(),
+            apron_height: fields.apron_height.clone(),
+            inner_surface: fields.inner_surface.clone(),
+            apron_surface: fields.apron_surface.clone(),
+            palette: palette.clone(),
+            look,
+        },
     }
 }
 

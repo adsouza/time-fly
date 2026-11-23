@@ -94,6 +94,7 @@ pub fn app(session: &Session) -> App {
         TerrainCdlodPlugin,
         sky::SkyPlugin,
         water::WaterPlugin,
+        terrain::warmup::RegionWarmupPlugin,
         OrbitCameraPlugin,
         RegionNavigationPlugin,
         FlyCameraPlugin,

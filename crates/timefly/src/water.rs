@@ -175,6 +175,31 @@ impl MaterialExtension for WaterExtension {
     }
 }
 
+/// The sea's material over the terrain's patch buffer and height textures (shared with the
+/// pipeline warm-up, `crate::terrain::warmup`, so its pipeline keys match).
+pub fn water_material(
+    patches: &Handle<ShaderBuffer>,
+    inner_height: &Handle<Image>,
+    apron_height: &Handle<Image>,
+    look: WaterLook,
+) -> WaterMaterial {
+    WaterMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.12,
+            // f0 = 0.16 × reflectance² = 0.02 (WATER_F0).
+            reflectance: (WATER_F0 / 0.16).sqrt(),
+            ..default()
+        },
+        extension: WaterExtension {
+            patches: patches.clone(),
+            inner_height: inner_height.clone(),
+            apron_height: apron_height.clone(),
+            look,
+        },
+    }
+}
+
 /// The sea for the current region (present while its entity exists).
 #[derive(Resource, Debug)]
 pub struct RegionWater {
@@ -222,21 +247,12 @@ fn sync_water(
     );
     match (action, scene, water) {
         (SkyAction::Build, Some(scene), _) => {
-            let material = materials.add(WaterMaterial {
-                base: StandardMaterial {
-                    base_color: Color::WHITE,
-                    perceptual_roughness: 0.12,
-                    // f0 = 0.16 × reflectance² = 0.02 (WATER_F0).
-                    reflectance: (WATER_F0 / 0.16).sqrt(),
-                    ..default()
-                },
-                extension: WaterExtension {
-                    patches: scene.buffer.clone(),
-                    inner_height: scene.inner_height.clone(),
-                    apron_height: scene.apron_height.clone(),
-                    look: water_look(&scene.grid),
-                },
-            });
+            let material = materials.add(water_material(
+                &scene.buffer,
+                &scene.inner_height,
+                &scene.apron_height,
+                water_look(&scene.grid),
+            ));
             let entity = commands
                 .spawn((
                     Name::new("Region sea"),
