@@ -1,9 +1,9 @@
 //! Region terrain geometry (design spec §6.3): CDLOD patch selection, the vertex morph, the
 //! inner/apron height blend and the curvature drop.
 //!
-//! Pure functions only. [`morph_vertex`], [`blended_height_m`] and [`curvature_drop_m`] are the
-//! Rust reference for the terrain vertex shader (`assets/shaders/terrain.wesl`), which mirrors
-//! them operation for operation; their doc comments give the exact formulas.
+//! Pure functions only. [`morph_vertex`], [`blended_height_m`], [`curvature_drop_m`] and
+//! [`surface_normal`] are the Rust reference for the terrain shaders (`terrain_cdlod.wesl`),
+//! which mirror them operation for operation; their doc comments give the exact formulas.
 //!
 //! Units: region local metres, `+x` east, `−z` north, `+y` up, sea level at `y = 0`.
 
@@ -51,6 +51,40 @@ pub fn blended_height_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
 /// camera: `d² / (2R)` with `R = 6,371,000 m` (the small-angle sagitta).
 pub fn curvature_drop_m(horizontal_distance_m: f64) -> f64 {
     horizontal_distance_m * horizontal_distance_m / (2.0 * EARTH_RADIUS_M)
+}
+
+/// The unit normal of the drawn surface at local `(x, z)` metres, for a camera at horizontal
+/// position `camera_xz`: the blended height minus the curvature drop, so far terrain tilts away
+/// from the camera by about `d / R` (9° at 1,000 km).
+///
+/// Exact formula (mirrored by `terrain_normal` in `terrain_cdlod.wesl`):
+/// - `e` is one texel of the field that dominates at `(x, z)`: the inner spacing where
+///   `max(|x|, |z|) < e1` (the blend's end), the apron spacing elsewhere;
+/// - `west, east, north, south` are [`blended_height_m`] at `(x ∓ e, z)` and `(x, z ∓ e)`;
+/// - `(dx, dz) = (x, z) − camera_xz`, in f32;
+/// - `n = normalize(west − east + 2e·dx/R, 2e, north − south + 2e·dz/R)`: central differences
+///   of `h − (dx² + dz²) / 2R`, whose slope is `−d/R` along the line from the camera.
+pub fn surface_normal(grid: &RegionGrid, camera_xz: [f64; 2], x_m: f64, z_m: f64) -> [f32; 3] {
+    let e1 = grid.inner.size_m / 2.0;
+    let e = if x_m.abs().max(z_m.abs()) < e1 {
+        grid.inner.spacing_m()
+    } else {
+        grid.apron.spacing_m()
+    };
+    let west = blended_height_m(grid, x_m - e, z_m);
+    let east = blended_height_m(grid, x_m + e, z_m);
+    let north = blended_height_m(grid, x_m, z_m - e);
+    let south = blended_height_m(grid, x_m, z_m + e);
+    let (e, r) = (e as f32, EARTH_RADIUS_M as f32);
+    let dx = (x_m - camera_xz[0]) as f32;
+    let dz = (z_m - camera_xz[1]) as f32;
+    let n = [
+        west - east + 2.0 * e * dx / r,
+        2.0 * e,
+        north - south + 2.0 * e * dz / r,
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    n.map(|c| c / len)
 }
 
 /// `t = clamp((x − e0) / (e1 − e0), 0, 1)`, then `t² (3 − 2t)`: WGSL's `smoothstep`.

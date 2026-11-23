@@ -11,10 +11,17 @@
 //! | 100 | read-only storage buffer: [`TerrainParams`] then [`PatchInstance`]s, indexed by `MeshTag` |
 //! | 101, 102 | inner and apron heights, `R32Float`, read with `textureLoad` |
 //! | 103, 104 | inner and apron surface codes, `Rgba8Unorm` (`Field::surface`), `textureLoad` |
-//! | 105 | the palette, `Rgba8UnormSrgb` (a placeholder until Task 8 fills it) |
+//! | 105 | the palette, `Rgba8UnormSrgb` ([`palette_texels`]: ground, canopy, rock per era and biome) |
+//! | 106 | uniform [`TerrainLook`]: the painterly light (shadow hue, ramp, brush, snowline latitude) |
 //!
 //! None of the textures has a sampler: `R32Float` is not filterable in baseline WebGPU, and the
 //! codes and palette are looked up texel by texel.
+//!
+//! The fragment (M2 design §6.4) blends the palette colours of the four surrounding surface
+//! texels in colour space, breaks them up with `noise.wesl` at 400 m, 60 m and 9 m, adds rock on
+//! slopes, snow from the ice byte and the snowline, and Barren-era microbial mats at the shore,
+//! then lights through Bevy PBR and repaints the light: a soft three-band ramp and a cool,
+//! era-tinted hue shift in shadow.
 //!
 //! The extension is not bindless, so the combined material is not either (Bevy only goes
 //! bindless when the base and the extension both are). That one layout works on Metal, Vulkan
@@ -23,12 +30,15 @@
 use bevy::asset::{RenderAssetUsages, uuid_handle};
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
+};
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bytemuck::{Pod, Zeroable};
 use timefly_core::globe::EARTH_RADIUS_KM;
 use timefly_core::terrain::{BLEND_APRON_TEXELS, LodSettings, Patch};
+use timefly_core::worldgen::biome::{BiomeClass, VegetationEra, palette};
 use timefly_core::worldgen::generate::{Field, RegionGrid};
 
 /// `terrain.wesl`: the main-pass vertex and fragment shaders.
@@ -39,6 +49,49 @@ pub const TERRAIN_PREPASS_SHADER: Handle<Shader> =
 /// `terrain_cdlod.wesl`: the shared CDLOD vertex math (imported by the two above).
 pub const TERRAIN_CDLOD_SHADER: Handle<Shader> =
     uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e13");
+/// `noise.wesl`: the shared lattice noise (Task 2), imported as `package::noise`.
+pub const NOISE_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e14");
+
+/// How strongly shadowed light takes the sky's cool, era-tinted hue (0 = not at all).
+pub const SHADOW_HUE_STRENGTH: f32 = 0.30;
+/// How far the diffuse light is pulled toward its three soft bands (0 = plain PBR).
+pub const RAMP_AMOUNT: f32 = 0.4;
+/// Brush-noise strength: the value jitter at the coarsest scale (finer scales are weaker).
+pub const BRUSH_STRENGTH: f32 = 0.08;
+/// How much steeper the terrain is lit than it is: the 293 m field's slopes read as soft
+/// rolling ground at flight altitudes, and a painter models the forms more boldly. Shading
+/// only; the geometry and the slope rules (rock, snow) use the true slope.
+pub const RELIEF_EXAGGERATION: f32 = 1.8;
+
+/// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
+#[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
+pub struct TerrainLook {
+    /// `rgb`: the hue shadowed light shifts toward, scaled to luminance 1 (the sky's zenith, so
+    /// shadows lit only by the sky take its colour); `a`: the shift's strength.
+    pub shadow: Vec4,
+    /// `x`: the illumination (exposure applied) of a surface facing the sun, which the ramp's
+    /// bands are measured against; `y`: [`RAMP_AMOUNT`]; `z`: [`BRUSH_STRENGTH`]; `w`: the
+    /// region centre's latitude in the era frame (degrees), for the snowline.
+    pub light: Vec4,
+    /// `x`: [`RELIEF_EXAGGERATION`]; `yzw`: reserved.
+    pub relief: Vec4,
+}
+
+impl Default for TerrainLook {
+    fn default() -> Self {
+        terrain_look(Vec3::ONE, 1.0, 0.0)
+    }
+}
+
+/// The look for a sky zenith colour (linear), the full-sun illumination and the centre latitude.
+pub fn terrain_look(zenith: Vec3, full_sun: f32, centre_lat_deg: f32) -> TerrainLook {
+    let luminance = zenith.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-6);
+    TerrainLook {
+        shadow: (zenith / luminance).extend(SHADOW_HUE_STRENGTH),
+        light: Vec4::new(full_sun, RAMP_AMOUNT, BRUSH_STRENGTH, centre_lat_deg),
+        relief: Vec4::new(RELIEF_EXAGGERATION, 0.0, 0.0, 0.0),
+    }
+}
 
 /// The terrain's material.
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
@@ -181,12 +234,95 @@ pub fn surface_image(field: &Field) -> Image {
     )
 }
 
-/// Palette texture size: one column per biome class, one row per vegetation era.
-pub const PALETTE_SIZE: UVec2 = UVec2::new(12, 6);
+/// Every biome class, in discriminant order (`ALL_BIOMES[i] as usize == i`).
+pub const ALL_BIOMES: [BiomeClass; 12] = [
+    BiomeClass::TropicalRainforest,
+    BiomeClass::MonsoonSavanna,
+    BiomeClass::HotDesert,
+    BiomeClass::ColdDesert,
+    BiomeClass::Steppe,
+    BiomeClass::Mediterranean,
+    BiomeClass::TemperateBroadleaf,
+    BiomeClass::TemperateRainforest,
+    BiomeClass::Boreal,
+    BiomeClass::Tundra,
+    BiomeClass::IceCap,
+    BiomeClass::Alpine,
+];
 
-/// A neutral placeholder palette ([`PALETTE_SIZE`]); Task 8 replaces it with the real colours.
-pub fn placeholder_palette() -> Image {
-    let texels = (PALETTE_SIZE.x * PALETTE_SIZE.y) as usize;
+/// Every vegetation era, in discriminant order (`ALL_ERAS[i] as usize == i`).
+pub const ALL_ERAS: [VegetationEra; 6] = [
+    VegetationEra::Barren,
+    VegetationEra::EarlyPlants,
+    VegetationEra::FirstForests,
+    VegetationEra::ConiferAge,
+    VegetationEra::FloweringPlants,
+    VegetationEra::Modern,
+];
+
+/// The colours a palette entry holds per `(era, biome)`, in column order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PaletteKind {
+    Ground = 0,
+    Canopy = 1,
+    Rock = 2,
+}
+
+/// Palette texture size: three columns (ground, canopy, rock) per biome class, one row per
+/// vegetation era. Texel `(biome × 3 + kind, era)`.
+pub const PALETTE_SIZE: UVec2 = UVec2::new(36, 6);
+
+/// Index into [`palette_texels`] of a colour (row-major, row = era).
+pub fn palette_texel_index(era: VegetationEra, biome: BiomeClass, kind: PaletteKind) -> usize {
+    era as usize * PALETTE_SIZE.x as usize + biome as usize * 3 + kind as usize
+}
+
+/// The share of the ground a biome's canopy covers where plants grow, which the shader breaks
+/// into brushy patches. Where nothing grows the canopy colour equals the ground's, so the cover
+/// does not matter there.
+pub fn canopy_cover(biome: BiomeClass) -> f32 {
+    match biome {
+        BiomeClass::TropicalRainforest => 0.95,
+        BiomeClass::MonsoonSavanna => 0.45,
+        BiomeClass::HotDesert => 0.06,
+        BiomeClass::ColdDesert => 0.12,
+        BiomeClass::Steppe => 0.40,
+        BiomeClass::Mediterranean => 0.50,
+        BiomeClass::TemperateBroadleaf => 0.85,
+        BiomeClass::TemperateRainforest => 0.95,
+        BiomeClass::Boreal => 0.85,
+        BiomeClass::Tundra => 0.50,
+        BiomeClass::IceCap => 0.0,
+        BiomeClass::Alpine => 0.35,
+    }
+}
+
+/// The palette texture's texels ([`PALETTE_SIZE`], row-major, sRGB bytes): Task 3's
+/// [`palette`] for every era and biome, ground, canopy and rock side by side. Alpha is 255,
+/// except the canopy's, which holds [`canopy_cover`].
+pub fn palette_texels() -> Vec<[u8; 4]> {
+    let mut texels = vec![[0u8; 4]; (PALETTE_SIZE.x * PALETTE_SIZE.y) as usize];
+    for era in ALL_ERAS {
+        for biome in ALL_BIOMES {
+            let p = palette(era, biome);
+            let cover = (canopy_cover(biome) * 255.0).round() as u8;
+            for (kind, colour, alpha) in [
+                (PaletteKind::Ground, p.ground, 255),
+                (PaletteKind::Canopy, p.canopy, cover),
+                (PaletteKind::Rock, p.rock, 255),
+            ] {
+                let [r, g, b, _] =
+                    Srgba::from(LinearRgba::rgb(colour[0], colour[1], colour[2])).to_u8_array();
+                texels[palette_texel_index(era, biome, kind)] = [r, g, b, alpha];
+            }
+        }
+    }
+    texels
+}
+
+/// The palette texture (`Rgba8UnormSrgb`, so `textureLoad` returns linear colour).
+pub fn palette_image() -> Image {
+    let bytes: Vec<u8> = palette_texels().into_iter().flatten().collect();
     Image::new(
         Extent3d {
             width: PALETTE_SIZE.x,
@@ -194,7 +330,7 @@ pub fn placeholder_palette() -> Image {
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        [128u8, 140, 110, 255].repeat(texels),
+        bytes,
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     )
@@ -223,6 +359,8 @@ pub struct TerrainExtension {
     pub apron_surface: Handle<Image>,
     #[texture(105, sample_type = "float", filterable = false)]
     pub palette: Handle<Image>,
+    #[uniform(106)]
+    pub look: TerrainLook,
 }
 
 impl MaterialExtension for TerrainExtension {
@@ -244,8 +382,13 @@ impl MaterialExtension for TerrainExtension {
 }
 
 /// Adds the embedded terrain shaders to the shader assets, so the terrain renders from any
-/// asset root. `terrain_cdlod.wesl` registers as the WESL module `timefly::terrain_cdlod`.
+/// asset root. `terrain_cdlod.wesl` registers as the WESL module `package::terrain_cdlod` and
+/// `noise.wesl` as `package::noise` (`import package::noise::gradient_noise3;`).
 pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
+    let noise = Shader::from_wesl(
+        include_str!("../../assets/shaders/noise.wesl"),
+        "embedded://timefly/noise.wesl",
+    );
     let cdlod = Shader::from_wesl(
         include_str!("../../assets/shaders/terrain_cdlod.wesl"),
         "embedded://timefly/terrain_cdlod.wesl",
@@ -258,6 +401,7 @@ pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
         include_str!("../../assets/shaders/terrain_prepass.wesl"),
         "embedded://timefly/terrain_prepass.wesl",
     );
+    let _ = shaders.insert(NOISE_SHADER.id(), noise);
     let _ = shaders.insert(TERRAIN_CDLOD_SHADER.id(), cdlod);
     let _ = shaders.insert(TERRAIN_SHADER.id(), terrain);
     let _ = shaders.insert(TERRAIN_PREPASS_SHADER.id(), prepass);
@@ -418,6 +562,73 @@ mod tests {
         assert_eq!(moved.debug, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(moved.with_wireframe(false).debug, [0.0; 4]);
         assert_eq!(moved.inner, p.inner);
+    }
+
+    /// The sRGB transfer function, written out independently of Bevy's.
+    fn srgb_byte(linear: f32) -> f32 {
+        let s = if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        s * 255.0
+    }
+
+    #[test]
+    fn palette_texture_matches_core() {
+        for (i, b) in ALL_BIOMES.iter().enumerate() {
+            assert_eq!(*b as usize, i);
+        }
+        for (i, e) in ALL_ERAS.iter().enumerate() {
+            assert_eq!(*e as usize, i);
+        }
+        let texels = palette_texels();
+        assert_eq!(texels.len(), (PALETTE_SIZE.x * PALETTE_SIZE.y) as usize);
+        for era in ALL_ERAS {
+            for biome in ALL_BIOMES {
+                let p = palette(era, biome);
+                for (kind, want) in [
+                    (PaletteKind::Ground, p.ground),
+                    (PaletteKind::Canopy, p.canopy),
+                    (PaletteKind::Rock, p.rock),
+                ] {
+                    let t = texels[palette_texel_index(era, biome, kind)];
+                    for c in 0..3 {
+                        let exact = srgb_byte(want[c]);
+                        assert!(
+                            (f32::from(t[c]) - exact).abs() <= 0.5 + 1e-3,
+                            "{era:?} {biome:?} {kind:?} channel {c}: {} vs {exact}",
+                            t[c]
+                        );
+                    }
+                    let alpha = match kind {
+                        PaletteKind::Canopy => (canopy_cover(biome) * 255.0).round() as u8,
+                        _ => 255,
+                    };
+                    assert_eq!(t[3], alpha, "{era:?} {biome:?} {kind:?}");
+                }
+            }
+        }
+        // The layout: texel (biome × 3 + kind, era).
+        assert_eq!(
+            palette_texel_index(
+                VegetationEra::FirstForests,
+                BiomeClass::Boreal,
+                PaletteKind::Rock
+            ),
+            2 * 36 + 8 * 3 + 2
+        );
+        for biome in ALL_BIOMES {
+            assert!((0.0..=1.0).contains(&canopy_cover(biome)), "{biome:?}");
+        }
+        assert!(canopy_cover(BiomeClass::HotDesert) < canopy_cover(BiomeClass::TropicalRainforest));
+        assert_eq!(canopy_cover(BiomeClass::IceCap), 0.0);
+        let image = palette_image();
+        assert_eq!(
+            image.texture_descriptor.format,
+            TextureFormat::Rgba8UnormSrgb
+        );
+        assert_eq!(image.size(), PALETTE_SIZE);
     }
 
     #[test]

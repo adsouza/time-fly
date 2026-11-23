@@ -368,3 +368,103 @@ fn leaving_frees_the_terrain() {
         "the scene still holds the grid"
     );
 }
+
+#[test]
+fn sky_and_water_follow_the_scene() {
+    use crate::sky::{RegionSky, SkyMaterial, add_sky_systems};
+    use crate::water::{RegionWater, WaterMaterial, add_water_systems};
+    use bevy::pbr::DistanceFog;
+
+    let grid = grid();
+    let mut app = pool_app();
+    app.init_asset::<SkyMaterial>()
+        .init_asset::<WaterMaterial>();
+    add_sky_systems(&mut app);
+    add_water_systems(&mut app);
+    enter(&mut app, &grid);
+    for _ in 0..3 {
+        app.update();
+    }
+    let (dome, sea) = {
+        let world = app.world();
+        let scene = world.resource::<TerrainScene>();
+        let sky = world.resource::<RegionSky>();
+        let water = world.resource::<RegionWater>();
+        assert!(Arc::ptr_eq(&sky.grid, &grid) && Arc::ptr_eq(&water.grid, &grid));
+        // The sea reads the terrain's own buffer and height textures.
+        let m = world
+            .resource::<Assets<WaterMaterial>>()
+            .get(&water.material)
+            .unwrap();
+        assert_eq!(m.extension.patches, scene.buffer);
+        assert_eq!(m.extension.inner_height, scene.inner_height);
+        assert_eq!(m.extension.apron_height, scene.apron_height);
+        // The region camera carries the era's fog and the sky-coloured ambient light.
+        let camera = world.entity(scene.camera);
+        assert!(camera.contains::<DistanceFog>());
+        let (zenith, _, fog) = crate::sky::sky_tint(sky.era, sky.biome);
+        assert_eq!(camera.get::<DistanceFog>().unwrap().color, fog);
+        assert_eq!(camera.get::<AmbientLight>().unwrap().color, zenith);
+        // The terrain's look carries the same zenith as its shadow hue.
+        let look = world
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&scene.material)
+            .unwrap()
+            .extension
+            .look;
+        assert_eq!(look, look_for(&grid));
+        (sky.dome, water.entity)
+    };
+
+    // A snapshot change: the same entities, rebound to the new grid and retinted for its era.
+    let mut deep = (*grid).clone();
+    deep.spec.snapshot = YearsBp(540.0e6);
+    let deep = Arc::new(deep);
+    enter(&mut app, &deep);
+    app.update();
+    app.update();
+    {
+        let world = app.world();
+        let scene = world.resource::<TerrainScene>();
+        let sky = world.resource::<RegionSky>();
+        let water = world.resource::<RegionWater>();
+        assert_eq!((sky.dome, water.entity), (dome, sea));
+        assert_eq!(
+            sky.era,
+            timefly_core::worldgen::biome::VegetationEra::Barren
+        );
+        assert!(Arc::ptr_eq(&water.grid, &deep));
+        let m = world
+            .resource::<Assets<WaterMaterial>>()
+            .get(&water.material)
+            .unwrap();
+        assert_eq!(m.extension.inner_height, scene.inner_height);
+        let fog = world
+            .entity(scene.camera)
+            .get::<DistanceFog>()
+            .unwrap()
+            .color;
+        assert_eq!(fog, crate::sky::sky_tint(sky.era, sky.biome).2);
+        let look = world
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&scene.material)
+            .unwrap()
+            .extension
+            .look;
+        assert_eq!(look, look_for(&deep));
+    }
+
+    // Leaving: both go, and their assets with them.
+    app.world_mut().remove_resource::<ActiveRegion>();
+    for _ in 0..4 {
+        app.update();
+    }
+    let world = app.world_mut();
+    assert!(world.get_resource::<RegionSky>().is_none());
+    assert!(world.get_resource::<RegionWater>().is_none());
+    assert!(world.get_entity(dome).is_err() && world.get_entity(sea).is_err());
+    assert_eq!(world.resource::<Assets<SkyMaterial>>().len(), 0);
+    assert_eq!(world.resource::<Assets<WaterMaterial>>().len(), 0);
+    assert_eq!(world.resource::<Assets<Mesh>>().len(), 0);
+    assert_eq!(world.resource::<Assets<Image>>().len(), 0);
+}

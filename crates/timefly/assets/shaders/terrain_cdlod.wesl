@@ -4,7 +4,8 @@
 // (tests/region_gpu.rs) compiles it on its own with a compute entry point.
 //
 // It mirrors timefly_core::terrain operation for operation: `cdlod_morph` is `morph_vertex`,
-// `blended_height` is `blended_height_m` and the drop in `cdlod_vertex` is `curvature_drop_m`.
+// `blended_height` is `blended_height_m`, the drop in `cdlod_vertex` is `curvature_drop_m` and
+// `terrain_normal` is `surface_normal`.
 // Heights are R32Float, which baseline WebGPU cannot filter, so they are read with textureLoad
 // and interpolated by hand, as the Rust reference does.
 //
@@ -127,7 +128,10 @@ fn texel_step(params: TerrainParams, xz: vec2<f32>) -> f32 {
     return select(params.apron.y, params.inner.y, a < params.apron.w);
 }
 
-// The surface normal by central differences over one texel.
+// `surface_normal`: the normal of the drawn surface, the blended height minus the curvature
+// drop, by central differences over one texel. The drop's slope is -d/R along the line from the
+// camera, so far terrain tilts away from it (9 degrees at 1,000 km) and is lit as the curved
+// surface it is drawn as.
 fn terrain_normal(
     inner: texture_2d<f32>,
     apron: texture_2d<f32>,
@@ -139,7 +143,13 @@ fn terrain_normal(
     let east = blended_height(inner, apron, params, xz + vec2<f32>(e, 0.0));
     let north = blended_height(inner, apron, params, xz - vec2<f32>(0.0, e));
     let south = blended_height(inner, apron, params, xz + vec2<f32>(0.0, e));
-    return normalize(vec3<f32>(west - east, 2.0 * e, north - south));
+    let d = xz - params.camera.xz;
+    let r = params.lattice.z;
+    return normalize(vec3<f32>(
+        west - east + 2.0 * e * d.x / r,
+        2.0 * e,
+        north - south + 2.0 * e * d.y / r,
+    ));
 }
 
 // The displaced vertex: morph, then the blended height at the morphed xz, then the curvature

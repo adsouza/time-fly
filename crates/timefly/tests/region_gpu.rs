@@ -8,6 +8,8 @@
 //! - `wesl_morph_matches_rust` does the same with `assets/shaders/terrain_cdlod.wesl`, the vertex
 //!   math every terrain pass runs, against `timefly_core::terrain`'s `morph_vertex`,
 //!   `blended_height_m` and `curvature_drop_m`, fed through the shell's own buffer packing.
+//! - `wesl_normal_matches_rust` runs `terrain_normal` (the per-pixel lighting normal, with the
+//!   curvature tilt) against `timefly_core::terrain::surface_normal`.
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -16,6 +18,7 @@ use timefly_core::deep_time::YearsBp;
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
 use timefly_core::terrain::{
     LodSettings, blended_height_m, curvature_drop_m, morph_factor, morph_vertex, select_patches,
+    surface_normal,
 };
 use timefly_core::worldgen::generate::{Field, RegionGrid, RegionSpec};
 use timefly_core::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
@@ -495,4 +498,173 @@ fn wesl_morph_matches_rust() {
     assert!(partial >= 10, "only {partial} partly morphed vertices");
     assert!(odd >= MORPH_VERTICES / 2, "only {odd} odd vertices");
     assert!(apron_far >= 10, "only {apron_far} far apron vertices");
+}
+
+const NORMAL_ENTRY: &str = r#"
+@group(0) @binding(0) var<storage, read> terrain: TerrainBuffer;
+@group(0) @binding(1) var inner_height: texture_2d<f32>;
+@group(0) @binding(2) var apron_height: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> queries: array<vec4<f32>>;   // (x, z, 0, 0)
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>; // normal, 0
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&out)) {
+        return;
+    }
+    let q = queries[n];
+    out[n] = vec4<f32>(terrain_normal(inner_height, apron_height, terrain.params, q.xy), 0.0);
+}
+"#;
+
+/// Per-component agreement of the GPU and Rust normals. Each height is within about 0.05 m
+/// (the morph test's bound); over a 2-texel baseline of at least 586 m that tilts the normal by
+/// under 2e-4.
+const NORMAL_TOLERANCE: f32 = 2.0e-4;
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_normal_matches_rust() {
+    let center = geo_to_render(latlon_to_geo(46.5, 10.0));
+    let grid = RegionGrid {
+        spec: RegionSpec::new(center, YearsBp(0.0), 1),
+        inner: rough_field(REGION_RES, REGION_SIZE_M, 3),
+        apron: rough_field(APRON_RES, APRON_SIZE_M, 4),
+    };
+    let settings = LodSettings::region();
+    let camera = Vec3::new(-20_000.0, 3_000.0, 35_000.0);
+    let params = TerrainParams::new(&grid, &settings).with_camera(camera);
+    let buffer_bytes = terrain_buffer_bytes(&params, &[], 1);
+
+    // Points near the camera, across the blend, and far out in the apron (up to 1,600 km).
+    let mut rng = SplitMix(0x7F1E_0008);
+    let mut queries: Vec<[f32; 4]> = Vec::new();
+    for k in 0..512 {
+        let reach = [20_000.0, 160_000.0, 600_000.0, 1_600_000.0][k % 4];
+        let x = (rng.unit() * 2.0 - 1.0) * reach;
+        let z = (rng.unit() * 2.0 - 1.0) * reach;
+        queries.push([x.clamp(-1.19e6, 1.19e6), z.clamp(-1.19e6, 1.19e6), 0.0, 0.0]);
+    }
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    println!("adapter: {:?}", adapter.get_info());
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("normal parity"),
+        source: wgpu::ShaderSource::Wgsl(format!("{CDLOD}\n{NORMAL_ENTRY}").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("normal parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let inner = r32_texture(&device, &queue, &grid.inner);
+    let apron = r32_texture(&device, &queue, &grid.apron);
+    let storage = |label, data: &[u8]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let terrain_buf = storage("terrain", &buffer_bytes);
+    let query_buf = storage("queries", bytemuck::cast_slice(&queries));
+    let bytes = (queries.len() * 16) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: terrain_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&inner),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&apron),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(queries.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<[f32; 4]> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    let (mut worst, mut worst_tilt_deg) = (0.0f32, 0.0f64);
+    for (q, g) in queries.iter().zip(&got) {
+        let want = surface_normal(
+            &grid,
+            [f64::from(camera.x), f64::from(camera.z)],
+            f64::from(q[0]),
+            f64::from(q[1]),
+        );
+        for c in 0..3 {
+            let diff = (g[c] - want[c]).abs();
+            worst = worst.max(diff);
+            assert!(
+                diff <= NORMAL_TOLERANCE,
+                "({}, {}) component {c}: gpu {:?} vs rust {want:?} (diff {diff})",
+                q[0],
+                q[1],
+                &g[..3]
+            );
+        }
+        // The far points carry the curvature tilt: a flat-terrain normal would be off by d/R.
+        let d = f64::from((q[0] - camera.x).hypot(q[1] - camera.z));
+        worst_tilt_deg = worst_tilt_deg.max((d / 6_371_000.0).atan().to_degrees());
+    }
+    println!(
+        "{} normals: worst component diff {worst:.2e}; largest curvature tilt checked {worst_tilt_deg:.1} deg",
+        queries.len()
+    );
+    assert!(worst_tilt_deg > 10.0);
 }

@@ -36,8 +36,9 @@ use tracing::instrument;
 
 use crate::region::ActiveRegion;
 use material::{
-    PatchInstance, TerrainExtension, TerrainMaterial, TerrainParams, add_terrain_shaders,
-    height_image, patch_instances, placeholder_palette, surface_image, terrain_buffer_bytes,
+    PatchInstance, TerrainExtension, TerrainLook, TerrainMaterial, TerrainParams,
+    add_terrain_shaders, height_image, palette_image, patch_instances, surface_image,
+    terrain_buffer_bytes, terrain_look,
 };
 use view::{RegionCamera, spawn_region_view, sync_region_view};
 
@@ -54,6 +55,24 @@ pub const PATCH_POOL_CHUNK: usize = 64;
 pub const WIREFRAME_KEY: KeyCode = KeyCode::F2;
 
 const EARTH_RADIUS_M: f32 = (EARTH_RADIUS_KM * 1000.0) as f32;
+
+/// Systems that build, replace and tear down the [`TerrainScene`]. The sky and the water order
+/// themselves after it.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerrainSceneSystems;
+
+/// The painterly look for a region: the sky's zenith as the shadow hue, the region sun's
+/// illumination, and the centre's latitude for the snowline.
+pub fn look_for(grid: &RegionGrid) -> TerrainLook {
+    let (era, biome) = crate::sky::region_look(grid);
+    let (zenith, _, _) = crate::sky::sky_tint(era, biome);
+    let z = zenith.to_linear();
+    terrain_look(
+        Vec3::new(z.red, z.green, z.blue),
+        view::full_sun_illumination(),
+        crate::sky::centre_lat_deg(grid),
+    )
+}
 
 /// What the terrain shows. Tasks 8 and 9 hide the terrain (and give the view back to the globe
 /// camera) with `visible = false`.
@@ -231,7 +250,12 @@ fn add_terrain_systems(app: &mut App) {
     app.init_resource::<TerrainSettings>()
         .add_systems(
             Update,
-            (sync_terrain_scene, toggle_wireframe, sync_region_view).chain(),
+            (
+                sync_terrain_scene.in_set(TerrainSceneSystems),
+                toggle_wireframe,
+                sync_region_view,
+            )
+                .chain(),
         )
         .add_systems(
             PostUpdate,
@@ -344,7 +368,7 @@ fn build_scene(
     let settings = LodSettings::region();
     let params = TerrainParams::new(grid, &settings);
     let fields = upload_fields(grid, images);
-    let palette = images.add(placeholder_palette());
+    let palette = images.add(palette_image());
     let mut buffer = ShaderBuffer::new(
         terrain_buffer_bytes(&params, &[], MAX_TERRAIN_PATCHES),
         RenderAssetUsages::default(),
@@ -366,6 +390,7 @@ fn build_scene(
             inner_surface: fields.inner_surface.clone(),
             apron_surface: fields.apron_surface.clone(),
             palette: palette.clone(),
+            look: look_for(grid),
         },
     });
     let (camera, sun) = spawn_region_view(commands, grid);
@@ -408,6 +433,7 @@ fn replace_fields(
         m.extension.apron_height = fields.apron_height.clone();
         m.extension.inner_surface = fields.inner_surface.clone();
         m.extension.apron_surface = fields.apron_surface.clone();
+        m.extension.look = look_for(grid);
     }
     scene.grid = grid.clone();
     scene.params = TerrainParams::new(grid, &scene.settings);

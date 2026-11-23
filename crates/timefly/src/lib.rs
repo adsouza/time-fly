@@ -13,9 +13,11 @@ pub mod diagnostics;
 pub mod globe;
 pub mod gpu;
 pub mod region;
+pub mod sky;
 pub mod terrain;
 pub mod time;
 pub mod ui;
+pub mod water;
 
 use args::LaunchArgs;
 use bench::ScrubBenchPlugin;
@@ -86,6 +88,8 @@ pub fn app(session: &Session) -> App {
         GlobePlugin,
         RegionPlugin,
         TerrainCdlodPlugin,
+        sky::SkyPlugin,
+        water::WaterPlugin,
         OrbitCameraPlugin,
         GameUiPlugins,
     ));

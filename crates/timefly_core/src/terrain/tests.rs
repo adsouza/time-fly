@@ -525,3 +525,73 @@ fn curvature_drop_is_the_sagitta() {
     assert!((curvature_drop_m(d) - 784.806_153_6).abs() < 1e-6);
     assert_eq!(curvature_drop_m(-d), curvature_drop_m(d));
 }
+
+fn flat_grid(f: fn(f64, f64) -> f64) -> RegionGrid {
+    RegionGrid {
+        spec: RegionSpec::new(RenderDir(DVec3::Y), YearsBp(0.0), 1),
+        inner: field(REGION_RES, REGION_SIZE_M, f),
+        apron: field(APRON_RES, APRON_SIZE_M, f),
+    }
+}
+
+fn tilt_deg(n: [f32; 3]) -> f64 {
+    f64::from(n[1]).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+#[test]
+fn surface_normal_tilts_with_the_curvature_drop() {
+    let r = 6_371_000.0;
+    let flat = flat_grid(|_, _| 500.0);
+    let camera = [12_000.0, -3_000.0];
+    // Under the camera the flat field faces straight up.
+    let n = surface_normal(&flat, camera, camera[0], camera[1]);
+    assert!(
+        n[0].abs() < 1e-6 && n[2].abs() < 1e-6 && (n[1] - 1.0).abs() < 1e-6,
+        "{n:?}"
+    );
+    // Away from the camera it tilts away from it by atan(d / R): about 9 degrees at 1,000 km.
+    for (dx, dz) in [
+        (1_000_000.0, 0.0),
+        (0.0, -1_000_000.0),
+        (100_000.0, 60_000.0),
+        (-40_000.0, 0.0),
+    ] {
+        let n = surface_normal(&flat, camera, camera[0] + dx, camera[1] + dz);
+        let d: f64 = f64::hypot(dx, dz);
+        let want = (d / r).atan().to_degrees();
+        assert!(
+            (tilt_deg(n) - want).abs() < 1e-3,
+            "({dx}, {dz}): {} vs {want}",
+            tilt_deg(n)
+        );
+        // Outward: the horizontal part points from the camera to the point.
+        let out = (f64::from(n[0]) * dx + f64::from(n[2]) * dz) / d;
+        assert!(out > 0.0, "({dx}, {dz}): {n:?}");
+        let len = n.iter().map(|c| c * c).sum::<f32>();
+        assert!((len - 1.0).abs() < 1e-5);
+    }
+    let far = surface_normal(&flat, [0.0, 0.0], 1_000_000.0, 0.0);
+    assert!((tilt_deg(far) - 8.93).abs() < 0.01, "{}", tilt_deg(far));
+
+    // A plane rising east at 10 %: the slope and the drop add, along x only.
+    let ramp = flat_grid(|x, _| 0.1 * x);
+    let at = surface_normal(&ramp, [0.0, 0.0], 0.0, 0.0);
+    assert!(
+        (at[0] / at[1] + 0.1).abs() < 1e-4 && at[2].abs() < 1e-6,
+        "{at:?}"
+    );
+    let x = 60_000.0;
+    let n = surface_normal(&ramp, [0.0, 0.0], x, 0.0);
+    let want = -0.1 + x / r;
+    assert!(
+        (f64::from(n[0] / n[1]) - want).abs() < 1e-4,
+        "{n:?} vs {want}"
+    );
+    // In the apron the step is an apron texel; the same plane gives the same slope.
+    let n = surface_normal(&ramp, [0.0, 0.0], 400_000.0, 0.0);
+    let want = -0.1 + 400_000.0 / r;
+    assert!(
+        (f64::from(n[0] / n[1]) - want).abs() < 1e-4,
+        "{n:?} vs {want}"
+    );
+}

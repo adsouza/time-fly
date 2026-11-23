@@ -11,6 +11,7 @@
 //! region centre, looking north and pitched down [`DEBUG_PITCH_DEG`]. Task 9 replaces it with
 //! the fly camera; the terrain follows whatever moves the `RegionCamera`'s `Transform`.
 
+use bevy::camera::Exposure;
 use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::CascadeShadowConfigBuilder;
@@ -36,17 +37,34 @@ pub const SHADOW_DISTANCE_M: f32 = 60_000.0;
 pub const FIRST_CASCADE_M: f32 = 2_500.0;
 /// Shadow cascades.
 pub const SHADOW_CASCADES: usize = 4;
-/// Direction toward the region's sun: west-south-west, 30° up, so relief reads across a
-/// north-facing view *(call; Task 8 tunes the look)*.
-pub const REGION_SUN_DIRECTION: Vec3 = Vec3::new(-0.70, 0.50, 0.51);
+/// Direction toward the region's sun: west-south-west, about 26° up, so relief reads across a
+/// north-facing view *(call)*.
+pub const REGION_SUN_DIRECTION: Vec3 = Vec3::new(-0.72, 0.42, 0.52);
 /// The sun's illuminance (lux).
-pub const REGION_SUN_LUX: f32 = 10_000.0;
-/// The region camera's ambient light (cd/m²): enough to read shadowed slopes.
-pub const REGION_AMBIENT: f32 = 250.0;
-/// Clear colour behind the terrain until Task 8's sky.
+pub const REGION_SUN_LUX: f32 = 7_000.0;
+/// The sun's colour: a warm, art-directed afternoon light (spec §9).
+pub const REGION_SUN_COLOR: Color = Color::srgb(1.0, 0.93, 0.80);
+/// The region camera's exposure (EV100): Bevy's default, pinned so the terrain's light ramp
+/// knows what a sunlit surface measures.
+pub const REGION_EV100: f32 = Exposure::EV100_BLENDER;
+/// The region camera's ambient light (cd/m²): enough to read shadowed slopes. Its colour is
+/// the sky's zenith (the sky plugin sets it per era and biome).
+pub const REGION_AMBIENT: f32 = 200.0;
+/// Clear colour behind the terrain; the sky dome covers it.
 pub const REGION_SKY: Color = Color::srgb(0.55, 0.68, 0.82);
 /// Camera order: above the globe camera's, though only one of them is active at a time.
 pub const REGION_CAMERA_ORDER: isize = 1;
+
+/// What a surface facing the region's sun receives after exposure (the diffuse term's
+/// `illuminance × exposure / π`): the unit the terrain's light ramp measures in.
+pub fn full_sun_illumination() -> f32 {
+    REGION_SUN_LUX
+        * Exposure {
+            ev100: REGION_EV100,
+        }
+        .exposure()
+        / core::f32::consts::PI
+}
 
 /// The camera that views a region. Spawned with the terrain scene, inactive until the view
 /// switches to it.
@@ -88,6 +106,9 @@ pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (
             }),
             // A LUT-free tonemapper: the LUT ones need a feature this build may not carry.
             Tonemapping::AcesFitted,
+            Exposure {
+                ev100: REGION_EV100,
+            },
             AmbientLight {
                 color: REGION_SKY,
                 brightness: REGION_AMBIENT,
@@ -103,6 +124,7 @@ pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (
             TerrainSun,
             DirectionalLight {
                 illuminance: REGION_SUN_LUX,
+                color: REGION_SUN_COLOR,
                 shadow_maps_enabled: true,
                 ..default()
             },
