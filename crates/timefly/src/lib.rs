@@ -22,6 +22,7 @@ pub mod water;
 
 use args::LaunchArgs;
 use bench::ScrubBenchPlugin;
+use bench::region::{RegionBenchConfig, RegionBenchPlugin};
 use camera::OrbitCameraPlugin;
 use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
@@ -37,7 +38,7 @@ use ui::GameUiPlugins;
 pub const APP_ID: &str = "io.github.adsouza.TimeFly";
 
 /// The primary window for the launch arguments: `--window WxH` sets its size in physical
-/// pixels, and the scrub bench turns vsync off on native so frame times show the real cost.
+/// pixels, and the benchmarks turn vsync off on native so frame times show the real cost.
 pub fn primary_window(args: &LaunchArgs) -> Window {
     #[cfg_attr(
         target_arch = "wasm32",
@@ -55,7 +56,7 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
         if let Some((w, h)) = args.window {
             window.resolution = WindowResolution::new(w, h);
         }
-        if args.scrub_bench {
+        if args.scrub_bench || args.region_bench {
             window.present_mode = PresentMode::AutoNoVsync;
         }
     }
@@ -98,19 +99,30 @@ pub fn app(session: &Session) -> App {
         FlyCameraPlugin,
         GameUiPlugins,
     ));
-    if let Some(region) = args.region {
-        app.insert_resource(LaunchRegion(region));
-    }
-    if args.scrub_bench {
-        let default_fps = if cfg!(target_arch = "wasm32") {
-            bench::WEB_TARGET_FPS
-        } else {
-            bench::NATIVE_TARGET_FPS
-        };
-        app.add_plugins(ScrubBenchPlugin {
-            target_fps: args.target_fps.unwrap_or(default_fps),
-            exit_when_done: !cfg!(target_arch = "wasm32"),
-        });
+    let default_fps = if cfg!(target_arch = "wasm32") {
+        bench::WEB_TARGET_FPS
+    } else {
+        bench::NATIVE_TARGET_FPS
+    };
+    let target_fps = args.target_fps.unwrap_or(default_fps);
+    let exit_when_done = !cfg!(target_arch = "wasm32");
+    if args.region_bench {
+        // The region bench enters its own regions; it takes precedence over the scrub bench
+        // and the launch region.
+        app.add_plugins(RegionBenchPlugin(RegionBenchConfig::new(
+            target_fps,
+            exit_when_done,
+        )));
+    } else {
+        if let Some(region) = args.region {
+            app.insert_resource(LaunchRegion(region));
+        }
+        if args.scrub_bench {
+            app.add_plugins(ScrubBenchPlugin {
+                target_fps,
+                exit_when_done,
+            });
+        }
     }
     app
 }

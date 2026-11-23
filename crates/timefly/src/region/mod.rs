@@ -78,13 +78,15 @@ pub struct RegionRequested {
 }
 
 /// Domain event: a region's grid is ready. `millis` runs from the request to the grid being
-/// ready; `tiles_fetched` counts tiles loaded for it (cache hits excluded); `fallback` says some
-/// tile it needs is missing, so part of the inner field uses globe-resolution data.
+/// ready; `tiles_fetched` counts tiles loaded for it (cache hits excluded) and `bytes_fetched`
+/// their file bytes (the session's one-time manifest and overview not included); `fallback`
+/// says some tile it needs is missing, so part of the inner field uses globe-resolution data.
 #[derive(Message, Copy, Clone, Debug, PartialEq)]
 pub struct RegionGenerated {
     pub spec: RegionSpec,
     pub millis: u32,
     pub tiles_fetched: u32,
+    pub bytes_fetched: u64,
     pub fallback: bool,
 }
 

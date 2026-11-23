@@ -366,6 +366,18 @@ fn generates_a_region_from_the_tiny_bake() {
     let event = generated(&app);
     assert!(!event.fallback, "{event:?}");
     assert_eq!(event.tiles_fetched, 4);
+    let tile_bytes: u64 = FIXTURE_TILES
+        .iter()
+        .map(|&(r, c)| {
+            fs::metadata(tiny_root().join(tile_path(r, c)))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert_eq!(
+        event.bytes_fetched, tile_bytes,
+        "the four tiles' file bytes"
+    );
     assert!(event.millis > 0 && event.millis < 20_000, "{event:?}");
     assert_eq!(seen.entered.len(), 1);
     assert_eq!(seen.entered[0].spec, event.spec);

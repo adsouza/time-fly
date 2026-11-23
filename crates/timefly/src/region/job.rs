@@ -125,6 +125,7 @@ enum Stage {
     Running {
         run: Running,
         tiles_fetched: u32,
+        bytes_fetched: u64,
         fallback: bool,
     },
 }
@@ -564,6 +565,7 @@ pub(super) fn advance_tiles(
     job.stage = Stage::Running {
         run,
         tiles_fetched: *fetched,
+        bytes_fetched: *bytes,
         fallback,
     };
 }
@@ -581,6 +583,7 @@ pub(super) fn poll_generation(
     let Stage::Running {
         run,
         tiles_fetched,
+        bytes_fetched,
         fallback,
     } = &mut job.stage
     else {
@@ -606,6 +609,7 @@ pub(super) fn poll_generation(
         spec,
         millis,
         tiles_fetched: *tiles_fetched,
+        bytes_fetched: *bytes_fetched,
         fallback: *fallback,
     });
     match job.replaces {

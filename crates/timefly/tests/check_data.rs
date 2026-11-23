@@ -1,17 +1,36 @@
-//! `--check-data[=DIR]`: loads a bake through the real loader in a window-less app (no GPU) and
-//! exits 0 when it reaches `Ready`, 1 when it fails. CI runs it on the production bake; these
-//! tests run it on the committed tiny bake.
+//! `--check-data[=DIR]`: loads a bake through the real loader in a window-less app (no GPU),
+//! then the region tiles beside it, and exits 0 when both load, 1 when either fails. CI runs it
+//! on the production bake; these tests run it on the committed tiny bake and fixture tiles.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use timefly::check_data::{DataSummary, check_globe_data};
+use timefly::check_data::{
+    CHECKED_TILES, DataSummary, TileSummary, check_globe_data, check_tiles, tiles_dir_beside,
+};
 use timefly::diagnostics::session::{PreviousOutcome, inspect_newest_session};
 
 fn tiny_globe() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets/data/globe")
+}
+
+fn tiny_tiles() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets/data/tiles")
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
 
 fn temp_dir(test: &str) -> PathBuf {
@@ -40,6 +59,72 @@ fn the_tiny_bake_checks_ready() {
         summary.revision.starts_with("manifest v2, sha256 "),
         "{}",
         summary.revision
+    );
+}
+
+#[test]
+fn the_fixture_tiles_check_ok() {
+    assert_eq!(
+        tiles_dir_beside(&tiny_globe()),
+        tiny_tiles().parent().unwrap().join("tiles")
+    );
+    let summary = check_tiles(&tiny_tiles(), Duration::from_secs(20)).expect("tiles load");
+    assert_eq!(summary.listed, 4);
+    // The fixture overview: one node per degree, both edges included.
+    assert_eq!(summary.overview, (361, 181));
+    assert_eq!(summary.loaded.len(), CHECKED_TILES);
+    let fixtures = [(17, 35), (17, 36), (18, 35), (18, 36)];
+    assert!(
+        summary.loaded.iter().all(|t| fixtures.contains(t)),
+        "{summary:?}"
+    );
+    // Largest first.
+    let size = |&(r, c): &(u8, u8)| {
+        fs::metadata(tiny_tiles().join(format!("r{r:02}c{c:02}.tfgrid")))
+            .unwrap()
+            .len()
+    };
+    assert!(
+        summary
+            .loaded
+            .windows(2)
+            .all(|w| size(&w[0]) >= size(&w[1]))
+    );
+    let text = summary.to_string();
+    assert!(
+        text.starts_with("4 tiles listed, overview 361x181, loaded 3 ("),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_corrupt_or_missing_tile_fails_the_tile_check() {
+    let summary: TileSummary = check_tiles(&tiny_tiles(), Duration::from_secs(20)).unwrap();
+    let (r, c) = summary.loaded[0];
+    let name = format!("r{r:02}c{c:02}.tfgrid");
+
+    let corrupt = temp_dir("corrupt-tile");
+    copy_dir(&tiny_tiles(), &corrupt);
+    let mut bytes = fs::read(corrupt.join(&name)).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    fs::write(corrupt.join(&name), bytes).unwrap();
+    let error = check_tiles(&corrupt, Duration::from_secs(20)).expect_err("corrupt");
+    assert!(error.contains(&name), "{error}");
+
+    let missing = temp_dir("missing-tile");
+    copy_dir(&tiny_tiles(), &missing);
+    fs::remove_file(missing.join(&name)).unwrap();
+    let error = check_tiles(&missing, Duration::from_secs(20)).expect_err("missing");
+    assert!(
+        error.contains(&name) && error.contains("not found"),
+        "{error}"
+    );
+
+    let error = check_tiles(&temp_dir("no-tiles"), Duration::from_secs(20)).expect_err("none");
+    assert!(
+        error.contains("manifest.json") && error.contains("not found"),
+        "{error}"
     );
 }
 
@@ -94,6 +179,38 @@ fn the_binary_checks_a_bake_and_exits_0() {
         run.stdout.contains("manifest v2, sha256 "),
         "{}",
         run.stdout
+    );
+    assert!(
+        run.stdout
+            .contains("region tiles OK: 4 tiles listed, overview 361x181, loaded 3 ("),
+        "{}",
+        run.stdout
+    );
+    let previous = inspect_newest_session(&logs.join("data-checks")).expect("a session");
+    assert_eq!(previous.outcome, PreviousOutcome::Clean);
+}
+
+#[test]
+fn the_binary_exits_1_when_the_tiles_beside_the_globe_are_missing() {
+    let logs = temp_dir("binary-no-tiles-logs");
+    let bake = temp_dir("binary-no-tiles-bake");
+    copy_dir(&tiny_globe(), &bake.join("data/globe"));
+    let run = run_binary(
+        &logs,
+        &format!("--check-data={}", bake.join("data/globe").display()),
+    );
+    assert_eq!(
+        run.code,
+        Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(run.stdout.contains("globe data OK"), "{}", run.stdout);
+    assert!(
+        run.stderr.contains("region tiles FAILED") && run.stderr.contains("manifest.json"),
+        "stderr:\n{}",
+        run.stderr
     );
     let previous = inspect_newest_session(&logs.join("data-checks")).expect("a session");
     assert_eq!(previous.outcome, PreviousOutcome::Clean);

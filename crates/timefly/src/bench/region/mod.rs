@@ -1,0 +1,1080 @@
+//! The region benchmark (`--region-bench`, web `?region-bench`): M2 design §8.
+//!
+//! Once the globe is interactive (on the web its shaders compile first, so a region never
+//! starts under a stalled render probe) and a short settle has passed, it enters each of the
+//! [`BENCH_REGIONS`] in turn, as the launch argument does: it sets the globe's time to the
+//! region's age and sends [`RegionRequested`]. Navigation fades in; once the player is flying
+//! and a settle has passed at the start pose, the bench drives [`FlyState`] along the region's
+//! scripted path ([`BenchPath`], [`SCRIPT_SECS`] of flight), then writes [`RegionLeft`] and
+//! waits on the globe. It then re-enters the first region [`MEMORY_CYCLES`] times, sampling
+//! memory on the globe after each leave.
+//!
+//! **Blocks.** One per region, in the scrub bench's format: frame statistics under the R14 rule
+//! (M1 ruling R14, see [`super::passes`]), generation milliseconds, tiles and bytes fetched,
+//! the load window, memory and the bake revision. Then a summary block with the gates:
+//!
+//! - **Frame rate** (R14), per region.
+//! - **First-region worst frame** (ruling R11): no frame from the first request to the first
+//!   path frame may exceed [`FIRST_REGION_FRAME_LIMIT_MS`]. That window holds the one-time
+//!   tile manifest and overview loads, the first terrain pipelines and the entering fade. The
+//!   gate applies in Chrome WebGPU, where the overview decodes on the main thread; natively the
+//!   number is reported and does not decide the result.
+//! - **Warm generation**, over the memory cycles' re-entries: at most
+//!   [`NATIVE_GEN_TARGET_MS`] natively, [`WEB_GEN_TARGET_MS`] on the web.
+//! - **Memory cycles**: after each leave the memory returns within
+//!   [`CYCLE_MEMORY_TOLERANCE`] of the first cycle's. Natively the process footprint; on the web
+//!   the wasm linear memory (it only grows, so the check is that it stops growing).
+//!
+//! On native the run exits after the summary: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL
+//! (a result, not a crash). The web logs each block to the console as one message.
+//!
+//! [`FAILED_RESULT_EXIT_CODE`]: crate::diagnostics::session::FAILED_RESULT_EXIT_CODE
+
+pub mod path;
+
+use bevy::ecs::system::SystemParam;
+use bevy::prelude::*;
+use bevy::render::renderer::RenderAdapterInfo;
+use bevy::window::{Monitor, PresentMode, PrimaryMonitor, PrimaryWindow};
+use timefly_core::deep_time::YearsBp;
+use timefly_core::terrain::blended_height_m;
+
+use super::{
+    MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
+    frame_budget_ms, frame_time_stats, header_lines_titled, memory, mib, missed_frames, pacing,
+    passes, stall_count,
+};
+use crate::args::RegionArg;
+use crate::data::GlobeData;
+use crate::diagnostics::SessionInfo;
+use crate::fly_camera::{FlyState, FlySystems};
+use crate::globe::GlobeRenderStatus;
+use crate::region::launch::launch_request;
+use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
+use crate::region::{
+    ActiveRegion, RegionGenerated, RegionLeft, RegionRequested, RegionState, RegionSystems,
+};
+use crate::time::GlobeTime;
+pub use path::{BenchPath, Coast, SCRIPT_SECS, Segment};
+
+/// A bench region: a name and the launch argument that enters it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct BenchRegion {
+    pub name: &'static str,
+    pub arg: RegionArg,
+}
+
+/// The three bench regions (M2 design §8). The Pangaea centre is pinned in the era's frame at
+/// 250 Ma: inland, a hot desert (Task 8).
+pub const BENCH_REGIONS: [BenchRegion; 3] = [
+    BenchRegion {
+        name: "Alps",
+        arg: RegionArg {
+            lat_deg: 46.5,
+            lon_deg: 10.0,
+            years: 0.0,
+        },
+    },
+    BenchRegion {
+        name: "Scandinavia",
+        arg: RegionArg {
+            lat_deg: 63.0,
+            lon_deg: 15.0,
+            years: 21_000.0,
+        },
+    },
+    BenchRegion {
+        name: "Pangaea interior",
+        arg: RegionArg {
+            lat_deg: -22.0,
+            lon_deg: -18.0,
+            years: 250.0e6,
+        },
+    },
+];
+
+/// Enter/leave cycles after the regions, re-entering the first region.
+pub const MEMORY_CYCLES: u32 = 10;
+/// After each leave, memory stays within this share above the first cycle's.
+pub const CYCLE_MEMORY_TOLERANCE: f64 = 0.10;
+/// Ruling R11: the longest frame allowed while the first region loads.
+pub const FIRST_REGION_FRAME_LIMIT_MS: f32 = 250.0;
+/// Warm generation targets (spec §15).
+pub const NATIVE_GEN_TARGET_MS: u32 = 3_000;
+pub const WEB_GEN_TARGET_MS: u32 = 8_000;
+/// Seconds on the globe before the first region, and at a region's start pose before its path.
+pub const SETTLE_SECS: f64 = 1.0;
+/// Seconds on the globe after a leave, before memory is sampled and the next region starts.
+pub const LEAVE_SETTLE_SECS: f64 = 1.5;
+/// A region that is not flying this long after its request fails.
+pub const REGION_TIMEOUT_SECS: f64 = 180.0;
+
+/// The bench's settings. Tests shorten the path and the cycles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionBenchConfig {
+    pub target_fps: u32,
+    pub exit_when_done: bool,
+    /// Real seconds the [`SCRIPT_SECS`] path takes.
+    pub path_secs: f32,
+    pub cycles: u32,
+    pub timeout_secs: f64,
+}
+
+impl RegionBenchConfig {
+    pub fn new(target_fps: u32, exit_when_done: bool) -> Self {
+        RegionBenchConfig {
+            target_fps,
+            exit_when_done,
+            path_secs: SCRIPT_SECS,
+            cycles: MEMORY_CYCLES,
+            timeout_secs: REGION_TIMEOUT_SECS,
+        }
+    }
+}
+
+pub struct RegionBenchPlugin(pub RegionBenchConfig);
+
+impl Plugin for RegionBenchPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(RegionBench::new(self.0.clone()))
+            .add_systems(
+                Update,
+                drive_region_bench
+                    .after(RegionSystems)
+                    .after(NavigationSystems)
+                    .after(FlySystems::Step)
+                    .before(FlySystems::Apply),
+            );
+    }
+}
+
+/// What follows a leave.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Next {
+    Region(usize),
+    Cycle(u32),
+    Summary,
+}
+
+/// Where the run is. Times are `Time<Real>` seconds.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Stage {
+    WaitingForGlobe,
+    Settling {
+        since: f64,
+    },
+    /// A bench region was requested; waiting until the player flies (the load window).
+    Loading {
+        region: usize,
+        since: f64,
+        started: bool,
+    },
+    /// At the start pose, settling (still the load window).
+    Poised {
+        region: usize,
+        since: f64,
+    },
+    Flying {
+        region: usize,
+        since: f64,
+    },
+    /// [`RegionLeft`] was written; waiting for the globe. `cycle` is the cycle that left.
+    Leaving {
+        next: Next,
+        cycle: Option<u32>,
+        since: f64,
+    },
+    Resting {
+        next: Next,
+        cycle: Option<u32>,
+        since: f64,
+    },
+    CycleLoading {
+        cycle: u32,
+        since: f64,
+        started: bool,
+    },
+    CyclePoised {
+        cycle: u32,
+        since: f64,
+    },
+    Done,
+}
+
+/// One bench region's measurements.
+#[derive(Clone, Debug, Default)]
+struct RegionRun {
+    requested_at: f64,
+    /// Frames from the request to the first path frame.
+    load_ms: Vec<f32>,
+    load_secs: Option<f64>,
+    generated: Option<RegionGenerated>,
+    path: Option<BenchPath>,
+    flight_ms: Vec<f32>,
+    segment_ms: [Vec<f32>; 4],
+    memory_before: Option<u64>,
+    memory_peak: Option<u64>,
+    failure: Option<String>,
+    pass: bool,
+}
+
+/// One enter/leave cycle.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct CycleRun {
+    generation_ms: Option<u32>,
+    in_region: Option<u64>,
+    on_globe: Option<u64>,
+    failed: bool,
+}
+
+/// The benchmark's state and measurements.
+#[derive(Resource)]
+pub struct RegionBench {
+    pub config: RegionBenchConfig,
+    stage: Stage,
+    runs: Vec<RegionRun>,
+    cycles: Vec<CycleRun>,
+    /// Web: the JS heap's peak over the run, where the browser reports it.
+    js_heap_peak: Option<u64>,
+    reports: Vec<String>,
+    summary: Option<String>,
+}
+
+impl RegionBench {
+    pub fn new(config: RegionBenchConfig) -> Self {
+        RegionBench {
+            config,
+            stage: Stage::WaitingForGlobe,
+            runs: vec![RegionRun::default(); BENCH_REGIONS.len()],
+            cycles: Vec::new(),
+            js_heap_peak: None,
+            reports: Vec::new(),
+            summary: None,
+        }
+    }
+
+    /// The per-region blocks logged so far.
+    pub fn reports(&self) -> &[String] {
+        &self.reports
+    }
+
+    /// The summary block, once the run has ended.
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+}
+
+/// The memory the cycles compare: the process footprint natively, the wasm linear memory on the
+/// web.
+fn cycle_memory() -> Option<u64> {
+    #[cfg(target_arch = "wasm32")]
+    return memory::web_memory().1;
+    #[cfg(not(target_arch = "wasm32"))]
+    memory::footprint_now()
+}
+
+/// What [`cycle_memory`] measures.
+fn cycle_memory_kind() -> &'static str {
+    if cfg!(target_arch = "wasm32") {
+        "wasm linear memory, which grows but never shrinks"
+    } else {
+        memory::FOOTPRINT_KIND
+    }
+}
+
+/// Logs a block as one message (the browser console shows it whole) and prints it on native.
+fn emit(report: &str) {
+    info!("{report}");
+    #[cfg(not(target_arch = "wasm32"))]
+    println!("{report}");
+}
+
+/// Whether the cycles' memory came back: the largest after-leave sample of cycles 2.. against
+/// the first cycle's, as `(pass, increase)`; `None` when there are fewer than two samples.
+pub fn memory_cycles_pass(on_globe: &[Option<u64>]) -> Option<(bool, f64)> {
+    let first = (*on_globe.first()?)? as f64;
+    let rest: Vec<u64> = on_globe.iter().skip(1).copied().collect::<Option<_>>()?;
+    let worst = *rest.iter().max()? as f64;
+    let increase = (worst - first) / first.max(1.0);
+    Some((increase <= CYCLE_MEMORY_TOLERANCE, increase))
+}
+
+/// The display the run is measured on.
+#[derive(SystemParam)]
+struct Screen<'w, 's> {
+    adapter: Option<Res<'w, RenderAdapterInfo>>,
+    windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    monitors: Query<'w, 's, &'static Monitor, With<PrimaryMonitor>>,
+}
+
+impl Screen<'_, '_> {
+    fn info(&self) -> DisplayInfo {
+        let window = self.windows.single().ok();
+        DisplayInfo {
+            size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
+            present_mode: window.map(|w| w.present_mode),
+            refresh_hz: self
+                .monitors
+                .iter()
+                .next()
+                .and_then(|m| m.refresh_rate_millihertz)
+                .map(|mhz| mhz as f32 / 1000.0),
+        }
+    }
+}
+
+struct DisplayInfo {
+    size: Option<UVec2>,
+    present_mode: Option<PresentMode>,
+    refresh_hz: Option<f32>,
+}
+
+/// What the bench reads about the game.
+#[derive(SystemParam)]
+struct Game<'w, 's> {
+    real: Res<'w, Time<Real>>,
+    status: Option<Res<'w, GlobeRenderStatus>>,
+    region_state: Option<Res<'w, State<RegionState>>>,
+    nav: Option<Res<'w, Navigation>>,
+    region: Option<Res<'w, ActiveRegion>>,
+    session: Option<Res<'w, SessionInfo>>,
+    globe: Option<Res<'w, GlobeData>>,
+    generated: MessageReader<'w, 's, RegionGenerated>,
+}
+
+impl Game<'_, '_> {
+    fn state(&self) -> RegionState {
+        self.region_state
+            .as_ref()
+            .map_or(RegionState::Globe, |s| *s.get())
+    }
+
+    /// In a region and flying (or, without navigation, in a region).
+    fn flying(&self) -> bool {
+        self.state() == RegionState::InRegion
+            && self
+                .nav
+                .as_ref()
+                .is_none_or(|n| n.phase == NavPhase::Flying)
+    }
+
+    /// Back on the globe, navigation included.
+    fn on_globe(&self) -> bool {
+        self.state() == RegionState::Globe
+            && self.nav.as_ref().is_none_or(|n| n.phase == NavPhase::Globe)
+    }
+}
+
+/// What the bench changes.
+#[derive(SystemParam)]
+struct Controls<'w> {
+    time: Option<ResMut<'w, GlobeTime>>,
+    fly: Option<ResMut<'w, FlyState>>,
+    requests: MessageWriter<'w, RegionRequested>,
+    leave: MessageWriter<'w, RegionLeft>,
+    exit: MessageWriter<'w, AppExit>,
+}
+
+impl Controls<'_> {
+    fn enter(&mut self, region: &BenchRegion) {
+        let request = launch_request(&region.arg);
+        if let Some(time) = self.time.as_mut() {
+            time.years = YearsBp(region.arg.years);
+        }
+        info!(
+            region = region.name,
+            lat_deg = region.arg.lat_deg,
+            lon_deg = region.arg.lon_deg,
+            years = region.arg.years,
+            "region bench: entering"
+        );
+        self.requests.write(request);
+    }
+}
+
+fn drive_region_bench(
+    mut bench: ResMut<RegionBench>,
+    mut game: Game,
+    mut controls: Controls,
+    display: Screen,
+) {
+    let now = game.real.elapsed_secs_f64();
+    let frame_ms = game.real.delta_secs() * 1000.0;
+    let generated: Vec<RegionGenerated> = game.generated.read().copied().collect();
+    let bench = &mut *bench;
+    #[cfg(target_arch = "wasm32")]
+    {
+        bench.js_heap_peak = super::max_opt(bench.js_heap_peak, memory::web_memory().0);
+    }
+    if bench.stage != Stage::Done
+        && let Some(GlobeRenderStatus::Failed(reason)) = game.status.as_deref()
+    {
+        let reason = format!("the globe failed: {reason}");
+        finish(bench, &game, &display, &mut controls, Some(&reason));
+        return;
+    }
+    let timeout = bench.config.timeout_secs;
+    match bench.stage {
+        Stage::WaitingForGlobe => {
+            if matches!(
+                game.status.as_deref(),
+                Some(GlobeRenderStatus::Interactive { .. })
+            ) {
+                info!("region bench: globe interactive, settling");
+                bench.stage = Stage::Settling { since: now };
+            }
+        }
+        Stage::Settling { since } => {
+            if now - since >= SETTLE_SECS {
+                start_region(bench, 0, now, &mut controls);
+            }
+        }
+        Stage::Loading {
+            region,
+            since,
+            started,
+        } => {
+            let run = &mut bench.runs[region];
+            run.load_ms.push(frame_ms);
+            run.memory_peak = super::max_opt(run.memory_peak, cycle_memory());
+            if let Some(g) = generated.last() {
+                run.generated = Some(*g);
+            }
+            let started = started || game.state() != RegionState::Globe;
+            if game.flying()
+                && let Some(active) = game.region.as_deref()
+            {
+                run.path = Some(BenchPath::for_grid(&active.grid));
+                bench.stage = Stage::Poised { region, since: now };
+            } else if started && game.state() == RegionState::Globe {
+                fail_region(
+                    bench,
+                    region,
+                    "the region did not load (see the log)",
+                    now,
+                    &game,
+                    &display,
+                    &mut controls,
+                );
+            } else if now - since > timeout {
+                fail_region(
+                    bench,
+                    region,
+                    "the region was not ready in time",
+                    now,
+                    &game,
+                    &display,
+                    &mut controls,
+                );
+            } else {
+                bench.stage = Stage::Loading {
+                    region,
+                    since,
+                    started,
+                };
+            }
+        }
+        Stage::Poised { region, since } => {
+            let run = &mut bench.runs[region];
+            run.load_ms.push(frame_ms);
+            run.memory_peak = super::max_opt(run.memory_peak, cycle_memory());
+            if !game.flying() {
+                fail_region(
+                    bench,
+                    region,
+                    "the region was left before its path",
+                    now,
+                    &game,
+                    &display,
+                    &mut controls,
+                );
+            } else if now - since >= SETTLE_SECS {
+                run.load_secs = Some(now - run.requested_at);
+                info!(
+                    region = BENCH_REGIONS[region].name,
+                    "region bench: flying the path"
+                );
+                bench.stage = Stage::Flying { region, since: now };
+                fly(bench, region, 0.0, &game, &mut controls);
+            }
+        }
+        Stage::Flying { region, since } => {
+            let script = ((now - since) as f32) * SCRIPT_SECS / bench.config.path_secs.max(1e-3);
+            let run = &mut bench.runs[region];
+            run.flight_ms.push(frame_ms);
+            let segment = Segment::ALL
+                .iter()
+                .position(|s| *s == Segment::at(script.min(SCRIPT_SECS)))
+                .unwrap_or(0);
+            run.segment_ms[segment].push(frame_ms);
+            run.memory_peak = super::max_opt(run.memory_peak, cycle_memory());
+            if !game.flying() {
+                fail_region(
+                    bench,
+                    region,
+                    "the region was left during its path",
+                    now,
+                    &game,
+                    &display,
+                    &mut controls,
+                );
+            } else if script >= SCRIPT_SECS {
+                let block = region_block(bench, region, &game, &display);
+                emit(&block);
+                bench.reports.push(block);
+                controls.leave.write(RegionLeft);
+                bench.stage = Stage::Leaving {
+                    next: after_region(region, bench.config.cycles),
+                    cycle: None,
+                    since: now,
+                };
+            } else {
+                fly(bench, region, script, &game, &mut controls);
+            }
+        }
+        Stage::Leaving { next, cycle, since } => {
+            if game.on_globe() {
+                bench.stage = Stage::Resting {
+                    next,
+                    cycle,
+                    since: now,
+                };
+            } else if now - since > timeout {
+                let reason = "the region did not leave in time";
+                finish(bench, &game, &display, &mut controls, Some(reason));
+            }
+        }
+        Stage::Resting { next, cycle, since } => {
+            if now - since < LEAVE_SETTLE_SECS {
+                return;
+            }
+            if let Some(c) = cycle
+                && let Some(record) = bench.cycles.get_mut(c as usize)
+            {
+                record.on_globe = cycle_memory();
+                info!(cycle = c + 1, on_globe = ?record.on_globe, "region bench: cycle left");
+            }
+            match next {
+                Next::Region(region) => start_region(bench, region, now, &mut controls),
+                Next::Cycle(c) => {
+                    bench.cycles.push(CycleRun::default());
+                    controls.enter(&BENCH_REGIONS[0]);
+                    bench.stage = Stage::CycleLoading {
+                        cycle: c,
+                        since: now,
+                        started: false,
+                    };
+                }
+                Next::Summary => finish(bench, &game, &display, &mut controls, None),
+            }
+        }
+        Stage::CycleLoading {
+            cycle,
+            since,
+            started,
+        } => {
+            if let Some(g) = generated.last()
+                && let Some(record) = bench.cycles.get_mut(cycle as usize)
+            {
+                record.generation_ms = Some(g.millis);
+            }
+            let started = started || game.state() != RegionState::Globe;
+            let failed = (started && game.state() == RegionState::Globe) || now - since > timeout;
+            if game.flying() {
+                bench.stage = Stage::CyclePoised { cycle, since: now };
+            } else if failed {
+                if let Some(record) = bench.cycles.get_mut(cycle as usize) {
+                    record.failed = true;
+                }
+                let reason = "a memory cycle's region did not load";
+                finish(bench, &game, &display, &mut controls, Some(reason));
+            } else {
+                bench.stage = Stage::CycleLoading {
+                    cycle,
+                    since,
+                    started,
+                };
+            }
+        }
+        Stage::CyclePoised { cycle, since } => {
+            if now - since >= SETTLE_SECS {
+                if let Some(record) = bench.cycles.get_mut(cycle as usize) {
+                    record.in_region = cycle_memory();
+                }
+                controls.leave.write(RegionLeft);
+                let next = if cycle + 1 < bench.config.cycles {
+                    Next::Cycle(cycle + 1)
+                } else {
+                    Next::Summary
+                };
+                bench.stage = Stage::Leaving {
+                    next,
+                    cycle: Some(cycle),
+                    since: now,
+                };
+            }
+        }
+        Stage::Done => {}
+    }
+}
+
+/// What follows region `region`.
+fn after_region(region: usize, cycles: u32) -> Next {
+    if region + 1 < BENCH_REGIONS.len() {
+        Next::Region(region + 1)
+    } else if cycles > 0 {
+        Next::Cycle(0)
+    } else {
+        Next::Summary
+    }
+}
+
+fn start_region(bench: &mut RegionBench, region: usize, now: f64, controls: &mut Controls) {
+    let run = &mut bench.runs[region];
+    run.requested_at = now;
+    run.memory_before = cycle_memory();
+    controls.enter(&BENCH_REGIONS[region]);
+    bench.stage = Stage::Loading {
+        region,
+        since: now,
+        started: false,
+    };
+}
+
+/// Puts the camera at the path's pose at `script` seconds.
+fn fly(bench: &RegionBench, region: usize, script: f32, game: &Game, controls: &mut Controls) {
+    let (Some(path), Some(active), Some(fly)) = (
+        bench.runs[region].path.as_ref(),
+        game.region.as_deref(),
+        controls.fly.as_mut(),
+    ) else {
+        return;
+    };
+    let grid = &active.grid;
+    **fly = path.at(script, |x, z| {
+        blended_height_m(grid, f64::from(x), f64::from(z))
+    });
+}
+
+/// Ends a region with a FAIL block and moves on (leaving first if a region is up).
+fn fail_region(
+    bench: &mut RegionBench,
+    region: usize,
+    reason: &str,
+    now: f64,
+    game: &Game,
+    display: &Screen,
+    controls: &mut Controls,
+) {
+    warn!(
+        region = BENCH_REGIONS[region].name,
+        reason, "region bench: region failed"
+    );
+    bench.runs[region].failure = Some(reason.to_string());
+    let block = region_block(bench, region, game, display);
+    emit(&block);
+    bench.reports.push(block);
+    if game.state() != RegionState::Globe {
+        controls.leave.write(RegionLeft);
+    }
+    bench.stage = Stage::Leaving {
+        next: after_region(region, bench.config.cycles),
+        cycle: None,
+        since: now,
+    };
+}
+
+fn secs(v: Option<f64>) -> String {
+    v.map_or("unknown".to_string(), |s| format!("{s:.2} s"))
+}
+
+fn show_mib(v: Option<u64>) -> String {
+    v.map_or("n/a".to_string(), mib)
+}
+
+fn stat_line(name: &str, frames: &[f32]) -> String {
+    let s = frame_time_stats(frames);
+    format!(
+        "{name}: frames {}, median {:.2} ms, worst {:.2} ms",
+        s.frames, s.median_ms, s.worst_ms
+    )
+}
+
+/// The pacing in effect for a series of frames on this display.
+fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
+    let uncapped_requested = matches!(
+        display.present_mode,
+        Some(PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox)
+    );
+    pacing(
+        cfg!(target_arch = "wasm32"),
+        uncapped_requested,
+        display.refresh_hz,
+        frame_time_stats(frames).median_ms,
+    )
+}
+
+fn pacing_name(pacing: Pacing) -> &'static str {
+    match pacing {
+        Pacing::DisplayPaced => "display-paced",
+        Pacing::Uncapped => "uncapped",
+    }
+}
+
+/// The first-region worst frame against the R11 limit.
+fn first_region_gate(bench: &RegionBench) -> Option<(f32, bool)> {
+    let first = &bench.runs[0];
+    (!first.load_ms.is_empty()).then(|| {
+        let worst = frame_time_stats(&first.load_ms).worst_ms;
+        (worst, worst <= FIRST_REGION_FRAME_LIMIT_MS)
+    })
+}
+
+fn r11_line(bench: &RegionBench) -> String {
+    let scope = if cfg!(target_arch = "wasm32") {
+        "decides the result"
+    } else {
+        "native: reported only, the gate applies in Chrome WebGPU"
+    };
+    match first_region_gate(bench) {
+        Some((worst, ok)) => format!(
+            "first-region worst frame (R11 gate <= {FIRST_REGION_FRAME_LIMIT_MS:.0} ms, request to first path frame, overview decode included): {worst:.2} ms -> {} ({scope})",
+            if ok { "PASS" } else { "FAIL" }
+        ),
+        None => format!("first-region worst frame (R11): not measured ({scope})"),
+    }
+}
+
+/// One region's block; also records whether it passed.
+fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &Screen) -> String {
+    let fps = bench.config.target_fps;
+    let spec = &BENCH_REGIONS[region];
+    let info = display.info();
+    let r = &bench.runs[region];
+    let title = format!(
+        "===== Time Fly region bench: {} ({}, {} at {} years) =====",
+        spec.name, spec.arg.lat_deg, spec.arg.lon_deg, spec.arg.years
+    );
+    let mut out = header_lines_titled(&title, game.session.as_deref(), display.adapter.as_deref());
+    if let Some(size) = info.size {
+        out.push(format!("render resolution: {}x{}", size.x, size.y));
+    }
+    if let Some(globe) = game.globe.as_deref() {
+        out.push(format!("bake: {}", globe.revision.summary()));
+    }
+    match &r.generated {
+        Some(g) => out.push(format!(
+            "generation: {} ms; tiles fetched {} ({} bytes); fallback {}",
+            g.millis,
+            g.tiles_fetched,
+            g.bytes_fetched,
+            if g.fallback {
+                "yes (a tile is missing)"
+            } else {
+                "no"
+            }
+        )),
+        None => out.push("generation: no region generated".to_string()),
+    }
+    let load = frame_time_stats(&r.load_ms);
+    out.push(format!(
+        "load (request to first path frame, {SETTLE_SECS:.0} s settle included): {}, frames {}, worst {:.2} ms",
+        secs(r.load_secs),
+        load.frames,
+        load.worst_ms
+    ));
+    if region == 0 {
+        out.push(r11_line(bench));
+    }
+    if let Some(path) = &r.path {
+        out.push(format!("coast: {}", path.coast.describe()));
+    }
+    out.push(format!(
+        "memory ({}): before entering {}, peak in region {}, lifetime peak {}",
+        cycle_memory_kind(),
+        show_mib(r.memory_before),
+        show_mib(r.memory_peak),
+        show_mib(memory::footprint_peak()),
+    ));
+    if cfg!(target_arch = "wasm32") {
+        out.push(format!(
+            "JS heap (performance.memory, Chrome only): peak so far {}",
+            show_mib(bench.js_heap_peak)
+        ));
+    }
+    let pacing = pacing_for(&info, &r.flight_ms);
+    let interval = frame_budget_ms(fps);
+    out.push(format!(
+        "present mode: {} requested{}; display refresh {}; median {:.2} ms -> {}",
+        info.present_mode
+            .map_or("unknown".to_string(), |m| format!("{m:?}")),
+        if cfg!(target_arch = "wasm32") {
+            " (browser requestAnimationFrame)"
+        } else {
+            ""
+        },
+        info.refresh_hz
+            .map_or("unknown".to_string(), |hz| format!("{hz:.1} Hz")),
+        frame_time_stats(&r.flight_ms).median_ms,
+        pacing_name(pacing)
+    ));
+    out.push(format!("target: {fps} fps (interval {interval:.2} ms)"));
+    out.push(match pacing {
+        Pacing::DisplayPaced => format!(
+            "pass rule (display-paced): missed frames (>{:.1} ms) <= {:.0}% and median <= {:.2} ms (interval +{:.0}%)",
+            MISSED_INTERVALS * interval,
+            MAX_MISSED_SHARE * 100.0,
+            (1.0 + MEDIAN_TOLERANCE) * interval,
+            MEDIAN_TOLERANCE * 100.0
+        ),
+        Pacing::Uncapped => format!("pass rule (uncapped): p95 <= {interval:.2} ms"),
+    });
+    let s = frame_time_stats(&r.flight_ms);
+    let flight_pass = passes(&r.flight_ms, fps, pacing);
+    let missed = missed_frames(&r.flight_ms, fps);
+    let share = if s.frames > 0 {
+        100.0 * missed as f64 / s.frames as f64
+    } else {
+        0.0
+    };
+    out.push(format!(
+        "flight ({SCRIPT_SECS:.0} s path): frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms, stalls (>{:.1} ms = {STALL_BUDGETS}x interval) {} -> {}",
+        s.frames,
+        s.median_ms,
+        s.p95_ms,
+        s.worst_ms,
+        STALL_BUDGETS * interval,
+        stall_count(&r.flight_ms, fps),
+        if flight_pass { "PASS" } else { "FAIL" }
+    ));
+    out.push(format!(
+        "  missed frames (>{:.1} ms = {MISSED_INTERVALS}x interval): {missed} ({share:.2}%)",
+        MISSED_INTERVALS * interval,
+    ));
+    for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
+        out.push(format!("  {}", stat_line(segment.label(), frames)));
+    }
+    let pass = r.failure.is_none() && flight_pass;
+    out.push(match &r.failure {
+        Some(reason) => format!("result: FAIL ({reason})"),
+        None => format!(
+            "result: {} (decided by the {} rule)",
+            if pass { "PASS" } else { "FAIL" },
+            match pacing {
+                Pacing::DisplayPaced => "display-paced missed-frame",
+                Pacing::Uncapped => "uncapped p95",
+            }
+        ),
+    });
+    out.push("===== end region bench =====".to_string());
+    bench.runs[region].pass = pass;
+    out.join("\n")
+}
+
+/// The summary block, then the exit.
+fn finish(
+    bench: &mut RegionBench,
+    game: &Game,
+    display: &Screen,
+    controls: &mut Controls,
+    failure: Option<&str>,
+) {
+    bench.stage = Stage::Done;
+    let web = cfg!(target_arch = "wasm32");
+    let mut out = header_lines_titled(
+        "===== Time Fly region bench summary =====",
+        game.session.as_deref(),
+        display.adapter.as_deref(),
+    );
+    let mut pass = failure.is_none();
+    let regions: Vec<String> = BENCH_REGIONS
+        .iter()
+        .zip(&bench.runs)
+        .map(|(spec, run)| {
+            let measured = run.failure.is_some() || !run.flight_ms.is_empty();
+            format!(
+                "{} {}",
+                spec.name,
+                match (measured, run.pass) {
+                    (false, _) => "not run",
+                    (true, true) => "PASS",
+                    (true, false) => "FAIL",
+                }
+            )
+        })
+        .collect();
+    pass &= bench.runs.iter().all(|r| r.pass);
+    out.push(format!("regions (R14 frame rate): {}", regions.join(", ")));
+    out.push(r11_line(bench));
+    if web {
+        pass &= first_region_gate(bench).is_some_and(|(_, ok)| ok);
+    }
+
+    let target = if web {
+        WEB_GEN_TARGET_MS
+    } else {
+        NATIVE_GEN_TARGET_MS
+    };
+    let warm: Vec<u32> = bench
+        .cycles
+        .iter()
+        .filter_map(|c| c.generation_ms)
+        .collect();
+    if warm.is_empty() {
+        out.push(format!(
+            "warm generation (target <= {target} ms): not measured"
+        ));
+    } else {
+        let mut sorted = warm.clone();
+        sorted.sort_unstable();
+        let max = *sorted.last().unwrap_or(&0);
+        let ok = max <= target;
+        pass &= ok;
+        out.push(format!(
+            "warm generation ({} re-entries of {}, target <= {target} ms): median {} ms, max {} ms -> {}",
+            warm.len(),
+            BENCH_REGIONS[0].name,
+            sorted[(sorted.len() - 1) / 2],
+            max,
+            if ok { "PASS" } else { "FAIL" }
+        ));
+    }
+    let cold: Vec<String> = BENCH_REGIONS
+        .iter()
+        .zip(&bench.runs)
+        .filter_map(|(spec, run)| {
+            run.generated
+                .map(|g| format!("{} {} ms", spec.name, g.millis))
+        })
+        .collect();
+    out.push(format!("first entries (cold tiles): {}", cold.join(", ")));
+
+    let on_globe: Vec<Option<u64>> = bench.cycles.iter().map(|c| c.on_globe).collect();
+    let listed = |pick: fn(&CycleRun) -> Option<u64>| {
+        bench
+            .cycles
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}: {}", i + 1, show_mib(pick(c))))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match memory_cycles_pass(&on_globe) {
+        Some((ok, increase)) => {
+            pass &= ok;
+            out.push(format!(
+                "memory cycles ({}, on the globe after each leave): {}; worst of cycles 2-{} is {:+.1}% of cycle 1 (limit +{:.0}%) -> {}",
+                cycle_memory_kind(),
+                listed(|c| c.on_globe),
+                bench.cycles.len(),
+                increase * 100.0,
+                CYCLE_MEMORY_TOLERANCE * 100.0,
+                if ok { "PASS" } else { "FAIL" }
+            ));
+            out.push(format!("  in the region: {}", listed(|c| c.in_region)));
+        }
+        None => out.push(format!(
+            "memory cycles: not measured ({} cycles, memory {})",
+            bench.cycles.len(),
+            if cycle_memory().is_some() {
+                "available"
+            } else {
+                "not reported here"
+            }
+        )),
+    }
+    if bench.cycles.iter().any(|c| c.failed) {
+        pass = false;
+    }
+    out.push(match failure {
+        Some(reason) => format!("result: FAIL ({reason})"),
+        None => format!("result: {}", if pass { "PASS" } else { "FAIL" }),
+    });
+    out.push("===== end region bench summary =====".to_string());
+    let summary = out.join("\n");
+    emit(&summary);
+    bench.summary = Some(summary);
+    if bench.config.exit_when_done {
+        controls.exit.write(bench_exit(pass));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_cli_flags() {
+        let parsed = crate::args::parse_launch_args(
+            [
+                "--region-bench",
+                "--target-fps",
+                "60",
+                "--window",
+                "2560x1440",
+            ]
+            .map(String::from),
+        );
+        assert!(parsed.region_bench);
+        assert!(!parsed.scrub_bench);
+        assert_eq!(parsed.target_fps, Some(60));
+        assert_eq!(parsed.window, Some((2560, 1440)));
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        let web = crate::args::parse_query_args("?region-bench&target-fps=30");
+        assert!(web.region_bench);
+        assert_eq!(web.target_fps, Some(30));
+        assert!(web.unknown.is_empty(), "{:?}", web.unknown);
+        // Not a prefix match.
+        let other = crate::args::parse_launch_args(["--region-benchmark".to_string()]);
+        assert!(!other.region_bench);
+        assert_eq!(other.unknown, vec!["--region-benchmark".to_string()]);
+        // The region bench turns vsync off on native, as the scrub bench does.
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(
+            crate::primary_window(&parsed).present_mode,
+            PresentMode::AutoNoVsync
+        );
+    }
+
+    #[test]
+    fn memory_cycles_return_within_ten_percent() {
+        let mib = |m: u64| Some(m << 20);
+        let ok = [mib(800), mib(830), mib(860), mib(870)];
+        let (pass, increase) = memory_cycles_pass(&ok).unwrap();
+        assert!(pass);
+        assert!((increase - 70.0 / 800.0).abs() < 1e-9);
+        // Dropping below the first is fine; growing past +10% is not.
+        assert!(memory_cycles_pass(&[mib(800), mib(700)]).unwrap().0);
+        assert!(
+            !memory_cycles_pass(&[mib(800), mib(830), mib(881)])
+                .unwrap()
+                .0
+        );
+        assert!(
+            memory_cycles_pass(&[mib(800), mib(880)]).unwrap().0,
+            "exactly +10%"
+        );
+        // Too few or missing samples are not judged.
+        assert_eq!(memory_cycles_pass(&[mib(800)]), None);
+        assert_eq!(memory_cycles_pass(&[]), None);
+        assert_eq!(memory_cycles_pass(&[mib(800), None]), None);
+        assert_eq!(memory_cycles_pass(&[None, mib(800)]), None);
+    }
+
+    #[test]
+    fn the_bench_regions_are_pinned() {
+        let names: Vec<_> = BENCH_REGIONS.iter().map(|r| r.name).collect();
+        assert_eq!(names, ["Alps", "Scandinavia", "Pangaea interior"]);
+        let arg = |lat_deg, lon_deg, years| RegionArg {
+            lat_deg,
+            lon_deg,
+            years,
+        };
+        assert_eq!(BENCH_REGIONS[0].arg, arg(46.5, 10.0, 0.0));
+        assert_eq!(BENCH_REGIONS[1].arg, arg(63.0, 15.0, 21_000.0));
+        assert_eq!(BENCH_REGIONS[2].arg, arg(-22.0, -18.0, 250.0e6));
+        assert_eq!(after_region(0, 10), Next::Region(1));
+        assert_eq!(after_region(2, 10), Next::Cycle(0));
+        assert_eq!(after_region(2, 0), Next::Summary);
+    }
+}

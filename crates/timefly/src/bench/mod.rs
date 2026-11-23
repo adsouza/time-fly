@@ -18,6 +18,11 @@
 //! If the globe fails instead of becoming interactive, it logs a FAIL block with the reason.
 //! On native it exits after logging: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL (a result,
 //! not a crash, so the next launch shows no crash notice).
+//!
+//! The region bench (`--region-bench`, web `?region-bench`) lives in [`region`] and shares the
+//! statistics, the pass rule, the block's header and the exit codes.
+
+pub mod region;
 
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -459,7 +464,16 @@ fn direction_lines(name: &str, frames: &[f32], target_fps: u32, pacing: Pacing) 
 
 /// The block's opening lines: session, build, spans, adapter and OS.
 fn header_lines(session: Option<&SessionInfo>, adapter: Option<&RenderAdapterInfo>) -> Vec<String> {
-    let mut out = vec!["===== Time Fly scrub bench =====".to_string()];
+    header_lines_titled("===== Time Fly scrub bench =====", session, adapter)
+}
+
+/// [`header_lines`] under another title line.
+fn header_lines_titled(
+    title: &str,
+    session: Option<&SessionInfo>,
+    adapter: Option<&RenderAdapterInfo>,
+) -> Vec<String> {
+    let mut out = vec![title.to_string()];
     if let Some(s) = session {
         out.push(format!("session: {}  log: {}", s.id, s.log));
         out.push(format!("build: {}", s.build));
@@ -725,6 +739,28 @@ mod memory {
         {
             std::env::consts::OS.to_string()
         }
+    }
+
+    /// Web: the JS heap in use (`performance.memory.usedJSHeapSize`, Chrome only) and the size
+    /// of the wasm linear memory (which grows but never shrinks).
+    #[cfg(target_arch = "wasm32")]
+    pub fn web_memory() -> (Option<u64>, Option<u64>) {
+        use wasm_bindgen::JsValue;
+        let get = |object: &JsValue, key: &str| {
+            js_sys::Reflect::get(object, &JsValue::from_str(key))
+                .ok()
+                .filter(|v| !v.is_undefined() && !v.is_null())
+        };
+        let bytes = |v: JsValue| v.as_f64().filter(|b| *b >= 0.0).map(|b| b as u64);
+        let js_heap = web_sys::window()
+            .and_then(|w| w.performance())
+            .and_then(|p| get(&JsValue::from(p), "memory"))
+            .and_then(|m| get(&m, "usedJSHeapSize"))
+            .and_then(bytes);
+        let linear = get(&wasm_bindgen::memory(), "buffer")
+            .and_then(|b| get(&b, "byteLength"))
+            .and_then(bytes);
+        (js_heap, linear)
     }
 
     #[cfg(target_os = "macos")]

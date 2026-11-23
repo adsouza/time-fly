@@ -1,8 +1,9 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--target-fps N`, `--window WxH` and `--region LAT,LON,AGE_YEARS`. A value may follow its flag as `--flag=value` or as the
-//! next argument; a next argument that starts with `--` is the next flag, never a value.
+//! `--region-bench`, `--target-fps N`, `--window WxH` and `--region LAT,LON,AGE_YEARS`. A value
+//! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
+//! with `--` is the next flag, never a value.
 //! `--check-data` takes its optional value only as `--check-data=DIR`.
 
 use timefly_core::deep_time::MAX_YEARS_BP;
@@ -16,7 +17,11 @@ pub struct LaunchArgs {
     pub diagnostics_probe: Option<ProbeMode>,
     /// `--scrub-bench` (web: `?scrub-bench`): run the automated scrub benchmark and report.
     pub scrub_bench: bool,
-    /// `--target-fps N`: the frame rate the benchmark checks its 95th percentile against.
+    /// `--region-bench` (web: `?region-bench`): fly the scripted path in the three bench regions,
+    /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`
+    /// and `--region`.
+    pub region_bench: bool,
+    /// `--target-fps N`: the frame rate the benchmarks check their frames against.
     pub target_fps: Option<u32>,
     /// `--window WxH`: the window's size in physical pixels (native only).
     pub window: Option<(u32, u32)>,
@@ -41,6 +46,7 @@ pub struct DataCheck {
 const CHECK_DATA_FLAG: &str = "--check-data";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
+const REGION_BENCH_FLAG: &str = "--region-bench";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
 const REGION_FLAG: &str = "--region";
@@ -99,6 +105,10 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
     while let Some(arg) = args.next() {
         if arg == BENCH_FLAG {
             parsed.scrub_bench = true;
+            continue;
+        }
+        if arg == REGION_BENCH_FLAG {
+            parsed.region_bench = true;
             continue;
         }
         if arg == CHECK_DATA_FLAG {
