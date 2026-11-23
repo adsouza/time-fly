@@ -13,6 +13,7 @@ use timefly_core::geo::{geo_to_render, latlon_to_geo};
 
 use crate::diagnostics::DiagnosticsContext;
 use crate::globe::{EARTH_RADIUS_KM, GlobeCamera, GlobeCameraSync};
+use crate::region::RegionState;
 use crate::ui::PointerOverUi;
 
 pub const MIN_DISTANCE_KM: f64 = EARTH_RADIUS_KM * 1.15;
@@ -26,6 +27,8 @@ pub const ZOOM_PER_LINE: f64 = 0.9;
 pub const MAX_LATITUDE_DEG: f64 = 89.0;
 /// Trackpad pixels per scroll line.
 const PIXELS_PER_LINE: f32 = 24.0;
+/// The time constant (s) of [`ease_toward`]: about 95 % of the way in three of them.
+pub const EASE_TIME_S: f64 = 0.6;
 
 /// Where the camera is: above `(lat, lon)` at `distance_km` from the globe centre.
 #[derive(Resource, Copy, Clone, Debug, PartialEq)]
@@ -83,6 +86,20 @@ pub fn orbit_step(state: OrbitState, input: OrbitInput) -> OrbitState {
     }
 }
 
+/// The orbit `dt_s` further along an exponential ease toward `target` (time constant
+/// [`EASE_TIME_S`]); longitude takes the short way round.
+pub fn ease_toward(state: OrbitState, target: OrbitState, dt_s: f64) -> OrbitState {
+    let k = 1.0 - (-dt_s.max(0.0) / EASE_TIME_S).exp();
+    let dlon = wrap_longitude(target.lon_deg - state.lon_deg);
+    OrbitState {
+        lat_deg: (state.lat_deg + (target.lat_deg - state.lat_deg) * k)
+            .clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
+        lon_deg: wrap_longitude(state.lon_deg + dlon * k),
+        distance_km: (state.distance_km + (target.distance_km - state.distance_km) * k)
+            .clamp(MIN_DISTANCE_KM, MAX_DISTANCE_KM),
+    }
+}
+
 fn wrap_longitude(lon: f64) -> f64 {
     let wrapped = (lon + 180.0).rem_euclid(360.0) - 180.0;
     if wrapped == -180.0 { 180.0 } else { wrapped }
@@ -92,6 +109,11 @@ fn wrap_longitude(lon: f64) -> f64 {
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct OrbitDrag(bool);
 
+/// The orbit controller and the system that moves the globe camera. Anything else that writes
+/// [`OrbitState`] (region navigation) runs before it.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OrbitCameraSystems;
+
 pub struct OrbitCameraPlugin;
 
 impl Plugin for OrbitCameraPlugin {
@@ -100,11 +122,18 @@ impl Plugin for OrbitCameraPlugin {
             .init_resource::<OrbitDrag>()
             .add_systems(
                 Update,
-                (orbit_camera_system, apply_orbit)
+                (orbit_camera_system.run_if(on_the_globe), apply_orbit)
                     .chain()
+                    .in_set(OrbitCameraSystems)
                     .before(GlobeCameraSync),
             );
     }
+}
+
+/// The orbit takes input only on the globe: while a region generates (the camera eases toward
+/// it), is shown or is being left, region navigation owns the camera.
+fn on_the_globe(state: Option<Res<State<RegionState>>>) -> bool {
+    state.is_none_or(|s| *s.get() == RegionState::Globe)
 }
 
 /// Gathers drag and scroll input and steps the orbit.
@@ -229,6 +258,62 @@ mod tests {
             ..s
         };
         assert!(orbit_step(near, input((10.0, 0.0), 0.0)).lon_deg.abs() < right.lon_deg.abs());
+    }
+
+    #[test]
+    fn ease_closes_in_by_the_short_way() {
+        let from = OrbitState {
+            lat_deg: 0.0,
+            lon_deg: 170.0,
+            distance_km: START_DISTANCE_KM,
+        };
+        let to = OrbitState {
+            lat_deg: 40.0,
+            lon_deg: -170.0,
+            distance_km: MIN_DISTANCE_KM,
+        };
+        let one = ease_toward(from, to, 0.1);
+        // East across the antimeridian (20°), not west (340°).
+        assert!(one.lon_deg > 170.0 || one.lon_deg < -170.0, "{one:?}");
+        assert!(one.lat_deg > 0.0 && one.lat_deg < 40.0);
+        assert!(one.distance_km < from.distance_km);
+        let mut s = from;
+        for _ in 0..100 {
+            s = ease_toward(s, to, 0.1);
+        }
+        assert!((s.lat_deg - 40.0).abs() < 1e-3 && (s.lon_deg + 170.0).abs() < 1e-3);
+        assert!((s.distance_km - MIN_DISTANCE_KM).abs() < 1e-3);
+        assert_eq!(ease_toward(from, to, 0.0), from);
+    }
+
+    #[test]
+    fn orbit_ignores_input_off_the_globe() {
+        use bevy::state::app::StatesPlugin;
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin))
+            .init_state::<RegionState>()
+            .init_resource::<AccumulatedMouseScroll>()
+            .add_plugins(OrbitCameraPlugin);
+        app.update();
+        let scroll = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<AccumulatedMouseScroll>()
+                .delta = Vec2::new(0.0, 3.0);
+            app.update();
+            app.world().resource::<OrbitState>().distance_km
+        };
+        for state in [RegionState::Generating, RegionState::InRegion] {
+            app.world_mut()
+                .resource_mut::<NextState<RegionState>>()
+                .set(state);
+            app.update();
+            assert_eq!(scroll(&mut app), START_DISTANCE_KM, "{state:?}");
+        }
+        app.world_mut()
+            .resource_mut::<NextState<RegionState>>()
+            .set(RegionState::Globe);
+        app.update();
+        assert!(scroll(&mut app) < START_DISTANCE_KM);
     }
 
     #[test]

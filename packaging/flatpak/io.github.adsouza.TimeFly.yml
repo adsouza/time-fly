@@ -28,4 +28,5 @@ modules:
     build-commands:
       - test -x lib/time-fly/time-fly
       - test -f lib/time-fly/assets/data/globe/manifest.json
+      - test -f lib/time-fly/assets/data/tiles/manifest.json
       - cp -R lib bin share /app/

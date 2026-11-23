@@ -1,5 +1,5 @@
 {
-  "comment": "Raw inputs of the globe bake, pinned by SHA-256 and size. Fetch with `cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`. Provenance, citations and terms: data/README.md. The PaleoDEM report PDF (data/raw/report/) is reference reading only and is not fetched.",
+  "comment": "Raw inputs of the globe and region-tile bakes, pinned by SHA-256 and size. Fetch with `cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`. Provenance, citations and terms: data/README.md. The PaleoDEM report PDF (data/raw/report/) is reference reading only and is not fetched.",
   "files": [
     {
       "path": "paleodem/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip",
@@ -217,6 +217,20 @@
       "sha256": "02f56f02f709b70ac70fe5e403326272e19b42bf34ee9b1bba3b8322e1375dc1",
       "bytes": 51519,
       "licence": "NOAA NCEI public data; cite Spratt & Lisiecki 2016 and doi:10.25921/rd66-5820"
+    },
+    {
+      "path": "etopo/ETOPO_2022_v1_60s_N90W180_surface.nc",
+      "url": "https://www.ngdc.noaa.gov/thredds/fileServer/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc",
+      "sha256": "74bbc5c23e85188d93f0beba8116babf69e1a8f160e8dc9f053bf8df01b197b6",
+      "bytes": 478290125,
+      "licence": "NOAA NCEI public data; cite ETOPO 2022 (NOAA NCEI 2022), doi:10.25921/fd45-gt74"
+    },
+    {
+      "path": "koppen/koppen_geiger_tif.zip",
+      "url": "https://ndownloader.figshare.com/files/61012822",
+      "sha256": "bb84453d4541f1a0bc5a804ead83f483c19ce70f16a5197f6d3a7b6a63e65562",
+      "bytes": 130618411,
+      "licence": "CC BY 4.0 (Beck et al. 2023, Scientific Data 10, 724)"
     }
   ]
 }

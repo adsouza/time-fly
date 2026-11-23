@@ -8,13 +8,15 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Plate reconstruction (rotations, polygons) | PALEOMAP plate model, Scotese & Wright (2018); see [Plate model](#plate-model) | CC BY 4.0 | Task 5 (`timefly_bake.plates`) |
 | Ice sheets, recent topography and coastlines (0–26 ka) | ICE-6G_C (VM5a) 1° files, W.R. Peltier; see [ICE-6G_C](#ice-6g_c-vm5a) | No licence stated; cite two papers (file attribute) | Task 7 (`timefly_bake.ice6g`) |
 | Global sea level (0–798 ka) | Spratt & Lisiecki (2016) via NOAA NCEI; see [Sea level](#sea-level) | NOAA NCEI public data; cite publication and dataset DOI | Task 7 (`timefly_bake.sealevel`) |
+| Terrain and bathymetry (region worlds) | ETOPO 2022 60″ surface, NOAA NCEI; see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | NOAA NCEI public data; cite doi:10.25921/fd45-gt74 | M2 Task 1 (`timefly_bake.etopo`, `tiles`) |
+| Climate classes (region worlds) | Köppen-Geiger 1991–2020, Beck et al. (2023); see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | CC BY 4.0 | M2 Task 1 (`timefly_bake.koppen`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
 ## Pinned downloads (`data/sources.json`)
 
 `data/sources.json` lists every raw file the bake reads, with its URL, path under `data/raw/`,
 SHA-256, size in bytes and licence: the PaleoDEM archive, the two plate-model archives, the 27
-ICE-6G_C slices and the sea-level file (31 files, 25,202,636 bytes). The URLs and checksums are
+ICE-6G_C slices, the sea-level file, ETOPO 2022 and the Köppen-Geiger archive (33 files). The URLs and checksums are
 the ones in the tables below (`tools/bake/tests/test_fetch.py` checks that they agree). The
 PaleoDEM report PDF is reference reading for the age table, not a bake input, so it is not
 listed and CI never downloads it.
@@ -267,6 +269,38 @@ regardless.
 has no ice overlay. The Quaternary bridge uses modern terrain (the present-day PaleoDEM) shifted by
 the sea-level curve, so glacial coastlines are approximated but Pleistocene ice sheets before
 26 ka and all pre-Quaternary ice are absent; PaleoDEMs carry their own published sea level.
+
+## Region tiles: ETOPO 2022 and Köppen-Geiger
+
+Inputs (both pinned in `data/sources.json`; 33 files in all):
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc` | 478,290,125 | `74bbc5c23e85188d93f0beba8116babf69e1a8f160e8dc9f053bf8df01b197b6` |
+| `data/raw/koppen/koppen_geiger_tif.zip` | 130,618,411 | `bb84453d4541f1a0bc5a804ead83f483c19ce70f16a5197f6d3a7b6a63e65562` |
+
+- **ETOPO 2022** 60 arc-second surface model (NOAA NCEI, doi:10.25921/fd45-gt74), URL
+  `https://www.ngdc.noaa.gov/thredds/fileServer/global/ETOPO2022/60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc`.
+  Variable `z` (m, EGM2008 height), 10800 × 21600. The axes are **cell centres** (lat
+  −89.99167…89.99167, lon −179.99167…179.99167, `node_offset = 1`), so the bake averages the four
+  cells around each node onto the 60″ node lattice (the poles average their two nearest cells,
+  longitude wraps).
+- **Köppen-Geiger** maps, Beck et al. (2023), Figshare article 21789074 (file
+  `https://ndownloader.figshare.com/files/61012822`, md5 `7fc2f5a15d4f5fe0ce59c9a9b502aa09`
+  per the figshare page). The zip holds a GeoTIFF per period, scenario and resolution plus
+  `legend.txt`. Used: **`1991_2020/koppen_geiger_0p00833333.tif`** (uint8, 21600 × 43200, 30″
+  cells, north up, origin 90 N / 180 W, LZW so decoding needs `imagecodecs`). Codes 1–30 are the
+  Beck classes (`legend.txt`) and 0 is sea / no data. The bake takes the mode of the 2 × 2 cells
+  centred on each node (zeros only win when no land class is present; ties go to the smaller
+  code).
+
+`cd tools/bake && uv run timefly-bake tiles --raw ../../data/raw --out ../../crates/timefly/assets/data/tiles`
+writes 2,592 tiles `r{row:02}c{col:02}.tfgrid` (36 rows × 72 columns, row 0 northernmost, column
+0 from lon −180) plus `manifest.json`. Each tile is a 5° × 5° `latlon` grid of 301 × 301 samples
+(both edges included, so neighbours share edge samples and column 71 meets column 0 across the
+antimeridian), 2 channels, float16: elevation in metres, then the Köppen code. The manifest lists
+every tile with its byte size and SHA-256 and the two source checksums. Sizes:
+[`docs/testing/region-m2/performance.md`](../docs/testing/region-m2/performance.md).
 
 ## Performance and memory (Task 10)
 

@@ -4,6 +4,9 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "src/build_features.rs"]
+mod build_features;
+
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
     if !out.status.success() {
@@ -15,6 +18,7 @@ fn git(args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/build_features.rs");
     println!("cargo:rerun-if-env-changed=TIMEFLY_GIT_SHA");
 
     // CI sets TIMEFLY_GIT_SHA; local builds ask git, and fall back to "unknown".
@@ -44,14 +48,15 @@ fn main() {
         }
     }
 
-    let mut features: Vec<String> = env::vars()
-        .filter_map(|(k, _)| {
-            k.strip_prefix("CARGO_FEATURE_")
-                .map(|f| f.to_lowercase().replace('_', "-"))
-        })
-        .filter(|f| f != "default")
-        .collect();
-    features.sort();
+    let features = build_features::effective_features(
+        env::vars()
+            .filter_map(|(k, _)| {
+                k.strip_prefix("CARGO_FEATURE_")
+                    .map(|f| f.to_lowercase().replace('_', "-"))
+            })
+            .collect(),
+        &env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default(),
+    );
 
     println!("cargo:rustc-env=TIMEFLY_GIT_SHA={sha}");
     println!(

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::diagnostic::FrameCount;
+use bevy::light::cluster::ClusterConfig;
 use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
 use bevy::render::render_resource::{PipelineCache, TextureFormat};
@@ -279,6 +280,11 @@ pub struct GlobeDebugView(pub bool);
 #[derive(Component)]
 pub struct GlobeCamera;
 
+/// Marks the globe's sun. The region has its own (`crate::terrain::view::TerrainSun`), which
+/// must not steer the globe materials' sun direction.
+#[derive(Component)]
+pub struct GlobeSun;
+
 /// The system that copies the globe camera's `Transform` and projection to the bridge cameras.
 /// Anything that moves the globe camera runs before it, so the bridge views never lag a frame.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -336,7 +342,9 @@ impl Plugin for GlobePlugin {
         .add_systems(
             Update,
             (
-                update_globe_view,
+                // A region view switches the globe camera off: the globe neither draws nor
+                // follows the time until it is back, then catches up at once.
+                update_globe_view.run_if(globe_camera_active),
                 sync_sun,
                 sync_bridge_cameras.in_set(GlobeCameraSync),
                 track_render_status,
@@ -352,6 +360,11 @@ impl Plugin for GlobePlugin {
     }
 }
 
+/// Whether the globe is on screen: its camera is active (or there is none, in headless runs).
+fn globe_camera_active(cameras: Query<&Camera, With<GlobeCamera>>) -> bool {
+    cameras.is_empty() || cameras.iter().any(|c| c.is_active)
+}
+
 fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamera>>) {
     if !cameras.is_empty() {
         return;
@@ -360,6 +373,9 @@ fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamer
         Name::new("Globe camera"),
         GlobeCamera,
         Camera3d::default(),
+        // No clustered lights in the game; on WebGPU Bevy 0.20 re-creates the cluster buffers
+        // every frame and they are never destroyed (ruling R28, `crate::clusters`).
+        ClusterConfig::None,
         Camera {
             clear_color: ClearColorConfig::Custom(SPACE_COLOR),
             ..default()
@@ -517,6 +533,7 @@ fn spawn_globe(
     ));
     commands.spawn((
         Name::new("Sun"),
+        GlobeSun,
         DirectionalLight {
             shadow_maps_enabled: false,
             ..default()
@@ -533,6 +550,8 @@ fn spawn_globe(
             Name::new("Bridge camera"),
             BridgeCamera { layer },
             Camera3d::default(),
+            // Clustering unused; leaks per-frame buffers on WebGPU (ruling R28).
+            ClusterConfig::None,
             Camera {
                 order,
                 is_active: true,
@@ -650,7 +669,7 @@ fn update_globe_view(
 
 /// Copies the sun light's direction into the materials when the light moves.
 fn sync_sun(
-    lights: Query<&GlobalTransform, (With<DirectionalLight>, Changed<GlobalTransform>)>,
+    lights: Query<&GlobalTransform, (With<GlobeSun>, Changed<GlobalTransform>)>,
     mut scene: ResMut<GlobeScene>,
     mut plates_m: ResMut<Assets<PlateMaterial>>,
     mut oceans_m: ResMut<Assets<OceanMaterial>>,
@@ -726,7 +745,8 @@ fn sync_bridge_cameras(
         *layers = wanted;
     }
     let bridging = mode == GlobeMode::Bridge;
-    let active = warming_up || bridging;
+    // Not while the globe camera is off (a region view replaces it).
+    let active = camera.is_active && (warming_up || bridging);
     if active
         && let Some(size) = camera.physical_target_size()
         && size != scene.target_size
@@ -845,6 +865,16 @@ fn probe_pipelines(cache: Res<PipelineCache>, probe: Res<RenderProbe>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The globe camera carries `ClusterConfig::None` from its own spawn (ruling R28).
+    #[test]
+    fn the_globe_camera_has_no_clusters() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Startup, spawn_globe_camera);
+        app.update();
+        crate::clusters::assert_no_clusters(app.world_mut());
+    }
     use timefly_core::surface::{FrameMeta, FrameSource};
 
     fn timeline() -> Timeline {

@@ -1,4 +1,4 @@
-# Linux Vulkan check (Task 11, Step 7)
+# Linux Vulkan check (M1 Task 11, Step 7; regions: M2 Task 10)
 
 The owner's Linux machine is for testing only. CI (`.github/workflows/linux-package.yml`) builds
 two packages from the same release binary and baked data:
@@ -61,6 +61,7 @@ cd ../..
       (add `WGPU_BACKEND=vulkan` in front if Vulkan isn't the default). Paste the whole output
       block back.
 - [ ] Crash probe (section 6) with `time-fly`.
+- [ ] Regions (section 7) with `time-fly`.
 
 ## 3. The Flatpak
 
@@ -82,6 +83,7 @@ extension matching the host driver; Flatpak normally installs it from Flathub au
 - [ ] Bench: `flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly --scrub-bench
       --target-fps 60 --window 2560x1440`. Paste the output block back.
 - [ ] Crash probe (section 6) with `flatpak run io.github.adsouza.TimeFly`.
+- [ ] Regions (section 7) with `flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly`.
 
 ## 4. Visual checks (Task 10 Step 5 list)
 
@@ -132,7 +134,72 @@ flatpak run io.github.adsouza.TimeFly
       sandbox may talk to, not a portal).
 - [ ] Send the `crash.txt` and `session.log` from that session directory back.
 
-## 7. Uninstall
+## 7. Regions (Milestone 2)
+
+Both packages ship the region tiles (`assets/data/tiles`: 2,592 tiles, the overview and the
+manifest, about 257 MB). Run this section with each package, using the launch command from its
+section above (`time-fly`, or `flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly`).
+
+### Region bench at 2560 × 1440 (the desktop target, ruling R21)
+
+This is the milestone's 2560 × 1440 desktop measurement (spec §15): the Mac's display was too
+small for it, so it is taken here. Use a display of at least 2560 × 1440 so the window is not
+clamped, and check the block's `render resolution: 2560x1440` line.
+
+```sh
+WGPU_BACKEND=vulkan time-fly --region-bench --target-fps 60 --window 2560x1440
+flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly \
+  --region-bench --target-fps 60 --window 2560x1440
+```
+
+It waits for the globe, then enters the bench regions in turn (rulings R24–R26): the Pangaea
+interior at 250 Ma (era-frame 22° S, 18° W), the Red Sea at the present (20° N, 37.5° E; ruling
+R30), the Himalayas at the present (28° N, 86.9° E,
+Everest's area), Sundaland at 21 ka (5° N, 107° E), Japan at 1 Ma (era-frame 36° N,
+138.5° E), Beringia at 21 ka (62° N, 175° W), then an 8 s globe pan to the Rockies ice margin at
+21 ka (48.5° N, 113.5° W), and Panama at 3 Ma (era-frame 9° N, 79.5° W). In each it flies a 60 s path (a low pass at 300 m, a climb to 30 km, a run along or
+toward the coast, a sweep toward the apron), then leaves. Then it re-enters the Himalayas ten times to
+measure warm generation and memory. It prints one block per region and a summary block, then
+exits: 0 on PASS, 3 on FAIL. A run takes about ten minutes. Leave the mouse and keyboard alone
+while it runs, and paste every block back unedited (one per region and the summary). A banner
+at the top centre shows the current stop (`Sundaland · 21 thousand years ago · 4 of 9`, the pan,
+`Next: …` on the globe) and finally `Region bench finished: PASS` or `FAIL`. The
+Rockies block also has a `globe pan from Beringia` line (R14-gated) and `frames fetched 0`.
+
+- [ ] Each block shows `render resolution: 2560x1440`.
+- [ ] Each region block ends `result: PASS` (ruling R14, as in section 5). A block whose coast
+      is in the field (Red Sea, Japan, Sundaland, Beringia, Panama) has a `the run stays within … km of
+      the coastline` line: it flew a real shore.
+- [ ] The summary: warm generation at most 3,000 ms, and memory cycles within +10% of the first.
+      The first-region worst-frame line (ruling R11) is informational on native.
+
+### By hand
+
+Launch normally. To go straight into a region, add `--region=LAT,LON,AGE_YEARS`, for example
+`--region=46.5,10,0`, `--region=63,15,21000` or `--region=-22,-18,250000000`.
+
+- [ ] **Alps, present.** With the slider at the present, double-click the Alps. If generation
+      takes over a second, "Descending..." shows; then the view fades into the region. Expect
+      ridges, forest and alpine ground, snow on the summits and haze toward the horizon (compare
+      `docs/testing/region-m2/bench-alps-0ka-shaded.png`).
+- [ ] **Fly.** `W` `A` `S` `D` move, a drag looks, `Space` / `E` climb, `Ctrl` / `Q` descend,
+      `Shift` boosts. Skim a ridge low, then climb high and look toward the horizon. There
+      should be no cracks or holes between terrain patches, no flicker along patch edges, no
+      popping water at the coast, and the camera never goes into the ground.
+- [ ] **Snapshot change.** Inside the region, press `[` (one snapshot older). The view fades
+      through a pale haze and returns over the same place at the same height above the ground,
+      and the age label changes. `]` steps back.
+- [ ] **Leave.** `Backspace` fades back to the globe, centred on the region.
+- [ ] **Scandinavia, 21 ka.** Step the globe to 21 thousand years ago and double-click central
+      Sweden: an ice sheet over rough ground, grey rock showing through
+      (`bench-scandinavia-21ka-shaded.png`). Leave.
+- [ ] **Pangaea, 250 Ma.** Step to 250 million years ago and double-click the interior of the
+      supercontinent: a hot, dry desert (`bench-pangaea-250ma-shaded.png`). Leave.
+- [ ] Enter and leave a few more times. The game stays responsive, and `session.log` shows
+      `region tiles ready` and `region generated in parallel` lines with no `warn` about missing
+      or corrupt tiles.
+
+## 8. Uninstall
 
 ```sh
 sudo apt remove time-fly
@@ -153,6 +220,15 @@ passes when each direction's p95 is at most 16.67 ms. The raw p95 is always repo
 target is missed, treat it as a Task 10 Step 6 strategy change and rerun. Results go
 into `data/README.md` (Performance and memory) next to the Mac numbers.
 
+## Acceptance (Milestone 2)
+
+Regions are accepted on Linux when, in both packages, the region checks in section 7 pass on
+Vulkan on a hardware GPU, and the `.deb` region bench at 2560 × 1440 ends its summary with
+`result: PASS` against 60 fps (every region under ruling R14, warm generation at most 3 s, memory
+cycles within +10%). The
+Flatpak's blocks are recorded too. Results go into `docs/testing/region-m2/performance.md` next
+to the Mac numbers.
+
 ## Results
 
 _Not run yet._
@@ -161,3 +237,8 @@ _Not run yet._
 |---|---|---|---|---|---|---|---|---|
 | `.deb` | | | | | | | | |
 | Flatpak | | | | | | | | |
+
+| Package (regions, 2560 × 1440) | GPU / driver | Region checks | Pangaea median / p95 / missed | Red Sea | Himalayas | Sundaland | Japan | Beringia | Pan / Rockies | Panama | Warm generation max | Memory cycles | Summary |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `.deb` | | | | | | | | | | | | | |
+| Flatpak | | | | | | | | | | | | | |
