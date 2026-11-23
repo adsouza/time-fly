@@ -9,21 +9,33 @@
 //!
 //! - **Same keys.** The terrain, sea and sky materials come from the same constructors as the
 //!   real ones; the meshes have the same vertex layout (positions only) and topology; the camera
-//!   has the region camera's components and draws to the same window (a pipeline's colour
-//!   format is the window's), through a 1 × 1 viewport, before the globe camera clears it
-//!   ([`WARMUP_CAMERA_ORDER`]); the sun casts the same cascaded shadows.
+//!   has the region camera's components; the sun casts the same cascaded shadows. A pipeline's
+//!   colour format is its camera's target's, so the camera draws into a 1 × 1 image in the
+//!   format Bevy gives a window's main pass ([`WARMUP_TARGET_FORMAT`]). A 1 × 1 target keeps
+//!   the camera's own textures (MSAA colour, depth, main textures) at a few bytes: drawn to the
+//!   window, the warm-up left about 100 MiB resident for the session.
 //! - **Its own layer** ([`WARMUP_LAYER`]), so nothing else ever sees it.
-//! - **Gone when the globe is interactive** (or has failed). The globe's render probe counts
-//!   every pending pipeline, these included, so "interactive" already waits for them. The
+//! - **Phases** ([`WarmupPhase`], decided by [`warmup_action`]). Behind the loading screen the
+//!   main-pass pipelines compile with the sun's shadows off; the globe's render probe counts
+//!   every pending pipeline, these included, so "interactive" waits for them. Once the globe is
+//!   interactive the sun casts shadows until the shadow pass's pipelines have compiled too (the
+//!   probe clean again), a fraction of a second. Shadows wait for that because the shadow map is
+//!   shared by every view: while the globe's offscreen bridge cameras render (they do during
+//!   loading) a four-cascade map stays resident after it is no longer used (about 100 MiB, as
+//!   measured on the region bench). Natively the shadow pipelines compile off the main thread; on
+//!   the web this is one compile on the idle globe, against the whole set on the first region
+//!   frame before. Then the camera stops and the shadows go off, and [`RETIRE_FRAMES`] later the
 //!   entities are despawned and every handle dropped: no asset outlives it. Bevy keeps the
 //!   compiled pipelines, so the first region finds them ready.
 
-use bevy::camera::Viewport;
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::RenderTarget;
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::ecs::system::SystemParam;
 use bevy::math::DVec3;
 use bevy::mesh::MeshTag;
 use bevy::prelude::*;
+use bevy::render::render_resource::TextureFormat;
 use bevy::render::storage::ShaderBuffer;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
@@ -32,40 +44,89 @@ use timefly_core::worldgen::generate::{Field, RegionGrid, RegionSpec};
 use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 
 use super::material::{TerrainMaterial, TerrainParams, palette_image, patch_instances};
-use super::view::{REGION_SKY, region_camera_parts, region_sun_parts};
+use super::view::{REGION_SKY, region_camera_parts, region_sun, region_sun_parts};
 use super::{grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
-use crate::globe::GlobeRenderStatus;
+use crate::globe::{GlobeRenderStatus, RenderProbe};
 use crate::sky::{SkyMaterial, distance_fog, region_look, sky_params};
 use crate::water::{WaterMaterial, water_look, water_material};
 use tracing::instrument;
 
 /// The warm-up's render layer: its camera, sun, patch, sea and sky only.
 pub const WARMUP_LAYER: usize = 5;
-/// Its camera draws before every other camera on the window, so the globe camera's clear
-/// covers its one pixel.
+/// Its camera's order: below every other camera (no other camera shares it).
 pub const WARMUP_CAMERA_ORDER: isize = -10;
+
+/// The colour format the region camera's main pass renders in, so its pipelines' format. Bevy
+/// renders a non-HDR window camera's main pass in the window's view format, normalized
+/// (`bevy_render::camera`): `Bgra8UnormSrgb` becomes `Rgba8UnormSrgb`, and before the window's
+/// first swap-chain texture is known the format falls back to `Rgba8UnormSrgb`. Metal, Vulkan and
+/// WebGPU windows are 8-bit sRGB, so this is the format in every case this game runs.
+pub const WARMUP_TARGET_FORMAT: TextureFormat = TextureFormat::Rgba8UnormSrgb;
+
+/// Frames the shadow phase lasts at least, and at most (about 10 s at 60 Hz: a pipeline that
+/// never finishes compiling must not keep the stand-in forever).
+pub const SHADOW_MIN_FRAMES: u32 = 6;
+pub const SHADOW_MAX_FRAMES: u32 = 600;
+/// Frames without a pending pipeline that end the shadow phase.
+pub const CLEAN_FRAMES: u32 = 3;
+/// Frames between switching the warm-up's camera and shadows off and despawning it.
+pub const RETIRE_FRAMES: u32 = 3;
+
+/// Where a warm-up is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WarmupPhase {
+    /// Behind the loading screen, until the globe is interactive: the main-pass pipelines,
+    /// the sun's shadows off.
+    MainPass,
+    /// The globe is interactive: the sun casts shadows, so the shadow pass's pipelines compile,
+    /// `frames` so far. It waits for the interactive globe because the shadow map is shared by
+    /// every view: while the globe's offscreen bridge cameras render (they do during loading),
+    /// a four-cascade map bound by them stays resident (about 100 MiB measured).
+    Shadows { frames: u32 },
+    /// The camera and the shadows are off, `frames` so far; then the entities go.
+    Retiring { frames: u32 },
+}
 
 /// What the warm-up does this frame.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WarmupAction {
     Wait,
     Start,
-    Keep,
-    Finish,
+    /// Go to (or stay in) this phase; apply its switches on entry.
+    Phase(WarmupPhase),
+    Despawn,
 }
 
-/// The warm-up's decision from the globe's status: start once while the globe's pipelines
-/// compile, finish once it is interactive or has failed, never start again.
-pub fn warmup_action(status: &GlobeRenderStatus, running: bool, done: bool) -> WarmupAction {
-    let settled = matches!(
-        status,
-        GlobeRenderStatus::Interactive { .. } | GlobeRenderStatus::Failed(_)
-    );
-    match (running, done) {
-        (true, _) if settled => WarmupAction::Finish,
-        (true, _) => WarmupAction::Keep,
-        (false, false) if *status == GlobeRenderStatus::PreparingGpu => WarmupAction::Start,
-        _ => WarmupAction::Wait,
+/// The warm-up's decision. `phase` is `None` while it is not running; `done` once it has run;
+/// `clean_streak` is the render probe's frames without a pending pipeline. It starts once while
+/// the globe's pipelines compile, takes the shadow phase once the globe is interactive (none if
+/// the globe failed), and never starts again.
+pub fn warmup_action(
+    status: &GlobeRenderStatus,
+    phase: Option<WarmupPhase>,
+    done: bool,
+    clean_streak: u32,
+) -> WarmupAction {
+    use WarmupPhase as P;
+    match phase {
+        None if !done && *status == GlobeRenderStatus::PreparingGpu => WarmupAction::Start,
+        None => WarmupAction::Wait,
+        Some(P::MainPass) => WarmupAction::Phase(match status {
+            GlobeRenderStatus::Interactive { .. } => P::Shadows { frames: 0 },
+            GlobeRenderStatus::Failed(_) => P::Retiring { frames: 0 },
+            _ => P::MainPass,
+        }),
+        Some(P::Shadows { frames }) => {
+            let compiled = frames >= SHADOW_MIN_FRAMES && clean_streak >= CLEAN_FRAMES;
+            let failed = matches!(status, GlobeRenderStatus::Failed(_));
+            WarmupAction::Phase(if compiled || failed || frames >= SHADOW_MAX_FRAMES {
+                P::Retiring { frames: 0 }
+            } else {
+                P::Shadows { frames: frames + 1 }
+            })
+        }
+        Some(P::Retiring { frames }) if frames >= RETIRE_FRAMES => WarmupAction::Despawn,
+        Some(P::Retiring { frames }) => WarmupAction::Phase(P::Retiring { frames: frames + 1 }),
     }
 }
 
@@ -73,6 +134,9 @@ pub fn warmup_action(status: &GlobeRenderStatus, running: bool, done: bool) -> W
 #[derive(Resource, Debug)]
 pub struct RegionWarmup {
     pub entities: Vec<Entity>,
+    pub camera: Entity,
+    pub sun: Entity,
+    pub phase: WarmupPhase,
 }
 
 /// Set once the warm-up has run.
@@ -120,24 +184,52 @@ struct WarmupAssets<'w> {
     sky: ResMut<'w, Assets<SkyMaterial>>,
 }
 
-/// Gathers the globe's status, decides with [`warmup_action`], and spawns or removes the
-/// stand-in region.
+/// Gathers the globe's status and the render probe, decides with [`warmup_action`], and
+/// spawns, switches or removes the stand-in region.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn region_warmup(
     mut commands: Commands,
     status: Option<Res<GlobeRenderStatus>>,
-    warmup: Option<Res<RegionWarmup>>,
+    probe: Option<Res<RenderProbe>>,
+    warmup: Option<ResMut<RegionWarmup>>,
     mut done: ResMut<WarmupDone>,
     mut assets: WarmupAssets,
+    mut cameras: Query<&mut Camera>,
+    mut suns: Query<&mut DirectionalLight>,
 ) {
     let Some(status) = status else { return };
-    match warmup_action(&status, warmup.is_some(), done.0) {
-        WarmupAction::Wait | WarmupAction::Keep => {}
+    let clean_streak = probe
+        .and_then(|p| p.0.lock().ok().map(|r| r.clean_streak))
+        .unwrap_or(u32::MAX);
+    let phase = warmup.as_ref().map(|w| w.phase);
+    match warmup_action(&status, phase, done.0, clean_streak) {
+        WarmupAction::Wait => {}
         WarmupAction::Start => {
-            let entities = spawn_warmup(&mut commands, &mut assets);
-            info!(entities = entities.len(), "region pipeline warm-up started");
-            commands.insert_resource(RegionWarmup { entities });
+            let warmup = spawn_warmup(&mut commands, &mut assets);
+            info!(
+                entities = warmup.entities.len(),
+                "region pipeline warm-up started"
+            );
+            commands.insert_resource(warmup);
         }
-        WarmupAction::Finish => {
+        WarmupAction::Phase(next) => {
+            let Some(mut warmup) = warmup else { return };
+            let entered = std::mem::discriminant(&next) != std::mem::discriminant(&warmup.phase);
+            if entered {
+                let shadows = matches!(next, WarmupPhase::Shadows { .. });
+                if let Ok(mut sun) = suns.get_mut(warmup.sun) {
+                    sun.shadow_maps_enabled = shadows;
+                }
+                if matches!(next, WarmupPhase::Retiring { .. })
+                    && let Ok(mut camera) = cameras.get_mut(warmup.camera)
+                {
+                    camera.is_active = false;
+                }
+                info!(phase = ?next, "region pipeline warm-up phase");
+            }
+            warmup.phase = next;
+        }
+        WarmupAction::Despawn => {
             if let Some(warmup) = warmup {
                 for &e in &warmup.entities {
                     commands.entity(e).despawn();
@@ -151,7 +243,7 @@ fn region_warmup(
 }
 
 #[instrument(level = "debug", skip_all)]
-fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> Vec<Entity> {
+fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWarmup {
     let WarmupAssets {
         images,
         meshes,
@@ -184,6 +276,9 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> Vec<Entit
         &fields.apron_height,
         water_look(&grid),
     ));
+    let mut target = Image::new_target_texture(1, 1, WARMUP_TARGET_FORMAT, None);
+    target.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    let target = images.add(target);
     let (era, biome) = region_look(&grid);
     let sky = sky_m.add(SkyMaterial {
         params: sky_params(era, biome),
@@ -197,7 +292,30 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> Vec<Entit
             layer.clone(),
         )
     };
-    vec![
+    let camera = commands
+        .spawn((
+            Name::new("Warm-up camera"),
+            Camera {
+                is_active: true,
+                order: WARMUP_CAMERA_ORDER,
+                clear_color: ClearColorConfig::Custom(REGION_SKY),
+                ..default()
+            },
+            RenderTarget::Image(target.into()),
+            region_camera_parts(&grid),
+            distance_fog(era, biome),
+            layer.clone(),
+        ))
+        .id();
+    // The region's sun, its shadows off until the shadow phase.
+    let sun = commands
+        .spawn((Name::new("Warm-up sun"), region_sun_parts(), layer.clone()))
+        .insert(DirectionalLight {
+            shadow_maps_enabled: false,
+            ..region_sun()
+        })
+        .id();
+    let entities = vec![
         commands
             .spawn((
                 drawn("Warm-up terrain patch"),
@@ -211,29 +329,15 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> Vec<Entit
         commands
             .spawn((drawn("Warm-up sky"), MeshMaterial3d(sky)))
             .id(),
-        commands
-            .spawn((
-                Name::new("Warm-up camera"),
-                Camera {
-                    is_active: true,
-                    order: WARMUP_CAMERA_ORDER,
-                    clear_color: ClearColorConfig::Custom(REGION_SKY),
-                    viewport: Some(Viewport {
-                        physical_position: UVec2::ZERO,
-                        physical_size: UVec2::ONE,
-                        ..default()
-                    }),
-                    ..default()
-                },
-                region_camera_parts(&grid),
-                distance_fog(era, biome),
-                layer.clone(),
-            ))
-            .id(),
-        commands
-            .spawn((Name::new("Warm-up sun"), region_sun_parts(), layer))
-            .id(),
-    ]
+        camera,
+        sun,
+    ];
+    RegionWarmup {
+        entities,
+        camera,
+        sun,
+        phase: WarmupPhase::MainPass,
+    }
 }
 
 #[cfg(test)]
@@ -244,21 +348,75 @@ mod tests {
     use crate::terrain::view::RegionCamera;
 
     #[test]
-    fn the_warm_up_runs_once_while_the_globe_prepares() {
+    fn the_warm_up_runs_once_and_takes_shadows_after_the_globe() {
         use GlobeRenderStatus as S;
         use WarmupAction as A;
+        use WarmupPhase as P;
         let interactive = S::Interactive { first_frame: 9 };
         let failed = S::Failed("no adapter".into());
-        // Not before the globe's pipelines start compiling.
-        assert_eq!(warmup_action(&S::LoadingData, false, false), A::Wait);
-        assert_eq!(warmup_action(&S::PreparingGpu, false, false), A::Start);
-        assert_eq!(warmup_action(&S::PreparingGpu, true, false), A::Keep);
-        assert_eq!(warmup_action(&interactive, true, false), A::Finish);
-        assert_eq!(warmup_action(&failed, true, false), A::Finish);
-        // Never again, and never late (a globe already interactive needs no warm-up).
-        assert_eq!(warmup_action(&S::PreparingGpu, false, true), A::Wait);
-        assert_eq!(warmup_action(&interactive, false, true), A::Wait);
-        assert_eq!(warmup_action(&interactive, false, false), A::Wait);
+        let act = |status: &S, phase, done, clean| warmup_action(status, phase, done, clean);
+        // Starts only while the globe's pipelines compile, and only once.
+        assert_eq!(act(&S::LoadingData, None, false, 0), A::Wait);
+        assert_eq!(act(&S::PreparingGpu, None, false, 0), A::Start);
+        assert_eq!(act(&S::PreparingGpu, None, true, 0), A::Wait);
+        assert_eq!(act(&interactive, None, false, 9), A::Wait);
+        assert_eq!(act(&interactive, None, true, 9), A::Wait);
+        // The main pass holds behind the loading screen.
+        assert_eq!(
+            act(&S::PreparingGpu, Some(P::MainPass), false, 9),
+            A::Phase(P::MainPass)
+        );
+        // Shadows once the globe is interactive, never on a failed one.
+        assert_eq!(
+            act(&interactive, Some(P::MainPass), false, 9),
+            A::Phase(P::Shadows { frames: 0 })
+        );
+        assert_eq!(
+            act(&failed, Some(P::MainPass), false, 9),
+            A::Phase(P::Retiring { frames: 0 })
+        );
+        // The shadow phase waits for its pipelines: a few frames, then a clean probe.
+        assert_eq!(
+            act(&interactive, Some(P::Shadows { frames: 0 }), false, 99),
+            A::Phase(P::Shadows { frames: 1 })
+        );
+        let late = P::Shadows {
+            frames: SHADOW_MIN_FRAMES,
+        };
+        assert_eq!(
+            act(&interactive, Some(late), false, CLEAN_FRAMES - 1),
+            A::Phase(P::Shadows {
+                frames: SHADOW_MIN_FRAMES + 1
+            })
+        );
+        assert_eq!(
+            act(&interactive, Some(late), false, CLEAN_FRAMES),
+            A::Phase(P::Retiring { frames: 0 })
+        );
+        // ...but not forever.
+        let stuck = P::Shadows {
+            frames: SHADOW_MAX_FRAMES,
+        };
+        assert_eq!(
+            act(&interactive, Some(stuck), false, 0),
+            A::Phase(P::Retiring { frames: 0 })
+        );
+        // Retiring: a few frames with everything off, then despawned.
+        assert_eq!(
+            act(&interactive, Some(P::Retiring { frames: 0 }), false, 0),
+            A::Phase(P::Retiring { frames: 1 })
+        );
+        assert_eq!(
+            act(
+                &interactive,
+                Some(P::Retiring {
+                    frames: RETIRE_FRAMES
+                }),
+                false,
+                0
+            ),
+            A::Despawn
+        );
     }
 
     fn warmup_app() -> App {
@@ -299,8 +457,9 @@ mod tests {
         app.update();
         let entities = app.world().resource::<RegionWarmup>().entities.clone();
         assert_eq!(entities.len(), 5);
-        // Five textures (four fields, the palette), one mesh, one buffer, one of each material.
-        assert_eq!(asset_counts(&app), [5, 1, 1, 1, 1, 1]);
+        // Six textures (four fields, the palette, the 1 x 1 target), one mesh, one buffer, one
+        // of each material.
+        assert_eq!(asset_counts(&app), [6, 1, 1, 1, 1, 1]);
         {
             let world = app.world_mut();
             // Everything on its own layer, none of it the region's camera or sun.
@@ -309,16 +468,19 @@ mod tests {
                 assert_eq!(*layers, RenderLayers::layer(WARMUP_LAYER));
             }
             assert_eq!(world.query::<&RegionCamera>().iter(world).count(), 0);
-            let mut cameras = world.query::<&Camera>();
-            let camera = cameras.single(world).unwrap();
+            let mut cameras = world.query::<(&Camera, &RenderTarget)>();
+            let (camera, target) = cameras.single(world).unwrap();
             assert!(camera.is_active);
             assert_eq!(camera.order, WARMUP_CAMERA_ORDER);
-            assert_eq!(
-                camera.viewport.as_ref().map(|v| v.physical_size),
-                Some(UVec2::ONE)
-            );
+            let image = world
+                .resource::<Assets<Image>>()
+                .get(target.as_image().unwrap())
+                .unwrap();
+            assert_eq!((image.width(), image.height()), (1, 1));
+            assert_eq!(image.texture_descriptor.format, WARMUP_TARGET_FORMAT);
+            // No shadows behind the loading screen.
             let mut suns = world.query::<&DirectionalLight>();
-            assert!(suns.single(world).unwrap().shadow_maps_enabled);
+            assert!(!suns.single(world).unwrap().shadow_maps_enabled);
         }
         // It stays while the globe prepares.
         app.update();
@@ -326,8 +488,35 @@ mod tests {
 
         *app.world_mut().resource_mut::<GlobeRenderStatus>() =
             GlobeRenderStatus::Interactive { first_frame: 30 };
-        // Freeing cascades over a few frames: entities, then materials, then their textures.
-        for _ in 0..4 {
+        let parts = |app: &App| {
+            let warmup = app.world().resource::<RegionWarmup>();
+            let world = app.world();
+            (
+                warmup.phase,
+                world.get::<Camera>(warmup.camera).unwrap().is_active,
+                world
+                    .get::<DirectionalLight>(warmup.sun)
+                    .unwrap()
+                    .shadow_maps_enabled,
+            )
+        };
+        // Shadows on for the shadow pass's pipelines (no render probe here: always clean).
+        app.update();
+        assert_eq!(
+            parts(&app),
+            (WarmupPhase::Shadows { frames: 0 }, true, true)
+        );
+        for _ in 0..SHADOW_MIN_FRAMES + 1 {
+            app.update();
+        }
+        // Then the camera stops and the shadows go off, the entities still there.
+        assert_eq!(
+            parts(&app),
+            (WarmupPhase::Retiring { frames: 0 }, false, false)
+        );
+        // Then they go. Freeing cascades over a few frames: entities, then materials, then
+        // their textures.
+        for _ in 0..RETIRE_FRAMES + 4 {
             app.update();
         }
         assert!(app.world().get_resource::<RegionWarmup>().is_none());

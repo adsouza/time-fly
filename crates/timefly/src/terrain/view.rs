@@ -122,15 +122,20 @@ pub(super) fn region_camera_parts(grid: &RegionGrid) -> impl Bundle {
     )
 }
 
+/// The region's directional light.
+pub(super) fn region_sun() -> DirectionalLight {
+    DirectionalLight {
+        illuminance: REGION_SUN_LUX,
+        color: REGION_SUN_COLOR,
+        shadow_maps_enabled: true,
+        ..default()
+    }
+}
+
 /// The region's sun without its marker and layers (shared with the pipeline warm-up).
 pub(super) fn region_sun_parts() -> impl Bundle {
     (
-        DirectionalLight {
-            illuminance: REGION_SUN_LUX,
-            color: REGION_SUN_COLOR,
-            shadow_maps_enabled: true,
-            ..default()
-        },
+        region_sun(),
         CascadeShadowConfigBuilder {
             num_cascades: SHADOW_CASCADES,
             first_cascade_far_bound: FIRST_CASCADE_M,
