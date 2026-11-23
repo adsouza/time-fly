@@ -76,8 +76,9 @@ pub struct RegionSpec {
     pub apron_res: u32,
     /// The snapshot's sea-level anomaly (m; negative when the sea stood lower):
     /// [`snapshot_sea_level_anomaly_m`](crate::worldgen::coarse::snapshot_sea_level_anomaly_m),
-    /// 0 in deep eras. It lowers the snowline in glacial eras (ruling R18, [`snowline_m`]); the
-    /// heights already carry the sea level through the coarse field.
+    /// weighted to the bridge endpoint's share in deep brackets that read it, 0 in older ones.
+    /// It lowers the snowline in glacial eras (ruling R18, [`snowline_m`]); the heights already
+    /// carry the sea level through the coarse field.
     pub sea_level_anomaly_m: f64,
 }
 

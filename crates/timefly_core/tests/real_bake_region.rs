@@ -300,17 +300,27 @@ fn covered_land_fallback_survey() {
     }
 }
 
-/// The two-level deep path over the real bake at 1 Ma: single-threaded generation time, and
-/// land/sea against the globe's reference (plus the region's sliver rule) wherever the reference
-/// is clearly land or sea (|elevation| > 150 m), across each inner field and apron.
+/// The two-level deep path over the real bake at every standard snapshot on it (50 ka, 100 ka,
+/// 1 Ma) and near its oldest end (2 Ma): single-threaded generation time, and land/sea against
+/// the globe's reference (plus the region's sliver rule) wherever the reference is clearly land
+/// or sea (|elevation| > 150 m), across each inner field and apron. Fails on any sign miss.
 #[test]
 #[ignore = "reads the real bake; run in release"]
-fn one_ma_modern_path() {
-    use timefly_core::globe::shell_surface_m;
-    use timefly_core::worldgen::coarse::SnapshotField;
+fn modern_path_on_the_real_bake() {
     let globe = data().join("globe");
     let b = bake(&globe);
-    let age = 1.0;
+    let mut total_misses = 0;
+    for age in [0.05, 0.1, 1.0, 2.0] {
+        total_misses += modern_path_at(&b, &globe, age);
+    }
+    assert_eq!(total_misses, 0, "sign misses where |reference| > 150 m");
+}
+
+/// [`modern_path_on_the_real_bake`] at one age; returns its sign misses.
+fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
+    use timefly_core::globe::shell_surface_m;
+    use timefly_core::worldgen::coarse::SnapshotField;
+    let mut total = 0;
     let mut grids: Vec<Option<Grid>> = vec![None; b.files.len()];
     for i in frames_needed(&b.timeline, age) {
         grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
@@ -351,7 +361,7 @@ fn one_ma_modern_path() {
         })
         .unwrap();
         let SnapshotField::Deep(df) = &field else {
-            panic!("1 Ma is a deep bracket")
+            panic!("{age} Ma is a deep bracket")
         };
         let spec = RegionSpec {
             seed: 0x7F1E_0002,
@@ -398,9 +408,10 @@ fn one_ma_modern_path() {
         let low = |f: &timefly_core::worldgen::generate::Field| {
             f.elevation_m.iter().copied().fold(f32::MAX, f32::min)
         };
+        total += misses.len();
         println!(
-            "{name}: {:.2} s single-threaded, {} tiles; {checked} off-node checks, {} sign misses; \
-             inner min {:.0} m",
+            "{age} Ma {name}: {:.2} s single-threaded, {} tiles; {checked} off-node checks, {} \
+             sign misses; inner min {:.0} m",
             secs,
             tiles.len(),
             misses.len(),
@@ -413,4 +424,5 @@ fn one_ma_modern_path() {
             );
         }
     }
+    total
 }

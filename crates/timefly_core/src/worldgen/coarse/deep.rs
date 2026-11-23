@@ -646,42 +646,48 @@ mod tests {
     #[test]
     fn modern_path_agrees_on_land_and_sea_off_nodes() {
         // Everywhere, plate edges, gaps and coasts included: where the reference is clearly land
-        // or sea (|elevation| > 150 m) the two-level sample is on the same side.
+        // or sea (|elevation| > 150 m) the two-level sample is on the same side. At every
+        // standard snapshot on the two-level path (50 ka, 100 ka, 1 Ma) and near its oldest end
+        // (2 Ma, ETOPO weight 0.56; it ends at 0.5, about 2.25 Ma).
         let (crust, fr, tiles) = modern_fixture();
-        let f = deep_at(&crust, &fr, &tiles, 1.0);
-        let (mut checked, mut edge, mut worst_miss) = (0, 0, 0.0f64);
-        let mut misses = Vec::new();
-        for lat in (-890..=890).step_by(9) {
-            for lon in (-1800..1800).step_by(11) {
-                let d = dir(f64::from(lat) / 10.0, f64::from(lon) / 10.0);
-                let reference = f.sample_with(d, SourceLevel::Overview).elevation_m;
-                if reference.abs() <= 150.0 {
-                    continue;
+        for age in [0.05, 0.1, 1.0, 2.0] {
+            let f = deep_at(&crust, &fr, &tiles, age);
+            assert!(f.is_modern(), "{age} Ma: ETOPO weight {}", f.etopo_weight());
+            let (mut checked, mut edge, mut worst_miss) = (0, 0, 0.0f64);
+            let mut misses = Vec::new();
+            for lat in (-890..=890).step_by(9) {
+                for lon in (-1800..1800).step_by(11) {
+                    let d = dir(f64::from(lat) / 10.0, f64::from(lon) / 10.0);
+                    let reference = f.sample_with(d, SourceLevel::Overview).elevation_m;
+                    if reference.abs() <= 150.0 {
+                        continue;
+                    }
+                    let modern = f.modern_sample(d, SourceLevel::Overview).elevation_m;
+                    let carriers: Vec<_> = crate::cube::bilinear_taps(d, f.support_n)
+                        .iter()
+                        .map(|&((face, col, row), _)| f.support(face, col, row).carrier)
+                        .collect();
+                    if !carriers.iter().all(|&c| c == carriers[0]) {
+                        edge += 1;
+                    }
+                    if (modern > 0.0) != (reference > 0.0) {
+                        worst_miss = worst_miss.max(reference.abs());
+                        misses.push((lat, lon, reference, modern));
+                    }
+                    checked += 1;
                 }
-                let modern = f.modern_sample(d, SourceLevel::Overview).elevation_m;
-                let carriers: Vec<_> = crate::cube::bilinear_taps(d, f.support_n)
-                    .iter()
-                    .map(|&((face, col, row), _)| f.support(face, col, row).carrier)
-                    .collect();
-                if !carriers.iter().all(|&c| c == carriers[0]) {
-                    edge += 1;
-                }
-                if (modern > 0.0) != (reference > 0.0) {
-                    worst_miss = worst_miss.max(reference.abs());
-                    misses.push((lat, lon, reference, modern));
-                }
-                checked += 1;
             }
+            println!(
+                "{age} Ma: {checked} points ({edge} at plate edges or gaps), {} sign misses",
+                misses.len()
+            );
+            assert!(checked > 20_000 && edge > 100, "{age} Ma: {checked} {edge}");
+            assert!(
+                misses.is_empty(),
+                "{age} Ma: {} misses, worst |ref| {worst_miss}: {:?}",
+                misses.len(),
+                &misses[..misses.len().min(8)]
+            );
         }
-        println!(
-            "{checked} points ({edge} at plate edges or gaps), {} sign misses",
-            misses.len()
-        );
-        assert!(checked > 20_000 && edge > 100, "{checked} {edge}");
-        assert!(
-            misses.is_empty(),
-            "worst |ref| {worst_miss}: {:?}",
-            &misses[..misses.len().min(8)]
-        );
     }
 }

@@ -89,6 +89,14 @@ impl PresentRead {
 /// at least this far from sea level, on the same side.
 const CLEAR_OF_SEA_LEVEL_M: f64 = 300.0;
 
+/// A one-plate sample whose formula value lies within this of sea level takes the plate's own
+/// terms at the sample instead of the support lattice's bilinear ones, so land and sea follow
+/// the plate value's zero contour exactly as the globe's land rule draws it. The bilinear
+/// PaleoDEM part errs by tens of metres between nodes on the real bake (a +15 m formula value
+/// where the plate's own value is water, and the globe draws the shell's −200 m crack fill), so
+/// this margin is several times that error. Beyond it the formula's sign is safe.
+const EXACT_NEAR_SEA_LEVEL_M: f64 = 150.0;
+
 /// Whether a support cell's samples take the reference: plate nodes against shell nodes, or
 /// different plates with a node near sea level or nodes on both sides of it.
 fn needs_reference(carriers: [Option<PlateIndex>; 4], values: [f64; 4]) -> bool {
@@ -272,7 +280,9 @@ impl<'a> DeepField<'a> {
     }
 
     /// The two-level sample at `d` (see the module doc), by the support cell's taps:
-    /// - all on one plate: `bilerp(residual) + bilerp(weight) · T(d)`;
+    /// - all on one plate: `bilerp(residual) + bilerp(weight) · T(d)`; within
+    ///   [`EXACT_NEAR_SEA_LEVEL_M`] of sea level, the plate's own residual and weight at `d`
+    ///   (or the reference, where the plate's footprint does not accept `d`);
     /// - all shell nodes, none a sliver: the globe's shell rule evaluated at `d` itself (both
     ///   endpoints read there, so coverage-mask edges fall where the reference has them);
     /// - where land and sea can change inside the cell for a reason the formula does not model
@@ -313,12 +323,37 @@ impl<'a> DeepField<'a> {
         };
         let (etopo, koppen) = self.etopo_read(read, level);
         let term = etopo - self.sampling.anomalies_m()[self.etopo_endpoint()];
+        let mut elevation_m = residual + weight * term;
+        if elevation_m.abs() < EXACT_NEAR_SEA_LEVEL_M
+            && let Some(plate) = nearest.carrier
+        {
+            if !self.plate_valid_at(plate, d) {
+                // A footprint edge inside the cell: the plate is not a candidate here.
+                return self.sample_with(era_dir, SourceLevel::Overview);
+            }
+            // The plate's own terms here (its endpoint weights included), with the ETOPO term
+            // still read at `level`.
+            if let Some(t) = self.plate_terms(plate, d) {
+                elevation_m = t.value_m - t.etopo_weight * t.etopo_term_m + t.etopo_weight * term;
+            }
+        }
         CoarseSample {
-            elevation_m: residual + weight * term,
+            elevation_m,
             ice: 0.0,
             koppen,
             lattice: <Self as super::CoarseField>::lattice_key(self, d, nearest.kind),
         }
+    }
+
+    /// Whether plate `plate`'s footprint accepts era direction `era` at the snapshot age (the
+    /// candidate test of [`CrustModel::resolve`](crate::geodynamics::CrustModel::resolve)).
+    fn plate_valid_at(&self, plate: PlateIndex, era: RenderDir) -> bool {
+        self.to_plate[plate.0 as usize].is_some_and(|q| {
+            let plate_fixed = RenderDir((q * era.0).normalize());
+            self.crust
+                .footprints()
+                .contains(plate, plate_fixed, self.sampling.age_myr)
+        })
     }
 
     /// The shell rule at `d`, read at `level`: the globe's shell blend (gap land where uncovered

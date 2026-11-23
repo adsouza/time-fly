@@ -302,14 +302,20 @@ pub fn frames_needed(timeline: &Timeline, age_myr: f64) -> Vec<usize> {
 }
 
 /// The sea-level anomaly (m) a region at `age_myr` uses for its snowline (ruling R18): the
-/// timeline's anomaly for recent and bridge snapshots, 0 for deep ones, whose frames carry their
-/// own sea level.
+/// anomaly its heights carry. Recent and bridge snapshots take the timeline's anomaly. A deep
+/// snapshot takes its bracket's endpoint anomalies by the endpoint weights: the modern-terrain
+/// bridge frame carries the timeline's anomaly (so 50 ka to about 4 Ma keep a lowered snowline,
+/// fading as the bracket moves toward the PaleoDEM), and PaleoDEM frames carry their own sea
+/// level (0).
 pub fn snapshot_sea_level_anomaly_m(timeline: &Timeline, age_myr: f64) -> f64 {
     match timeline.select_frames(age_myr) {
         FrameSelection::Recent(_) | FrameSelection::Bridge { .. } => {
             timeline.sea_level_anomaly_m(age_myr)
         }
-        FrameSelection::Deep(_) => 0.0,
+        FrameSelection::Deep(d) => {
+            let [young, old] = d.sea_level_anomaly_m;
+            young + (old - young) * d.frames.older_weight
+        }
     }
 }
 
@@ -380,7 +386,7 @@ mod tests {
     use crate::worldgen::testkit::*;
 
     #[test]
-    fn snowline_anomaly_is_the_timeline_s_in_recent_eras_and_zero_in_deep_ones() {
+    fn snowline_anomaly_is_the_sea_level_the_heights_carry() {
         let s = timeline();
         // Recent (ICE-6G) and bridge snapshots: the timeline's curve.
         for age in [0.0, 0.021, 0.026076, 0.028] {
@@ -389,9 +395,21 @@ mod tests {
         }
         assert!(snapshot_sea_level_anomaly_m(&s, 0.021) < -30.0);
         assert_eq!(snapshot_sea_level_anomaly_m(&s, 0.0), 0.0);
-        // Deep snapshots: zero, even inside the curve's taper toward 4.47 Ma.
-        assert!(s.sea_level_anomaly_m(1.0) < -10.0);
-        for age in [0.03, 1.0, 50.0, 100.0] {
+        // Deep snapshots on the bridge frame (30 ka to 4.47 Ma): the bridge endpoint's heights
+        // carry the timeline's anomaly, by its weight in the blend; the PaleoDEM endpoint none.
+        let weighted = |age: f64| {
+            let w = (age - 0.03) / (4.47 - 0.03);
+            s.sea_level_anomaly_m(age) * (1.0 - w)
+        };
+        for age in [0.03, 0.05, 0.1, 1.0, 2.0] {
+            let got = snapshot_sea_level_anomaly_m(&s, age);
+            assert!((got - weighted(age)).abs() < 1e-9, "{age}: {got}");
+        }
+        // 50 ka: nearly the whole glacial lowering (the curve is -50 m at 30 ka, -100 m at
+        // 100 ka), so the Alps keep a lowered snowline past 21 ka.
+        assert!(snapshot_sea_level_anomaly_m(&s, 0.05) < -60.0);
+        // Older brackets read no bridge frame: no anomaly.
+        for age in [4.47, 50.0, 100.0] {
             assert_eq!(snapshot_sea_level_anomaly_m(&s, age), 0.0, "{age}");
         }
     }

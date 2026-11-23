@@ -60,8 +60,8 @@ pub const SNOWLINE_DROP_PER_ANOMALY_M: f64 = 1000.0 / 120.0;
 ///
 /// Ruling R18: ICE-6G's 1-degree grid misses mountain glaciers (the Alps at 21 ka have zero ice
 /// fraction), so a glacial era lowers the snowline by `1000 m × (anomaly / −120 m)`, clamped to
-/// `0..=1,200 m`: no change for a positive anomaly. `sea_level_anomaly_m` is the era's (0 in deep
-/// eras). Mirrored by `snowline_m` in `snowline.wesl`.
+/// `0..=1,200 m`: no change for a positive anomaly. `sea_level_anomaly_m` is the anomaly the era's
+/// heights carry (0 from the first PaleoDEM bracket on). Mirrored by `snowline_m` in `snowline.wesl`.
 pub fn snowline_m(lat_deg: f64, sea_level_anomaly_m: f64) -> f64 {
     let drop = (-sea_level_anomaly_m * SNOWLINE_DROP_PER_ANOMALY_M)
         .clamp(0.0, MAX_GLACIAL_SNOWLINE_DROP_M);
@@ -69,8 +69,8 @@ pub fn snowline_m(lat_deg: f64, sea_level_anomaly_m: f64) -> f64 {
 }
 
 /// The zonal rule for deep time, from paleolatitude (degrees), effective elevation (m),
-/// distance to the coast (km) and the era's sea-level anomaly (m, for [`snowline_m`]; 0 in deep
-/// eras). Bands are `[lower, upper)` in |latitude|; a distance threshold belongs to its wetter
+/// distance to the coast (km) and the era's sea-level anomaly (m, for [`snowline_m`]; 0 from the
+/// first PaleoDEM bracket on). Bands are `[lower, upper)` in |latitude|; a distance threshold belongs to its wetter
 /// side ("within 500 km" includes 500).
 pub fn zonal_biome(
     paleolat_deg: f64,
