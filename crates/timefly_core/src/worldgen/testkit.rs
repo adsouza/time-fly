@@ -166,13 +166,49 @@ pub fn paleo_frame(f: impl Fn(RenderDir) -> (f32, bool)) -> Grid {
     })
 }
 
-/// Constant tiles over everything a field of side `size_m` around `centre` reads.
-pub fn flat_tiles(centre: RenderDir, size_m: f64, elevation_m: f32, koppen: u8) -> TileSet {
-    let frame = RegionFrame { center: centre };
+/// Constant tiles over everything the inner field around `centre` reads (no overview).
+pub fn flat_tiles(centre: RenderDir, elevation_m: f32, koppen: u8) -> TileSet {
+    flat_tiles_around(&[centre], elevation_m, koppen)
+}
+
+/// Constant tiles for the inner fields around each centre (no overview).
+pub fn flat_tiles_around(centres: &[RenderDir], elevation_m: f32, koppen: u8) -> TileSet {
     let mut set = TileSet::new();
-    for (r, c) in TileSet::needed_for(&frame, size_m) {
-        set.insert(r, c, tile_from(r, c, |_, _| (elevation_m, koppen)))
-            .unwrap();
+    for &centre in centres {
+        for (r, c) in TileSet::needed_for(&RegionFrame { center: centre }) {
+            if !set.contains(r, c) {
+                set.insert(r, c, tile_from(r, c, |_, _| (elevation_m, koppen)))
+                    .unwrap();
+            }
+        }
     }
     set
+}
+
+/// One constant tile around a latitude and longitude.
+pub fn single_tile(lat: f64, lon: f64, elevation_m: f32, koppen: u8) -> TileSet {
+    let (r, c) = crate::worldgen::tiles::tile_of(lat, lon);
+    let mut set = TileSet::new();
+    set.insert(r, c, tile_from(r, c, |_, _| (elevation_m, koppen)))
+        .unwrap();
+    set
+}
+
+/// Timeline-indexed frames: ICE-6G placeholders, then PaleoDEMs from `paleo(frame)`.
+pub fn frames(paleo: impl Fn(usize, RenderDir) -> (f32, bool)) -> Vec<Grid> {
+    (0..7)
+        .map(|i| {
+            if i < 4 {
+                ice_frame(0.0, 0.0)
+            } else {
+                paleo_frame(|d| paleo(i, d))
+            }
+        })
+        .collect()
+}
+
+/// A constant global overview at 2 nodes per degree (the bake's is 12; the shape rule is the
+/// same and this one builds fast).
+pub fn flat_overview(elevation_m: f32, koppen: u8) -> Grid {
+    crate::worldgen::tiles::tests::overview_from(2, |_, _| (elevation_m, koppen))
 }

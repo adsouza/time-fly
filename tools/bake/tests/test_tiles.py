@@ -115,3 +115,46 @@ def test_manifest_lists_every_tile_with_hashes(tmp_path):
     header, data = formats.read_tfgrid(tmp_path / "r00c00.tfgrid")
     assert header["kind"] == "latlon" and header["dtype"] == "f16" and header["channels"] == 2
     assert data.shape == (6, 6, 2)
+
+
+def test_overview_shape_and_edges():
+    elev, kop = _ramp(per_deg=5)
+    ov = tiles.overview(elev, kop, per_deg=5, factor=5)
+    # 1 degree nodes, both edges: 181 rows (90 N first) by 361 columns (-180 .. +180).
+    assert ov.shape == (181, 361, 2) and ov.dtype == np.float16
+    # The -180 column is the +180 column.
+    assert np.array_equal(ov[:, 0, :], ov[:, -1, :])
+    assert tiles.OVERVIEW_ROWS == 2161 and tiles.OVERVIEW_COLS == 4321
+    assert tiles.OVERVIEW_FACTOR * 12 == tiles.PER_DEG
+
+
+def test_overview_is_the_block_mean_and_mode():
+    per_deg, factor = 5, 5
+    elev, kop = _ramp(per_deg=per_deg)
+    rng = np.random.default_rng(3)
+    kop = rng.integers(0, 31, size=kop.shape).astype(np.uint8)
+    ov = tiles.overview(elev, kop, per_deg=per_deg, factor=factor)
+    rows, cols = elev.shape
+
+    def block(a, i, j):
+        r = np.clip(np.arange(i * factor - 2, i * factor + 3), 0, rows - 1)
+        c = np.arange(j * factor - 2, j * factor + 3) % cols
+        return a[np.ix_(r, c)]
+
+    for i, j in [(0, 0), (1, 1), (90, 200), (180, 359), (37, 0), (180, 0), (5, 360)]:
+        out_row = ov.shape[0] - 1 - i  # output is north first; node row i counts from the south
+        want = np.float16(block(elev, i, j % 360).mean(dtype=np.float64))
+        assert ov[out_row, j, 0] == want, (i, j)
+        assert ov[out_row, j, 1] == np.float16(tiles.mode_resample(block(kop, i, j % 360), factor)[0, 0])
+    # A ramp's block mean away from the poles is the ramp at the block's centre node.
+    assert ov[ov.shape[0] - 1 - 90, 200, 0] == np.float16(90 * 5 * 3 + 200 * 5 - 500.0)
+
+
+def test_manifest_lists_the_overview(tmp_path):
+    elev, kop = _ramp()
+    manifest = cli.write_tiles(elev, kop, tmp_path, {"etopo": "e" * 64, "koppen": "k" * 64}, per_deg=1)
+    blob = (tmp_path / "overview.tfgrid").read_bytes()
+    assert manifest["overview"] == {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
+    header, data = formats.read_tfgrid(tmp_path / "overview.tfgrid")
+    assert header["kind"] == "latlon" and header["channels"] == 2
+    assert data.shape == (180 // 5 + 1, 360 // 5 + 1, 2)

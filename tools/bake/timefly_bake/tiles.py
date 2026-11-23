@@ -9,6 +9,11 @@ so :func:`cell_to_node_mean` and :func:`mode_resample_nodes` move cell grids ont
 arrays are ordered south to north, ``180 * per_deg + 1`` rows by ``360 * per_deg`` columns from
 lon -180 (the 180 E column is the -180 column, so longitude wraps).
 
+Overview. One global grid at 5 arc-minutes (1/12 degree) for region aprons: each node is the
+mean (elevation) and mode (Koppen) of the 5 x 5 block of 60 arc-second nodes centred on it, with
+longitude wrapping and pole rows clamped as in :func:`cell_to_node_mean`. It is a node lattice
+like the tiles: rows from 90 N to 90 S and columns from lon -180 to +180, both edges included.
+
 Tiles. Tile ``(row, col)`` covers ``TILE_DEG`` x ``TILE_DEG`` degrees; row 0 is the northernmost
 (lat 85..90 N), column 0 starts at lon -180. Inside a tile row 0 is the northern edge. Channel 0
 is elevation in metres and channel 1 the Koppen code, both float16.
@@ -27,6 +32,10 @@ TILE_ROWS = 180 // TILE_DEG
 TILE_COLS = 360 // TILE_DEG
 PER_DEG = 60  # 60 arc-second lattice
 _CHUNK_ROWS = 512
+OVERVIEW_FACTOR = 5  # 60 arc-second nodes per overview step: 5 arc-minutes
+OVERVIEW_ROWS = 180 * PER_DEG // OVERVIEW_FACTOR + 1
+OVERVIEW_COLS = 360 * PER_DEG // OVERVIEW_FACTOR + 1
+_OVERVIEW_CHUNK = 64  # overview rows per chunk
 
 
 @traced
@@ -114,4 +123,36 @@ def cell_to_node_mean(cells: np.ndarray) -> np.ndarray:
         idx = np.arange(i0, min(i0 + _CHUNK_ROWS, h + 1))
         band = 0.5 * (cells[np.clip(idx - 1, 0, h - 1)] + cells[np.clip(idx, 0, h - 1)])
         out[idx] = 0.5 * (band + np.roll(band, 1, axis=1))
+    return out
+
+
+@traced
+def overview(
+    elev: np.ndarray, koppen: np.ndarray, per_deg: int = PER_DEG, factor: int = OVERVIEW_FACTOR
+) -> np.ndarray:
+    """The global overview grid: float16 ``(h, w, 2)``, north first, both longitude edges
+    included (column 0 equals the last column). ``elev`` and ``koppen`` are node lattices (see
+    module doc); ``factor`` must be odd so blocks centre on nodes. Elevation is the block mean,
+    the Koppen code the block mode under :func:`mode_resample`'s rules."""
+    rows, cols = 180 * per_deg + 1, 360 * per_deg
+    if elev.shape != (rows, cols) or koppen.shape != (rows, cols):
+        raise ValueError(f"expected node lattices of {(rows, cols)}, got {elev.shape} and {koppen.shape}")
+    if factor % 2 == 0 or (rows - 1) % factor or cols % factor:
+        raise ValueError(f"factor {factor} must be odd and divide the lattice {(rows, cols)}")
+    half = factor // 2
+    out_rows, out_cols = (rows - 1) // factor + 1, cols // factor
+    out = np.empty((out_rows, out_cols + 1, 2), dtype=np.float16)
+    for i0 in range(0, out_rows, _OVERVIEW_CHUNK):
+        i1 = min(i0 + _OVERVIEW_CHUNK, out_rows)
+        # Source rows of each block, pole rows clamped; columns rolled so blocks start at 0.
+        src = np.clip(np.arange(i0 * factor - half, i1 * factor - half), 0, rows - 1)
+        e = np.roll(elev[src].astype(np.float64), half, axis=1)
+        k = np.roll(koppen[src], half, axis=1)
+        mean = e.reshape(i1 - i0, factor, out_cols, factor).mean(axis=(1, 3))
+        mode = mode_resample(k, factor)
+        # Node row i counts from the south; the output is north first.
+        dst = slice(out_rows - i1, out_rows - i0)
+        out[dst, :out_cols, 0] = mean[::-1]
+        out[dst, :out_cols, 1] = mode[::-1]
+    out[:, out_cols, :] = out[:, 0, :]
     return out

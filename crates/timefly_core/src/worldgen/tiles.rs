@@ -6,6 +6,11 @@
 //! Beck classes). Row 0 is the tile's north edge: sample `(i, j)` sits at
 //! `lat = lat_n − i/60`, `lon = lon_w + j/60`, where tile `(row, col)` has `lat_n = 90 − 5·row`
 //! and `lon_w = −180 + 5·col`.
+//!
+//! The **overview** (ruling R7) is one global grid on a coarser node lattice (5′ in the bake:
+//! 2161 × 4321), rows from 90°N to 90°S and columns from −180° to +180°, both edges included.
+//! Region aprons read only the overview; inner fields read tiles, then the overview where a tile
+//! is missing ([`TileSet::lookup`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -13,7 +18,8 @@ use std::sync::Arc;
 
 use crate::formats::{Grid, GridKind};
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
-use crate::worldgen::frame::RegionFrame;
+use crate::worldgen::REGION_SIZE_M;
+use crate::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
 
 /// Degrees per tile side.
 pub const TILE_DEG: f64 = 5.0;
@@ -24,18 +30,29 @@ pub const TILE_ROWS: u8 = 36;
 pub const TILE_COLS: u8 = 72;
 /// Sample spacing of the tiles: 60″ of latitude, in metres.
 pub const TILE_SPACING_M: f64 = 1852.0;
-/// [`TileSet::needed_for`] widens the square by this much on every side, for the coastline
+/// [`TileSet::needed_for`] widens the inner field by this much on every side, for the coastline
 /// clamp's corner samples and the coarse lattice's overhang past the field's edge.
 pub const TILE_MARGIN_M: f64 = 5_000.0;
 
 /// Samples per degree.
 const PER_DEG: f64 = (TILE_SAMPLES - 1) as f64 / TILE_DEG;
 
-/// A tile grid that is not a 2-channel 301 × 301 `LatLon` grid, or a tile index off the map.
+/// Which data a lookup may read.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SourceLevel {
+    /// A loaded tile, else the overview (inner fields).
+    Tiles,
+    /// The overview only (aprons, and lattices as coarse as the apron's).
+    Overview,
+}
+
+/// A tile grid that is not a 2-channel 301 × 301 `LatLon` grid, a tile index off the map, or an
+/// overview that is not a global 2-channel node lattice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileError {
     BadIndex { row: u8, col: u8 },
     BadShape { row: u8, col: u8 },
+    BadOverview { width: u32, height: u32 },
 }
 
 impl fmt::Display for TileError {
@@ -47,6 +64,11 @@ impl fmt::Display for TileError {
             TileError::BadShape { row, col } => write!(
                 f,
                 "tile r{row:02}c{col:02} is not a 2-channel 301 x 301 lat-lon grid"
+            ),
+            TileError::BadOverview { width, height } => write!(
+                f,
+                "the overview ({width} x {height}) is not a 2-channel global lat-lon node lattice \
+                 (180k + 1 rows by 360k + 1 columns)"
             ),
         }
     }
@@ -70,11 +92,32 @@ fn wrap_lon(lon_deg: f64) -> f64 {
     (lon_deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
-/// The decoded tiles a region needs, keyed by `(row, col)`. Tiles are shared (`Arc`), so a
-/// caller's tile cache can hand them over without copying.
+/// The decoded tiles a region needs, keyed by `(row, col)`, and the global overview. Grids are
+/// shared (`Arc`), so a caller's cache can hand them over without copying.
 #[derive(Clone, Debug, Default)]
 pub struct TileSet {
     tiles: HashMap<(u8, u8), Arc<Grid>>,
+    overview: Option<Arc<Grid>>,
+}
+
+/// Bilinear channel 0 and nearest channel 1 (a Köppen code) of a lat-lon grid at fractional
+/// row `i` and column `j`, both already clamped to the grid.
+fn sample_nodes(grid: &Grid, i: f64, j: f64) -> (f32, u8) {
+    let (last_i, last_j) = (f64::from(grid.height - 1), f64::from(grid.width - 1));
+    let (i0, j0) = (i.floor().min(last_i - 1.0), j.floor().min(last_j - 1.0));
+    let (fi, fj) = ((i - i0) as f32, (j - j0) as f32);
+    let (i0, j0) = (i0 as u32, j0 as u32);
+    let e = |r: u32, c: u32| grid.texel_f32(0, r, c, 0);
+    let top = e(i0, j0) + (e(i0, j0 + 1) - e(i0, j0)) * fj;
+    let bottom = e(i0 + 1, j0) + (e(i0 + 1, j0 + 1) - e(i0 + 1, j0)) * fj;
+    let elevation = top + (bottom - top) * fi;
+    let code = grid.texel_f32(0, i.round() as u32, j.round() as u32, 1);
+    let code = if (0.0..=30.0).contains(&code) {
+        code.round() as u8
+    } else {
+        0
+    };
+    (elevation, code)
 }
 
 impl TileSet {
@@ -116,10 +159,57 @@ impl TileSet {
         self.tiles.is_empty()
     }
 
-    /// Every tile a square field of side `size_m` around `frame`'s centre can read, widened by
-    /// [`TILE_MARGIN_M`] on every side, sorted. The square's latitude and longitude extremes lie
-    /// on its boundary unless it contains a pole, in which case it takes whole rows of tiles.
-    pub fn needed_for(frame: &RegionFrame, size_m: f64) -> Vec<(u8, u8)> {
+    /// Sets the overview after checking that it is a 2-channel `LatLon` node lattice covering
+    /// the globe with both edges: `180k + 1` rows by `360k + 1` columns (k = 12 in the bake).
+    pub fn set_overview(&mut self, grid: impl Into<Arc<Grid>>) -> Result<(), TileError> {
+        let grid = grid.into();
+        let (w, h) = (grid.width, grid.height);
+        let per_deg = h.saturating_sub(1) / 180;
+        let ok = grid.kind == GridKind::LatLon
+            && grid.channels == 2
+            && per_deg >= 1
+            && h == 180 * per_deg + 1
+            && w == 360 * per_deg + 1;
+        if !ok {
+            return Err(TileError::BadOverview {
+                width: w,
+                height: h,
+            });
+        }
+        self.overview = Some(grid);
+        Ok(())
+    }
+
+    pub fn has_overview(&self) -> bool {
+        self.overview.is_some()
+    }
+
+    /// The overview's node spacing in metres (along a meridian), if there is one.
+    pub fn overview_spacing_m(&self) -> Option<f64> {
+        let per_deg = f64::from((self.overview.as_ref()?.height - 1) / 180);
+        Some(EARTH_RADIUS_M * (1.0f64).to_radians() / per_deg)
+    }
+
+    /// Tiles an inner field around `frame` needs that are not loaded. Empty means the inner field
+    /// reads tiles everywhere; otherwise generation falls back (overview, then cube frames).
+    pub fn missing_for(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+        TileSet::needed_for(frame)
+            .into_iter()
+            .filter(|&(r, c)| !self.contains(r, c))
+            .collect()
+    }
+
+    /// Every tile the inner field ([`REGION_SIZE_M`]) around `frame` can read, widened by
+    /// [`TILE_MARGIN_M`] on every side, sorted. The apron reads only the overview. At most one
+    /// row of 72 tiles when the field contains a pole, and fewer elsewhere.
+    pub fn needed_for(frame: &RegionFrame) -> Vec<(u8, u8)> {
+        Self::covering(frame, REGION_SIZE_M)
+    }
+
+    /// The tiles a square of side `size_m` (plus the margin) touches. The square's latitude and
+    /// longitude extremes lie on its boundary unless it contains a pole, in which case it takes
+    /// whole rows of tiles.
+    fn covering(frame: &RegionFrame, size_m: f64) -> Vec<(u8, u8)> {
         let half = size_m / 2.0 + TILE_MARGIN_M;
         let basis = frame.basis();
         let (_, centre_lon) = geo_to_latlon(render_to_geo(RenderDir(basis.center)));
@@ -197,20 +287,35 @@ impl TileSet {
         let last = f64::from(TILE_SAMPLES - 1);
         let i = ((lat_n - lat) * PER_DEG).clamp(0.0, last);
         let j = ((lon - lon_w) * PER_DEG).clamp(0.0, last);
-        let (i0, j0) = (i.floor().min(last - 1.0), j.floor().min(last - 1.0));
-        let (fi, fj) = ((i - i0) as f32, (j - j0) as f32);
-        let (i0, j0) = (i0 as u32, j0 as u32);
-        let e = |r: u32, c: u32| grid.texel_f32(0, r, c, 0);
-        let top = e(i0, j0) + (e(i0, j0 + 1) - e(i0, j0)) * fj;
-        let bottom = e(i0 + 1, j0) + (e(i0 + 1, j0 + 1) - e(i0 + 1, j0)) * fj;
-        let elevation = top + (bottom - top) * fi;
-        let code = grid.texel_f32(0, i.round() as u32, j.round() as u32, 1);
-        let code = if (0.0..=30.0).contains(&code) {
-            code.round() as u8
-        } else {
-            0
-        };
-        Some((elevation, code))
+        Some(sample_nodes(grid, i, j))
+    }
+
+    /// [`sample`](Self::sample) from the overview, or `None` without one.
+    pub fn sample_overview(&self, lat_deg: f64, lon_deg: f64) -> Option<(f32, u8)> {
+        if !(lat_deg.is_finite() && lon_deg.is_finite()) {
+            return None;
+        }
+        let grid = self.overview.as_ref()?;
+        let per_deg = f64::from((grid.height - 1) / 180);
+        let i = (90.0 - lat_deg.clamp(-90.0, 90.0)) * per_deg;
+        let j = (wrap_lon(lon_deg) + 180.0) * per_deg;
+        Some(sample_nodes(
+            grid,
+            i.clamp(0.0, f64::from(grid.height - 1)),
+            j.clamp(0.0, f64::from(grid.width - 1)),
+        ))
+    }
+
+    /// The lookup order of a level: [`SourceLevel::Tiles`] reads a loaded tile, else the
+    /// overview; [`SourceLevel::Overview`] reads only the overview. `None` means the caller
+    /// falls back to its cube frames.
+    pub fn lookup(&self, lat_deg: f64, lon_deg: f64, level: SourceLevel) -> Option<(f32, u8)> {
+        match level {
+            SourceLevel::Tiles => self
+                .sample(lat_deg, lon_deg)
+                .or_else(|| self.sample_overview(lat_deg, lon_deg)),
+            SourceLevel::Overview => self.sample_overview(lat_deg, lon_deg),
+        }
     }
 }
 
@@ -333,12 +438,17 @@ pub(crate) mod tests {
             (90.0, 0.0),
         ];
         for (lat, lon) in cases {
+            // The inner field through `needed_for`; the apron-sized square through the same
+            // covering rule (the apron itself reads only the overview).
             for size in [
                 crate::worldgen::REGION_SIZE_M,
                 crate::worldgen::APRON_SIZE_M,
             ] {
                 let frame = frame_at(lat, lon);
-                let needed = TileSet::needed_for(&frame, size);
+                let needed = TileSet::covering(&frame, size);
+                if size == crate::worldgen::REGION_SIZE_M {
+                    assert_eq!(needed, TileSet::needed_for(&frame));
+                }
                 let half = size / 2.0 + TILE_MARGIN_M * 0.99;
                 let n = 80;
                 for a in 0..=n {
@@ -356,8 +466,119 @@ pub(crate) mod tests {
             }
         }
         // A mid-latitude inner field spans at most two tiles per axis.
-        assert!(
-            TileSet::needed_for(&frame_at(37.0, -122.0), crate::worldgen::REGION_SIZE_M).len() <= 4
+        assert!(TileSet::needed_for(&frame_at(37.0, -122.0)).len() <= 4);
+    }
+
+    #[test]
+    fn needed_tiles_stay_bounded_near_the_poles() {
+        let mut worst = 0;
+        for k in 0..=80 {
+            let lat = 80.0 + f64::from(k) * 0.125;
+            for lon in [-180.0, -97.0, 0.0, 33.0, 179.9] {
+                for sign in [1.0, -1.0] {
+                    let n = TileSet::needed_for(&frame_at(sign * lat, lon)).len();
+                    worst = worst.max(n);
+                }
+            }
+        }
+        assert!(worst <= 80, "{worst} tiles");
+        assert_eq!(TileSet::needed_for(&frame_at(90.0, 0.0)).len(), 72);
+    }
+
+    /// A global overview at `per_deg` nodes per degree, from a function of (lat, lon).
+    pub(crate) fn overview_from(per_deg: u32, f: impl Fn(f64, f64) -> (f32, u8)) -> Grid {
+        let (h, w) = (180 * per_deg + 1, 360 * per_deg + 1);
+        let mut data = Vec::with_capacity((h * w * 4) as usize);
+        for i in 0..h {
+            for j in 0..w {
+                let lat = 90.0 - f64::from(i) / f64::from(per_deg);
+                let lon = -180.0 + f64::from(j) / f64::from(per_deg);
+                let (e, k) = f(lat, if j == w - 1 { -180.0 } else { lon });
+                data.extend_from_slice(&half::f16::from_f32(e).to_le_bytes());
+                data.extend_from_slice(&half::f16::from_f32(f32::from(k)).to_le_bytes());
+            }
+        }
+        Grid {
+            kind: GridKind::LatLon,
+            dtype: DType::F16,
+            channels: 2,
+            width: w,
+            height: h,
+            data,
+        }
+    }
+
+    #[test]
+    fn overview_shape_is_checked() {
+        let mut set = TileSet::new();
+        assert!(!set.has_overview() && set.overview_spacing_m().is_none());
+        let mut bad = overview_from(1, |_, _| (0.0, 0));
+        bad.width -= 1;
+        assert_eq!(
+            set.set_overview(bad),
+            Err(TileError::BadOverview {
+                width: 360,
+                height: 181
+            })
         );
+        set.set_overview(overview_from(2, |_, _| (0.0, 0))).unwrap();
+        let spacing = set.overview_spacing_m().unwrap();
+        assert!((spacing - 55_597.0).abs() < 1.0, "{spacing}");
+        // The bake's 5' grid: 2161 x 4321 and about 9.27 km.
+        let per_deg = (2161 - 1) / 180;
+        assert_eq!((180 * per_deg + 1, 360 * per_deg + 1), (2161, 4321));
+    }
+
+    #[test]
+    fn overview_is_bilinear_and_wraps() {
+        // Elevation linear in latitude, plus a longitude term that matches across 180.
+        let f = |lat: f64, lon: f64| {
+            (
+                (lat * 4.0 + lon.abs()) as f32,
+                if lat > 0.0 { 5 } else { 6 },
+            )
+        };
+        let mut set = TileSet::new();
+        set.set_overview(overview_from(4, f)).unwrap();
+        let (e, k) = set.sample_overview(10.1, 20.05).unwrap();
+        assert!((e - (10.1 * 4.0 + 20.05) as f32).abs() < 0.05, "{e}");
+        assert_eq!(k, 5);
+        assert_eq!(set.sample_overview(-30.0, 0.0).unwrap().1, 6);
+        let west = set.sample_overview(3.0, 179.99).unwrap().0;
+        let east = set.sample_overview(3.0, -179.99).unwrap().0;
+        assert!((west - east).abs() < 0.1, "{west} {east}");
+        assert!(
+            set.sample_overview(90.0, 0.0).is_some() && set.sample_overview(-90.0, 7.0).is_some()
+        );
+    }
+
+    #[test]
+    fn lookup_reads_tiles_then_the_overview() {
+        let mut set = TileSet::new();
+        set.insert(16, 37, tile_from(16, 37, |_, _| (100.0, 3)))
+            .unwrap(); // 5..10 N, 5..10 E
+        assert_eq!(set.lookup(7.0, 7.0, SourceLevel::Tiles), Some((100.0, 3)));
+        assert_eq!(set.lookup(7.0, 7.0, SourceLevel::Overview), None);
+        assert_eq!(
+            set.lookup(12.0, 7.0, SourceLevel::Tiles),
+            None,
+            "no tile, no overview"
+        );
+        set.set_overview(overview_from(1, |_, _| (300.0, 9)))
+            .unwrap();
+        assert_eq!(set.lookup(7.0, 7.0, SourceLevel::Tiles), Some((100.0, 3)));
+        assert_eq!(
+            set.lookup(7.0, 7.0, SourceLevel::Overview),
+            Some((300.0, 9))
+        );
+        assert_eq!(set.lookup(12.0, 7.0, SourceLevel::Tiles), Some((300.0, 9)));
+        // Missing inner tiles are what makes a region fall back.
+        let frame = frame_at(7.0, 7.0);
+        assert!(
+            set.missing_for(&frame).is_empty(),
+            "{:?}",
+            set.missing_for(&frame)
+        );
+        assert!(!TileSet::new().missing_for(&frame).is_empty());
     }
 }

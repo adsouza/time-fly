@@ -3,7 +3,7 @@
 //! `h = coastline_clamp(coarse + D, corners)` at every texel, where:
 //! - `coarse` is the coarse field upsampled bilinearly from a lattice of coarse nodes;
 //! - `D` is detail noise seeded by the texel's canonical crust-space position (its
-//!   [`LatticeKey`]), with only the octaves finer than the source data;
+//!   [`LatticeKey`](crate::worldgen::coarse::LatticeKey)), with only the octaves finer than the source data;
 //! - `corners` are the coarse field at `(±spacing/2, ±spacing/2)` along the texel's own east and
 //!   north. Where all four agree on land or sea, `h` keeps their side of sea level
 //!   ([`coastline_clamp`]), so detail draws fractal coastlines only inside the data's own
@@ -11,10 +11,20 @@
 //!
 //! **The coarse lattice is global, not the region's.** Nodes are the texel centres of a cube map
 //! whose face-centre texel spans `max(spacing/4, texel)`, and upsampling is
-//! [`bilinear_taps`] on that cube. Every texel is therefore a pure function of its era-frame
+//! [`bilinear_taps`](crate::cube::bilinear_taps) on that cube. Every texel is therefore a pure function of its era-frame
 //! direction, the snapshot field, the seed and the field's resolution: overlapping regions agree
 //! exactly, and a grid texel equals [`RegionGenerator::sample_point`] at its direction. A region
-//! only decides which nodes `new` precomputes; any other node is computed on demand.
+//! only decides which nodes it precomputes; any other node is computed on demand.
+//!
+//! **Source levels (ruling R7).** The apron's lattice reads present-day data only from the
+//! global overview (never tiles), so apron texels stay a function of direction whatever tiles
+//! are loaded. A separate inner lattice reads tiles. When both fields share one lattice (the
+//! source is coarser than the apron's texels, as in deep time) it is the overview-level one.
+//!
+//! **Incremental construction (ruling R8).** [`RegionPrep`] does the precompute in bounded
+//! steps: planning which nodes the region touches, sampling them, the apron's coarse land mask,
+//! and finally the coast-distance transform in a step of its own. [`RegionGenerator::new`] is
+//! all of it at once.
 //!
 //! Why a lattice at all: the deep source is about 110 km, and resolving plates (every candidate
 //! plate's rotation, footprint and endpoint samples) at every 293 m texel would be wasted work.
@@ -22,20 +32,25 @@
 
 use std::ops::Range;
 
-use bevy_math::DVec3;
 use tracing::instrument;
 
-use crate::cube::{CubeFace, bilinear_taps, texel_center_dir};
 use crate::deep_time::YearsBp;
 use crate::geo::RenderDir;
 use crate::worldgen::biome::{
     BiomeClass, VegetationEra, biome_from_koppen, effective_biome, snowline_m, vegetation_era,
     zonal_biome,
 };
-use crate::worldgen::coarse::{CoarseField, CoarseSample, KeyKind, LatticeKey};
+use crate::worldgen::coarse::CoarseField;
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
-use crate::worldgen::noise::{fbm, hash3, ridged};
+use crate::worldgen::tiles::SourceLevel;
 use crate::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
+
+mod detail;
+mod lattice;
+
+pub use detail::coastline_clamp;
+use detail::{Detail, octaves_for, smoothstep};
+use lattice::{Coarse, Lattice};
 
 /// Surface byte 3 for a texel in the shoreline band (Task 8 tints Barren-era shores with it).
 pub const SURFACE_SHORE: u8 = 255;
@@ -43,28 +58,8 @@ pub const SURFACE_SHORE: u8 = 255;
 pub const SHORE_BAND_M: f64 = 15.0;
 /// Coast distance where the apron holds no coast at all.
 pub const COAST_UNKNOWN_KM: f32 = 1.0e6;
-
-/// Detail relief per metre of source spacing: the first octave's amplitude on plains (scaled
-/// down on low ground and up to full at [`PLAINS_FULL_M`]) and in mountains.
-const PLAINS_RELIEF: f64 = 0.004;
-const PLAINS_FULL_M: f64 = 500.0;
-const PLAINS_FLOOR: f64 = 0.1;
-const MOUNTAIN_RELIEF: f64 = 0.02;
-/// Ridged octaves fade in between these coarse elevations, or these coarse gradients (on land).
-const MOUNTAIN_START_M: f64 = 1000.0;
-const MOUNTAIN_FULL_M: f64 = 2000.0;
-const SLOPE_START: f64 = 0.01;
-const SLOPE_FULL: f64 = 0.03;
-/// The long-run mean of [`ridged`] (0.678 over 400,000 random points on the sphere, the same for
-/// any octave count), removed so detail does not shift the coarse trend.
-const RIDGED_MEAN: f64 = 0.678;
 /// Snow fades in over this many metres either side of the snowline.
 const SNOW_RAMP_M: f64 = 150.0;
-const MAX_OCTAVES: u32 = 16;
-
-const PLATE_SALT: u32 = 0x9E37_79B9;
-const ERA_SALT: u32 = 0x85EB_CA6B;
-const RIDGE_SALT: u32 = 0xC2B2_AE35;
 
 /// Everything that decides a region: its centre, snapshot, seed and grid resolutions. Sizes are
 /// [`REGION_SIZE_M`] and [`APRON_SIZE_M`]; resolutions below 2 are raised to 2.
@@ -179,252 +174,51 @@ pub struct FieldRows {
     pub surface: Vec<[u8; 4]>,
 }
 
-/// The coastline rule (design spec §5.3): where all four corner samples are land the height
-/// stays at least +1 m; where all are sea, at most −1 m; mixed corners leave it unchanged.
-pub fn coastline_clamp(h_m: f64, corners_m: [f64; 4]) -> f64 {
-    if corners_m.iter().all(|&c| c > 0.0) {
-        h_m.max(1.0)
-    } else if corners_m.iter().all(|&c| c < 0.0) {
-        h_m.min(-1.0)
-    } else {
-        h_m
-    }
-}
-
-fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// A coarse node: elevation, ice (quantised to bytes, as the output is), Köppen code (0 = none)
-/// and its key's kind. Precomputed and on-demand nodes go through the same quantisation, so a
-/// texel never depends on which nodes a region happened to precompute.
-#[derive(Copy, Clone, Debug, PartialEq)]
-struct Node {
-    elevation_m: f32,
-    ice: u8,
-    koppen: u8,
-    kind: KeyKind,
-}
-
-impl Node {
-    fn from_sample(s: CoarseSample) -> Node {
-        let e = s.elevation_m;
-        // Never let a bad source value become NaN terrain: NaN is sea, infinities clamp.
-        let e = if e.is_nan() {
-            -1.0
-        } else {
-            e.clamp(-12_000.0, 12_000.0)
-        };
-        let ice = if s.ice.is_finite() {
-            s.ice.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        Node {
-            elevation_m: e as f32,
-            ice: (ice * 255.0).round() as u8,
-            koppen: s.koppen.unwrap_or(0),
-            kind: s.lattice.kind(),
-        }
-    }
-}
-
-/// A stored node: 8 bytes, with the key kind as an index into [`Lattice::kinds`]. A recent
-/// region near a cube corner precomputes about 4 million nodes.
-#[derive(Copy, Clone, Debug)]
-struct PackedNode {
-    elevation_m: f32,
-    ice: u8,
-    koppen: u8,
-    kind: u16,
-}
-
-/// Precomputed nodes of one cube face, over a column/row rectangle.
-#[derive(Clone, Debug)]
-struct Block {
-    c0: u32,
-    r0: u32,
-    w: u32,
-    h: u32,
-    nodes: Vec<PackedNode>,
-}
-
-impl Block {
-    fn get(&self, col: u32, row: u32) -> Option<PackedNode> {
-        let (c, r) = (col.wrapping_sub(self.c0), row.wrapping_sub(self.r0));
-        (c < self.w && r < self.h).then(|| self.nodes[(r * self.w + c) as usize])
-    }
-}
-
-/// The interpolated coarse field at a direction.
-struct Coarse {
-    elevation_m: f64,
-    ice: f64,
-    /// The highest-weight tap's key kind: the texel's plate.
-    kind: KeyKind,
-    /// The highest-weight tap with a Köppen code, if any.
-    koppen: Option<u8>,
-}
-
-/// The global coarse lattice of one cube size, with the nodes a region needs precomputed.
-#[derive(Clone, Debug)]
-struct Lattice {
-    n: u32,
-    blocks: [Option<Block>; 6],
-    /// The distinct key kinds of the stored nodes.
-    kinds: Vec<KeyKind>,
-}
-
-impl Lattice {
-    /// Precomputes every node the square of half-side `half_m` around the frame can tap.
-    fn build<F: CoarseField>(field: &F, n: u32, basis: &FrameBasis, half_m: f64) -> Lattice {
-        const POINTS: u32 = 128;
-        let mut bbox: [Option<[u32; 4]>; 6] = [None; 6];
-        for a in 0..=POINTS {
-            for b in 0..=POINTS {
-                let x = -half_m + 2.0 * half_m * f64::from(a) / f64::from(POINTS);
-                let z = -half_m + 2.0 * half_m * f64::from(b) / f64::from(POINTS);
-                for ((face, col, row), _) in bilinear_taps(basis.local_to_dir(x, z), n) {
-                    let bb = &mut bbox[face as usize];
-                    *bb = Some(match *bb {
-                        None => [col, col, row, row],
-                        Some([c0, c1, r0, r1]) => {
-                            [c0.min(col), c1.max(col), r0.min(row), r1.max(row)]
-                        }
-                    });
-                }
-            }
-        }
-        // Between sample points the footprint can reach a little further: by one point step,
-        // in nodes as small as a cube corner's (under half a face-centre node).
-        let node_m = 2.0 * EARTH_RADIUS_M / f64::from(n);
-        let step_m = 2.0 * half_m / f64::from(POINTS);
-        let grow = (step_m / (0.45 * node_m)).ceil() as u32 + 2;
-        let mut blocks: [Option<Block>; 6] = Default::default();
-        let mut kinds: Vec<KeyKind> = Vec::new();
-        for face in CubeFace::ALL {
-            let Some([c0, c1, r0, r1]) = bbox[face as usize] else {
-                continue;
-            };
-            let (c0, r0) = (c0.saturating_sub(grow), r0.saturating_sub(grow));
-            let (c1, r1) = ((c1 + grow).min(n - 1), (r1 + grow).min(n - 1));
-            let (w, h) = (c1 - c0 + 1, r1 - r0 + 1);
-            let mut nodes = Vec::with_capacity((w * h) as usize);
-            for row in r0..=r1 {
-                for col in c0..=c1 {
-                    let node = Node::from_sample(field.sample(texel_center_dir(face, col, row, n)));
-                    // Kinds repeat in long runs (one plate, or geographic everywhere).
-                    let kind = match kinds.iter().rposition(|&k| k == node.kind) {
-                        Some(i) => i,
-                        None => {
-                            kinds.push(node.kind);
-                            kinds.len() - 1
-                        }
-                    };
-                    nodes.push(PackedNode {
-                        elevation_m: node.elevation_m,
-                        ice: node.ice,
-                        koppen: node.koppen,
-                        kind: u16::try_from(kind).expect("fewer than 65,536 plates"),
-                    });
-                }
-            }
-            blocks[face as usize] = Some(Block {
-                c0,
-                r0,
-                w,
-                h,
-                nodes,
-            });
-        }
-        Lattice { n, blocks, kinds }
-    }
-
-    fn node<F: CoarseField>(&self, field: &F, face: CubeFace, col: u32, row: u32) -> Node {
-        match self.blocks[face as usize]
-            .as_ref()
-            .and_then(|b| b.get(col, row))
-        {
-            Some(p) => Node {
-                elevation_m: p.elevation_m,
-                ice: p.ice,
-                koppen: p.koppen,
-                kind: self.kinds[p.kind as usize],
-            },
-            None => Node::from_sample(field.sample(texel_center_dir(face, col, row, self.n))),
-        }
-    }
-
-    fn interp<F: CoarseField>(&self, field: &F, dir: RenderDir) -> Coarse {
-        let (mut e, mut ice) = (0.0, 0.0);
-        let (mut best_w, mut kind) = (-1.0, KeyKind::EraFixed);
-        let (mut koppen_w, mut koppen) = (-1.0, None);
-        for ((face, col, row), w) in bilinear_taps(dir, self.n) {
-            let node = self.node(field, face, col, row);
-            e += w * f64::from(node.elevation_m);
-            ice += w * f64::from(node.ice) / 255.0;
-            if w > best_w {
-                best_w = w;
-                kind = node.kind;
-            }
-            if node.koppen != 0 && w > koppen_w {
-                koppen_w = w;
-                koppen = Some(node.koppen);
-            }
-        }
-        Coarse {
-            elevation_m: e,
-            ice,
-            kind,
-            koppen,
-        }
-    }
-
-    fn elevation<F: CoarseField>(&self, field: &F, dir: RenderDir) -> f64 {
-        bilinear_taps(dir, self.n)
-            .iter()
-            .map(|&((face, col, row), w)| {
-                w * f64::from(self.node(field, face, col, row).elevation_m)
-            })
-            .sum()
-    }
-}
-
 /// Per-field constants.
 #[derive(Copy, Clone, Debug)]
 struct Layer {
     res: u32,
     size_m: f64,
-    /// Index into `RegionGenerator::lattices`.
+    /// Index into the lattices.
     lattice: usize,
     octaves: u32,
 }
 
-/// Generates a region's fields from a coarse field. `new` precomputes the coarse lattice nodes,
-/// their plates and the coast distance; [`rows`](Self::rows) then produces any block of rows of
-/// either field, independently and in any order (Task 5 runs blocks in parallel on native and
-/// time-boxed on the web); [`assemble`](Self::assemble) joins blocks into a [`RegionGrid`].
-/// [`generate_rows`](Self::generate_rows) and [`finish`](Self::finish) are the sequential
-/// convenience: inner rows first, then the apron.
-pub struct RegionGenerator<'a, F: CoarseField> {
+/// Where a [`RegionPrep`] is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Planning which nodes lattice `i` touches.
+    Plan(usize),
+    /// Sampling lattice `i`'s nodes.
+    Fill(usize),
+    /// The apron's coarse land mask, texel by texel.
+    Mask,
+    /// The coast-distance transform, in a step of its own.
+    Chamfer,
+    Done,
+}
+
+/// A region generator under construction (ruling R8). [`new`](Self::new) samples nothing;
+/// [`step`](Self::step) does at most `max_nodes` units of work (one unit is a planning point, a
+/// lattice node or an apron mask texel), except the final coast-distance step, which runs alone;
+/// [`finish`](Self::finish) completes whatever is left. The result is identical for any step
+/// sizes.
+pub struct RegionPrep<'a, F: CoarseField> {
     spec: RegionSpec,
     field: &'a F,
     basis: FrameBasis,
     spacing_m: f64,
     lattices: Vec<Lattice>,
     layers: [Layer; 2],
-    /// Distance to the coast (km) over the apron's texels, from its coarse land mask.
-    coast_km: Vec<f32>,
-    era: VegetationEra,
-    era_fixed_seed: u32,
-    next_row: [u32; 2],
-    done: [Vec<FieldRows>; 2],
+    phase: Phase,
+    /// The chamfer's input: 0 at sea, infinity on land, filled texel by texel.
+    coast: Vec<f32>,
+    units_done: u64,
 }
 
-impl<'a, F: CoarseField> RegionGenerator<'a, F> {
-    #[instrument(level = "debug", skip_all, fields(inner_res = spec.inner_res, apron_res = spec.apron_res))]
-    pub fn new(spec: RegionSpec, field: &'a F) -> RegionGenerator<'a, F> {
+impl<'a, F: CoarseField> RegionPrep<'a, F> {
+    /// Sizes the lattices. Cheap: no field samples.
+    pub fn new(spec: RegionSpec, field: &'a F) -> RegionPrep<'a, F> {
         let spec = RegionSpec {
             inner_res: spec.inner_res.max(2),
             apron_res: spec.apron_res.max(2),
@@ -438,22 +232,17 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
             let n = (2.0 * EARTH_RADIUS_M / lattice_m)
                 .ceil()
                 .clamp(1.0, f64::from(1u32 << 24)) as u32;
-            let octaves = if spacing_m >= 2.0 * texel_m {
-                ((spacing_m / (2.0 * texel_m)).log2().floor() as u32 + 1).min(MAX_OCTAVES)
-            } else {
-                0
-            };
             // Corners reach half a spacing past the edge; taps one node beyond that.
             let half_m = size_m / 2.0 + spacing_m / 2.0 + 2.0 * lattice_m;
-            (n, octaves, half_m)
+            (n, octaves_for(spacing_m, texel_m), half_m)
         };
         let (apron_n, apron_octaves, apron_half) = layer_params(spec.apron_res, APRON_SIZE_M);
         let (inner_n, inner_octaves, inner_half) = layer_params(spec.inner_res, REGION_SIZE_M);
-        let mut lattices = vec![Lattice::build(field, apron_n, &basis, apron_half)];
+        let mut lattices = vec![Lattice::new(apron_n, SourceLevel::Overview, apron_half)];
         let inner_lattice = if inner_n == apron_n {
             0
         } else {
-            lattices.push(Lattice::build(field, inner_n, &basis, inner_half));
+            lattices.push(Lattice::new(inner_n, SourceLevel::Tiles, inner_half));
             1
         };
         let layers = [
@@ -470,25 +259,141 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
                 octaves: apron_octaves,
             },
         ];
-        let coast_km = coast_distance_km(field, &lattices[0], &basis, spec.apron_res);
-        let age_bits = spec.snapshot.0.to_bits();
-        let era_fixed_seed = hash3(
-            [age_bits as i32, (age_bits >> 32) as i32, 0],
-            spec.seed ^ ERA_SALT,
-        );
-        RegionGenerator {
+        RegionPrep {
             spec,
             field,
             basis,
             spacing_m,
             lattices,
             layers,
-            coast_km,
+            phase: Phase::Plan(0),
+            coast: Vec::with_capacity((spec.apron_res * spec.apron_res) as usize),
+            units_done: 0,
+        }
+    }
+
+    /// Does up to `max_nodes` units of work (at least one); returns true when construction is
+    /// complete. The coast-distance transform runs in a step of its own, whatever `max_nodes`.
+    pub fn step(&mut self, max_nodes: u32) -> bool {
+        let start = max_nodes.max(1);
+        let mut budget = start;
+        let done = self.run(&mut budget);
+        self.units_done += u64::from(start - budget);
+        done
+    }
+
+    fn run(&mut self, budget: &mut u32) -> bool {
+        let mut used_any = false;
+        while *budget > 0 {
+            match self.phase {
+                Phase::Plan(i) => {
+                    let used = self.lattices[i].plan(&self.basis, *budget);
+                    *budget -= used;
+                    used_any |= used > 0;
+                    if self.lattices[i].planned() {
+                        self.phase = if i + 1 < self.lattices.len() {
+                            Phase::Plan(i + 1)
+                        } else {
+                            Phase::Fill(0)
+                        };
+                    }
+                }
+                Phase::Fill(i) => {
+                    let used = self.lattices[i].fill(self.field, *budget);
+                    *budget -= used;
+                    used_any |= used > 0;
+                    if self.lattices[i].filled() {
+                        self.phase = if i + 1 < self.lattices.len() {
+                            Phase::Fill(i + 1)
+                        } else {
+                            Phase::Mask
+                        };
+                    }
+                }
+                Phase::Mask => {
+                    let res = self.spec.apron_res;
+                    let total = (res * res) as usize;
+                    while *budget > 0 && self.coast.len() < total {
+                        let k = self.coast.len() as u32;
+                        let (x, z) = local_of(res, APRON_SIZE_M, k / res, k % res);
+                        let dir = self.basis.local_to_dir(x, z);
+                        let land = self.lattices[0].elevation(self.field, dir) > 0.0;
+                        self.coast.push(if land { f32::INFINITY } else { 0.0 });
+                        *budget -= 1;
+                        used_any = true;
+                    }
+                    if self.coast.len() == total {
+                        self.phase = Phase::Chamfer;
+                    }
+                }
+                Phase::Chamfer => {
+                    if used_any {
+                        return false;
+                    }
+                    let mask = std::mem::take(&mut self.coast);
+                    self.coast = chamfer_km(mask, self.spec.apron_res);
+                    self.phase = Phase::Done;
+                    return true;
+                }
+                Phase::Done => return true,
+            }
+        }
+        self.phase == Phase::Done
+    }
+
+    /// Work units done so far (planning points, lattice nodes and mask texels): a progress
+    /// measure. The final coast-distance step adds none.
+    pub fn units_done(&self) -> u64 {
+        self.units_done
+    }
+
+    /// Completes any remaining work and returns the generator.
+    #[instrument(level = "debug", skip_all, fields(inner_res = self.spec.inner_res, apron_res = self.spec.apron_res))]
+    pub fn finish(mut self) -> RegionGenerator<'a, F> {
+        while !self.step(u32::MAX) {}
+        let spec = self.spec;
+        RegionGenerator {
+            spec,
+            field: self.field,
+            basis: self.basis,
+            spacing_m: self.spacing_m,
+            lattices: self.lattices,
+            layers: self.layers,
+            coast_km: self.coast,
             era: vegetation_era(spec.snapshot),
-            era_fixed_seed,
+            detail: Detail::new(self.spacing_m, spec.seed, spec.snapshot),
             next_row: [0, 0],
             done: [Vec::new(), Vec::new()],
         }
+    }
+}
+
+/// Generates a region's fields from a coarse field. Built by [`RegionPrep`] (or `new`, which is
+/// a whole [`RegionPrep`] at once): the coarse lattice nodes, their plates and the coast
+/// distance are precomputed. [`rows`](Self::rows) then produces any block of rows of either
+/// field, independently and in any order (Task 5 runs blocks in parallel on native and
+/// time-boxed on the web); [`assemble`](Self::assemble) joins blocks into a [`RegionGrid`].
+/// [`generate_rows`](Self::generate_rows) and [`finish`](Self::finish) are the sequential
+/// convenience: inner rows first, then the apron.
+pub struct RegionGenerator<'a, F: CoarseField> {
+    spec: RegionSpec,
+    field: &'a F,
+    basis: FrameBasis,
+    spacing_m: f64,
+    lattices: Vec<Lattice>,
+    layers: [Layer; 2],
+    /// Distance to the coast (km) over the apron's texels, from its coarse land mask.
+    coast_km: Vec<f32>,
+    era: VegetationEra,
+    detail: Detail,
+    next_row: [u32; 2],
+    done: [Vec<FieldRows>; 2],
+}
+
+impl<'a, F: CoarseField> RegionGenerator<'a, F> {
+    /// Builds the generator in one go: [`RegionPrep`] run to completion.
+    pub fn new(spec: RegionSpec, field: &'a F) -> RegionGenerator<'a, F> {
+        RegionPrep::new(spec, field).finish()
     }
 
     pub fn spec(&self) -> &RegionSpec {
@@ -626,58 +531,12 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
         let gz = ((c[0] + c[1]) - (c[2] + c[3])) / (2.0 * s);
         let slope = gx.hypot(gz);
         let key = self.field.lattice_key(dir, coarse.kind);
-        let detail = self.detail_m(&key, coarse.elevation_m, slope, layer.octaves);
+        let detail = self
+            .detail
+            .detail_m(&key, coarse.elevation_m, slope, layer.octaves);
         let h = coastline_clamp(coarse.elevation_m + detail, c);
         let h = if h.is_finite() { h } else { -1.0 };
         (h as f32, self.surface(dir, h, &coarse))
-    }
-
-    /// The detail noise `D` (m) for a texel: ridged octaves in mountains (high or steep land),
-    /// fBm elsewhere, from the source spacing down to twice the texel.
-    fn detail_m(&self, key: &LatticeKey, coarse_m: f64, slope: f64, octaves: u32) -> f64 {
-        if octaves == 0 {
-            return 0.0;
-        }
-        let (p, seed) = self.noise_input(key);
-        let s = self.spacing_m;
-        // Raw octave sum: fbm and ridged normalise by the total amplitude, which differs between
-        // octave counts; undoing it keeps the apron's octaves a prefix of the inner field's.
-        let total = 2.0 * (1.0 - 0.5f64.powi(octaves as i32));
-        let mountain = if coarse_m > 0.0 {
-            smoothstep(MOUNTAIN_START_M, MOUNTAIN_FULL_M, coarse_m).max(smoothstep(
-                SLOPE_START,
-                SLOPE_FULL,
-                slope,
-            ))
-        } else {
-            0.0
-        };
-        let mut d = 0.0;
-        if mountain < 1.0 {
-            let amp = PLAINS_RELIEF * s * (coarse_m.abs() / PLAINS_FULL_M).clamp(PLAINS_FLOOR, 1.0);
-            let n = f64::from(fbm(p, s, octaves, 2.0, 0.5, seed)) * total;
-            d += (1.0 - mountain) * amp * n;
-        }
-        if mountain > 0.0 {
-            let n = (f64::from(ridged(p, s, octaves, seed ^ RIDGE_SALT)) - RIDGED_MEAN) * total;
-            d += mountain * MOUNTAIN_RELIEF * s * n;
-        }
-        d
-    }
-
-    /// Noise position (m on the sphere) and seed of a lattice key.
-    fn noise_input(&self, key: &LatticeKey) -> (DVec3, u32) {
-        match *key {
-            LatticeKey::Geographic(v) => (v.normalize() * EARTH_RADIUS_M, self.spec.seed),
-            LatticeKey::Tracked {
-                plate_id,
-                plate_fixed,
-            } => (
-                plate_fixed.normalize() * EARTH_RADIUS_M,
-                hash3([plate_id.0 as i32, 0, 0], self.spec.seed ^ PLATE_SALT),
-            ),
-            LatticeKey::EraFixed(v) => (v.normalize() * EARTH_RADIUS_M, self.era_fixed_seed),
-        }
     }
 
     fn surface(&self, dir: RenderDir, h: f64, coarse: &Coarse) -> [u8; 4] {
@@ -735,25 +594,15 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
     }
 }
 
-/// A two-pass chamfer distance transform (weights 1 and √2) over the apron's coarse land mask:
-/// each land texel's distance (km) to the nearest sea texel; 0 at sea; [`COAST_UNKNOWN_KM`]
-/// everywhere if the apron holds no sea.
-fn coast_distance_km<F: CoarseField>(
-    field: &F,
-    lattice: &Lattice,
-    basis: &FrameBasis,
-    res: u32,
-) -> Vec<f32> {
+/// A two-pass chamfer distance transform (weights 1 and √2) over the apron's coarse land mask
+/// (`mask`: 0 at sea, infinity on land): each land texel's distance (km) to the nearest sea
+/// texel; 0 at sea; [`COAST_UNKNOWN_KM`] everywhere if the apron holds no sea.
+///
+/// Known limitation, accepted for M2 (ruling R9): the distance comes from each region's own
+/// apron window, so the deep-era zonal biome near a threshold can differ between overlapping
+/// regions. Heights and every other surface byte are window-independent.
+fn chamfer_km(mut d: Vec<f32>, res: u32) -> Vec<f32> {
     let n = res as usize;
-    let mut d = vec![f32::INFINITY; n * n];
-    for row in 0..res {
-        for col in 0..res {
-            let (x, z) = local_of(res, APRON_SIZE_M, row, col);
-            if lattice.elevation(field, basis.local_to_dir(x, z)) <= 0.0 {
-                d[row as usize * n + col as usize] = 0.0;
-            }
-        }
-    }
     let diag = std::f32::consts::SQRT_2;
     let at = |d: &[f32], r: isize, c: isize| -> f32 {
         if r < 0 || c < 0 || r >= n as isize || c >= n as isize {

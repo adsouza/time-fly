@@ -429,12 +429,13 @@ def _bake_staged(raw, out, cube_size, ages_path, paleodem_step_myr, footprint_di
 TILES_MANIFEST_VERSION = 1
 ETOPO_RAW = "etopo/ETOPO_2022_v1_60s_N90W180_surface.nc"
 KOPPEN_RAW = "koppen/koppen_geiger_tif.zip"
+OVERVIEW_NAME = "overview.tfgrid"
 
 
 @traced
 def write_tiles(elev, koppen_codes, out, sources: dict, per_deg: int = tiles.PER_DEG) -> dict:
-    """Write every tile as ``r{row:02}c{col:02}.tfgrid`` plus ``manifest.json`` into ``out`` and
-    return the manifest. ``sources`` maps ``"etopo"`` and ``"koppen"`` to the raw files' SHA-256."""
+    """Write every tile as ``r{row:02}c{col:02}.tfgrid``, the 5 arc-minute ``overview.tfgrid``
+    and ``manifest.json`` into ``out`` and return the manifest. ``sources`` maps ``"etopo"`` and ``"koppen"`` to the raw files' SHA-256."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     entries = []
@@ -445,12 +446,16 @@ def write_tiles(elev, koppen_codes, out, sources: dict, per_deg: int = tiles.PER
         entries.append(
             {"row": row, "col": col, "bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
         )
+    path = out / OVERVIEW_NAME
+    formats.write_tfgrid(path, "latlon", tiles.overview(elev, koppen_codes, per_deg))
+    blob = path.read_bytes()
     manifest = {
         "version": TILES_MANIFEST_VERSION,
         "tile_deg": tiles.TILE_DEG,
         "samples": tiles.TILE_DEG * per_deg + 1,
         "sources": dict(sources),
         "tiles": entries,
+        "overview": {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()},
     }
     staged = out / ".manifest.json.tmp"
     staged.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
@@ -475,11 +480,12 @@ def bake_tiles(raw, out) -> dict:
     manifest = write_tiles(elev, kop, out, sources)
     sizes = [t["bytes"] for t in manifest["tiles"]]
     _log.info(
-        "tiles done in %.1f s: %d tiles, %.2f MB, largest %d bytes",
+        "tiles done in %.1f s: %d tiles, %.2f MB, largest %d bytes; overview %d bytes",
         time.perf_counter() - started,
         len(sizes),
         sum(sizes) / 1e6,
         max(sizes),
+        manifest["overview"]["bytes"],
     )
     return manifest
 

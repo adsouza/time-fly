@@ -1,11 +1,14 @@
 use super::*;
+use crate::cube::{CubeFace, texel_center_dir};
 use crate::formats::Grid;
 use crate::geodynamics::{CrustModel, PlateIndex};
 use crate::globe::{PlateRotations, plate_rotations, rendered_surface};
 use crate::surface::FrameSelection;
+use crate::worldgen::coarse::{CoarseSample, LatticeKey};
 use crate::worldgen::coarse::{DeepField, RecentField, SnapshotField, snapshot_field};
 use crate::worldgen::testkit::*;
 use crate::worldgen::tiles::TileSet;
+use bevy_math::DVec3;
 use proptest::prelude::*;
 
 /// A synthetic coarse field: elevation from a function of the direction, geographic keys.
@@ -188,18 +191,31 @@ fn generator_is_sync_and_send() {
 
 #[test]
 fn overlap_agreement() {
-    let tiles_centre = dir(30.0, 10.0);
     let a = dir(30.0, 10.0);
     // About 100 km east.
     let b = RegionFrame { center: a }.local_to_dir(100_000.0, 0.0);
     let probe = RegionFrame { center: a }.local_to_dir(50_000.0, -20_000.0);
     // Recent: everything, biome included, is a function of the direction.
-    let tiles = flat_tiles(tiles_centre, APRON_SIZE_M + 400_000.0, 350.0, 26);
+    let mut tiles = flat_tiles_around(&[a, b], 350.0, 26);
+    tiles.set_overview(flat_overview(340.0, 26)).unwrap();
     let (era, present) = (ice_frame(380.0, 0.2), ice_frame(350.0, 0.0));
     let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
     let ga = RegionGenerator::new(spec_at(a, 0.021, 33, 17), &recent);
     let gb = RegionGenerator::new(spec_at(b, 0.021, 33, 17), &recent);
     assert_eq!(ga.sample_point(probe), gb.sample_point(probe));
+    // Apron texels too (from the overview), even far apart and with different tiles loaded.
+    let only_a = {
+        let mut t = flat_tiles(a, 350.0, 26);
+        t.set_overview(flat_overview(340.0, 26)).unwrap();
+        t
+    };
+    let recent_a = RecentField::new(&only_a, [&era, &era], 0.0, &present, false).unwrap();
+    let ga = RegionGenerator::new(spec_at(a, 0.021, 33, 17), &recent_a);
+    let far = RegionFrame { center: a }.local_to_dir(900_000.0, 300_000.0);
+    assert_eq!(
+        ga.sample_point_in(FieldKind::Apron, far),
+        gb.sample_point_in(FieldKind::Apron, far)
+    );
     // Deep: heights and every byte but the biome (the zonal rule's coast distance comes from
     // each region's own apron window).
     let field = FnField {
@@ -332,7 +348,8 @@ fn deep_matches_globe() {
 #[test]
 fn recent_adds_ice_delta() {
     let centre = dir(62.0, -45.0);
-    let tiles = flat_tiles(centre, APRON_SIZE_M, 100.0, 29);
+    let mut tiles = flat_tiles(centre, 100.0, 29);
+    tiles.set_overview(flat_overview(100.0, 29)).unwrap();
     let (era, present) = (ice_frame(2100.0, 1.0), ice_frame(100.0, 0.0));
     let field = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
     let grid = generate(spec_at(centre, 0.021, 33, 17), &field);
@@ -341,7 +358,8 @@ fn recent_adds_ice_delta() {
         assert_eq!(s[2], 255, "ice code");
     }
     // A -100 m shelf with the delta +120: +20 m land, clamped to stay land.
-    let tiles = flat_tiles(centre, APRON_SIZE_M, -100.0, 0);
+    let mut tiles = flat_tiles(centre, -100.0, 0);
+    tiles.set_overview(flat_overview(-100.0, 0)).unwrap();
     let (era, present) = (ice_frame(20.0, 0.0), ice_frame(-100.0, 0.0));
     let field = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
     let grid = generate(spec_at(centre, 0.021, 33, 17), &field);
@@ -372,7 +390,8 @@ fn regions_at_awkward_places_are_finite() {
     }
     // Recent eras across the antimeridian (with tiles) and at a pole (no tiles: cube fallback).
     let centre = dir(-12.0, 179.9);
-    let tiles = flat_tiles(centre, APRON_SIZE_M, 40.0, 1);
+    let mut tiles = flat_tiles(centre, 40.0, 1);
+    tiles.set_overview(flat_overview(40.0, 1)).unwrap();
     let (era, present) = (ice_frame(80.0, 0.0), ice_frame(40.0, 0.0));
     let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
     let grid = generate(spec_at(centre, 0.021, 33, 17), &recent);
@@ -505,6 +524,109 @@ fn snapshot_selection_drives_the_field() {
     ));
 }
 
+#[test]
+fn prep_in_steps_matches_new() {
+    // One lattice shared by both fields (deep spacing) and two lattices (recent spacing).
+    for spacing_m in [111_000.0, 1852.0] {
+        let field = FnField {
+            f: hilly,
+            spacing_m,
+            koppen: None,
+        };
+        let spec = spec_at(dir(-33.0, 151.0), 100.0, 33, 17);
+        let whole = bits(&RegionGenerator::new(spec, &field).finish());
+        for max_nodes in [1, 97, u32::MAX] {
+            let mut prep = RegionPrep::new(spec, &field);
+            let mut steps = 0u64;
+            loop {
+                let before = prep.units_done();
+                let done = prep.step(max_nodes);
+                steps += 1;
+                // Every step stays within its budget (the final transform counts no units).
+                assert!(prep.units_done() - before <= u64::from(max_nodes));
+                if done {
+                    break;
+                }
+            }
+            assert!(prep.step(max_nodes), "stays done");
+            if max_nodes == 1 {
+                assert!(steps > u64::from(lattice::PLAN_UNITS), "{steps} steps");
+            }
+            assert_eq!(
+                bits(&prep.finish().finish()),
+                whole,
+                "{spacing_m} m, steps of {max_nodes}"
+            );
+        }
+        // finish() completes a part-built prep.
+        let mut prep = RegionPrep::new(spec, &field);
+        prep.step(500);
+        assert_eq!(bits(&prep.finish().finish()), whole);
+    }
+}
+
+#[test]
+fn apron_reads_the_overview_not_tiles() {
+    // Tiles say 100 m, the overview 300 m, the ICE-6G frames 50 m with no change since: the
+    // inner field reads tiles, the apron only the overview (at 1852 m spacing the apron adds no
+    // detail, so its texels are the overview exactly).
+    let centre = dir(-25.0, 135.0);
+    let mut tiles = flat_tiles(centre, 100.0, 4);
+    let (era, present) = (ice_frame(50.0, 0.0), ice_frame(50.0, 0.0));
+    let spec = spec_at(centre, 0.021, 33, 17);
+    {
+        let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
+        // Without an overview the apron falls back to the cube frames, never to tiles.
+        let grid = generate(spec, &recent);
+        assert!(grid.apron.elevation_m.iter().all(|&h| h == 50.0));
+        assert!(
+            grid.inner
+                .elevation_m
+                .iter()
+                .all(|&h| (h - 100.0).abs() < 10.0)
+        );
+    }
+    tiles.set_overview(flat_overview(300.0, 4)).unwrap();
+    let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
+    let grid = generate(spec, &recent);
+    assert!(grid.apron.elevation_m.iter().all(|&h| h == 300.0));
+    assert!(grid.inner.elevation_m.iter().all(|&h| h == 100.0));
+}
+
+/// Steps a prep through with `max_nodes` per step; returns (slowest step before the last,
+/// the last step (the coast-distance transform), number of steps), in seconds.
+fn prep_profile<F: CoarseField>(spec: RegionSpec, field: &F, max_nodes: u32) -> (f64, f64, u64) {
+    let mut prep = RegionPrep::new(spec, field);
+    let (mut worst, mut steps) = (0.0f64, 0u64);
+    loop {
+        let t = std::time::Instant::now();
+        let done = prep.step(max_nodes);
+        let dt = t.elapsed().as_secs_f64();
+        steps += 1;
+        if done {
+            return (worst, dt, steps);
+        }
+        worst = worst.max(dt);
+    }
+}
+
+fn print_profile<F: CoarseField>(label: &str, spec: RegionSpec, field: &F) {
+    let t = std::time::Instant::now();
+    let _ = RegionPrep::new(spec, field);
+    println!(
+        "  {label}: RegionPrep::new {:.3} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    for max_nodes in [256, 1024, 4096] {
+        let (worst, last, steps) = prep_profile(spec, field, max_nodes);
+        println!(
+            "  {label}: step({max_nodes}): {steps} steps, slowest {:.2} ms, final transform {:.2} ms",
+            worst * 1e3,
+            last * 1e3
+        );
+    }
+}
+
 /// Single-threaded generation of a full deep region on a 150-plate synthetic bake. Run with
 /// `cargo test --release -p timefly_core generation_timing -- --ignored --nocapture`.
 #[test]
@@ -528,6 +650,7 @@ fn generation_timing() {
         t_new.as_secs_f64(),
         t_all.as_secs_f64()
     );
+    print_profile("deep", spec, &field);
     // Recent regions with tiles: mid-latitude, and at a cube corner, where lattice nodes are
     // densest (the worst case for `new`).
     let (era, present) = (ice_frame(1500.0, 0.5), ice_frame(1200.0, 0.0));
@@ -535,7 +658,13 @@ fn generation_timing() {
         ("mid-latitude", dir(46.0, 8.0)),
         ("cube corner", RenderDir(DVec3::ONE.normalize())),
     ] {
-        let tiles = flat_tiles(centre, APRON_SIZE_M, 1200.0, 26);
+        let mut tiles = flat_tiles(centre, 1200.0, 26);
+        // The bake's 5' overview (2161 x 4321).
+        tiles
+            .set_overview(crate::worldgen::tiles::tests::overview_from(12, |_, _| {
+                (1200.0, 26)
+            }))
+            .unwrap();
         let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
         let t0 = std::time::Instant::now();
         let g = RegionGenerator::new(RegionSpec::new(centre, YearsBp(21_000.0), 1), &recent);
@@ -555,5 +684,10 @@ fn generation_timing() {
             t0.elapsed().as_secs_f64()
         );
         assert_finite(&grid, "timing recent");
+        print_profile(
+            label,
+            RegionSpec::new(centre, YearsBp(21_000.0), 1),
+            &recent,
+        );
     }
 }
