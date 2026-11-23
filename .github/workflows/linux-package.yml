@@ -3,8 +3,8 @@
 #
 # Jobs: `test` (dev-profile gates) runs in parallel with `build` (release binary, data, .deb);
 # `flatpak` needs both. Caches: Rust targets per job (rust-cache, saved on failure too), uv
-# downloads, the raw data (keyed on data/sources.json) and the baked globe (keyed on its inputs;
-# a hit skips fetch and bake).
+# downloads, the raw data (keyed on data/sources.json), the baked globe and the baked region
+# tiles (each keyed on its inputs; when both hit, nothing is fetched or baked).
 name: linux-package
 
 on:
@@ -129,8 +129,16 @@ jobs:
           path: crates/timefly/assets/data/globe
           key: baked-globe-${{ hashFiles('data/sources.json', 'data/paleodem_ages.csv', 'tools/bake/**') }}
 
+      # The region tiles (ETOPO 2022 + Koppen-Geiger, about 256 MB); same rule as the globe.
+      - name: Cache baked tiles
+        id: tiles-cache
+        uses: actions/cache@v6
+        with:
+          path: crates/timefly/assets/data/tiles
+          key: baked-tiles-${{ hashFiles('data/sources.json', 'tools/bake/**') }}
+
       - uses: astral-sh/setup-uv@v10.3.3
-        if: steps.bake-cache.outputs.cache-hit != 'true'
+        if: steps.bake-cache.outputs.cache-hit != 'true' || steps.tiles-cache.outputs.cache-hit != 'true'
         with:
           enable-cache: true
           cache-dependency-glob: tools/bake/uv.lock
@@ -156,14 +164,14 @@ jobs:
           grep -E 'diagnostics/probe\.rs:[0-9]+' "$crash"
 
       - name: Cache raw data
-        if: steps.bake-cache.outputs.cache-hit != 'true'
+        if: steps.bake-cache.outputs.cache-hit != 'true' || steps.tiles-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v6
         with:
           path: data/raw
           key: raw-data-${{ hashFiles('data/sources.json') }}
 
       - name: Fetch raw data (pinned, verified)
-        if: steps.bake-cache.outputs.cache-hit != 'true'
+        if: steps.bake-cache.outputs.cache-hit != 'true' || steps.tiles-cache.outputs.cache-hit != 'true'
         working-directory: tools/bake
         run: |
           uv run --locked timefly-fetch --sources ../../data/sources.json --raw ../../data/raw \
@@ -176,8 +184,17 @@ jobs:
           uv run --locked timefly-bake --raw ../../data/raw \
             --out ../../crates/timefly/assets/data/globe 2>&1 | tee ../../ci-logs/bake.txt
 
-      # Whether baked here or restored from the cache, the bake must load in this build's reader
-      # (window-less, no GPU): exits 1 with the loader's error otherwise.
+      - name: Bake region tiles
+        if: steps.tiles-cache.outputs.cache-hit != 'true'
+        working-directory: tools/bake
+        run: |
+          uv run --locked timefly-bake tiles --raw ../../data/raw \
+            --out ../../crates/timefly/assets/data/tiles 2>&1 | tee ../../ci-logs/bake-tiles.txt
+
+      # Whether baked here or restored from the cache, the bakes must load in this build's
+      # readers (window-less, no GPU): the globe, then the tiles beside it (the manifest, the
+      # overview and the three largest tiles, size- and SHA-256-checked). Exits 1 with the
+      # loader's error otherwise.
       - name: Load the bake with the game's reader
         run: |
           TIMEFLY_LOG_DIR="$RUNNER_TEMP/check-data-logs" target/release/timefly \
@@ -186,10 +203,12 @@ jobs:
       - name: Stage install tree
         run: |
           echo "baked globe from cache: ${{ steps.bake-cache.outputs.cache-hit == 'true' }}"
+          echo "baked tiles from cache: ${{ steps.tiles-cache.outputs.cache-hit == 'true' }}"
           packaging/linux/stage.sh target/release/timefly crates/timefly/assets staged
-          find staged -path '*/frames/f0*' -prune -o -print | sort
+          find staged -path '*/frames/f0*' -prune -o -path '*/tiles/r*' -prune -o -print | sort
           test ! -e staged/lib/time-fly/assets/data/globe/bake.log
-          du -sh staged
+          test ! -e staged/lib/time-fly/assets/data/tiles/bake.log
+          du -sh staged staged/lib/time-fly/assets/data/*
 
       - name: Validate desktop entry and AppStream metadata
         run: |
@@ -226,6 +245,7 @@ jobs:
           path: |
             ci-logs/
             crates/timefly/assets/data/globe/bake.log
+            crates/timefly/assets/data/tiles/bake.log
           if-no-files-found: warn
           retention-days: 14
 
