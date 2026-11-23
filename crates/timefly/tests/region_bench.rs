@@ -122,9 +122,14 @@ fn region_bench_reports_all_regions() {
         "{}",
         reports[0]
     );
-    // None of the bench regions has a fixture tile.
+    // None of the bench regions has a fixture tile; each reports its first-entry generation
+    // (gated on the web only).
     for report in reports {
         assert!(report.contains("tiles fetched 0 (0 bytes)"), "{report}");
+        assert!(
+            report.contains("first-entry generation: reported only natively"),
+            "{report}"
+        );
     }
 
     let summary = bench.summary().unwrap();
@@ -136,7 +141,7 @@ fn region_bench_reports_all_regions() {
         "regions (R14 frame rate): Alps PASS, Scandinavia PASS, Pangaea interior PASS, Aegean PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Alps",
-        "first entries (cold tiles): Alps ",
+        "first entries (cold tiles; reported only natively): Alps ",
         "memory cycles",
         "result: ",
     ] {
