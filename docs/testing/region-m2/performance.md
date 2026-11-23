@@ -533,6 +533,8 @@ Summary gates:
 - No host stalls, and no stall over 66.7 ms, in any flight, load window or the pan.
 - Every flight and the pan were display-paced at about 60 Hz, against the 30 fps target.
 
+The owner watched the whole run and reported that it "looked smooth the entire time".
+
 To repeat it, build and serve from `crates/timefly`:
 
 ```sh
