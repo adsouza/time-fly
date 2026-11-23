@@ -295,6 +295,29 @@ Warm generation median 486 ms, max 537 ms. Memory cycles 1,142.7–1,153.8 MiB o
 1920 × 951 runs). An earlier attempt was invalid: the display changed mid-run and the window
 resized (2338 × 1237 to 2567 × 1237).
 
+#### Bench regions since rulings R24–R26 (real bake, single-threaded)
+
+`TIMEFLY_GENERATE=1 TIMEFLY_CANDIDATES=... cargo test --release -p timefly_core --test
+real_bake_region bench_region_candidates -- --ignored --nocapture` (61 × 61 coarse samples of
+the inner field; coast by the bench's 36-ray search; generation single-threaded, warm files):
+
+| Region | Centre, age | Tiles | Land | Anomaly land | Coast | Ice | Max (inner) | Snowline | Plates | Generation |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Pangaea interior | −22, −18, 250 Ma | 0 | | | none in 1,150 km | | | | | (unchanged) |
+| Himalayas | 28, 86.9, 0 ka | 1 | 1.00 | 0.000 | 684 km | 0.00 | 7,576 m | 4,940 m (26.5% above) | — | 0.55 s |
+| Sundaland | 5, 107, 21 ka | 2 | 0.97 | 0.948 | 40 km | 0.00 | 558 m | 4,513 m | — | 0.52 s |
+| Japan | 36, 138.5, 1 Ma | 4 | 0.74 | — | 80 km | 0.00 | 2,588 m | 3,811 m | 610 | 2.36 s |
+| Beringia | 62, −175, 21 ka | 2 | 0.85 | 0.850 | 80 km | 0.00 | 355 m | 1,573 m | — | 0.60 s |
+| Rockies ice margin | 48.5, −113.5, 21 ka | 2 | 1.00 | 0.000 | 724 km | 0.67 | 3,524 m | 2,518 m (13% above) | — | 0.83 s |
+| Panama | 9, −79.5, 3 Ma | 0 | 0.15 | — | 14 km | 0.00 | 113 m | 5,398 m | 203, 230 | 0.79 s |
+| Aegean (left the bench) | 38, 24.5, 1 Ma | 2 | 0.29 | — | 6 km | 0.00 | 1,127 m | 3,671 m | 307, 308, 504, 510 | 3.27–3.33 s |
+
+**The bench no longer holds the slowest known generation.** The Aegean (3.3 s single-threaded,
+2.38 s natively in the final-fix-wave bench) is not benched any more; the slowest bench region is
+Japan at 2.36 s, 72% of it (Panama 0.79 s, Sundaland 0.52 s). The web gate's worst case is
+therefore unbenched; the Aegean's number is kept here for reference (owner decision R26, raised
+by the controller).
+
 #### The two-level deep path on the real bake (finding 4)
 
 `cargo test --release -p timefly_core --test real_bake_region modern_path_on_the_real_bake -- --ignored --nocapture`

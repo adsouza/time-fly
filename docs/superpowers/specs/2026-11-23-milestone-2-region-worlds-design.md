@@ -359,18 +359,21 @@ notes: deep-era biomes are zonal approximations, and ice-age biomes use the pres
 - **CDLOD tests:** crack-free and morph-continuity property tests on the Rust reference. A GPU
   golden check of the shader morph runs where a GPU exists.
 - **Benchmark:** `--region-bench` flies a scripted path (low pass, climb, coastline, apron) in
-  fixed regions:
-  - present-day Himalayas (Everest area)
+  fixed regions, in this order:
+  - 250 Ma Pangaea interior (first: the cold-start window)
+  - present-day Himalayas (Everest area; the memory cycles re-enter it)
+  - 21 ka Sundaland (the exposed tropical shelf and its coast)
+  - 1 Ma Japan (mountains and both coasts)
   - 21 ka Beringia (land below today's sea level, and its coast)
   - a globe pan across Canada, then the 21 ka Rockies ice margin (ice edge, glacial snowline)
-  - 250 Ma Pangaea interior
-  - 1 Ma Aegean (coasts throughout)
+  - 3 Ma Panama (the closing isthmus, plate pieces meeting)
 
   Owner decisions 2026-11-23: the Himalayas replace the Alps, to stress relief, f16 height
   precision, and sky and fog at altitude (plan ruling R24). Scandinavia is replaced by Beringia
   (sea-level anomaly land and coast) and the Rockies ice margin (ice edge and glacial snowline on
   mountains), joined by a globe pan across Canada. One continuous flight needs region streaming
-  (M3 or later) (ruling R25).
+  (M3 or later) (ruling R25). The Aegean is replaced by Japan and Panama, Sundaland is added,
+  and the order above is the owner's (ruling R26).
 - **What the benchmark reports:**
   - frame-time stats under the R14 rule
   - region generation time (native and web)

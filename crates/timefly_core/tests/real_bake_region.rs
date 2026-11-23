@@ -301,7 +301,8 @@ fn covered_land_fallback_survey() {
 }
 
 /// The two-level deep path over the real bake at every standard snapshot on it (50 ka, 100 ka,
-/// 1 Ma) and near its oldest end (2 Ma): single-threaded generation time, and land/sea against
+/// 1 Ma), near its oldest end (2 Ma) and at Panama's 3 Ma (past the path: the field is the
+/// reference there): single-threaded generation time, and land/sea against
 /// the globe's reference (plus the region's sliver rule) wherever the reference is clearly land
 /// or sea (|elevation| > 150 m), across each inner field and apron. Fails on any sign miss.
 #[test]
@@ -310,7 +311,8 @@ fn modern_path_on_the_real_bake() {
     let globe = data().join("globe");
     let b = bake(&globe);
     let mut total_misses = 0;
-    for age in [0.05, 0.1, 1.0, 2.0] {
+    // 3 Ma (Panama's bench age) is past the two-level path: the field is the reference there.
+    for age in [0.05, 0.1, 1.0, 2.0, 3.0] {
         total_misses += modern_path_at(&b, &globe, age);
     }
     assert_eq!(total_misses, 0, "sign misses where |reference| > 150 m");
@@ -344,6 +346,9 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
         ("himalayas", 28.0, 86.9),
         ("beringia", 62.0, -175.0),
         ("rockies", 48.5, -113.5),
+        ("japan", 36.0, 138.5),
+        ("panama", 9.0, -79.5),
+        ("sundaland", 5.0, 107.0),
     ] {
         let centre = geo_to_render(latlon_to_geo(lat, lon));
         let frame = RegionFrame { center: centre };

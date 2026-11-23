@@ -163,10 +163,11 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Himalayas PASS, Beringia PASS, Rockies ice margin PASS, Pangaea interior PASS, Aegean PASS",
+        "regions (R14 frame rate): Pangaea interior PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Himalayas",
-        "first entries (cold tiles; reported only natively): Himalayas ",
+        "first entries (cold tiles; reported only natively): Pangaea interior ",
+        "Himalayas load-window worst frame (cold tiles; reported only): ",
         "memory cycles",
         "result: ",
     ] {

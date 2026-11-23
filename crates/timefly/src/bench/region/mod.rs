@@ -6,8 +6,9 @@
 //! region's age and sends [`RegionRequested`]. Navigation fades in; once the player is flying
 //! and a settle has passed at the start pose, the bench drives [`FlyState`] along the region's
 //! scripted path ([`BenchPath`], [`SCRIPT_SECS`] of flight), then writes [`RegionLeft`] and
-//! waits on the globe. It then re-enters the first region [`MEMORY_CYCLES`] times, sampling
-//! memory on the globe after each leave.
+//! waits on the globe. A region marked `pan_from_previous` is reached by an 8 s globe pan
+//! from the one before ([`pan_orbit`]). It then re-enters [`CYCLE_REGION`] [`MEMORY_CYCLES`]
+//! times, sampling memory on the globe after each leave.
 //!
 //! **Blocks.** One per region, in the scrub bench's format: frame statistics under the R14 rule
 //! (M1 ruling R14, see [`super::passes`]), generation milliseconds, tiles and bytes fetched,
@@ -96,19 +97,50 @@ pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -
     }
 }
 
-/// The bench regions: the design's (M2 design §8), with the Himalayas (Everest area) in the
-/// Alps' place (ruling R24: highest relief, sky and fog high up; first, so it is the cold-start
-/// region and the memory cycles' re-entry), and the Aegean (ruling R22). The Pangaea centre is
-/// pinned in the era's frame at 250 Ma: inland, a hot desert (Task 8). The Aegean at 1 Ma (era
-/// frame) has coastlines throughout the inner field, so its coast run flies a real shore up
-/// close, and it is Task 4's slowest real generation (about 3 s single-threaded).
-pub const BENCH_REGIONS: [BenchRegion; 5] = [
+/// The bench regions, in order (M2 design §8; owner decisions, rulings R24–R26):
+/// - **Pangaea interior** (era frame, 250 Ma): inland hot desert, no tiles. First, so it holds
+///   R11's first-region window (overview load and first pipelines; no tile fetch).
+/// - **Himalayas** (0 ka, Everest's area): the highest relief; the memory cycles' region
+///   ([`CYCLE_REGION`]).
+/// - **Sundaland** (21 ka): the exposed tropical shelf and its 21 ka coast.
+/// - **Japan** (era frame, 1 Ma): mountains and both coasts, the close-coast case.
+/// - **Beringia** (21 ka): land below today's sea level and its 21 ka coast.
+/// - a globe pan to the **Rockies ice margin** (21 ka): ice edge and the glacial snowline.
+/// - **Panama** (era frame, 3 Ma): the closing isthmus where plate pieces meet.
+pub const BENCH_REGIONS: [BenchRegion; 7] = [
+    BenchRegion {
+        name: "Pangaea interior",
+        arg: RegionArg {
+            lat_deg: -22.0,
+            lon_deg: -18.0,
+            years: 250.0e6,
+        },
+        pan_from_previous: false,
+    },
     BenchRegion {
         name: "Himalayas",
         arg: RegionArg {
             lat_deg: 28.0,
             lon_deg: 86.9,
             years: 0.0,
+        },
+        pan_from_previous: false,
+    },
+    BenchRegion {
+        name: "Sundaland",
+        arg: RegionArg {
+            lat_deg: 5.0,
+            lon_deg: 107.0,
+            years: 21_000.0,
+        },
+        pan_from_previous: false,
+    },
+    BenchRegion {
+        name: "Japan",
+        arg: RegionArg {
+            lat_deg: 36.0,
+            lon_deg: 138.5,
+            years: 1.0e6,
         },
         pan_from_previous: false,
     },
@@ -131,24 +163,32 @@ pub const BENCH_REGIONS: [BenchRegion; 5] = [
         pan_from_previous: true,
     },
     BenchRegion {
-        name: "Pangaea interior",
+        name: "Panama",
         arg: RegionArg {
-            lat_deg: -22.0,
-            lon_deg: -18.0,
-            years: 250.0e6,
-        },
-        pan_from_previous: false,
-    },
-    BenchRegion {
-        name: "Aegean",
-        arg: RegionArg {
-            lat_deg: 38.0,
-            lon_deg: 24.5,
-            years: 1.0e6,
+            lat_deg: 9.0,
+            lon_deg: -79.5,
+            years: 3.0e6,
         },
         pan_from_previous: false,
     },
 ];
+
+/// The region the memory cycles and the warm-generation gate re-enter (owner decision, R26):
+/// it fetches tiles, so re-entries exercise the tile cache's eviction and refetch.
+pub const CYCLE_REGION: &str = "Himalayas";
+
+/// [`CYCLE_REGION`]'s index in [`BENCH_REGIONS`].
+pub fn cycle_region() -> usize {
+    BENCH_REGIONS
+        .iter()
+        .position(|r| r.name == CYCLE_REGION)
+        .unwrap_or(0)
+}
+
+/// Bench stops: the regions plus the globe pans before panned regions.
+pub fn stop_count() -> usize {
+    BENCH_REGIONS.len() + BENCH_REGIONS.iter().filter(|r| r.pan_from_previous).count()
+}
 
 /// Enter/leave cycles after the regions, re-entering the first region.
 pub const MEMORY_CYCLES: u32 = 10;
@@ -644,7 +684,7 @@ fn drive_region_bench(
                 Next::Region(region) => start_region(bench, region, now, &mut controls),
                 Next::Cycle(c) => {
                     bench.cycles.push(CycleRun::default());
-                    controls.enter(&BENCH_REGIONS[0]);
+                    controls.enter(&BENCH_REGIONS[cycle_region()]);
                     bench.stage = Stage::CycleLoading {
                         cycle: c,
                         since: now,
@@ -888,6 +928,19 @@ fn r11_line(bench: &RegionBench) -> String {
     }
 }
 
+/// The cycle region's load-window worst frame (its tiles fetched cold), reported only beside
+/// the R11 gate on the first region.
+fn cycle_region_load_line(bench: &RegionBench) -> String {
+    let run = &bench.runs[cycle_region()];
+    if run.load_ms.is_empty() {
+        return format!("{CYCLE_REGION} load-window worst frame (cold tiles): not measured");
+    }
+    format!(
+        "{CYCLE_REGION} load-window worst frame (cold tiles; reported only): {:.2} ms",
+        frame_time_stats(&run.load_ms).worst_ms
+    )
+}
+
 /// One region's block; also records whether it passed.
 fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &Screen) -> String {
     let fps = bench.config.target_fps;
@@ -943,6 +996,9 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     out.push(host_stall_line("load window", &r.load_ms));
     if region == 0 {
         out.push(r11_line(bench));
+    }
+    if region == cycle_region() && region != 0 {
+        out.push(cycle_region_load_line(bench));
     }
     if let Some(path) = &r.path {
         out.push(format!("coast: {}", path.coast.describe()));
@@ -1100,6 +1156,7 @@ fn finish(
     pass &= bench.runs.iter().all(|r| r.pass);
     out.push(format!("regions (R14 frame rate): {}", regions.join(", ")));
     out.push(r11_line(bench));
+    out.push(cycle_region_load_line(bench));
     if web {
         pass &= first_region_gate(bench).is_some_and(|(_, ok)| ok);
     }
@@ -1127,7 +1184,7 @@ fn finish(
         out.push(format!(
             "warm generation ({} re-entries of {}, target <= {target} ms): median {} ms, max {} ms -> {}",
             warm.len(),
-            BENCH_REGIONS[0].name,
+            BENCH_REGIONS[cycle_region()].name,
             sorted[(sorted.len() - 1) / 2],
             max,
             if ok { "PASS" } else { "FAIL" }
@@ -1307,11 +1364,13 @@ mod tests {
         assert_eq!(
             names,
             [
+                "Pangaea interior",
                 "Himalayas",
+                "Sundaland",
+                "Japan",
                 "Beringia",
                 "Rockies ice margin",
-                "Pangaea interior",
-                "Aegean"
+                "Panama"
             ]
         );
         let arg = |lat_deg, lon_deg, years| RegionArg {
@@ -1323,24 +1382,36 @@ mod tests {
         assert_eq!(
             args,
             [
+                arg(-22.0, -18.0, 250.0e6),
                 // Ruling R24: Everest (27.99, 86.93) is in the inner field.
                 arg(28.0, 86.9, 0.0),
+                // Ruling R26: 21 ka anomaly land and coast on the tropical shelf.
+                arg(5.0, 107.0, 21_000.0),
+                arg(36.0, 138.5, 1.0e6),
                 // Ruling R25: 21 ka anomaly land and its coast; the ice margin under mountains.
                 arg(62.0, -175.0, 21_000.0),
                 arg(48.5, -113.5, 21_000.0),
-                arg(-22.0, -18.0, 250.0e6),
-                // Ruling R22: coastlines throughout the inner field.
-                arg(38.0, 24.5, 1.0e6),
+                arg(9.0, -79.5, 3.0e6),
             ]
         );
         // Only the Rockies are reached by a pan, from Beringia at the same snapshot.
         let pans: Vec<_> = BENCH_REGIONS.iter().map(|r| r.pan_from_previous).collect();
-        assert_eq!(pans, [false, false, true, false, false]);
-        assert_eq!(BENCH_REGIONS[1].arg.years, BENCH_REGIONS[2].arg.years);
+        assert_eq!(pans, [false, false, false, false, false, true, false]);
+        assert_eq!(BENCH_REGIONS[4].arg.years, BENCH_REGIONS[5].arg.years);
+        assert_eq!(stop_count(), 8);
         assert_eq!(after_region(0, 10), Next::Region(1));
-        assert_eq!(after_region(3, 10), Next::Region(4));
-        assert_eq!(after_region(4, 10), Next::Cycle(0));
-        assert_eq!(after_region(4, 0), Next::Summary);
+        assert_eq!(after_region(5, 10), Next::Region(6));
+        assert_eq!(after_region(6, 10), Next::Cycle(0));
+        assert_eq!(after_region(6, 0), Next::Summary);
+    }
+
+    #[test]
+    fn the_memory_cycles_re_enter_the_himalayas_by_name() {
+        assert_eq!(CYCLE_REGION, "Himalayas");
+        assert_eq!(BENCH_REGIONS[cycle_region()].name, CYCLE_REGION);
+        // Not the first region: the cycles must not depend on the order.
+        assert_ne!(cycle_region(), 0);
+        assert!(BENCH_REGIONS[cycle_region()].arg.years == 0.0);
     }
 
     #[test]
