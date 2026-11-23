@@ -16,7 +16,8 @@ use crate::globe::{EARTH_RADIUS_KM, GlobeCamera, GlobeCameraSync};
 use crate::region::RegionState;
 use crate::ui::PointerOverUi;
 
-pub const MIN_DISTANCE_KM: f64 = EARTH_RADIUS_KM * 1.15;
+/// Closest zoom: the globe nearly fills the default 45° vertical view (95% of its height).
+pub const MIN_DISTANCE_KM: f64 = EARTH_RADIUS_KM * 2.74;
 pub const MAX_DISTANCE_KM: f64 = EARTH_RADIUS_KM * 6.0;
 pub const START_DISTANCE_KM: f64 = EARTH_RADIUS_KM * 3.0;
 /// Degrees of rotation per dragged pixel at the start distance; scales with the distance.
@@ -231,8 +232,23 @@ mod tests {
             s = orbit_step(s, input((0.0, 0.0), -1.0));
         }
         assert_eq!(s.distance_km, MAX_DISTANCE_KM);
-        let one = orbit_step(OrbitState::default(), input((0.0, 0.0), 1.0));
-        assert!((one.distance_km - START_DISTANCE_KM * ZOOM_PER_LINE).abs() < 1e-9);
+        // One line out from the start (one line in already reaches the closest zoom).
+        let one = orbit_step(OrbitState::default(), input((0.0, 0.0), -1.0));
+        assert!((one.distance_km - START_DISTANCE_KM / ZOOM_PER_LINE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn closest_zoom_nearly_fills_the_view() {
+        // The globe camera uses Bevy's default perspective; its fov is vertical, the limiting
+        // direction in a landscape window.
+        let fov = f64::from(PerspectiveProjection::default().fov);
+        let globe = 2.0 * (EARTH_RADIUS_KM / MIN_DISTANCE_KM).asin();
+        let share = globe / fov;
+        assert!(
+            (0.95..1.0).contains(&share),
+            "at the closest zoom the globe spans {:.1}% of the view's height",
+            share * 100.0
+        );
     }
 
     #[test]
@@ -335,9 +351,9 @@ mod tests {
 
         app.world_mut()
             .resource_mut::<AccumulatedMouseScroll>()
-            .delta = Vec2::new(0.0, 3.0);
+            .delta = Vec2::new(0.0, -3.0);
         app.update();
-        let expected = START_DISTANCE_KM * ZOOM_PER_LINE.powi(3);
+        let expected = START_DISTANCE_KM * ZOOM_PER_LINE.powi(-3);
         assert!((f64::from(at(&app).length()) - expected).abs() < 0.5);
         let context = app.world().resource::<DiagnosticsContext>();
         assert!((context.camera_distance_km.unwrap() - expected).abs() < 1e-6);

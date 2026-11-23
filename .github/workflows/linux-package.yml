@@ -1,7 +1,8 @@
-# Linux x86-64 test packages: a .deb and a single-file Flatpak bundle from one release build.
+# Linux x86-64 test packages: a .deb and a single-file Flatpak bundle from one optimized build.
 # Manual (workflow_dispatch) or on v* tags only, to save CI minutes. No secrets.
 #
-# Jobs: `test` (dev-profile gates) runs in parallel with `build` (release binary, data, .deb);
+# Jobs: `test` (ci-test profile gates) runs in parallel with `build` (optimized binary: `dist`
+# on tags, `release` otherwise; data; .deb);
 # `flatpak` needs both. Caches: Rust targets per job (rust-cache, saved on failure too), uv
 # downloads, the raw data (keyed on data/sources.json), the baked globe and the baked region
 # tiles (each keyed on its inputs; when both hit, nothing is fetched or baked).
@@ -85,12 +86,16 @@ jobs:
     outputs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
     env:
-      # Line tables stay in the binary for panic backtraces (release profile unchanged). CI
+      # Line tables stay in the binary for panic backtraces (both `release` and `dist`). CI
       # alone compresses the debug sections with zlib, which keeps the packages small (owner
       # decision 2026-11-22: about 123 MB download / 230 MB installed, against 80 / 576 MB
       # uncompressed); local builds are unaffected. Linking uses rustc's default on this target
       # since Rust 1.90, the bundled rust-lld (mold-class speed).
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-Wl,--compress-debug-sections=zlib
+      # Tagged builds ship, so they use the fully optimized `dist` profile (thin LTO, one
+      # codegen unit). Manual test packages use `release`: far faster to link, a little slower
+      # to run, so they understate rather than overstate performance.
+      PROFILE: ${{ startsWith(github.ref, 'refs/tags/') && 'dist' || 'release' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -143,20 +148,21 @@ jobs:
           enable-cache: true
           cache-dependency-glob: tools/bake/uv.lock
 
-      - name: Release build
+      - name: Optimized build
         env:
           TIMEFLY_GIT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
-          cargo build --locked --release -p timefly 2>&1 | tee ci-logs/cargo-build.txt
-          ls -l target/release/timefly
-          readelf -p .comment target/release/timefly | grep -iE 'lld|mold|GNU ld' || true
-          readelf -SW target/release/timefly | grep -E ' \.(text|rodata|debug_[a-z]+) ' || true
+          echo "profile: $PROFILE"
+          cargo build --locked --profile "$PROFILE" -p timefly 2>&1 | tee ci-logs/cargo-build.txt
+          ls -l target/$PROFILE/timefly
+          readelf -p .comment target/$PROFILE/timefly | grep -iE 'lld|mold|GNU ld' || true
+          readelf -SW target/$PROFILE/timefly | grep -E ' \.(text|rodata|debug_[a-z]+) ' || true
 
       - name: Smoke test the binary (headless probes, backtrace has file:line)
         run: |
           logs="$RUNNER_TEMP/probe-logs"
-          TIMEFLY_LOG_DIR="$logs" target/release/timefly --diagnostics-probe=clean
-          if TIMEFLY_LOG_DIR="$logs" target/release/timefly --diagnostics-probe=panic; then
+          TIMEFLY_LOG_DIR="$logs" target/$PROFILE/timefly --diagnostics-probe=clean
+          if TIMEFLY_LOG_DIR="$logs" target/$PROFILE/timefly --diagnostics-probe=panic; then
             echo "panic probe exited 0"; exit 1
           fi
           crash=$(find "$logs" -name crash.txt | head -1)
@@ -197,14 +203,14 @@ jobs:
       # loader's error otherwise.
       - name: Load the bake with the game's reader
         run: |
-          TIMEFLY_LOG_DIR="$RUNNER_TEMP/check-data-logs" target/release/timefly \
+          TIMEFLY_LOG_DIR="$RUNNER_TEMP/check-data-logs" target/$PROFILE/timefly \
             --check-data=crates/timefly/assets/data/globe 2>&1 | tee ci-logs/check-data.txt
 
       - name: Stage install tree
         run: |
           echo "baked globe from cache: ${{ steps.bake-cache.outputs.cache-hit == 'true' }}"
           echo "baked tiles from cache: ${{ steps.tiles-cache.outputs.cache-hit == 'true' }}"
-          packaging/linux/stage.sh target/release/timefly crates/timefly/assets staged
+          packaging/linux/stage.sh target/$PROFILE/timefly crates/timefly/assets staged
           find staged -path '*/frames/f0*' -prune -o -path '*/tiles/r*' -prune -o -print | sort
           test ! -e staged/lib/time-fly/assets/data/globe/bake.log
           test ! -e staged/lib/time-fly/assets/data/tiles/bake.log

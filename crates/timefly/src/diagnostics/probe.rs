@@ -101,8 +101,10 @@ pub fn run_headless_probe(session: Session, mode: ProbeMode) -> AppExit {
         app.update();
     }
     let exit = app.should_exit().unwrap_or(AppExit::Success);
-    drop(app);
     if mode == ProbeMode::Abort {
+        // A real abort never tears the world down; dropping it would run the world's teardown
+        // (`EndOnTeardown`), which records a clean end.
+        std::mem::forget(app);
         // Write out what was logged, then die without unwinding or marking the session clean.
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -117,6 +119,7 @@ pub fn run_headless_probe(session: Session, mode: ProbeMode) -> AppExit {
         }
         std::process::abort();
     }
+    drop(app);
     session.finish(&exit);
     exit
 }

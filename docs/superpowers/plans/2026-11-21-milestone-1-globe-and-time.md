@@ -706,7 +706,7 @@ The example omits intermediate frames. Files are numbered by first occurrence in
     - With this mapping, the last ~12,000 years fill roughly the right third of the slider.
     - The UI fades to 30% opacity after 3 s without input, and returns to 100% on hover, drag or key press.
   - **`OrbitCameraPlugin`:**
-    - Drag rotates around the origin. The scroll wheel zooms between distances `EARTH_RADIUS_KM * 1.15` and `EARTH_RADIUS_KM * 6.0`, starting at `* 3.0` facing lon 0.
+    - Drag rotates around the origin. The scroll wheel zooms between distances `EARTH_RADIUS_KM * 2.74` and `EARTH_RADIUS_KM * 6.0`, starting at `* 3.0` facing lon 0. (Was `* 1.15`; raised 2026-11-23 after the Mac checks so the closest zoom shows the whole globe at 95% of the view's height.)
     - Use Bevy 0.20's `pan_orbit_camera` controller (feature `pan_orbit_camera`) if it supports orbiting a fixed target with distance limits. Otherwise write `orbit_camera_system` yourself.
   - **`StatusUiPlugin`:** show "Loading Earth's history…" until the first interactive globe frame. Show a failure message if the bake fails to load or the renderer cannot initialize.
   - **`CreditsPlugin`:** `Esc` toggles a scrollable overlay showing `include_str!("../../assets/credits.txt")`. `credits.txt` lists every dataset's citation and licence from `data/README.md`.

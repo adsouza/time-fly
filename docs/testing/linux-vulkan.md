@@ -98,7 +98,7 @@ credits. Compare with the Mac screenshots in `docs/testing/globe-m1/`.
 - [ ] About 250 Ma: Pangaea as one landmass (`globe-250ma.png`).
 - [ ] 540 Ma: the slider's oldest end shows the Cambrian continents (`globe-540ma.png`).
 - [ ] Full-range scrubbing both ways runs without stalls, gaps or flicker.
-- [ ] Orbit limits: zoom stops between about 1.15 and 6 Earth radii from the centre, and
+- [ ] Orbit limits: zoom stops between about 2.74 and 6 Earth radii from the centre, and
       dragging stops at 89 degrees latitude, so the camera never flips over a pole.
 - [ ] The age label tracks the slider and the stepped ages.
 - [ ] `Esc` opens the credits with every data citation; `Esc` again closes them.
