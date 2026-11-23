@@ -8,7 +8,13 @@
   <style>
     html, body { margin: 0; height: 100%; background: #101c28; color: #fff; }
     body { font: 1rem system-ui, sans-serif; }
-    canvas { display: block; touch-action: none; }
+    canvas {
+      display: block;
+      /* Override the engine's inline pixel size so the timeline stays inside the viewport. */
+      width: 100% !important;
+      height: 100% !important;
+      touch-action: none;
+    }
     #startup { padding: 1.5rem; margin: 0; }
   </style>
 </head>
