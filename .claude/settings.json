@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/tools/dev/target-guard.sh --hook",
+            "timeout": 180,
+            "statusMessage": "Checking build-disk budget"
+          }
+        ]
+      }
+    ]
+  }
+}

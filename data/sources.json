@@ -1,0 +1,222 @@
+{
+  "comment": "Raw inputs of the globe bake, pinned by SHA-256 and size. Fetch with `cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`. Provenance, citations and terms: data/README.md. The PaleoDEM report PDF (data/raw/report/) is reference reading only and is not fetched.",
+  "files": [
+    {
+      "path": "paleodem/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip",
+      "url": "https://www.earthbyte.org/webdav/ftp/Data_Collections/Scotese_Wright_2018_PaleoDEM/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip",
+      "sha256": "7014767a168c28d3762f55117ebafcd0f6b6b90029a495e2d14fd23f94abc16d",
+      "bytes": 9302291,
+      "licence": "CC BY 4.0 (Scotese & Wright 2018, doi:10.5281/zenodo.5460860)"
+    },
+    {
+      "path": "plates/Rotations.zip",
+      "url": "https://repo.gplates.org/webdav/pmm/scotese_and_wright2018/Rotations.zip",
+      "sha256": "73a92b7734b6e7471a15a116703886b9d030f6da7f00172e593abbdf300f2031",
+      "bytes": 19585,
+      "licence": "CC BY 4.0 (Scotese & Wright 2018, doi:10.5281/zenodo.5460860)"
+    },
+    {
+      "path": "plates/StaticPolygons.zip",
+      "url": "https://repo.gplates.org/webdav/pmm/scotese_and_wright2018/StaticPolygons.zip",
+      "sha256": "27dbc00cbd0bff840198706d306571eecfff62781fe4dfd49d396d73463f77d2",
+      "bytes": 177393,
+      "licence": "CC BY 4.0 (Scotese & Wright 2018, doi:10.5281/zenodo.5460860)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.0.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.0.nc.gz",
+      "sha256": "ca6262d23cdae07e3ed286e8b3c6cabcc4327db63caec70fa4096811bb0f6f88",
+      "bytes": 235079,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.1.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.1.nc.gz",
+      "sha256": "6f79f2fb8a67c745bd2b1b404c518b70affb5810d0e268d5c6ea7f622b6f8b38",
+      "bytes": 589557,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.2.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.2.nc.gz",
+      "sha256": "2535b5f348767fa560fcd60f43ad3b65bd8ff314f136235a166844cad78612d8",
+      "bytes": 590549,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.3.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.3.nc.gz",
+      "sha256": "276e4288cc17faef8146c9038bd2a652f21b0fe4d49b9a8bb0dfb46ce4418de5",
+      "bytes": 590713,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.4.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.4.nc.gz",
+      "sha256": "983ddd8536e4366e01c54f96c6aab052dcc3079cce5dcbfe5df1aa69791f9f18",
+      "bytes": 591413,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.5.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.5.nc.gz",
+      "sha256": "b44e554dbf1b7210e4c8a3b3505644cc3250fcb7cb01663343c72aa5db9f7672",
+      "bytes": 591722,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.6.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.6.nc.gz",
+      "sha256": "8777cae75945b44bee41a7633f97e623910722452a1de5e4005fdb7fc2fc61ca",
+      "bytes": 591966,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.7.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.7.nc.gz",
+      "sha256": "c9a21b0cd7eb81cb9f66d6078dd7ac4c8b6a141d4cfcda7b0fa63c78af23a7fa",
+      "bytes": 593745,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.8.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.8.nc.gz",
+      "sha256": "30f07879863c2737d508fb2576940f20ddcfd3013616afeda786885b4d9a4c1d",
+      "bytes": 591678,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.9.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.9.nc.gz",
+      "sha256": "f59de2d2023fbe8055f9b874c35ff8f4bb7b18cc73bded44d15bcdd5b87019fa",
+      "bytes": 590176,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.10.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.10.nc.gz",
+      "sha256": "71af901c690bc2fddc6ce2ed3e47a7694c8a8c3cb946b10677f054d15925456d",
+      "bytes": 589571,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.11.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.11.nc.gz",
+      "sha256": "730cd50b907cbd4c335d15971cf1ebfb84d5708be69f68275e69d7414c8ad477",
+      "bytes": 591863,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.12.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.12.nc.gz",
+      "sha256": "d00d07bc721409cabc1f4278bd0d3785e3829111f876a4562176ce4cd5160029",
+      "bytes": 592016,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.13.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.13.nc.gz",
+      "sha256": "8c76e98fabf04077114761ac6632554e8de8376b982314477503b36bb6c4bd5c",
+      "bytes": 591032,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.14.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.14.nc.gz",
+      "sha256": "cde4b282e5990f3881696a04b0f1a8b94fa508b9030e3224bce393c7a5a326e6",
+      "bytes": 589781,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.15.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.15.nc.gz",
+      "sha256": "1b60f0c58e6be350b74cfa160d309312a2dfa5b584822fea2bd5a0de620567ea",
+      "bytes": 591787,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.16.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.16.nc.gz",
+      "sha256": "c91539b1ae365120ba360e22ed0ef11783dcf76e59ea2a29370614bfbad37a19",
+      "bytes": 594143,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.17.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.17.nc.gz",
+      "sha256": "20887af039bd69c37a7e950604bb21c608bd908db325eebc2feb8b3be3e342fd",
+      "bytes": 595004,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.18.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.18.nc.gz",
+      "sha256": "18da872e17da4cca0dd0b0e0a958dc3f0e942aa4ef0fbb8be943769a73a36223",
+      "bytes": 594960,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.19.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.19.nc.gz",
+      "sha256": "cb5d41f35eb92ed9108549ad628fe6ae48f61eb87c0846b64e3a12723eb22a51",
+      "bytes": 595163,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.20.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.20.nc.gz",
+      "sha256": "63558909c89de96f5a5954f6ce60616719e4b32782df906f7d17ecbf1d20bf62",
+      "bytes": 594970,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.21.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.21.nc.gz",
+      "sha256": "09d6a94b6f470812ea9f6f7f42027bd491f774fa8ef980341192242d70bb0a51",
+      "bytes": 595009,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.22.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.22.nc.gz",
+      "sha256": "bd2337a45a2664e75c70b6f52e2d9972ccf4bbfe4449296ad78af3ebb8f65646",
+      "bytes": 595234,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.23.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.23.nc.gz",
+      "sha256": "1f1b3d6ec6bf4c019a52aaafb39d77c28d676a3dcec819d57bb83045603e6a8b",
+      "bytes": 595496,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.24.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.24.nc.gz",
+      "sha256": "f0e8255be5af19264d158ab21ec4f561134beee8f48a0ea50e920c27c5ca1c96",
+      "bytes": 596235,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.25.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.25.nc.gz",
+      "sha256": "b4cf7be4a74e8ec571808f06d38cb01c319b332ce0819698bb3080f21bc538f1",
+      "bytes": 595914,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "ice6g/I6_C.VM5a_1deg.26.nc.gz",
+      "url": "https://www.atmosp.physics.utoronto.ca/~peltier/datasets/Ice6G_C_VM5a/I6_C.VM5a_1deg.26.nc.gz",
+      "sha256": "f219b296032f0850772c3a26b90b0072a140ac307e4e0a0ebe5937ecaf401b95",
+      "bytes": 597072,
+      "licence": "No licence stated; cite Argus et al. 2014 and Peltier et al. 2015; baked derivatives distributed with citation and credit (owner approval 2026-11-22)"
+    },
+    {
+      "path": "sealevel/spratt2016-noaa.txt",
+      "url": "https://www.ncei.noaa.gov/pub/data/paleo/contributions_by_author/spratt2016/spratt2016-noaa.txt",
+      "sha256": "02f56f02f709b70ac70fe5e403326272e19b42bf34ee9b1bba3b8322e1375dc1",
+      "bytes": 51519,
+      "licence": "NOAA NCEI public data; cite Spratt & Lisiecki 2016 and doi:10.25921/rd66-5820"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+[workspace]
+members = ["crates/timefly_core", "crates/timefly"]
+resolver = "3"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+# CI test builds. Dependencies stay unoptimized: the tests are CPU-light, and compiling Bevy at
+# opt-level 3 (the dev profile's choice, so the game runs smoothly locally) dominated the test
+# job. Run with `cargo test --profile ci-test`.
+[profile.ci-test]
+inherits = "dev"
+
+[profile.ci-test.package."*"]
+opt-level = 0
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# File and line in panic backtraces, for crash reports (spec §20).
+debug = "line-tables-only"
+
+# Web builds (ruling R15): the release profile without debuginfo. Line tables are no use in the
+# browser (panics report file and line from the panic message itself), and `strip` also drops
+# the wasm `name` section (~31 MB), so browser stack traces show function indices, not names.
+# Build and serve from `crates/timefly` (wasm-server-runner serves `./assets`):
+#   cargo run --profile web-release -p timefly --target wasm32-unknown-unknown
+[profile.web-release]
+inherits = "release"
+debug = false
+strip = true

@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "cube_size": 8,
+  "frames": [
+    {
+      "age_myr": 0.0,
+      "file": "frames/f0000.tfgrid",
+      "source": "ice6g"
+    },
+    {
+      "age_myr": 7.6e-05,
+      "file": "frames/f0000.tfgrid",
+      "source": "ice6g"
+    },
+    {
+      "age_myr": 0.03,
+      "file": "frames/f0001.tfgrid",
+      "source": "paleodem",
+      "source_rotation_age_myr": 0.0
+    },
+    {
+      "age_myr": 540.0,
+      "file": "frames/f0002.tfgrid",
+      "source": "paleodem",
+      "source_rotation_age_myr": 540.0
+    }
+  ],
+  "footprints": "plates.tfplates",
+  "rotations": "rotations.tfrot",
+  "sea_level_curve": [
+    [7.6e-05, 0.5],
+    [0.001076, -1.5],
+    [0.002076, -1.8],
+    [0.029076, -78.0],
+    [0.030076, -80.0],
+    [0.031076, -82.5]
+  ],
+  "attribution": [
+    "Paleotopography: Scotese, C.R. & Wright, N. (2018). PALEOMAP Paleodigital Elevation Models (PaleoDEMS) for the Phanerozoic. PALEOMAP Project. doi:10.5281/zenodo.5460860 (CC BY 4.0).",
+    "Plate model: PALEOMAP Global Plate Model rotations and continental polygons, Scotese, C.R. & Wright, N. (2018). doi:10.5281/zenodo.5460860 (CC BY 4.0).",
+    "Ice sheets and recent topography: ICE-6G_C (VM5a), W.R. Peltier, University of Toronto. Argus, D.F., Peltier, W.R., Drummond, R. & Moore, A.W. (2014), Geophys. J. Int. 198, 537-563, doi:10.1093/gji/ggu140; Peltier, W.R., Argus, D.F. & Drummond, R. (2015), J. Geophys. Res. Solid Earth 120, 450-487, doi:10.1002/2014JB011176.",
+    "Sea level: Spratt, R.M. & Lisiecki, L.E. (2016). A Late Pleistocene sea level stack. Climate of the Past 12, 1079-1092, doi:10.5194/cp-12-1079-2016; data from NOAA NCEI, doi:10.25921/rd66-5820."
+  ]
+}

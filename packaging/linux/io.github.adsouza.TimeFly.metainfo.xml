@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 the Time Fly authors -->
+<component type="desktop-application">
+  <id>io.github.adsouza.TimeFly</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>Time Fly</name>
+  <summary>Earth through deep time</summary>
+  <description>
+    <p>
+      Time Fly is a globe of the Earth from 540 million years ago to the present. Drag the time
+      slider to watch the continents drift, Pangaea assemble and break apart, and the ice sheets
+      of the last ice age grow and melt, then orbit the globe to look closer.
+    </p>
+    <p>
+      The terrain comes from the PALEOMAP PaleoDEMs and plate model (Scotese and Wright, 2018),
+      the ICE-6G_C ice and topography model (Peltier and colleagues) and the Spratt and Lisiecki
+      (2016) sea-level stack. The in-game credits list the full citations.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.adsouza.TimeFly.desktop</launchable>
+  <provides>
+    <binary>time-fly</binary>
+  </provides>
+  <url type="homepage">https://github.com/adsouza/time-fly</url>
+  <url type="bugtracker">https://github.com/adsouza/time-fly/issues</url>
+  <developer id="io.github.adsouza">
+    <name>Antonio D'souza</name>
+  </developer>
+  <developer_name>Antonio D'souza</developer_name>
+  <update_contact>275832+adsouza@users.noreply.github.com</update_contact>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-22">
+      <description>
+        <p>Milestone 1 test build: the globe, the time slider and the orbit camera.</p>
+      </description>
+    </release>
+  </releases>
+</component>

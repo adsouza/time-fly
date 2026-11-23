@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Time Fly
+GenericName=Deep-time globe
+Comment=Earth through deep time, from 540 million years ago to the present
+Exec=time-fly
+Icon=io.github.adsouza.TimeFly
+Terminal=false
+Categories=Game;Education;Geography;
+Keywords=earth;globe;geology;paleogeography;plate tectonics;ice age;
+StartupNotify=true
+StartupWMClass=io.github.adsouza.TimeFly

@@ -1,0 +1,23 @@
+# cargo-mutants configuration. See docs/testing/mutation-testing.md.
+#
+# Equivalent mutants: these source changes cannot alter any output, so no test can catch them.
+# Each pattern pins one file:line:column so nothing else in the function is hidden. If you edit
+# one of these lines, re-check the location (cargo mutants --list | grep <file>).
+exclude_re = [
+    # SHA-256 Ch: (e & f) and (!e & g) never share a set bit, so XOR equals OR.
+    'timefly_core/src/sha256\.rs:44:30: replace \^ with \|',
+    # SHA-256 Maj: for three bits, XOR of the pairwise ANDs equals their OR.
+    'timefly_core/src/sha256\.rs:51:31: replace \^ with \|',
+    'timefly_core/src/sha256\.rs:51:41: replace \^ with \|',
+    # Cube face sign test: the major component is zero only for the zero vector.
+    'timefly_core/src/cube\.rs:79:14: replace > with >= in face_coords',
+    'timefly_core/src/cube\.rs:85:14: replace > with >= in face_coords',
+    'timefly_core/src/cube\.rs:90:17: replace > with >= in face_coords',
+    # 100 tenths is exactly 10 million either way ("10 million years ago").
+    'timefly_core/src/deep_time\.rs:96:15: replace < with <= in format_years_bp',
+    # Pole test: differs only at a horizontal length of exactly 1e-12, within 1e-12 of a pole,
+    # where longitude is meaningless.
+    'timefly_core/src/geo\.rs:32:23: replace < with <= in geo_to_latlon',
+    # Skipping zero-weight samples only saves work: blend_endpoints_m drops them anyway.
+    'timefly_core/src/globe\.rs:305:20: replace match guard weights\[e\] != 0\.0 with true',
+]
