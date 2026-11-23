@@ -25,10 +25,11 @@ SHA-256, then renames; any mismatch deletes the download and fails naming the fi
 verification is never disabled. The ICE-6G_C host sends only its leaf certificate, without the
 Sectigo Public Server Authentication CA OV R36 intermediate, which OpenSSL (Python, Linux CI)
 cannot complete on its own (macOS curl can). For exactly that failure ("unable to get local
-issuer certificate") the fetcher reads the leaf's AIA "CA Issuers" URL, downloads that one
-intermediate (at most 16 KB, must be a CA, not self-signed, and the leaf's issuer), and retries
-with the system roots plus it, partial chains disallowed, so the chain must still end at a
-system root (here Sectigo Public Server Authentication Root R46); hostname checks and the
+issuer certificate") the fetcher requires the configured host and matching Sectigo issuer URL.
+It refuses redirects, downloads that one intermediate (at most 16 KB, must be a CA,
+not self-signed, and the leaf's issuer), and retries with the system roots plus it.
+Partial chains are disallowed, so the chain must still end at a system root (here
+Sectigo Public Server Authentication Root R46). Hostname checks and the
 SHA-256 pins are unchanged (owner decision, 2026-11-22). CI
 (`.github/workflows/linux-package.yml`) runs it with `data/raw/` cached under the hash of
 `sources.json`.
@@ -239,14 +240,19 @@ renderer takes land/water from `sftlf`, not from the sign of `Topo`.
 ## Baked globe assets
 
 `cd tools/bake && uv run timefly-bake --raw ../../data/raw --out ../../crates/timefly/assets/data/globe`
-reads the archives above in place (nothing is unpacked into `data/raw`) and writes, git-ignored:
+reads the archives above in place and writes the generated assets to the git-ignored globe directory.
+
+New bakes include the SHA-256 of each payload in its filename. The manifest selects the
+active assets and is replaced after all of them have been written. Superseded payloads
+remain available to readers using an earlier manifest. Packaging copies only referenced
+assets. To reclaim space, remove the old output directory when it is no longer in use.
 
 | Output | Count | Size (bytes) |
 |---|---|---|
-| `frames/f0000–f0026.tfgrid` ICE-6G_C, `(6,128,128,4)` f16, zstd 19 | 27 images, 28 frames (age 0 reuses 0 ka) | 6,294,972 |
-| `frames/f0027–f0135.tfgrid` PaleoDEM, `(6,128,128,2)` f16 | 109 images and frames, 0.030–540 Myr | 9,978,180 |
-| `rotations.tfrot` | 149 plates × 551 times, 99.32% valid (plate 617 never) | 744,577 |
-| `plates.tfplates` | 35,795 of 98,304 cells covered, 35,797 entries | 45,880 |
+| `frames/f0000–f0026.<sha256>.tfgrid` ICE-6G_C, `(6,128,128,4)` f16, zstd 19 | 27 images, 28 frames (age 0 reuses 0 ka) | 6,294,972 |
+| `frames/f0027–f0135.<sha256>.tfgrid` PaleoDEM, `(6,128,128,2)` f16 | 109 images and frames, 0.030–540 Myr | 9,978,180 |
+| `rotations.<sha256>.tfrot` | 149 plates × 551 times, 99.32% valid (plate 617 never) | 744,577 |
+| `plates.<sha256>.tfplates` | 35,795 of 98,304 cells covered, 35,797 entries | 45,880 |
 | `manifest.json` | 137 frames, 799 sea-level knots, 4 attribution lines | 38,264 |
 | **Total** (plus `bake.log`, 460 KB, not shipped) | | **17,101,873** |
 

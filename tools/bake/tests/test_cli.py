@@ -1,5 +1,6 @@
 """The bake CLI end to end on the committed tiny raw tree (tests/fixtures/raw_tiny)."""
 
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -62,17 +63,15 @@ def test_cli_builds_manifest_from_tiny_inputs(tiny_bake):
     assert [f["age_myr"] for f in frames] == [0.0, 0.000076, 0.030, 540.0]
     assert [f["source"] for f in frames] == ["ice6g", "ice6g", "paleodem", "paleodem"]
     # Files are numbered by first occurrence; age 0 reuses the youngest ICE-6G_C image.
-    assert [f["file"] for f in frames] == [
-        "frames/f0000.tfgrid",
-        "frames/f0000.tfgrid",
-        "frames/f0001.tfgrid",
-        "frames/f0002.tfgrid",
-    ]
+    for frame, slot in zip(frames, (0, 0, 1, 2), strict=True):
+        digest = hashlib.sha256((out / frame["file"]).read_bytes()).hexdigest()
+        assert frame["file"] == f"frames/f{slot:04d}.{digest}.tfgrid"
     assert len({f["file"] for f in frames}) == 3
     # PaleoDEMs carry their source reconstruction ages; ICE-6G_C frames carry none.
     assert [f.get("source_rotation_age_myr") for f in frames] == [None, None, 0.0, 540.0]
-    assert manifest["footprints"] == "plates.tfplates"
-    assert manifest["rotations"] == "rotations.tfrot"
+    for key, stem, ext in [("footprints", "plates", "tfplates"), ("rotations", "rotations", "tfrot")]:
+        digest = hashlib.sha256((out / manifest[key]).read_bytes()).hexdigest()
+        assert manifest[key] == f"{stem}.{digest}.{ext}"
     assert len(manifest["attribution"]) == 4
     text = " ".join(manifest["attribution"])
     for name in ("Scotese", "ICE-6G_C", "Argus", "Peltier", "Spratt"):
@@ -88,7 +87,7 @@ def test_tiny_bake_references_are_valid_across_formats(tiny_bake):
         assert header["channels"] == (4 if f["source"] == "ice6g" else 2)
         assert np.all(np.isfinite(data.astype(np.float32)))
     # The ICE-6G_C frame has land, ocean, and ice on both land and water.
-    _, ice = formats.read_tfgrid(out / "frames/f0000.tfgrid")
+    _, ice = formats.read_tfgrid(out / manifest["frames"][0]["file"])
     ice = ice.astype(np.float32)
     assert ice[..., 1].max() == 1.0 and ice[..., 1].min() == 0.0
     assert np.any((ice[..., 2] > 0.5) & (ice[..., 1] < 0.5))  # floating ice
@@ -146,3 +145,26 @@ def test_cli_rejects_missing_raw_inputs(tmp_path):
     finally:
         bake_log.configure(None)
     assert not (tmp_path / "out" / "manifest.json").exists()
+
+
+def test_rebake_publishes_only_complete_revisions(tmp_path, monkeypatch):
+    original = cli.bake(FIXTURE, tmp_path, CUBE, footprint_dilate_cells=0)
+    previous = (tmp_path / "manifest.json").read_bytes()
+    changed = cli.bake(FIXTURE, tmp_path, CUBE, footprint_dilate_cells=2)
+    assert changed["footprints"] != original["footprints"]
+    assert (tmp_path / original["footprints"]).is_file()
+    current = (tmp_path / "manifest.json").read_bytes()
+    assert current != previous
+
+    replace = Path.replace
+
+    def fail_publish(src, dest):
+        if dest == tmp_path / "manifest.json":
+            raise OSError("publish failed")
+        return replace(src, dest)
+
+    monkeypatch.setattr(Path, "replace", fail_publish)
+    with pytest.raises(OSError, match="publish failed"):
+        cli.bake(FIXTURE, tmp_path, 4)
+    assert (tmp_path / "manifest.json").read_bytes() == current
+    assert all((tmp_path / f["file"]).is_file() for f in changed["frames"])

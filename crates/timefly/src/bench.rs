@@ -318,12 +318,16 @@ fn drive_scrub_bench(
 ) {
     let now = Instant::now();
     let interactive = first.read().last().is_some();
+    if bench.phase != Phase::Done
+        && let Some(GlobeRenderStatus::Failed(reason)) = status.as_deref()
+    {
+        let report = failure_block(session.as_deref(), adapter.as_deref(), reason);
+        bench.finish(report, false, &mut exit);
+        return;
+    }
     match bench.phase {
         Phase::WaitingForGlobe => {
-            if let Some(GlobeRenderStatus::Failed(reason)) = status.as_deref() {
-                let report = failure_block(session.as_deref(), adapter.as_deref(), reason);
-                bench.finish(report, false, &mut exit);
-            } else if interactive {
+            if interactive {
                 bench.cold_load_secs = session
                     .as_ref()
                     .map(|s| now.duration_since(s.started).as_secs_f64());
@@ -484,7 +488,7 @@ fn header_lines(session: Option<&SessionInfo>, adapter: Option<&RenderAdapterInf
     out
 }
 
-/// The block for a run whose globe failed before it became interactive.
+/// The block for a run interrupted by a globe failure.
 fn failure_block(
     session: Option<&SessionInfo>,
     adapter: Option<&RenderAdapterInfo>,
@@ -945,6 +949,16 @@ mod tests {
         // Reported once.
         app.update();
         assert!(exits(&app).is_empty());
+    }
+
+    #[test]
+    fn a_pipeline_failure_during_scrubbing_fails_the_bench() {
+        let mut app = bench_app(GlobeRenderStatus::Interactive { first_frame: 1 }, true);
+        app.world_mut().resource_mut::<ScrubBench>().phase = Phase::Scrubbing;
+        app.world_mut()
+            .insert_resource(GlobeRenderStatus::Failed("composite failed".into()));
+        app.update();
+        assert_eq!(exits(&app), vec![bench_exit(false)]);
     }
 
     #[test]

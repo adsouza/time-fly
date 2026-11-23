@@ -17,7 +17,7 @@
 # /usr/bin -> /opt/time-fly.
 #
 # Usage: stage.sh BINARY ASSETS_DIR OUT_DIR    (OUT_DIR must not exist or be empty)
-# Works on any host with bash and coreutils-style tools (checked on macOS too).
+# Requires bash, Python 3 and coreutils-style tools (checked on macOS too).
 set -euo pipefail
 
 APP_ID=io.github.adsouza.TimeFly
@@ -44,21 +44,38 @@ install -m 0755 "$binary" "$lib/time-fly"
 # Runtime assets, by allowlist: what the game loads (`data.rs`: the manifest, the frames it
 # lists, the plate footprints and rotations). Shaders and credits.txt are compiled into the
 # binary; bake.log is a build log.
-for f in manifest.json plates.tfplates rotations.tfrot; do
-  [ -f "$globe/$f" ] || die "missing $globe/$f"
-  install -m 0644 "$globe/$f" "$lib/assets/data/globe/$f"
-done
-n_frames=0
-for f in "$globe"/frames/*.tfgrid; do
-  [ -f "$f" ] || die "no frames in $globe/frames"
-  install -m 0644 "$f" "$lib/assets/data/globe/frames/"
-  n_frames=$((n_frames + 1))
-done
-skipped=$(cd "$globe" && find . -type f ! -name manifest.json ! -name plates.tfplates \
-  ! -name rotations.tfrot ! -path './frames/*.tfgrid' | sort)
-if [ -n "$skipped" ]; then
-  echo "stage.sh: not shipped (not loaded by the game): $(echo "$skipped" | tr "\n" " ")" >&2
-fi
+n_frames=$(python3 - "$globe" "$lib/assets/data/globe" <<'PYTHON'
+import json
+from pathlib import Path
+import re
+import shutil
+import sys
+
+source, dest = map(Path, sys.argv[1:])
+manifest = (source / "manifest.json").read_bytes()
+data = json.loads(manifest)
+frames = {f["file"] for f in data["frames"]}
+if not frames:
+    sys.exit("manifest has no frames")
+# Accept both numbered legacy assets and content-addressed bakes.
+digest = r"(?:\.[0-9a-f]{64})?"
+
+
+def copy(name, pattern):
+    if not re.fullmatch(pattern, name):
+        sys.exit(f"invalid manifest asset name {name!r}")
+    shutil.copyfile(source / name, dest / name)
+    (dest / name).chmod(0o644)
+
+
+copy(data["footprints"], "plates" + digest + r"\.tfplates")
+copy(data["rotations"], "rotations" + digest + r"\.tfrot")
+for frame in frames:
+    copy(frame, r"frames/f[0-9]+" + digest + r"\.tfgrid")
+(dest / "manifest.json").write_bytes(manifest)
+print(len(frames))
+PYTHON
+)
 
 cat >"$out/bin/time-fly" <<'WRAPPER'
 #!/bin/sh

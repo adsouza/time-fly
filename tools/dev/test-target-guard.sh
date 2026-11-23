@@ -62,6 +62,14 @@ check "deps kept" test -f "$ROOT/target/debug/deps/d.bin"
 check "report mentions removal" grep -qi 'removed' <<<"$out"
 check "no cargo clean/sweep" test ! -s "$CALLS"
 
+newroot ancestor-link
+mkfile "$ROOT/target/debug/a.bin" 2
+mkfile "$TMP/external/incremental/stale/x" 1
+age "$TMP/external/incremental/stale" $OLD
+ln -s "$TMP/external" "$ROOT/target/release"
+TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=0 guard >/dev/null
+check "symlinked profile keeps external incremental session" test -f "$TMP/external/incremental/stale/x"
+
 echo "3. still over after step 1: least recently modified stale profile removed, newest kept"
 newroot 3
 mkfile "$ROOT/target/release/r.bin" 4;                 age "$ROOT/target/release" 202001010000

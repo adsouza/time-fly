@@ -20,8 +20,8 @@ pub struct LaunchArgs {
     pub window: Option<(u32, u32)>,
     /// Hidden `--check-data[=DIR]` (native only): load the globe data headlessly and exit.
     pub check_data: Option<DataCheck>,
-    /// Arguments this build does not understand. They are ignored, and logged as warnings once
-    /// the log subscriber exists.
+    /// Unrecognized arguments. Diagnostics log only their count because URL query
+    /// values and command-line arguments can contain private data.
     pub unknown: Vec<String>,
 }
 

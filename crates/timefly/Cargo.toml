@@ -63,6 +63,7 @@ web-sys = { version = "0.3", features = [
     # Needed for append_child/set_text_content and the pagehide listener.
     "Node",
     "EventTarget",
+    "PageTransitionEvent",
 ] }
 
 [dev-dependencies]

@@ -340,9 +340,45 @@ fn home() -> Home {
 /// Opens this session's diagnostics. Runs before the Bevy `App` exists; see the module docs.
 pub fn start(args: LaunchArgs) -> Session {
     let now = now_unix_millis();
+    start_session(
+        args,
+        now,
+        short_id(now),
+        #[cfg(target_arch = "wasm32")]
+        None,
+    )
+}
+
+/// Register this document's live lock before publishing its record to other tabs.
+#[cfg(target_arch = "wasm32")]
+pub fn start_web(args: LaunchArgs, run: impl FnOnce(Session) + 'static) {
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
+
+    #[wasm_bindgen(module = "/src/diagnostics/session/locks.js")]
+    extern "C" {
+        #[wasm_bindgen(js_name = withSessionLocks)]
+        fn with_session_locks(id: &str, register: &js_sys::Function);
+    }
+
+    let now = now_unix_millis();
+    let id = short_id(now);
+    let session_id = id.clone();
+    let register = Closure::once_into_js(move |held: JsValue| {
+        let held = held.dyn_into::<js_sys::Array>().ok();
+        run(start_session(args, now, session_id, held));
+    });
+    with_session_locks(&id, register.unchecked_ref());
+}
+
+fn start_session(
+    args: LaunchArgs,
+    now: u64,
+    id: String,
+    #[cfg(target_arch = "wasm32")] held: Option<js_sys::Array>,
+) -> Session {
     let started = UtcTime::from_unix_millis(now);
     let record = SessionRecord {
-        id: short_id(now),
+        id,
         started_utc: started.rfc3339(),
         build: BuildInfo::current(),
         platform: PlatformInfo::current(),
@@ -353,9 +389,10 @@ pub fn start(args: LaunchArgs) -> Session {
     let home = home();
 
     #[cfg(not(target_arch = "wasm32"))]
-    let (findings, log_writer, guard) = session::store::open(&record, &started, &home);
+    let (findings, log_writer, guard) =
+        session::store::open(&record, &started, &home, args.check_data.is_some());
     #[cfg(target_arch = "wasm32")]
-    let findings = session::web::open(&record);
+    let findings = session::web::open(&record, held);
 
     let mut findings = findings;
     let problems = std::mem::take(&mut findings.problems);
@@ -379,7 +416,7 @@ pub fn start(args: LaunchArgs) -> Session {
     }
     report::install_panic_hook(shared.clone());
     #[cfg(target_arch = "wasm32")]
-    session::web::install_pagehide(shared.clone());
+    session::web::install_page_lifecycle(shared.clone());
 
     let (route, pending) = notice::before_app(&shared);
     *lock(&shared.notice_route) = route;
@@ -609,8 +646,11 @@ fn log_findings(handle: Res<DiagnosticsHandle>) {
     for problem in shared.take_problems_for_logging() {
         warn!("{problem}");
     }
-    for arg in &shared.args.unknown {
-        warn!(arg = %arg, "ignoring an unknown launch argument");
+    if !shared.args.unknown.is_empty() {
+        warn!(
+            count = shared.args.unknown.len(),
+            "ignoring unknown launch arguments"
+        );
     }
     if let Some(previous) = &findings.previous {
         match previous.outcome {

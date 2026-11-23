@@ -169,6 +169,7 @@ def setup(tmp_path, monkeypatch):
     https = ThreadingHTTPServer(
         ("127.0.0.1", 0), partial(_Handler, directory=str(www), requests=tls_requests)
     )
+    monkeypatch.setitem(fetch._ISSUER_URLS, ("127.0.0.1", https.server_address[1]), aia_url)
     server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_ctx.load_cert_chain(tmp_path / "leaf.pem", tmp_path / "leaf.key")  # leaf only
     https.socket = server_ctx.wrap_socket(https.socket, server_side=True)
@@ -366,6 +367,8 @@ def test_aia_context_is_cached_per_host(monkeypatch):
     calls = []
     monkeypatch.setattr(fetch, "_leaf_der", lambda h, port: calls.append(h) or _der(p.leaf))
     monkeypatch.setattr(fetch, "_get_capped", lambda url, cap: _der(p.inter))
+    for host in ("h.example", "other.example"):
+        monkeypatch.setitem(fetch._ISSUER_URLS, (host, 443), fetch.issuer_url(_der(p.leaf)))
     a = fetch.aia_context("h.example", 443)
     b = fetch.aia_context("h.example", 443)
     assert a is b and calls == ["h.example"]
@@ -386,3 +389,26 @@ def test_main_reports_aia_failure_and_exits_nonzero(tmp_path, monkeypatch):
     monkeypatch.setattr(fetch, "_download", fail_download)
     monkeypatch.setattr(fetch, "_leaf_der", lambda h, port: b"not a certificate")
     assert fetch.main(["--sources", str(sources), "--raw", str(tmp_path / "raw")]) == 1
+
+
+def test_unconfigured_host_never_probes_leaf(monkeypatch):
+    monkeypatch.setattr(fetch, "_leaf_der", lambda *_: pytest.fail("unexpected TLS probe"))
+    with pytest.raises(fetch.AiaError, match="no issuer URL configured"):
+        fetch.aia_context("other.example", 443)
+
+
+def test_unexpected_issuer_url_is_rejected_before_download(setup, monkeypatch):
+    port = int(setup["base"].rsplit(":", 1)[1])
+    monkeypatch.setitem(fetch._ISSUER_URLS, ("127.0.0.1", port), "https://ca.example/issuer")
+    with pytest.raises(fetch.AiaError, match="differs"):
+        fetch.aia_context("127.0.0.1", port)
+    assert setup["aia"] == []
+
+
+def test_issuer_redirect_is_rejected(setup):
+    # SimpleHTTPRequestHandler redirects a directory request to its slash-suffixed URL.
+    (setup["tmp"] / "www" / "folder").mkdir()
+    url = fetch.issuer_url(_der(setup["pki"].leaf)).rsplit("/", 1)[0] + "/folder"
+    with pytest.raises(fetch.AiaError, match="redirects"):
+        fetch._get_capped(url, fetch.AIA_MAX_BYTES)
+    assert setup["aia"] == ["/folder"]

@@ -243,11 +243,16 @@ pub fn next_render_status(
     frame: u32,
     stalled_secs: f64,
 ) -> GlobeRenderStatus {
+    if matches!(
+        current,
+        GlobeRenderStatus::PreparingGpu | GlobeRenderStatus::Interactive { .. }
+    ) && let Some(error) = &report.error
+    {
+        return GlobeRenderStatus::Failed(format!("globe pipeline failed: {error}"));
+    }
     match current {
         GlobeRenderStatus::PreparingGpu => {
-            if let Some(error) = &report.error {
-                GlobeRenderStatus::Failed(format!("the renderer could not start: {error}"))
-            } else if report.frames > spawned_at + u64::from(CLEAN_FRAMES_FOR_INTERACTIVE)
+            if report.frames > spawned_at + u64::from(CLEAN_FRAMES_FOR_INTERACTIVE)
                 && report.clean_streak >= CLEAN_FRAMES_FOR_INTERACTIVE
             {
                 GlobeRenderStatus::Interactive { first_frame: frame }
@@ -587,7 +592,6 @@ fn update_globe_view(
     mut composites_m: ResMut<Assets<CompositeMaterial>>,
     mut atmospheres_m: ResMut<Assets<AtmosphereMaterial>>,
     debug: Res<GlobeDebugView>,
-    mut cameras: Query<&mut RenderLayers, With<GlobeCamera>>,
     mut changes: MessageWriter<FrameSelectionChanged>,
     context: Option<ResMut<DiagnosticsContext>>,
 ) {
@@ -634,14 +638,6 @@ fn update_globe_view(
         m.params = GlobeParams::composite(view.deep_weight, sun).with_debug(dbg);
     }
     if let Some(change) = selection_change(scene.view.as_ref(), &view) {
-        let layer = match view.mode {
-            GlobeMode::Recent => RECENT_LAYER,
-            GlobeMode::Deep => DEEP_LAYER,
-            GlobeMode::Bridge => COMPOSITE_LAYER,
-        };
-        for mut layers in &mut cameras {
-            *layers = RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer]);
-        }
         if let Some(mut context) = context {
             context.frame_selection = Some(format!("{:?} {:?}", change.mode, change.frames));
         }
@@ -695,7 +691,10 @@ fn sync_bridge_cameras(
     status: Res<GlobeRenderStatus>,
     mut images: ResMut<Assets<Image>>,
     mut composites_m: ResMut<Assets<CompositeMaterial>>,
-    main: Query<(&Camera, &Transform, &Projection), (With<GlobeCamera>, Without<BridgeCamera>)>,
+    mut main: Query<
+        (&Camera, &Transform, &Projection, &mut RenderLayers),
+        (With<GlobeCamera>, Without<BridgeCamera>),
+    >,
     mut bridge: Query<
         (
             &BridgeCamera,
@@ -707,11 +706,26 @@ fn sync_bridge_cameras(
         Without<GlobeCamera>,
     >,
 ) {
-    let Ok((camera, transform, projection)) = main.single() else {
+    let Ok((camera, transform, projection, mut layers)) = main.single_mut() else {
         return;
     };
     let warming_up = *status == GlobeRenderStatus::PreparingGpu;
-    let bridging = scene.view.is_some_and(|v| v.mode == GlobeMode::Bridge);
+    let mode = scene.view.map_or(GlobeMode::Recent, |v| v.mode);
+    let layer = match mode {
+        GlobeMode::Recent => RECENT_LAYER,
+        GlobeMode::Deep => DEEP_LAYER,
+        GlobeMode::Bridge => COMPOSITE_LAYER,
+    };
+    // The offscreen cameras prepare both inputs. Draw the composite on the actual
+    // presentation camera during loading so its target-specific pipeline warms up too.
+    let mut wanted = RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer]);
+    if warming_up {
+        wanted = wanted.with(COMPOSITE_LAYER);
+    }
+    if *layers != wanted {
+        *layers = wanted;
+    }
+    let bridging = mode == GlobeMode::Bridge;
     let active = warming_up || bridging;
     if active
         && let Some(size) = camera.physical_target_size()
@@ -786,6 +800,7 @@ fn probe_pipelines(cache: Res<PipelineCache>, probe: Res<RenderProbe>) {
     use bevy::render::render_resource::CachedPipelineState;
     let mut pending = cache.waiting_pipelines().count();
     let mut error = None;
+    let mut composite_ready = false;
     for pipeline in cache.pipelines() {
         match &pipeline.state {
             CachedPipelineState::Queued | CachedPipelineState::Creating(_) => pending += 1,
@@ -797,8 +812,20 @@ fn probe_pipelines(cache: Res<PipelineCache>, probe: Res<RenderProbe>) {
             CachedPipelineState::Err(e) => {
                 error.get_or_insert_with(|| e.to_string());
             }
-            CachedPipelineState::Ok(_) => {}
+            CachedPipelineState::Ok(_) => {
+                use bevy::render::render_resource::PipelineDescriptor;
+                if let PipelineDescriptor::RenderPipelineDescriptor(desc) = &pipeline.descriptor
+                    && desc.label.as_deref() == Some(material::COMPOSITE_PIPELINE_LABEL)
+                {
+                    composite_ready = true;
+                }
+            }
         }
+    }
+    // An empty pipeline queue can also mean that visibility or asset preparation has
+    // not queued the composite yet. Wait for positive confirmation of its compilation.
+    if !composite_ready {
+        pending = pending.max(1);
     }
     let Ok(mut report) = probe.0.lock() else {
         return;
@@ -968,7 +995,7 @@ mod tests {
         let done = GlobeRenderStatus::Interactive { first_frame: 3 };
         assert_eq!(
             next_render_status(&done, &report(99, 0, Some("x")), 10, 40, 0.0),
-            done
+            GlobeRenderStatus::Failed("globe pipeline failed: x".into())
         );
         assert_eq!(
             next_render_status(

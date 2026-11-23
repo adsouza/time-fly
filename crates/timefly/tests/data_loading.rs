@@ -198,6 +198,26 @@ fn failed_load_enters_failed_state() {
 }
 
 #[test]
+fn malformed_manifest_paths_fail_without_panicking() {
+    for field in ["footprints", "rotations", "frame"] {
+        let root = tiny_copy(&format!("bad-path-{field}"));
+        edit_manifest(&root, |m| {
+            let path = if field == "frame" {
+                &mut m["frames"][0]["file"]
+            } else {
+                &mut m[field]
+            };
+            *path = "broken#".into();
+        });
+        let error = load_failure(&root);
+        assert!(
+            error.contains("invalid asset path") && error.contains("broken#"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn missing_manifest_fails() {
     let root = tiny_copy("no-manifest");
     fs::remove_file(root.join("data/globe/manifest.json")).unwrap();

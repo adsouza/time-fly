@@ -131,6 +131,7 @@ pub fn open(
     record: &SessionRecord,
     started: &UtcTime,
     home: &Home,
+    data_check: bool,
 ) -> (Findings, Option<NonBlocking>, Option<WorkerGuard>) {
     let mut findings = Findings::default();
     let Some(root) = resolve_log_root(std::env::consts::OS, &log_root_env()) else {
@@ -138,6 +139,12 @@ pub fn open(
             .problems
             .push("no log location on this platform; logging to the console only".into());
         return (findings, None, None);
+    };
+    // Headless checks have their own retention and never displace a player's crash record.
+    let root = if data_check {
+        root.join("data-checks")
+    } else {
+        root
     };
     if let Err(e) = fs::create_dir_all(&root) {
         findings.problems.push(format!(
@@ -147,7 +154,9 @@ pub fn open(
         return (findings, None, None);
     }
     findings.log_root = Some(root.clone());
-    findings.previous = inspect_newest_session(&root);
+    if !data_check {
+        findings.previous = inspect_newest_session(&root);
+    }
 
     let name = session_dir_name(started, &record.id);
     let dir = root.join(&name);

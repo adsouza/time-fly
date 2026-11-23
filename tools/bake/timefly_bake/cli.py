@@ -11,9 +11,9 @@ plus the reviewed PaleoDEM age table (``--paleodem-ages``; by default ``<raw>/pa
 or else ``<raw>/../paleodem_ages.csv``), and writes to ``--out``::
 
     manifest.json           version 2: frames, footprints, rotations, sea level, attribution
-    frames/fNNNN.tfgrid     geographic cube images, numbered by first use in age order
-    plates.tfplates         plate footprints
-    rotations.tfrot         plate rotations and validity
+    frames/fNNNN.<sha256>.tfgrid   geographic cube images in order of first use
+    plates.<sha256>.tfplates       plate footprints
+    rotations.<sha256>.tfrot       plate rotations and validity
     bake.log                DEBUG log of the run
 
 Timeline: the youngest ICE-6G_C image at age 0, then one frame per slice at ``(k ka + 76 yr)``,
@@ -282,18 +282,41 @@ def bake(
 ) -> dict:
     """Bake everything from ``raw`` into ``out`` and return the manifest written there.
 
-    The manifest is written last, so a failed bake never leaves one pointing at missing files.
+    Immutable payload names let readers finish loading an older manifest while a new
+    generation is published. Only replacement of manifest.json changes the active bake.
     """
     raw, out = Path(raw), Path(out)
     if cube_size < 1:
         raise ValueError(f"cube size must be positive, got {cube_size}")
     ages_path = _ages_path(raw, None if ages_path is None else Path(ages_path))
-    started = time.perf_counter()
     out.mkdir(parents=True, exist_ok=True)
-    (out / MANIFEST_NAME).unlink(missing_ok=True)
-    for stale in (out / FRAMES_DIR).glob("f*.tfgrid") if (out / FRAMES_DIR).is_dir() else []:
-        stale.unlink()
+    with tempfile.TemporaryDirectory(prefix=".bake-", dir=out) as tmp:
+        stage = Path(tmp)
+        manifest = _bake_staged(
+            raw, stage, cube_size, ages_path, paleodem_step_myr, footprint_dilate_cells
+        )
+        payloads = {frame["file"] for frame in manifest["frames"]}
+        payloads.update([manifest["footprints"], manifest["rotations"]])
+        names = {}
+        for rel in sorted(payloads):
+            src = stage / rel
+            name = Path(rel).with_suffix(f".{_sha256(src)}{src.suffix}").as_posix()
+            dest = out / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dest)
+            names[rel] = name
+        for frame in manifest["frames"]:
+            frame["file"] = names[frame["file"]]
+        for key in ("footprints", "rotations"):
+            manifest[key] = names[manifest[key]]
+        staged_manifest = stage / MANIFEST_NAME
+        staged_manifest.write_text(_manifest_json(manifest), encoding="utf-8")
+        staged_manifest.replace(out / MANIFEST_NAME)
+        return manifest
 
+
+def _bake_staged(raw, out, cube_size, ages_path, paleodem_step_myr, footprint_dilate_cells):
+    started = time.perf_counter()
     paleo_zip = _one(sorted((raw / "paleodem").glob("*.zip")), "PaleoDEM archive")
     plate_zips = sorted((raw / "plates").glob("*.zip"))
     sea_path = raw / "sealevel" / SEA_LEVEL_NAME
@@ -390,21 +413,13 @@ def bake(
         "sea_level_curve": [[float(a), float(s)] for a, s in zip(sea_age, sea_m)],
         "attribution": ATTRIBUTION,
     }
-    for rel in {*files, FOOTPRINTS_NAME, ROTATIONS_NAME}:
-        if not (out / rel).is_file():
-            raise ValueError(f"manifest references missing file {rel}")
-    tmp_manifest = out / (MANIFEST_NAME + ".tmp")
-    tmp_manifest.write_text(_manifest_json(manifest), encoding="utf-8")
-    tmp_manifest.replace(out / MANIFEST_NAME)
-
-    total = sum(p.stat().st_size for p in out.rglob("*.tf*") if p.is_file())
+    total = sum((out / name).stat().st_size for name in [*files, FOOTPRINTS_NAME, ROTATIONS_NAME])
     _log.info(
-        "bake done in %.1f s: %d frames, %d images, %.2f MB of assets in %s",
+        "bake done in %.1f s: %d frames, %d images, %.2f MB of staged assets",
         time.perf_counter() - started,
         len(frames),
         len(images),
-        (total + (out / MANIFEST_NAME).stat().st_size) / 1e6,
-        out,
+        total / 1e6,
     )
     return manifest
 

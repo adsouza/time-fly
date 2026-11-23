@@ -77,6 +77,7 @@ if [ "$MODE" = status ]; then
 fi
 
 if limits_ok; then exit 0; fi
+PHYSICAL_TARGET="$(cd -P -- "$TARGET" && pwd -P)" || exit 0
 
 BEFORE="$(describe_state)"
 REMOVED=()
@@ -87,8 +88,14 @@ build_running() { pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>
 # remove <path>: only ever inside $TARGET, never through symlinks.
 remove() {
   case "$1" in "$TARGET"/*) ;; *) return 1 ;; esac
-  [ -L "$1" ] && return 1
-  rm -rf -- "$1" && REMOVED+=("${1#"$ROOT"/}")
+  local parent=${1%/*} leaf=${1##*/}
+  # Stay in the verified physical parent during removal. A symlinked ancestor
+  # leads to a different directory, even when the last component looks ordinary.
+  (
+    cd -P -- "$parent" || exit 1
+    [ "$(pwd -P)" = "$PHYSICAL_TARGET${parent#"$TARGET"}" ] || exit 1
+    [ ! -L "./$leaf" ] && rm -rf -- "./$leaf"
+  ) && REMOVED+=("${1#"$ROOT"/}")
 }
 fresh() { [ -n "$(find "$1" -mmin -"$STALE_MIN" -print -quit 2>/dev/null)" ]; }
 newest_mtime() {   # newest mtime (epoch) of a dir and its subdirs down to depth 2

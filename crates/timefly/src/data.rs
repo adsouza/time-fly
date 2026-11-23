@@ -290,11 +290,17 @@ pub fn describe_load_error(path: &str, e: &AssetLoadError) -> String {
     }
 }
 
+fn sibling_path(parent: &AssetPath<'_>, file: &str) -> Result<AssetPath<'static>, GlobeDataError> {
+    let path = AssetPath::try_parse(file)
+        .map_err(|e| GlobeDataError::Manifest(format!("invalid asset path {file:?}: {e}")))?;
+    Ok(parent.resolve_embed(&path))
+}
+
 async fn read_sibling(
     load_context: &mut LoadContext<'_>,
     file: &str,
 ) -> Result<(String, Vec<u8>), GlobeDataError> {
-    let path = load_context.path().resolve_embed(&AssetPath::parse(file));
+    let path = sibling_path(load_context.path(), file)?;
     let bytes = load_context
         .read_asset_bytes(path.clone())
         .await
@@ -349,10 +355,10 @@ async fn load_manifest(
     let images = files
         .iter()
         .map(|file| {
-            let path = load_context.path().resolve_embed(&AssetPath::parse(file));
-            load_context.load::<Image>(path)
+            let path = sibling_path(load_context.path(), file)?;
+            Ok(load_context.load::<Image>(path))
         })
-        .collect();
+        .collect::<Result<_, GlobeDataError>>()?;
     Ok(GlobeManifest {
         revision,
         cube_size: manifest.cube_size,

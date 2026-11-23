@@ -402,6 +402,8 @@ pub struct CompositeMaterial {
     pub deep_view: Handle<Image>,
 }
 
+pub(super) const COMPOSITE_PIPELINE_LABEL: &str = "timefly_bridge_composite";
+
 impl Material for CompositeMaterial {
     fn vertex_shader() -> ShaderRef {
         GLOBE_SHADER.into()
@@ -421,6 +423,7 @@ impl Material for CompositeMaterial {
         layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.label = Some(COMPOSITE_PIPELINE_LABEL.into());
         push_def(descriptor, "COMPOSITE");
         descriptor.primitive.cull_mode = None;
         position_only_layout(descriptor, layout)

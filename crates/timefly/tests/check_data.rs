@@ -95,7 +95,7 @@ fn the_binary_checks_a_bake_and_exits_0() {
         "{}",
         run.stdout
     );
-    let previous = inspect_newest_session(&logs).expect("a session");
+    let previous = inspect_newest_session(&logs.join("data-checks")).expect("a session");
     assert_eq!(previous.outcome, PreviousOutcome::Clean);
 }
 
@@ -122,6 +122,26 @@ fn the_binary_exits_1_on_a_broken_bake_without_recording_a_crash() {
         run.stderr
     );
     // A failed check is a result, not a crash: the next launch shows no crash notice.
-    let previous = inspect_newest_session(&logs).expect("a session");
+    let previous = inspect_newest_session(&logs.join("data-checks")).expect("a session");
     assert_eq!(previous.outcome, PreviousOutcome::Clean);
+}
+
+#[test]
+fn data_check_preserves_pending_game_crash() {
+    let logs = temp_dir("pending-crash");
+    let crash = run_binary(&logs, "--diagnostics-probe=panic");
+    assert_ne!(crash.code, Some(0));
+    let before = inspect_newest_session(&logs).unwrap();
+    let check = run_binary(&logs, &format!("--check-data={}", tiny_globe().display()));
+    assert_eq!(check.code, Some(0), "{}", check.stderr);
+    assert!(!check.stderr.contains("didn't close normally"));
+    let after = inspect_newest_session(&logs).unwrap();
+    assert_eq!(after.dir, before.dir);
+    assert!(matches!(
+        after.outcome,
+        PreviousOutcome::Crashed {
+            during_startup: true,
+            ..
+        }
+    ));
 }

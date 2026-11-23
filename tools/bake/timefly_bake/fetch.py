@@ -166,6 +166,10 @@ def _download(source: Source, part: Path, context: ssl.SSLContext | None = None)
 
 _UNABLE_TO_GET_ISSUER_CERT_LOCALLY = 20  # X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
 AIA_MAX_BYTES = 16 * 1024
+_ISSUER_URLS = {
+    ("www.atmosp.physics.utoronto.ca", 443):
+        "http://crt.sectigo.com/SectigoPublicServerAuthenticationCAOVR36.crt",
+}
 _AIA_CONTEXTS: dict[tuple[str, int], ssl.SSLContext] = {}
 
 
@@ -282,9 +286,15 @@ def _leaf_der(host: str, port: int) -> bytes:
     return der
 
 
+class _NoIssuerRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise AiaError("issuer certificate redirects are not allowed")
+
+
 def _get_capped(url: str, cap: int) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=_TIMEOUT_S) as response:
+    opener = urllib.request.build_opener(_NoIssuerRedirects)
+    with opener.open(request, timeout=_TIMEOUT_S) as response:
         data = response.read(cap + 1)
     if len(data) > cap:
         raise AiaError(f"issuer certificate at {url} is larger than {cap} bytes")
@@ -297,9 +307,13 @@ def aia_context(host: str, port: int) -> ssl.SSLContext:
     key = (host, port)
     if key in _AIA_CONTEXTS:
         return _AIA_CONTEXTS[key]
+    url = _ISSUER_URLS.get(key)
+    if url is None:
+        raise AiaError(f"no issuer URL configured for {host}:{port}")
     try:
         leaf = _leaf_der(host, port)
-        url = issuer_url(leaf)
+        if issuer_url(leaf) != url:
+            raise AiaError("leaf issuer URL differs from the configured issuer URL")
         intermediate = parse_intermediate(_get_capped(url, AIA_MAX_BYTES), leaf)
     except AiaError:
         raise
@@ -307,8 +321,8 @@ def aia_context(host: str, port: int) -> ssl.SSLContext:
         raise AiaError(f"fetching the issuer certificate for {host} failed: {exc}") from exc
     ctx = context_with_intermediate(intermediate)
     _log.warning(
-        "%s does not send its intermediate certificate; using %s from its AIA URL %s "
-        "(sha256 %s), verified up to a system root",
+        "%s does not send its intermediate certificate; retrying with %s from %s "
+        "(sha256 %s), requiring a chain to a trusted root",
         host,
         intermediate.subject,
         url,
