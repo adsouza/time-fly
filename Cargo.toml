@@ -20,18 +20,26 @@ inherits = "dev"
 opt-level = 0
 debug = false
 
+# Everyday optimized builds: `cargo run --release`, the benchmarks, CI test packages. No
+# cross-crate LTO and the default 16 codegen units, so a rebuild after an edit relinks in about
+# 12 s instead of about 110 s (M4, 2026-11-23); thin LTO re-optimizes all of Bevy at every link.
 [profile.release]
-lto = "thin"
-codegen-units = 1
 # File and line in panic backtraces, for crash reports (spec §20).
 debug = "line-tables-only"
 
-# Web builds (ruling R15): the release profile without debuginfo. Line tables are no use in the
+# Shipping builds: tagged Linux packages and, through `web-release`, the web build. Full
+# optimization for the smallest, fastest binary, at the cost of slow links.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
+# Web builds (ruling R15): the dist profile without debuginfo. Line tables are no use in the
 # browser (panics report file and line from the panic message itself), and `strip` also drops
 # the wasm `name` section (~31 MB), so browser stack traces show function indices, not names.
 # Build and serve from `crates/timefly` (wasm-server-runner serves `./assets`):
 #   cargo run --profile web-release -p timefly --target wasm32-unknown-unknown
 [profile.web-release]
-inherits = "release"
+inherits = "dist"
 debug = false
 strip = true

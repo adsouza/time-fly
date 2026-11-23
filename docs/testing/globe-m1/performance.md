@@ -18,9 +18,13 @@ threshold and count on their own line, and which rule decided the result. The ru
 below predate the rule (they were judged by p95 alone); the re-run after it follows.
 
 ```sh
-PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo run --release -p timefly -- --scrub-bench --window 2560x1440
+PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo run --profile dist -p timefly -- --scrub-bench --window 2560x1440
 # web: open the wasm-server-runner URL with ?scrub-bench (see "Chrome WebGPU" below)
 ```
+
+Since 2026-11-23 the fully optimized settings these runs used (thin LTO, one codegen unit) live
+in the `dist` profile; `release` now skips cross-crate LTO so rebuilds link fast. Compare like
+with like: bench shipping performance with `--profile dist`.
 
 ## Native Metal, Apple M4 (2026-11-22)
 
@@ -133,7 +137,8 @@ How it was measured: `proc_pid_rusage(RUSAGE_INFO_V4)` sampled each frame by the
 
 ## Web build size (ruling R15)
 
-`[profile.web-release]` (root `Cargo.toml`): inherits `release`, `debug = false`,
+`[profile.web-release]` (root `Cargo.toml`): inherits `release` (since 2026-11-23, `dist`, which
+holds the same settings), `debug = false`,
 `strip = true`. Sizes of the wasm wasm-server-runner serves (after wasm-bindgen), measured
 2026-11-22 from the same source:
 
