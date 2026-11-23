@@ -34,6 +34,7 @@
 //!
 //! [`FAILED_RESULT_EXIT_CODE`]: crate::diagnostics::session::FAILED_RESULT_EXIT_CODE
 
+pub mod banner;
 pub mod path;
 
 use bevy::ecs::system::SystemParam;
@@ -234,13 +235,17 @@ pub struct RegionBenchPlugin(pub RegionBenchConfig);
 impl Plugin for RegionBenchPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(RegionBench::new(self.0.clone()))
+            .add_systems(Startup, banner::spawn_banner)
             .add_systems(
                 Update,
-                drive_region_bench
-                    .after(RegionSystems)
-                    .after(NavigationSystems)
-                    .after(FlySystems::Step)
-                    .before(FlySystems::Apply),
+                (
+                    drive_region_bench
+                        .after(RegionSystems)
+                        .after(NavigationSystems)
+                        .after(FlySystems::Step)
+                        .before(FlySystems::Apply),
+                    banner::update_banner.after(drive_region_bench),
+                ),
             );
     }
 }
@@ -345,6 +350,10 @@ pub struct RegionBench {
     js_heap_peak: Option<u64>,
     reports: Vec<String>,
     summary: Option<String>,
+    /// The summary's result, once it is out.
+    passed: Option<bool>,
+    /// The path segment being flown (for the banner).
+    segment: Segment,
 }
 
 impl RegionBench {
@@ -357,6 +366,8 @@ impl RegionBench {
             js_heap_peak: None,
             reports: Vec::new(),
             summary: None,
+            passed: None,
+            segment: Segment::LowPass,
         }
     }
 
@@ -608,6 +619,7 @@ fn drive_region_bench(
         }
         Stage::Flying { region, since } => {
             let script = ((now - since) as f32) * SCRIPT_SECS / bench.config.path_secs.max(1e-3);
+            bench.segment = banner::segment_at(script);
             let run = &mut bench.runs[region];
             run.flight_ms.push(frame_ms);
             let segment = Segment::ALL
@@ -1266,6 +1278,7 @@ fn finish(
     let summary = out.join("\n");
     emit(&summary);
     bench.summary = Some(summary);
+    bench.passed = Some(pass && failure.is_none());
     if bench.config.exit_when_done {
         controls.exit.write(bench_exit(pass));
     }

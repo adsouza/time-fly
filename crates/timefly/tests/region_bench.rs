@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::bench::bench_exit;
+use timefly::bench::region::banner::BenchBannerText;
 use timefly::bench::region::{BENCH_REGIONS, RegionBench, RegionBenchConfig, RegionBenchPlugin};
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::globe::GlobeRenderStatus;
@@ -63,10 +64,26 @@ fn bench_app(config: RegionBenchConfig) -> App {
     })
     .insert_resource(TimeUpdateStrategy::ManualDuration(STEP))
     .init_resource::<Exits>()
-    .add_systems(Last, record_exits)
+    .init_resource::<BannerTexts>()
+    .add_systems(Last, (record_exits, record_banner))
     // Stands in for the globe's renderer.
     .insert_resource(GlobeRenderStatus::LoadingData);
     app
+}
+
+/// Every distinct text the bench banner showed, in order.
+#[derive(Resource, Default)]
+struct BannerTexts(Vec<String>);
+
+fn record_banner(
+    mut seen: ResMut<BannerTexts>,
+    texts: Query<&Text, (With<BenchBannerText>, Changed<Text>)>,
+) {
+    for t in &texts {
+        if seen.0.last() != Some(&t.0) {
+            seen.0.push(t.0.clone());
+        }
+    }
 }
 
 fn exits(app: &mut App) -> Vec<AppExit> {
@@ -180,6 +197,32 @@ fn region_bench_reports_all_regions() {
     // Reported once.
     app.update();
     assert!(exits(&mut app).is_empty());
+
+    // The banner followed the stops, the pan and the result, and kept the result.
+    let shown = &app.world().resource::<BannerTexts>().0;
+    for text in [
+        "Next: Pangaea interior · 250 million years ago · 1 of 8",
+        "Pangaea interior · 250 million years ago · 1 of 8",
+        "Sundaland · 21 thousand years ago · 3 of 8",
+        "Globe · Beringia → Rockies ice margin",
+        "Panama · 3 million years ago · 8 of 8",
+        "Memory cycles · Himalayas · 1 of 2",
+    ] {
+        assert!(
+            shown.iter().any(|s| s == text),
+            "{text:?} not in {shown:#?}"
+        );
+    }
+    let last = shown.last().unwrap();
+    assert_eq!(
+        *last,
+        format!(
+            "Region bench finished: {}",
+            if pass { "PASS" } else { "FAIL" }
+        )
+    );
+    // Written only on change: a few dozen texts over thousands of frames.
+    assert!(shown.len() < 60, "{}", shown.len());
 }
 
 #[test]

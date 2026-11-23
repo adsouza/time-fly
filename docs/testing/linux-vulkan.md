@@ -160,7 +160,9 @@ Everest's area), Sundaland at 21 ka (5° N, 107° E), Japan at 1 Ma (era-frame 3
 toward the coast, a sweep toward the apron), then leaves. Then it re-enters the Himalayas ten times to
 measure warm generation and memory. It prints one block per region and a summary block, then
 exits: 0 on PASS, 3 on FAIL. A run takes about ten minutes. Leave the mouse and keyboard alone
-while it runs, and paste every block back unedited (one per region and the summary). The
+while it runs, and paste every block back unedited (one per region and the summary). A banner
+at the top centre shows the current stop (`Sundaland · 21 thousand years ago · 3 of 8`, the pan,
+`Next: …` on the globe) and finally `Region bench finished: PASS` or `FAIL`. The
 Rockies block also has a `globe pan from Beringia` line (R14-gated) and `frames fetched 0`.
 
 - [ ] Each block shows `render resolution: 2560x1440`.

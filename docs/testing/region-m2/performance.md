@@ -295,6 +295,9 @@ Warm generation median 486 ms, max 537 ms. Memory cycles 1,142.7–1,153.8 MiB o
 1920 × 951 runs). An earlier attempt was invalid: the display changed mid-run and the window
 resized (2338 × 1237 to 2567 × 1237).
 
+While the bench runs, a translucent banner at the top centre shows the current stop (region,
+age, `k of 8` with the pan counted), `Next: …` on the globe, and at the end the result.
+
 #### Bench regions since rulings R24–R26 (real bake, single-threaded)
 
 `TIMEFLY_GENERATE=1 TIMEFLY_CANDIDATES=... cargo test --release -p timefly_core --test
