@@ -40,6 +40,7 @@ use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
 use bevy::window::{Monitor, PresentMode, PrimaryMonitor, PrimaryWindow};
 use timefly_core::deep_time::YearsBp;
+use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
 use timefly_core::terrain::blended_height_m;
 
 use super::{
@@ -48,6 +49,7 @@ use super::{
     passes, stall_count,
 };
 use crate::args::RegionArg;
+use crate::camera::{MAX_LATITUDE_DEG, OrbitState};
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
 use crate::fly_camera::{FlyState, FlySystems};
@@ -60,11 +62,38 @@ use crate::region::{
 use crate::time::GlobeTime;
 pub use path::{BenchPath, Coast, SCRIPT_SECS, Segment};
 
-/// A bench region: a name and the launch argument that enters it.
+/// A bench region: a name and the launch argument that enters it. With `pan_from_previous`,
+/// the bench reaches it from the previous region by a globe pan ([`pan_orbit`]) instead of
+/// entering it from where the globe was left.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BenchRegion {
     pub name: &'static str,
     pub arg: RegionArg,
+    pub pan_from_previous: bool,
+}
+
+/// Seconds the globe pan between two bench regions takes (eased at both ends).
+pub const PAN_SECS: f64 = 8.0;
+
+/// The orbit camera `t_s` seconds into a pan from `from` to `to` (lat, lon in degrees) at
+/// `distance_km`: along the great circle, eased in and out over [`PAN_SECS`].
+pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -> OrbitState {
+    let dir = |(lat, lon): (f64, f64)| geo_to_render(latlon_to_geo(lat, lon)).0.normalize();
+    let (a, b) = (dir(from), dir(to));
+    let u = (t_s / PAN_SECS).clamp(0.0, 1.0);
+    let s = u * u * (3.0 - 2.0 * u);
+    let angle = a.dot(b).clamp(-1.0, 1.0).acos();
+    let p = if angle < 1e-12 {
+        a
+    } else {
+        (a * ((1.0 - s) * angle).sin() + b * (s * angle).sin()) / angle.sin()
+    };
+    let (lat, lon) = geo_to_latlon(render_to_geo(RenderDir(p.normalize())));
+    OrbitState {
+        lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
+        lon_deg: lon,
+        distance_km,
+    }
 }
 
 /// The bench regions: the design's (M2 design §8), with the Himalayas (Everest area) in the
@@ -73,7 +102,7 @@ pub struct BenchRegion {
 /// pinned in the era's frame at 250 Ma: inland, a hot desert (Task 8). The Aegean at 1 Ma (era
 /// frame) has coastlines throughout the inner field, so its coast run flies a real shore up
 /// close, and it is Task 4's slowest real generation (about 3 s single-threaded).
-pub const BENCH_REGIONS: [BenchRegion; 4] = [
+pub const BENCH_REGIONS: [BenchRegion; 5] = [
     BenchRegion {
         name: "Himalayas",
         arg: RegionArg {
@@ -81,14 +110,25 @@ pub const BENCH_REGIONS: [BenchRegion; 4] = [
             lon_deg: 86.9,
             years: 0.0,
         },
+        pan_from_previous: false,
     },
     BenchRegion {
-        name: "Scandinavia",
+        name: "Beringia",
         arg: RegionArg {
-            lat_deg: 63.0,
-            lon_deg: 15.0,
+            lat_deg: 62.0,
+            lon_deg: -175.0,
             years: 21_000.0,
         },
+        pan_from_previous: false,
+    },
+    BenchRegion {
+        name: "Rockies ice margin",
+        arg: RegionArg {
+            lat_deg: 48.5,
+            lon_deg: -113.5,
+            years: 21_000.0,
+        },
+        pan_from_previous: true,
     },
     BenchRegion {
         name: "Pangaea interior",
@@ -97,6 +137,7 @@ pub const BENCH_REGIONS: [BenchRegion; 4] = [
             lon_deg: -18.0,
             years: 250.0e6,
         },
+        pan_from_previous: false,
     },
     BenchRegion {
         name: "Aegean",
@@ -105,6 +146,7 @@ pub const BENCH_REGIONS: [BenchRegion; 4] = [
             lon_deg: 24.5,
             years: 1.0e6,
         },
+        pan_from_previous: false,
     },
 ];
 
@@ -193,6 +235,14 @@ enum Stage {
         region: usize,
         since: f64,
     },
+    /// Panning the globe from the previous region toward `region` ([`pan_orbit`]), then
+    /// entering it.
+    Panning {
+        region: usize,
+        since: f64,
+        from: (f64, f64),
+        distance_km: f64,
+    },
     /// [`RegionLeft`] was written; waiting for the globe. `cycle` is the cycle that left.
     Leaving {
         next: Next,
@@ -227,6 +277,8 @@ struct RegionRun {
     path: Option<BenchPath>,
     flight_ms: Vec<f32>,
     segment_ms: [Vec<f32>; 4],
+    /// The globe pan that led here, if any.
+    pan_ms: Vec<f32>,
     memory_before: Option<u64>,
     memory_peak: Option<u64>,
     failure: Option<String>,
@@ -385,6 +437,7 @@ impl Game<'_, '_> {
 struct Controls<'w> {
     time: Option<ResMut<'w, GlobeTime>>,
     fly: Option<ResMut<'w, FlyState>>,
+    orbit: Option<ResMut<'w, OrbitState>>,
     requests: MessageWriter<'w, RegionRequested>,
     leave: MessageWriter<'w, RegionLeft>,
     exit: MessageWriter<'w, AppExit>,
@@ -570,6 +623,24 @@ fn drive_region_bench(
                 info!(cycle = c + 1, on_globe = ?record.on_globe, "region bench: cycle left");
             }
             match next {
+                Next::Region(region) if BENCH_REGIONS[region].pan_from_previous => {
+                    let prev = BENCH_REGIONS[region - 1].arg;
+                    let distance_km = controls
+                        .orbit
+                        .as_ref()
+                        .map_or(crate::region::navigate::NEAR_ORBIT_KM, |o| o.distance_km);
+                    info!(
+                        from = BENCH_REGIONS[region - 1].name,
+                        to = BENCH_REGIONS[region].name,
+                        "region bench: panning the globe"
+                    );
+                    bench.stage = Stage::Panning {
+                        region,
+                        since: now,
+                        from: (prev.lat_deg, prev.lon_deg),
+                        distance_km,
+                    };
+                }
                 Next::Region(region) => start_region(bench, region, now, &mut controls),
                 Next::Cycle(c) => {
                     bench.cycles.push(CycleRun::default());
@@ -581,6 +652,28 @@ fn drive_region_bench(
                     };
                 }
                 Next::Summary => finish(bench, &game, &display, &mut controls, None),
+            }
+        }
+        Stage::Panning {
+            region,
+            since,
+            from,
+            distance_km,
+        } => {
+            bench.runs[region].pan_ms.push(frame_ms);
+            let to = (
+                BENCH_REGIONS[region].arg.lat_deg,
+                BENCH_REGIONS[region].arg.lon_deg,
+            );
+            let t = now - since;
+            if let Some(orbit) = controls.orbit.as_mut() {
+                let next = pan_orbit(from, to, distance_km, t);
+                if **orbit != next {
+                    **orbit = next;
+                }
+            }
+            if t >= PAN_SECS {
+                start_region(bench, region, now, &mut controls);
             }
         }
         Stage::CycleLoading {
@@ -814,10 +907,11 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     }
     match &r.generated {
         Some(g) => out.push(format!(
-            "generation: {} ms; tiles fetched {} ({} bytes); fallback {}",
+            "generation: {} ms; tiles fetched {} ({} bytes); frames fetched {}; fallback {}",
             g.millis,
             g.tiles_fetched,
             g.bytes_fetched,
+            g.frames_fetched,
             if g.fallback {
                 "yes (a tile is missing)"
             } else {
@@ -877,6 +971,25 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
             show_mib(bench.js_heap_peak)
         ));
     }
+    let pan_pass = if r.pan_ms.is_empty() {
+        true
+    } else {
+        let pan_pacing = pacing_for(&info, &r.pan_ms);
+        let p = frame_time_stats(&r.pan_ms);
+        let ok = passes(&r.pan_ms, fps, pan_pacing);
+        out.push(format!(
+            "globe pan from {} ({PAN_SECS:.0} s, great circle): frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms -> {} ({} rule)",
+            BENCH_REGIONS[region.saturating_sub(1)].name,
+            p.frames,
+            p.median_ms,
+            p.p95_ms,
+            p.worst_ms,
+            if ok { "PASS" } else { "FAIL" },
+            pacing_name(pan_pacing)
+        ));
+        out.push(host_stall_line("pan", &r.pan_ms));
+        ok
+    };
     let pacing = pacing_for(&info, &r.flight_ms);
     let interval = frame_budget_ms(fps);
     out.push(format!(
@@ -930,7 +1043,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
         out.push(format!("  {}", stat_line(segment.label(), frames)));
     }
-    let pass = r.failure.is_none() && flight_pass && gen_gate.unwrap_or(true);
+    let pass = r.failure.is_none() && flight_pass && pan_pass && gen_gate.unwrap_or(true);
     out.push(match &r.failure {
         Some(reason) => format!("result: FAIL ({reason})"),
         None => format!(
@@ -1193,25 +1306,68 @@ mod tests {
         let names: Vec<_> = BENCH_REGIONS.iter().map(|r| r.name).collect();
         assert_eq!(
             names,
-            ["Himalayas", "Scandinavia", "Pangaea interior", "Aegean"]
+            [
+                "Himalayas",
+                "Beringia",
+                "Rockies ice margin",
+                "Pangaea interior",
+                "Aegean"
+            ]
         );
         let arg = |lat_deg, lon_deg, years| RegionArg {
             lat_deg,
             lon_deg,
             years,
         };
-        // Ruling R24: Everest (27.99, 86.93) is in the inner field.
-        assert_eq!(BENCH_REGIONS[0].arg, arg(28.0, 86.9, 0.0));
-        assert_eq!(BENCH_REGIONS[1].arg, arg(63.0, 15.0, 21_000.0));
-        assert_eq!(BENCH_REGIONS[2].arg, arg(-22.0, -18.0, 250.0e6));
-        // Ruling R22: coastlines throughout the inner field, Task 4's slowest real region.
+        let args: Vec<_> = BENCH_REGIONS.iter().map(|r| r.arg).collect();
         assert_eq!(
-            BENCH_REGIONS.get(3).map(|r| r.arg),
-            Some(arg(38.0, 24.5, 1.0e6))
+            args,
+            [
+                // Ruling R24: Everest (27.99, 86.93) is in the inner field.
+                arg(28.0, 86.9, 0.0),
+                // Ruling R25: 21 ka anomaly land and its coast; the ice margin under mountains.
+                arg(62.0, -175.0, 21_000.0),
+                arg(48.5, -113.5, 21_000.0),
+                arg(-22.0, -18.0, 250.0e6),
+                // Ruling R22: coastlines throughout the inner field.
+                arg(38.0, 24.5, 1.0e6),
+            ]
         );
+        // Only the Rockies are reached by a pan, from Beringia at the same snapshot.
+        let pans: Vec<_> = BENCH_REGIONS.iter().map(|r| r.pan_from_previous).collect();
+        assert_eq!(pans, [false, false, true, false, false]);
+        assert_eq!(BENCH_REGIONS[1].arg.years, BENCH_REGIONS[2].arg.years);
         assert_eq!(after_region(0, 10), Next::Region(1));
-        assert_eq!(after_region(2, 10), Next::Region(3));
-        assert_eq!(after_region(3, 10), Next::Cycle(0));
-        assert_eq!(after_region(3, 0), Next::Summary);
+        assert_eq!(after_region(3, 10), Next::Region(4));
+        assert_eq!(after_region(4, 10), Next::Cycle(0));
+        assert_eq!(after_region(4, 0), Next::Summary);
+    }
+
+    #[test]
+    fn the_pan_follows_the_great_circle_eased() {
+        let from = (62.0, -175.0);
+        let to = (48.5, -113.5);
+        let dir = |o: OrbitState| geo_to_render(latlon_to_geo(o.lat_deg, o.lon_deg)).0;
+        let (a, b) = (
+            geo_to_render(latlon_to_geo(from.0, from.1)).0,
+            geo_to_render(latlon_to_geo(to.0, to.1)).0,
+        );
+        let start = pan_orbit(from, to, 955.0, 0.0);
+        assert!((dir(start) - a).length() < 1e-9);
+        assert_eq!(start.distance_km, 955.0);
+        let end = pan_orbit(from, to, 955.0, PAN_SECS);
+        assert!((dir(end) - b).length() < 1e-9);
+        assert_eq!(pan_orbit(from, to, 955.0, PAN_SECS + 3.0), end);
+        // Halfway in time is halfway along the arc (the ease is symmetric).
+        let mid = dir(pan_orbit(from, to, 955.0, PAN_SECS / 2.0));
+        assert!((mid.dot(a) - mid.dot(b)).abs() < 1e-9);
+        assert!(
+            (mid.normalize().dot(a.cross(b).normalize())).abs() < 1e-9,
+            "on the great circle"
+        );
+        // Eased: the first tenth of the time covers under a tenth of the arc.
+        let early = dir(pan_orbit(from, to, 955.0, PAN_SECS / 10.0));
+        let total = a.dot(b).acos();
+        assert!(early.dot(a).clamp(-1.0, 1.0).acos() < 0.1 * total);
     }
 }

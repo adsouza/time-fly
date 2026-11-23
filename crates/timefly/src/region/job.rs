@@ -191,6 +191,8 @@ pub(super) struct RegionJob {
     started: Instant,
     /// The snapshot of the active region this job replaces.
     replaces: Option<YearsBp>,
+    /// Frame files it loads (not in the frame cache).
+    frames_fetched: u32,
     stage: Stage,
 }
 
@@ -304,6 +306,7 @@ pub(super) fn start_region_request(
         spec,
         started: Instant::now(),
         replaces,
+        frames_fetched: u32::try_from(pending.len()).unwrap_or(u32::MAX),
         stage: Stage::Frames {
             slots,
             pending,
@@ -721,6 +724,7 @@ pub(super) fn poll_generation(
         millis,
         tiles_fetched: *tiles_fetched,
         bytes_fetched: *bytes_fetched,
+        frames_fetched: job.frames_fetched,
         fallback: *fallback,
     });
     match job.replaces {

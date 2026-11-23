@@ -342,6 +342,8 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
         ("scandinavia", 63.0, 15.0),
         ("aegean", 38.5, 25.0),
         ("himalayas", 28.0, 86.9),
+        ("beringia", 62.0, -175.0),
+        ("rockies", 48.5, -113.5),
     ] {
         let centre = geo_to_render(latlon_to_geo(lat, lon));
         let frame = RegionFrame { center: centre };

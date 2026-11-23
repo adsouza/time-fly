@@ -93,7 +93,7 @@ fn region_bench_reports_all_regions() {
     }
     let bench = app.world().resource::<RegionBench>();
     let reports = bench.reports();
-    assert_eq!(reports.len(), 4, "{reports:#?}");
+    assert_eq!(reports.len(), BENCH_REGIONS.len(), "{reports:#?}");
     for (report, region) in reports.iter().zip(&BENCH_REGIONS) {
         let title = format!("===== Time Fly region bench: {} (", region.name);
         assert!(report.starts_with(&title), "{report}");
@@ -142,6 +142,20 @@ fn region_bench_reports_all_regions() {
             "{report}"
         );
     }
+    // The globe pan into each panned region (ruling R25): 8 s at 60 updates a second, and the
+    // same snapshot as the region before it, so no frame is fetched again.
+    for (report, region) in reports.iter().zip(&BENCH_REGIONS) {
+        let pan = report.contains("globe pan from ");
+        assert_eq!(pan, region.pan_from_previous, "{report}");
+        if pan {
+            assert!(
+                report.contains("(8 s, great circle): frames 48"),
+                "{report}"
+            );
+            assert!(report.contains("frames fetched 0;"), "{report}");
+            assert!(report.contains("host stalls in the pan (frames > 1000 ms"));
+        }
+    }
 
     let summary = bench.summary().unwrap();
     assert!(
@@ -149,7 +163,7 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Himalayas PASS, Scandinavia PASS, Pangaea interior PASS, Aegean PASS",
+        "regions (R14 frame rate): Himalayas PASS, Beringia PASS, Rockies ice margin PASS, Pangaea interior PASS, Aegean PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Himalayas",
         "first entries (cold tiles; reported only natively): Himalayas ",

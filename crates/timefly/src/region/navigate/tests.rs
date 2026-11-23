@@ -900,6 +900,7 @@ fn snapshot_change_regenerates_around_the_carried_position() {
         millis: 1,
         tiles_fetched: 0,
         bytes_fetched: 0,
+        frames_fetched: 0,
         fallback: false,
     });
     app.world_mut().write_message(RegionSnapshotChanged {
@@ -1019,6 +1020,7 @@ fn fake_job(
         millis: 1,
         tiles_fetched: 0,
         bytes_fetched: 0,
+        frames_fetched: 0,
         fallback: false,
     });
     changed.write(RegionSnapshotChanged {

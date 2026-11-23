@@ -152,14 +152,16 @@ flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly \
   --region-bench --target-fps 60 --window 2560x1440
 ```
 
-It waits for the globe, then enters the four bench regions in turn: the Himalayas at the present
-(28° N, 86.9° E, Everest's area; ruling R24), Scandinavia at 21 ka (63° N, 15° E), the Pangaea interior at 250 Ma
+It waits for the globe, then enters the bench regions in turn: the Himalayas at the present
+(28° N, 86.9° E, Everest's area; ruling R24), Beringia at 21 ka (62° N, 175° W), then an 8 s
+globe pan to the Rockies ice margin at 21 ka (48.5° N, 113.5° W; ruling R25), the Pangaea interior at 250 Ma
 (era-frame 22° S, 18° W) and the Aegean at 1 Ma (era-frame 38° N, 24.5° E, coastlines
 throughout). In each it flies a 60 s path (a low pass at 300 m, a climb to 30 km, a run along or
 toward the coast, a sweep toward the apron), then leaves. Then it re-enters the Himalayas ten times to
 measure warm generation and memory. It prints one block per region and a summary block, then
-exits: 0 on PASS, 3 on FAIL. A run takes about five minutes. Leave the mouse and keyboard alone
-while it runs, and paste all five blocks back unedited.
+exits: 0 on PASS, 3 on FAIL. A run takes about seven minutes. Leave the mouse and keyboard alone
+while it runs, and paste every block back unedited (one per region and the summary). The
+Rockies block also has a `globe pan from Beringia` line (R14-gated) and `frames fetched 0`.
 
 - [ ] Each block shows `render resolution: 2560x1440`.
 - [ ] Each region block ends `result: PASS` (ruling R14, as in section 5). The Aegean block's
@@ -232,7 +234,7 @@ _Not run yet._
 | `.deb` | | | | | | | | |
 | Flatpak | | | | | | | | |
 
-| Package (regions, 2560 × 1440) | GPU / driver | Region checks | Himalayas median / p95 / missed | Scandinavia | Pangaea | Aegean | Warm generation max | Memory cycles | Summary |
+| Package (regions, 2560 × 1440) | GPU / driver | Region checks | Himalayas median / p95 / missed | Beringia | Pan / Rockies | Pangaea | Aegean | Warm generation max | Memory cycles | Summary |
 |---|---|---|---|---|---|---|---|---|---|
 | `.deb` | | | | | | | | | |
 | Flatpak | | | | | | | | | |

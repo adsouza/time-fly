@@ -842,6 +842,25 @@ fn a_superseding_request_wins() {
     assert_eq!(app.world().resource::<Seen>().generated.len(), 1);
 }
 
+/// A region at the snapshot just left (the bench's Beringia → Rockies pan, both 21 ka) takes its
+/// frames from the frame cache: `RegionGenerated::frames_fetched` is 0.
+#[test]
+fn a_same_snapshot_entry_fetches_no_frames() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    let first = generated(&app);
+    assert!(first.frames_fetched > 0, "{first:?}");
+    app.world_mut().write_message(RegionLeft);
+    app.update();
+    app.update();
+    app.world_mut().resource_mut::<Seen>().generated.clear();
+    app.world_mut().resource_mut::<Seen>().states.clear();
+    request(&mut app, 2.0, 3.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    assert_eq!(generated(&app).frames_fetched, 0);
+}
+
 #[test]
 fn repeated_requests_reuse_decoded_frames() {
     let mut app = region_app(&tiny_root(), SMALL);

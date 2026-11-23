@@ -96,6 +96,8 @@ pub struct RegionGenerated {
     pub millis: u32,
     pub tiles_fetched: u32,
     pub bytes_fetched: u64,
+    /// Globe frame files loaded for it (0 when the frame cache held them all).
+    pub frames_fetched: u32,
     pub fallback: bool,
 }
 
