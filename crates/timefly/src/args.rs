@@ -442,6 +442,41 @@ mod tests {
         assert_eq!(parsed.unknown, args(&["--region=north"]));
     }
 
+    /// `--region` and `?region=` start directly in a region; a malformed value is ignored and
+    /// lands in `unknown`, which the session start-up logs as a `warn` (by count only).
+    #[test]
+    fn region_arg_parses() {
+        let want = Some(RegionArg {
+            lat_deg: -22.0,
+            lon_deg: -18.0,
+            years: 250e6,
+        });
+        for native in [
+            args(&["--region=-22,-18,250000000"]),
+            args(&["--region", "-22,-18,2.5e8"]),
+            args(&["--scrub-bench", "--region= -22 , -18 , 250000000 "]),
+        ] {
+            let parsed = parse_launch_args(native.clone());
+            assert_eq!(parsed.region, want, "{native:?}");
+            assert!(parsed.unknown.is_empty(), "{native:?}");
+        }
+        for web in [
+            "?region=-22,-18,250000000",
+            "region=-22%2C-18%2C2.5e8",
+            "?scrub-bench&region=-22,-18,250000000",
+        ] {
+            assert_eq!(parse_query_args(web).region, want, "{web}");
+        }
+        for bad in ["--region=-22,-18", "--region=north", "--region=0,0,6e8"] {
+            let parsed = parse_launch_args(args(&[bad]));
+            assert_eq!(parsed.region, None, "{bad}");
+            assert_eq!(parsed.unknown, args(&[bad]), "{bad}");
+        }
+        let parsed = parse_query_args("?region=0,200,0");
+        assert_eq!(parsed.region, None);
+        assert_eq!(parsed.unknown, args(&["--region=0,200,0"]));
+    }
+
     #[test]
     fn web_query_unknown_keys() {
         let parsed = parse_query_args("utm_source=x&diagnostics-probe=clean&debug");

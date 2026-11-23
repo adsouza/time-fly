@@ -10,6 +10,7 @@ pub mod camera;
 pub mod check_data;
 pub mod data;
 pub mod diagnostics;
+pub mod fly_camera;
 pub mod globe;
 pub mod gpu;
 pub mod region;
@@ -24,9 +25,11 @@ use bench::ScrubBenchPlugin;
 use camera::OrbitCameraPlugin;
 use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
+use fly_camera::FlyCameraPlugin;
 use globe::GlobePlugin;
 use region::RegionPlugin;
 use region::launch::LaunchRegion;
+use region::navigate::RegionNavigationPlugin;
 use terrain::TerrainCdlodPlugin;
 use ui::GameUiPlugins;
 
@@ -91,6 +94,8 @@ pub fn app(session: &Session) -> App {
         sky::SkyPlugin,
         water::WaterPlugin,
         OrbitCameraPlugin,
+        RegionNavigationPlugin,
+        FlyCameraPlugin,
         GameUiPlugins,
     ));
     if let Some(region) = args.region {

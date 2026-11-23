@@ -7,9 +7,10 @@
 //! region camera is active and draws the UI, and the globe camera is inactive (which also stops
 //! the globe's offscreen bridge cameras).
 //!
-//! Task 7's camera is a fixed debug view: [`CAMERA_START_ALTITUDE_M`] above the ground at the
-//! region centre, looking north and pitched down [`DEBUG_PITCH_DEG`]. Task 9 replaces it with
-//! the fly camera; the terrain follows whatever moves the `RegionCamera`'s `Transform`.
+//! The camera spawns at Task 7's debug view, [`CAMERA_START_ALTITUDE_M`] above the ground at
+//! the region centre, looking north and pitched down [`DEBUG_PITCH_DEG`] (the fly camera's start
+//! pose). From then on `crate::fly_camera` moves it; the terrain follows whatever moves the
+//! `RegionCamera`'s `Transform`.
 
 use bevy::camera::Exposure;
 use bevy::camera::visibility::RenderLayers;

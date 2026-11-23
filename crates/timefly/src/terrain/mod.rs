@@ -312,7 +312,6 @@ fn upload_fields(grid: &RegionGrid, images: &mut Assets<Image>) -> FieldImages {
 
 /// Gathers the region, decides with [`scene_action`], and builds, replaces or tears down the
 /// terrain scene.
-#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn sync_terrain_scene(
     mut commands: Commands,
     region: Option<Res<ActiveRegion>>,
@@ -321,7 +320,6 @@ fn sync_terrain_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut cameras: Query<&mut Transform, With<RegionCamera>>,
 ) {
     let action = scene_action(
         region.as_ref().map(|r| &r.grid),
@@ -340,10 +338,8 @@ fn sync_terrain_scene(
             commands.insert_resource(scene);
         }
         (SceneAction::Replace, Some(region), Some(mut scene)) => {
+            // The camera stays put: region navigation places it over the new region.
             replace_fields(&mut scene, &region.grid, &mut images, &mut materials);
-            if let Ok(mut t) = cameras.get_mut(scene.camera) {
-                *t = view::debug_camera_transform(&region.grid);
-            }
         }
         (SceneAction::Teardown, _, Some(scene)) => {
             info!(patches = scene.pool.len(), "terrain scene removed");

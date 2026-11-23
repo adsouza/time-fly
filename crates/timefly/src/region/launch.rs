@@ -24,12 +24,15 @@ pub fn launch_request(arg: &RegionArg) -> RegionRequested {
     }
 }
 
-/// Sends the launch region's request (on entering `GlobeLoadState::Ready`).
+/// Sends the launch region's request (on entering `GlobeLoadState::Ready`), once: the resource
+/// is removed, so the launch region is never requested again.
 pub(super) fn request_launch_region(
     launch: Res<LaunchRegion>,
+    mut commands: Commands,
     mut time: ResMut<GlobeTime>,
     mut requests: MessageWriter<RegionRequested>,
 ) {
+    commands.remove_resource::<LaunchRegion>();
     let request = launch_request(&launch.0);
     info!(
         lat_deg = launch.0.lat_deg,
@@ -44,6 +47,37 @@ pub(super) fn request_launch_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_request_is_sent_once() {
+        #[derive(Resource, Default)]
+        struct Sent(usize);
+        let mut app = App::new();
+        app.add_message::<RegionRequested>()
+            .init_resource::<GlobeTime>()
+            .init_resource::<Sent>()
+            .add_systems(
+                Last,
+                |mut sent: ResMut<Sent>, mut r: MessageReader<RegionRequested>| {
+                    sent.0 += r.read().count();
+                },
+            )
+            .insert_resource(LaunchRegion(RegionArg {
+                lat_deg: 46.5,
+                lon_deg: 10.0,
+                years: 21_000.0,
+            }))
+            .add_systems(
+                Update,
+                request_launch_region.run_if(resource_exists::<LaunchRegion>),
+            );
+        app.update();
+        app.update();
+        app.update();
+        assert_eq!(app.world().resource::<Sent>().0, 1);
+        assert!(app.world().get_resource::<LaunchRegion>().is_none());
+        assert_eq!(app.world().resource::<GlobeTime>().years, YearsBp(21_000.0));
+    }
 
     #[test]
     fn launch_request_points_at_the_era_frame_place() {

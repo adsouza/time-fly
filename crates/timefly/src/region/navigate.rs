@@ -1,0 +1,857 @@
+//! Entering and leaving regions, and snapshot changes inside one: the stand-in for zoom-and-swap
+//! (M2 design §6.1–6.2, parent spec §5.2, §6.2 and §11).
+//!
+//! - **Entering.** A double-click on the globe ([`is_double_click`]) ray-casts to the direction
+//!   under the cursor ([`globe_hit`]), snaps the time to the nearest snapshot
+//!   ([`nearest_snapshot`]) and sends [`RegionRequested`]. While the region generates, the orbit
+//!   camera eases toward the spot. When it is ready ([`RegionEntered`]), the view fades over
+//!   [`ENTER_FADE_S`] to the fly camera at its start pose ([`FlyState::start`]).
+//! - **Leaving.** `Backspace` fades back to the globe, centred on the region; [`RegionLeft`] is
+//!   written at the fade's midpoint, once the view is back on the globe.
+//! - **Snapshot changes.** When the time moves to another snapshot while flying (the slider
+//!   snaps on release inside a region; `[` and `]` step snapshots), the camera's crust position
+//!   is carried to the new era ([`carry_crust_position`]). The region regenerates around it,
+//!   keeping the camera's height above ground, behind a [`SNAPSHOT_FADE_S`] fade that holds at
+//!   its midpoint until the new region is ready. If that crust does not exist in the new era,
+//!   the view returns to the globe instead.
+//! - **"Descending..."** shows only after a region has been generating for
+//!   [`CAPTION_DELAY_S`].
+//!
+//! **The crossfade** is a fade through a full-screen overlay ([`FadeOverlay`], [`FADE_COLOR`])
+//! drawn under the rest of the UI: the old view fades out to a pale haze over the first half,
+//! the views swap at the midpoint (only one camera is ever active, so the frame cost never
+//! doubles), and the new view fades in over the second half. A true two-image crossfade would
+//! render both worlds for the whole fade; this costs one UI quad on Metal and WebGPU alike.
+//!
+//! The systems gather → decide → apply: [`step_nav`] is the decision, a pure function of
+//! [`NavInputs`] that returns the next [`NavPhase`] and the [`NavAction`]s to apply.
+
+use bevy::ecs::system::SystemParam;
+use bevy::input::mouse::MouseButton;
+use bevy::math::DVec3;
+use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+use timefly_core::deep_time::YearsBp;
+use timefly_core::geo::{RenderDir, geo_to_latlon, render_to_geo};
+use timefly_core::geodynamics::{CrustModel, ResolvedPosition};
+use timefly_core::terrain::blended_height_m;
+use tracing::instrument;
+
+use super::{
+    ActiveRegion, RegionEntered, RegionLeft, RegionRequested, RegionSnapshotChanged, RegionState,
+};
+use crate::camera::{
+    MAX_LATITUDE_DEG, MIN_DISTANCE_KM, OrbitCameraSystems, OrbitState, ease_toward,
+};
+use crate::data::GlobeData;
+use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState};
+use crate::globe::{EARTH_RADIUS_KM, GlobeCamera};
+use crate::terrain::{TerrainSceneSystems, TerrainSettings};
+use crate::time::{GlobeTime, TimeChangeCause, TimeChanged, nearest_snapshot};
+use crate::ui::{PointerOverUi, TEXT_COLOR};
+
+/// The fade from the globe into a region, and back out (design §6.1: under a second).
+pub const ENTER_FADE_S: f32 = 0.8;
+/// The fade across a snapshot change inside a region (design §6.2: about a second).
+pub const SNAPSHOT_FADE_S: f32 = 1.0;
+/// Two presses within this many seconds...
+pub const DOUBLE_CLICK_S: f64 = 0.35;
+/// ...and this many logical pixels make a double-click.
+pub const DOUBLE_CLICK_PX: f32 = 6.0;
+/// "Descending..." shows only once a region has been generating this long (design §6.1).
+pub const CAPTION_DELAY_S: f64 = 1.0;
+/// The caption's text (the built-in font has no ellipsis glyph).
+pub const CAPTION_TEXT: &str = "Descending...";
+/// A request the region plugin never starts on (it ignores requests it cannot serve, with a
+/// `warn`) stops the descent after this long.
+pub const START_TIMEOUT_S: f64 = 2.0;
+/// The haze the views fade through.
+pub const FADE_COLOR: Color = Color::srgb(0.86, 0.89, 0.93);
+/// The orbit distance the camera eases to while descending, and returns at when leaving.
+pub const NEAR_ORBIT_KM: f64 = MIN_DISTANCE_KM;
+
+/// The ICE-6G_C frames, the recent globe's geographic frame, end at 26 ka BP (1950), 26,076
+/// years before the game's present. Up to that age a direction is geographic: crust positions
+/// use the present-day plate orientation, with validity still at the age (parent spec §5.2).
+/// Past it they use the era's rotation. (The short bridge above it, to 30 ka, crossfades two
+/// frames that differ by under 2 km of plate motion.)
+pub const GEOGRAPHIC_FRAME_MAX_YEARS: f64 = 26_076.0;
+
+/// Whether a press at `now_s` and `pos` (logical pixels) completes a double-click with the
+/// previous press: within [`DOUBLE_CLICK_S`] and [`DOUBLE_CLICK_PX`].
+pub fn is_double_click(prev: Option<(f64, Vec2)>, now_s: f64, pos: Vec2) -> bool {
+    prev.is_some_and(|(then_s, at)| {
+        let dt = now_s - then_s;
+        (0.0..=DOUBLE_CLICK_S).contains(&dt) && at.distance(pos) <= DOUBLE_CLICK_PX
+    })
+}
+
+/// The direction (render frame) of the first point where `ray` meets the globe, a sphere of
+/// radius [`EARTH_RADIUS_KM`] at the origin in the globe's units (1 unit = 1 km). `None` when
+/// the ray misses or the sphere is behind it.
+pub fn globe_hit(ray: Ray3d) -> Option<RenderDir> {
+    let origin = ray.origin.as_dvec3();
+    let dir = ray.direction.as_vec3().as_dvec3().normalize();
+    // |o + t d|² = R²  →  t² + 2 b t + c = 0
+    let b = origin.dot(dir);
+    let c = origin.length_squared() - EARTH_RADIUS_KM * EARTH_RADIUS_KM;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let root = disc.sqrt();
+    let t = [-b - root, -b + root].into_iter().find(|&t| t >= 0.0)?;
+    let hit = origin + dir * t;
+    (hit.length_squared() > 0.0).then(|| RenderDir(hit.normalize()))
+}
+
+/// Whether ages up to `age` read their directions in the geographic frame (see
+/// [`GEOGRAPHIC_FRAME_MAX_YEARS`]).
+fn geographic(age: YearsBp) -> bool {
+    age.0 <= GEOGRAPHIC_FRAME_MAX_YEARS
+}
+
+/// Where the crust under `era_dir` at `from` lies at `to`: the era-frame direction to centre
+/// the new region on, or `None` when the point is era-fixed at `from` (no valid plate) or that
+/// crust is not valid at `to` (parent spec §5.2: the traveller returns to the globe).
+///
+/// Overlapping plates resolve to the lowest valid plate ID, the generator's rule where there is
+/// no visible land.
+pub fn carry_crust_position(
+    crust: &CrustModel,
+    era_dir: RenderDir,
+    from: YearsBp,
+    to: YearsBp,
+) -> Option<RenderDir> {
+    let resolved = if geographic(from) {
+        crust.resolve_recent(era_dir, from.myr(), |_| None)
+    } else {
+        crust.resolve(era_dir, from.myr(), |_| None)
+    };
+    let ResolvedPosition::Tracked(pos) = resolved else {
+        return None;
+    };
+    if geographic(to) {
+        crust.forward_recent(pos, to.myr())
+    } else {
+        crust.forward(pos, to.myr())
+    }
+}
+
+/// Progress within this of the midpoint or the end counts as reaching it (frame times add up
+/// in `f32`).
+const FADE_EPSILON: f32 = 1e-4;
+
+/// A fade through the overlay: out over the first half, in over the second.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Fade {
+    pub elapsed_s: f32,
+    pub duration_s: f32,
+}
+
+impl Fade {
+    pub fn new(duration_s: f32) -> Fade {
+        Fade {
+            elapsed_s: 0.0,
+            duration_s,
+        }
+    }
+
+    /// The fade `dt_s` later. With `hold`, it stops at the midpoint (fully covered) until a
+    /// later advance without it; a fade already past the midpoint never holds.
+    pub fn advance(self, dt_s: f32, hold: bool) -> Fade {
+        let mid = self.duration_s * 0.5;
+        // Held at the midpoint (or wherever within rounding of it the fade stopped).
+        let limit = if hold && self.progress() <= 0.5 + FADE_EPSILON {
+            mid.max(self.elapsed_s)
+        } else {
+            self.duration_s
+        };
+        Fade {
+            elapsed_s: (self.elapsed_s + dt_s.max(0.0)).min(limit),
+            ..self
+        }
+    }
+
+    /// Progress in [0, 1].
+    pub fn progress(self) -> f32 {
+        if self.duration_s <= 0.0 {
+            return 1.0;
+        }
+        (self.elapsed_s / self.duration_s).clamp(0.0, 1.0)
+    }
+
+    /// The overlay's opacity: [`fade_alpha`] of the progress.
+    pub fn alpha(self) -> f32 {
+        fade_alpha(self.progress())
+    }
+
+    /// Whether the views have swapped (the midpoint is reached).
+    pub fn swapped(self) -> bool {
+        self.progress() >= 0.5 - FADE_EPSILON
+    }
+
+    pub fn done(self) -> bool {
+        self.progress() >= 1.0 - FADE_EPSILON
+    }
+}
+
+/// The overlay's opacity at fade progress `t`: 0 at both ends, 1 at the midpoint, eased
+/// (smoothstep) both ways.
+pub fn fade_alpha(t: f32) -> f32 {
+    if !(0.0..=1.0).contains(&t) {
+        return 0.0;
+    }
+    let tri = 1.0 - (2.0 * t - 1.0).abs();
+    tri * tri * (3.0 - 2.0 * tri)
+}
+
+/// Whether "Descending..." shows, `generating_for_s` after the region started generating.
+pub fn caption_shown(generating_for_s: Option<f64>) -> bool {
+    generating_for_s.is_some_and(|s| s > CAPTION_DELAY_S)
+}
+
+/// Where the player is in the enter → fly → leave cycle.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum NavPhase {
+    Globe,
+    /// A region was requested from the globe; the orbit camera eases toward `target`.
+    /// `started` once the region plugin has left `RegionState::Globe` for it.
+    Descending {
+        target: RenderDir,
+        since_s: f64,
+        started: bool,
+    },
+    /// Fading from the globe into the region; `placed` once the fly camera is at its start.
+    Entering {
+        fade: Fade,
+        placed: bool,
+    },
+    /// The fly camera has the controls.
+    Flying,
+    /// A snapshot change: fading out, held while the region regenerates at `to` (`ready` once
+    /// it has), then fading in with the camera `agl_m` above the new ground.
+    ChangingSnapshot {
+        fade: Fade,
+        to: YearsBp,
+        agl_m: f32,
+        ready: bool,
+        placed: bool,
+    },
+    /// Fading back to the globe, centred on `centre`; `left` once `RegionLeft` is written.
+    Leaving {
+        fade: Fade,
+        centre: RenderDir,
+        left: bool,
+    },
+}
+
+impl NavPhase {
+    /// Whether the region camera, rather than the globe camera, should be showing.
+    pub fn region_shown(&self) -> bool {
+        match *self {
+            NavPhase::Globe | NavPhase::Descending { .. } => false,
+            NavPhase::Entering { placed, .. } => placed,
+            NavPhase::Flying | NavPhase::ChangingSnapshot { .. } => true,
+            NavPhase::Leaving { left, .. } => !left,
+        }
+    }
+
+    /// The fade overlay's opacity.
+    pub fn overlay_alpha(&self) -> f32 {
+        match *self {
+            NavPhase::Entering { fade, .. }
+            | NavPhase::ChangingSnapshot { fade, .. }
+            | NavPhase::Leaving { fade, .. } => fade.alpha(),
+            NavPhase::Globe | NavPhase::Descending { .. } | NavPhase::Flying => 0.0,
+        }
+    }
+}
+
+/// A time change seen while flying: the new snapshot, where the camera's crust lies then, and
+/// the camera's height above `max(ground, 0)`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TimeChange {
+    pub to: YearsBp,
+    pub carried: Option<RenderDir>,
+    pub agl_m: f32,
+}
+
+/// Everything [`step_nav`] decides from, gathered once per frame.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct NavInputs {
+    pub now_s: f64,
+    pub dt_s: f32,
+    pub region_state: RegionState,
+    pub time: YearsBp,
+    /// The globe direction under a double-click this frame.
+    pub double_click: Option<RenderDir>,
+    pub backspace: bool,
+    /// [`RegionEntered`] arrived.
+    pub entered: bool,
+    /// [`RegionSnapshotChanged`] arrived.
+    pub replaced: bool,
+    /// The active region's centre.
+    pub region_centre: Option<RenderDir>,
+    /// A time change to act on (gathered only while flying or waiting for a new snapshot).
+    pub time_change: Option<TimeChange>,
+}
+
+/// What [`step_nav`] asks the shell to do.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum NavAction {
+    /// Set the globe time (a snap to a snapshot before entering).
+    SnapTime(YearsBp),
+    Request(RegionRequested),
+    Leave,
+    /// Put the fly camera at the region's start pose.
+    PlaceAtStart,
+    /// Put the fly camera over the new region's centre, `agl_m` above its ground.
+    PlaceAfterChange {
+        agl_m: f32,
+    },
+    /// Centre the orbit camera over a direction, close in.
+    CentreGlobe(RenderDir),
+}
+
+/// The next phase and the actions to apply, from this frame's inputs.
+pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
+    let mut actions = Vec::new();
+    let leave = |centre: Option<RenderDir>| NavPhase::Leaving {
+        fade: Fade::new(ENTER_FADE_S),
+        // Without a region (it cannot happen while flying) the globe stays where it is.
+        centre: centre.unwrap_or(RenderDir(DVec3::ZERO)),
+        left: false,
+    };
+    let next = match phase {
+        NavPhase::Globe => {
+            if i.entered {
+                // A region entered without a double-click: the launch argument.
+                NavPhase::Entering {
+                    fade: Fade::new(ENTER_FADE_S),
+                    placed: false,
+                }
+            } else if let Some(target) = i.double_click
+                && i.region_state == RegionState::Globe
+            {
+                let snapshot = nearest_snapshot(i.time);
+                if snapshot != i.time {
+                    actions.push(NavAction::SnapTime(snapshot));
+                }
+                actions.push(NavAction::Request(RegionRequested {
+                    era_dir: target,
+                    snapshot,
+                }));
+                NavPhase::Descending {
+                    target,
+                    since_s: i.now_s,
+                    started: false,
+                }
+            } else {
+                NavPhase::Globe
+            }
+        }
+        NavPhase::Descending {
+            target,
+            since_s,
+            started,
+        } => {
+            let started = started || i.region_state != RegionState::Globe;
+            if i.backspace {
+                actions.push(NavAction::Leave);
+                NavPhase::Globe
+            } else if i.entered {
+                NavPhase::Entering {
+                    fade: Fade::new(ENTER_FADE_S),
+                    placed: false,
+                }
+            } else if started && i.region_state == RegionState::Globe {
+                // The generation failed (the region plugin logged why).
+                NavPhase::Globe
+            } else if !started && i.now_s - since_s > START_TIMEOUT_S {
+                NavPhase::Globe
+            } else {
+                NavPhase::Descending {
+                    target,
+                    since_s,
+                    started,
+                }
+            }
+        }
+        NavPhase::Entering { fade, placed } => {
+            let fade = fade.advance(i.dt_s, false);
+            let placed = placed || {
+                let swap = fade.swapped();
+                if swap {
+                    actions.push(NavAction::PlaceAtStart);
+                }
+                swap
+            };
+            if i.region_state == RegionState::Globe {
+                NavPhase::Globe
+            } else if fade.done() {
+                NavPhase::Flying
+            } else {
+                NavPhase::Entering { fade, placed }
+            }
+        }
+        NavPhase::Flying => {
+            if i.region_state == RegionState::Globe {
+                NavPhase::Globe
+            } else if i.backspace {
+                leave(i.region_centre)
+            } else if let Some(change) = i.time_change {
+                match change.carried {
+                    Some(era_dir) => {
+                        actions.push(NavAction::Request(RegionRequested {
+                            era_dir,
+                            snapshot: change.to,
+                        }));
+                        NavPhase::ChangingSnapshot {
+                            fade: Fade::new(SNAPSHOT_FADE_S),
+                            to: change.to,
+                            agl_m: change.agl_m,
+                            ready: false,
+                            placed: false,
+                        }
+                    }
+                    None => leave(i.region_centre),
+                }
+            } else {
+                NavPhase::Flying
+            }
+        }
+        NavPhase::ChangingSnapshot {
+            fade,
+            mut to,
+            agl_m,
+            ready,
+            placed,
+        } => {
+            let ready = ready || i.replaced;
+            if i.region_state == RegionState::Globe {
+                // The generation failed; the region plugin removed the region.
+                return (NavPhase::Globe, actions);
+            }
+            if i.backspace {
+                return (leave(i.region_centre), actions);
+            }
+            if !ready && let Some(change) = i.time_change {
+                // The time moved again before the region was ready: carry from the region
+                // still shown, which supersedes the request in flight.
+                match change.carried {
+                    Some(era_dir) => {
+                        to = change.to;
+                        actions.push(NavAction::Request(RegionRequested {
+                            era_dir,
+                            snapshot: to,
+                        }));
+                    }
+                    None => return (leave(i.region_centre), actions),
+                }
+            }
+            let fade = fade.advance(i.dt_s, !ready);
+            let placed = placed || {
+                let swap = ready && fade.swapped();
+                if swap {
+                    actions.push(NavAction::PlaceAfterChange { agl_m });
+                }
+                swap
+            };
+            if placed && fade.done() {
+                NavPhase::Flying
+            } else {
+                NavPhase::ChangingSnapshot {
+                    fade,
+                    to,
+                    agl_m,
+                    ready,
+                    placed,
+                }
+            }
+        }
+        NavPhase::Leaving { fade, centre, left } => {
+            let fade = fade.advance(i.dt_s, false);
+            let left = left || {
+                let swap = fade.swapped();
+                if swap {
+                    actions.push(NavAction::Leave);
+                    if centre.0 != DVec3::ZERO {
+                        actions.push(NavAction::CentreGlobe(centre));
+                    }
+                }
+                swap
+            };
+            if fade.done() {
+                NavPhase::Globe
+            } else {
+                NavPhase::Leaving { fade, centre, left }
+            }
+        }
+    };
+    (next, actions)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The shell
+
+/// The navigation state: the phase, the last press (for double-clicks) and when the current
+/// generation started (for the caption).
+#[derive(Resource, Clone, Debug, PartialEq)]
+pub struct Navigation {
+    pub phase: NavPhase,
+    pub last_press: Option<(f64, Vec2)>,
+    pub generating_since: Option<f64>,
+}
+
+impl Default for Navigation {
+    fn default() -> Self {
+        Navigation {
+            phase: NavPhase::Globe,
+            last_press: None,
+            generating_since: None,
+        }
+    }
+}
+
+/// The navigation systems; the fly camera and the terrain scene order themselves after them.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NavigationSystems;
+
+/// The full-screen fade overlay.
+#[derive(Component)]
+pub struct FadeOverlay;
+
+/// The "Descending..." caption.
+#[derive(Component)]
+pub struct DescendingCaption;
+
+/// `Backspace` leaves a region.
+pub const LEAVE_KEY: KeyCode = KeyCode::Backspace;
+
+pub struct RegionNavigationPlugin;
+
+impl Plugin for RegionNavigationPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Navigation>()
+            .init_resource::<TerrainSettings>()
+            .init_resource::<OrbitState>()
+            .init_resource::<FlyState>()
+            .add_systems(Startup, spawn_overlay)
+            .add_systems(
+                Update,
+                navigate
+                    .in_set(NavigationSystems)
+                    .before(TerrainSceneSystems)
+                    .before(OrbitCameraSystems),
+            );
+    }
+}
+
+fn spawn_overlay(mut commands: Commands) {
+    commands.spawn((
+        Name::new("Fade overlay"),
+        FadeOverlay,
+        // Under the rest of the UI (the slider stays readable through a fade).
+        GlobalZIndex(-1),
+        Pickable::IGNORE,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(0),
+            right: px(0),
+            top: px(0),
+            bottom: px(0),
+            display: Display::None,
+            ..default()
+        },
+        BackgroundColor(FADE_COLOR.with_alpha(0.0)),
+    ));
+    commands
+        .spawn((
+            Name::new("Descending caption"),
+            DescendingCaption,
+            Pickable::IGNORE,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                right: px(0),
+                top: percent(40),
+                justify_content: JustifyContent::Center,
+                display: Display::None,
+                ..default()
+            },
+        ))
+        .with_child((
+            Text::new(CAPTION_TEXT),
+            TextFont::from_font_size(24.0),
+            TextColor(TEXT_COLOR.with_alpha(0.85)),
+            Pickable::IGNORE,
+        ));
+}
+
+/// The globe direction under the cursor, from the globe camera.
+fn cursor_globe_dir(
+    windows: &Query<&Window, With<PrimaryWindow>>,
+    cameras: &Query<(&Camera, &GlobalTransform), With<GlobeCamera>>,
+) -> Option<RenderDir> {
+    let cursor = windows.single().ok()?.cursor_position()?;
+    let (camera, transform) = cameras.single().ok()?;
+    let ray = camera.viewport_to_world(transform, cursor).ok()?;
+    globe_hit(ray)
+}
+
+/// The time change to act on, if the time differs from the snapshot the view expects.
+fn gather_time_change(
+    phase: &NavPhase,
+    time: YearsBp,
+    region: Option<&ActiveRegion>,
+    fly: &FlyState,
+    globe: Option<&GlobeData>,
+) -> Option<TimeChange> {
+    let region = region?;
+    let expected = match *phase {
+        NavPhase::Flying => region.grid.spec.snapshot,
+        NavPhase::ChangingSnapshot {
+            to, ready: false, ..
+        } => to,
+        _ => return None,
+    };
+    if time == expected {
+        return None;
+    }
+    let (x, z) = (f64::from(fly.pos_m.x), f64::from(fly.pos_m.z));
+    let ground = blended_height_m(&region.grid, x, z).max(0.0);
+    let camera_dir = region.frame.local_to_dir(x, z);
+    let carried = globe
+        .and_then(|g| carry_crust_position(&g.crust, camera_dir, region.grid.spec.snapshot, time));
+    Some(TimeChange {
+        to: time,
+        carried,
+        agl_m: fly.pos_m.y - ground,
+    })
+}
+
+/// Gathers input, events and the region; decides with [`step_nav`]; applies the actions and
+/// the phase's view (which camera, the overlay, the caption, the orbit ease).
+/// The pointer and keys navigation reads.
+#[derive(SystemParam)]
+struct NavInput<'w, 's> {
+    keys: Option<Res<'w, ButtonInput<KeyCode>>>,
+    mouse: Option<Res<'w, ButtonInput<MouseButton>>>,
+    over_ui: Option<Res<'w, PointerOverUi>>,
+    windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    globe_cameras: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<GlobeCamera>>,
+}
+
+/// The fade overlay's node and colour.
+type OverlayQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Node, &'static mut BackgroundColor),
+    (With<FadeOverlay>, Without<DescendingCaption>),
+>;
+
+/// The overlay and caption nodes.
+#[derive(SystemParam)]
+struct NavUi<'w, 's> {
+    overlay: OverlayQuery<'w, 's>,
+    caption: Query<'w, 's, &'static mut Node, (With<DescendingCaption>, Without<FadeOverlay>)>,
+}
+
+/// Gathers input, events and the region; decides with [`step_nav`]; applies the actions and
+/// the phase's view (which camera, the overlay, the caption, the orbit ease).
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
+fn navigate(
+    mut nav: ResMut<Navigation>,
+    real: Res<Time<Real>>,
+    region_state: Res<State<RegionState>>,
+    input: NavInput,
+    globe: Option<Res<GlobeData>>,
+    region: Option<Res<ActiveRegion>>,
+    mut events: (
+        MessageReader<RegionEntered>,
+        MessageReader<RegionSnapshotChanged>,
+    ),
+    mut writers: (
+        MessageWriter<RegionRequested>,
+        MessageWriter<RegionLeft>,
+        MessageWriter<TimeChanged>,
+    ),
+    mut time: ResMut<GlobeTime>,
+    mut fly: ResMut<FlyState>,
+    mut orbit: ResMut<OrbitState>,
+    mut terrain: ResMut<TerrainSettings>,
+    mut ui: NavUi,
+) {
+    let now_s = real.elapsed_secs_f64();
+    let dt_s = real.delta_secs();
+    let state = *region_state.get();
+
+    // Gather.
+    let mut double_click = None;
+    if nav.phase == NavPhase::Globe
+        && let Some(mouse) = &input.mouse
+        && mouse.just_pressed(MouseButton::Left)
+        && !input.over_ui.as_ref().is_some_and(|o| o.0)
+        && let Some(pos) = input
+            .windows
+            .single()
+            .ok()
+            .and_then(Window::cursor_position)
+    {
+        if is_double_click(nav.last_press, now_s, pos) {
+            nav.last_press = None;
+            double_click = cursor_globe_dir(&input.windows, &input.globe_cameras);
+        } else {
+            nav.last_press = Some((now_s, pos));
+        }
+    }
+    let inputs = NavInputs {
+        now_s,
+        dt_s,
+        region_state: state,
+        time: time.years,
+        double_click,
+        backspace: input
+            .keys
+            .as_ref()
+            .is_some_and(|k| k.just_pressed(LEAVE_KEY)),
+        entered: events.0.read().count() > 0,
+        replaced: events.1.read().count() > 0,
+        region_centre: region.as_ref().map(|r| r.frame.center),
+        time_change: gather_time_change(
+            &nav.phase,
+            time.years,
+            region.as_deref(),
+            &fly,
+            globe.as_deref(),
+        ),
+    };
+    nav.generating_since = match (state, nav.generating_since) {
+        (RegionState::Generating, None) => Some(now_s),
+        (RegionState::Generating, since) => since,
+        _ => None,
+    };
+
+    // Decide.
+    let before = nav.phase;
+    let (phase, actions) = step_nav(before, &inputs);
+
+    // Apply.
+    let (requests, left, changes) = &mut writers;
+    for action in actions {
+        apply_action(
+            action,
+            region.as_deref(),
+            &mut time,
+            &mut fly,
+            &mut orbit,
+            requests,
+            left,
+            changes,
+        );
+    }
+    if std::mem::discriminant(&phase) != std::mem::discriminant(&before) {
+        info!(from = ?before, to = ?phase, "navigation phase");
+    }
+    nav.phase = phase;
+    if let NavPhase::Descending { target, .. } = phase {
+        let (lat, lon) = geo_to_latlon(render_to_geo(target));
+        let goal = OrbitState {
+            lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
+            lon_deg: lon,
+            distance_km: NEAR_ORBIT_KM,
+        };
+        let next = ease_toward(*orbit, goal, f64::from(dt_s));
+        if next != *orbit {
+            *orbit = next;
+        }
+    }
+    let shown = phase.region_shown();
+    if terrain.visible != shown {
+        terrain.visible = shown;
+    }
+    let alpha = phase.overlay_alpha();
+    for (mut node, mut color) in &mut ui.overlay {
+        let display = if alpha > 0.0 {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+        let want = FADE_COLOR.with_alpha(alpha);
+        if color.0 != want {
+            color.0 = want;
+        }
+    }
+    let leaving = matches!(phase, NavPhase::Leaving { .. });
+    let show_caption = !leaving && caption_shown(nav.generating_since.map(|since| now_s - since));
+    for mut node in &mut ui.caption {
+        let display = if show_caption {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "the shell's writers")]
+#[instrument(level = "debug", skip_all, fields(?action))]
+fn apply_action(
+    action: NavAction,
+    region: Option<&ActiveRegion>,
+    time: &mut GlobeTime,
+    fly: &mut FlyState,
+    orbit: &mut OrbitState,
+    requests: &mut MessageWriter<RegionRequested>,
+    left: &mut MessageWriter<RegionLeft>,
+    changes: &mut MessageWriter<TimeChanged>,
+) {
+    match action {
+        NavAction::SnapTime(to) => {
+            let from = time.years;
+            time.years = to;
+            changes.write(TimeChanged {
+                from,
+                to,
+                cause: TimeChangeCause::Snap,
+            });
+        }
+        NavAction::Request(request) => {
+            requests.write(request);
+        }
+        NavAction::Leave => {
+            left.write(RegionLeft);
+        }
+        NavAction::PlaceAtStart => {
+            if let Some(region) = region {
+                *fly = FlyState::start(&region.grid);
+            }
+        }
+        NavAction::PlaceAfterChange { agl_m } => {
+            if let Some(region) = region {
+                let ground = blended_height_m(&region.grid, 0.0, 0.0).max(0.0);
+                let y = (ground + agl_m)
+                    .min(CAMERA_CEILING_M)
+                    .max(ground + CAMERA_CLEARANCE_M);
+                fly.pos_m = Vec3::new(0.0, y, 0.0);
+            }
+        }
+        NavAction::CentreGlobe(dir) => {
+            let (lat, lon) = geo_to_latlon(render_to_geo(dir));
+            *orbit = OrbitState {
+                lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
+                lon_deg: lon,
+                distance_km: NEAR_ORBIT_KM,
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

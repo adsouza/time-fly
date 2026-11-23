@@ -27,6 +27,7 @@ pub mod frames;
 pub mod generate;
 mod job;
 pub mod launch;
+pub mod navigate;
 pub mod tiles;
 
 use std::sync::Arc;

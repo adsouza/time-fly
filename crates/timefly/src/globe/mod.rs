@@ -341,7 +341,9 @@ impl Plugin for GlobePlugin {
         .add_systems(
             Update,
             (
-                update_globe_view,
+                // A region view switches the globe camera off: the globe neither draws nor
+                // follows the time until it is back, then catches up at once.
+                update_globe_view.run_if(globe_camera_active),
                 sync_sun,
                 sync_bridge_cameras.in_set(GlobeCameraSync),
                 track_render_status,
@@ -355,6 +357,11 @@ impl Plugin for GlobePlugin {
                 .add_systems(Render, probe_pipelines.in_set(RenderSystems::Cleanup));
         }
     }
+}
+
+/// Whether the globe is on screen: its camera is active (or there is none, in headless runs).
+fn globe_camera_active(cameras: Query<&Camera, With<GlobeCamera>>) -> bool {
+    cameras.is_empty() || cameras.iter().any(|c| c.is_active)
 }
 
 fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamera>>) {

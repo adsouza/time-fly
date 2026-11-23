@@ -71,3 +71,5 @@ web-sys = { version = "0.3", features = [
 ruzstd = "0.9"
 # Edits f16 frame texels in the globe fixture test (already a timefly_core dependency).
 half = "2"
+# The fly camera's clearance property test (already a timefly_core dev-dependency).
+proptest = "1.12"
