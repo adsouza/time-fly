@@ -190,11 +190,16 @@ impl Slice {
         }
     }
 
-    /// Yields when the slice's budget is spent and starts the next slice on resuming.
-    async fn yield_if_spent(&mut self) {
+    /// Counts the time spent so far in this slice towards the longest slice.
+    fn record(&mut self) -> Duration {
         let spent = self.started.elapsed();
         self.longest = self.longest.max(spent);
-        if spent >= self.budget {
+        spent
+    }
+
+    /// Yields when the slice's budget is spent and starts the next slice on resuming.
+    async fn yield_if_spent(&mut self) {
+        if self.record() >= self.budget {
             YieldOnce(false).await;
             self.started = Instant::now();
             self.count += 1;
@@ -202,9 +207,16 @@ impl Slice {
     }
 }
 
-async fn run_budgeted(inputs: GenInputs, budget: Duration) -> Result<RegionGrid, GenError> {
+/// `earlier` is main-thread work for this region done before the run (the tile probe), which
+/// counts as a slice of its own.
+async fn run_budgeted(
+    inputs: GenInputs,
+    budget: Duration,
+    earlier: Duration,
+) -> Result<RegionGrid, GenError> {
     let started = Instant::now();
     let mut slice = Slice::new(budget);
+    slice.longest = earlier;
     let field = inputs.field()?;
     slice.yield_if_spent().await;
     let mut prep = RegionPrep::new(inputs.spec, &field);
@@ -212,7 +224,9 @@ async fn run_budgeted(inputs: GenInputs, budget: Duration) -> Result<RegionGrid,
         slice.yield_if_spent().await;
     }
     slice.yield_if_spent().await;
+    // Done stepping, so this does no lattice work; timed like everything else.
     let generator = prep.finish();
+    slice.yield_if_spent().await;
     let mut done: [Vec<FieldRows>; 2] = [Vec::new(), Vec::new()];
     for (k, kind) in [FieldKind::Inner, FieldKind::Apron].into_iter().enumerate() {
         for range in row_blocks(generator.rows_in(kind), 1) {
@@ -222,6 +236,7 @@ async fn run_budgeted(inputs: GenInputs, budget: Duration) -> Result<RegionGrid,
     }
     let [inner, apron] = done;
     let grid = generator.assemble(inner, apron);
+    slice.record();
     info!(
         slices = slice.count,
         longest_ms = format!("{:.1}", slice.longest.as_secs_f64() * 1e3),
@@ -234,17 +249,21 @@ async fn run_budgeted(inputs: GenInputs, budget: Duration) -> Result<RegionGrid,
 type RunFuture = Pin<Box<dyn Future<Output = Result<RegionGrid, GenError>> + Send>>;
 
 /// A time-boxed run: each [`poll_slice`](Self::poll_slice) works until about `budget` has
-/// passed (plus at most one prep step or one row), then returns. Built for the web, where it is
-/// polled once per frame; it runs the same on native (and is tested there).
+/// passed (plus at most one prep step, one row, or the final assembly), then returns. Built for
+/// the web, where it is polled once per frame; it runs the same on native (and is tested
+/// there). Its closing log line's `longest_ms` covers every slice, the field build,
+/// `prep.finish()`, `assemble` and the tile probe that preceded the run.
 pub struct BudgetedRun {
     // A `Mutex` only to make the run `Sync` for a Bevy resource; it is never contended.
     future: Mutex<RunFuture>,
 }
 
 impl BudgetedRun {
-    pub fn new(inputs: GenInputs, budget: Duration) -> BudgetedRun {
+    /// `earlier` is main-thread time already spent on this region in an earlier frame (the tile
+    /// probe), reported with the slices.
+    pub fn new(inputs: GenInputs, budget: Duration, earlier: Duration) -> BudgetedRun {
         BudgetedRun {
-            future: Mutex::new(Box::pin(run_budgeted(inputs, budget))),
+            future: Mutex::new(Box::pin(run_budgeted(inputs, budget, earlier))),
         }
     }
 

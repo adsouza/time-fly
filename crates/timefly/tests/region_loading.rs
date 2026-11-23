@@ -18,7 +18,7 @@ use bevy::log::tracing_subscriber::{Layer, Registry};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use timefly::data::{GlobeData, GlobeDataPlugin, GlobeLoadState};
-use timefly::region::frames::CpuGrid;
+use timefly::region::frames::{CpuGrid, FRAME_CACHE_SLOTS, FrameCache};
 use timefly::region::generate::{BudgetedRun, GenInputs, generate_parallel, tiles_needed};
 use timefly::region::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, tile_path};
 use timefly::region::{
@@ -474,8 +474,12 @@ fn leaving_frees_the_region() {
             "{path} still has a strong handle"
         );
     }
-    // The tile cache stays, bounded, for the next region.
+    // The tile and frame caches stay, bounded, for the next region (ruling R11): the frame
+    // cache holds the present-day request's one frame file, not the region's own grids.
     assert_eq!(app.world().resource::<TileCache>().len(), 4);
+    let frames = app.world().resource::<FrameCache>();
+    assert!(frames.len() <= FRAME_CACHE_SLOTS);
+    assert_eq!(frames.len(), 1);
 }
 
 #[test]
@@ -518,6 +522,114 @@ fn leaving_while_generating_cancels_the_job() {
     assert_eq!(state(&app), RegionState::Globe);
     assert!(app.world().get_resource::<ActiveRegion>().is_none());
     assert!(app.world().resource::<Seen>().generated.is_empty());
+}
+
+/// Updates until the overview's load is in flight (a live `CpuGrid` handle to it), so a test
+/// can cancel the job at exactly that point.
+fn until_overview_in_flight(app: &mut App) {
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    loop {
+        app.update();
+        let server = app.world().resource::<AssetServer>();
+        if server.get_handle::<CpuGrid>(OVERVIEW_PATH).is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the overview never started loading"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_job_keeps_the_overview() {
+    for cancel in ["leave", "supersede"] {
+        let mut app = region_app(&tiny_root(), SMALL);
+        request(&mut app, 0.0, 0.0, 0.0);
+        until_overview_in_flight(&mut app);
+        match cancel {
+            "leave" => {
+                app.world_mut().write_message(RegionLeft);
+                // State changes apply in the next update's transition schedule.
+                app.update();
+                app.update();
+                assert_eq!(state(&app), RegionState::Globe, "{cancel}");
+                request(&mut app, 0.0, 0.0, 0.0);
+            }
+            _ => request(&mut app, 0.0, 0.0, 400.0e6),
+        }
+        run_until(&mut app, RegionState::InRegion);
+        let cache = app.world().resource::<TileCache>();
+        assert!(
+            cache.overview().is_some(),
+            "{cancel}: the overview was lost"
+        );
+        assert_eq!(
+            app.world().resource::<Seen>().generated.len(),
+            1,
+            "{cancel}"
+        );
+    }
+}
+
+#[test]
+fn a_superseding_request_wins() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    app.update();
+    app.update();
+    assert_eq!(state(&app), RegionState::Generating);
+    request(&mut app, 1.0, 1.0, 400.0e6);
+    run_until(&mut app, RegionState::InRegion);
+    let event = generated(&app);
+    assert_eq!(event.spec.snapshot, YearsBp(400.0e6));
+    assert_eq!(event.spec.center, dir(1.0, 1.0));
+    assert_eq!(active(&app).grid.spec, event.spec);
+
+    // A leave in the middle of a load leaves no CPU grid behind once the loads settle.
+    request(&mut app, 0.0, 0.0, 10.0e3);
+    app.update();
+    app.world_mut().write_message(RegionLeft);
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        app.update();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(state(&app), RegionState::Globe);
+    assert_eq!(app.world().resource::<Assets<CpuGrid>>().len(), 0);
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 1);
+}
+
+#[test]
+fn repeated_requests_reuse_decoded_frames() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    let frame = app
+        .world()
+        .resource::<GlobeData>()
+        .frame_path(0)
+        .to_string();
+    app.world_mut().resource_mut::<Seen>().states.clear();
+    request(&mut app, 0.5, 0.5, 0.0);
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    loop {
+        app.update();
+        let server = app.world().resource::<AssetServer>();
+        assert!(
+            server.get_handle::<CpuGrid>(frame.clone()).is_none(),
+            "{frame} was loaded again"
+        );
+        let seen = app.world().resource::<Seen>();
+        if state(&app) == RegionState::InRegion && seen.states.contains(&RegionState::Generating) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second region never finished"
+        );
+    }
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 2);
 }
 
 #[test]
@@ -611,7 +723,7 @@ fn budgeted_run_is_time_boxed() {
     let inputs = inputs(&app, spec);
     let expected = generate_parallel(&inputs).unwrap();
     let budget = Duration::from_millis(6);
-    let mut run = BudgetedRun::new(inputs, budget);
+    let mut run = BudgetedRun::new(inputs, budget, Duration::ZERO);
     let mut slices = Vec::new();
     let grid = loop {
         let t = Instant::now();

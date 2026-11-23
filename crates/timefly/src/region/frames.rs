@@ -7,6 +7,7 @@
 //! no label (see the Task 5 report, "Deviations").
 
 use std::fmt;
+use std::sync::Arc;
 
 use bevy::asset::io::Reader;
 use bevy::asset::{AssetLoader, LoadContext};
@@ -124,9 +125,112 @@ pub fn decode_cpu_grid(
         .map_err(CpuGridError::Format)
 }
 
+/// Decoded globe frames kept between requests (ruling R11), so a snapshot change or a new
+/// region at a nearby snapshot does not load and decode the same files again. At most
+/// [`FRAME_CACHE_SLOTS`] files (about 0.8 MB each at the bake's cube size of 128), least
+/// recently used first out; frames the current request reads are never evicted. It lives for the
+/// session and is not cleared when a region is left: it is bounded, and re-entering is common.
+#[derive(Resource, Default, Debug)]
+pub struct FrameCache {
+    frames: Vec<CachedFrame>,
+    clock: u64,
+}
+
+/// Frame files the [`FrameCache`] holds: a bridge snapshot reads up to four.
+pub const FRAME_CACHE_SLOTS: usize = 4;
+
+#[derive(Debug)]
+struct CachedFrame {
+    /// The file's image slot in `GlobeData`.
+    slot: u32,
+    grid: Arc<Grid>,
+    last_used: u64,
+}
+
+impl FrameCache {
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// The cached grid of image slot `slot`, marked as just used.
+    pub fn get(&mut self, slot: u32) -> Option<Arc<Grid>> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.frames.iter_mut().find(|f| f.slot == slot).map(|f| {
+            f.last_used = clock;
+            f.grid.clone()
+        })
+    }
+
+    /// Adds a slot's grid, then evicts the least recently used slots outside `keep` (the current
+    /// request's slots) down to [`FRAME_CACHE_SLOTS`].
+    pub fn insert(&mut self, slot: u32, grid: Arc<Grid>, keep: &[u32]) {
+        self.clock += 1;
+        self.frames.retain(|f| f.slot != slot);
+        self.frames.push(CachedFrame {
+            slot,
+            grid,
+            last_used: self.clock,
+        });
+        while self.frames.len() > FRAME_CACHE_SLOTS {
+            let victim = self
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| !keep.contains(&f.slot))
+                .min_by_key(|(_, f)| f.last_used)
+                .map(|(i, _)| i);
+            match victim {
+                Some(i) => {
+                    self.frames.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_cache_is_bounded_lru_and_keeps_the_current_slots() {
+        let grid = |v: u8| {
+            Arc::new(Grid {
+                kind: timefly_core::formats::GridKind::Cube,
+                dtype: timefly_core::formats::DType::F16,
+                channels: 1,
+                width: 1,
+                height: 1,
+                data: vec![v; 12],
+            })
+        };
+        let mut cache = FrameCache::default();
+        for slot in 0..4 {
+            cache.insert(slot, grid(slot as u8), &[slot]);
+        }
+        assert_eq!(cache.len(), 4);
+        // Slot 0 is touched, so slot 1 is the least recently used.
+        assert_eq!(cache.get(0).unwrap().data[0], 0);
+        cache.insert(4, grid(4), &[4]);
+        assert_eq!(cache.len(), FRAME_CACHE_SLOTS);
+        assert!(cache.get(1).is_none());
+        assert!(cache.get(0).is_some());
+        // The current request's slots survive even when they are the oldest.
+        let mut cache = FrameCache::default();
+        for slot in 0..4 {
+            cache.insert(slot, grid(0), &[]);
+        }
+        cache.insert(9, grid(9), &[0, 1, 2, 9]);
+        assert!(cache.get(3).is_none());
+        assert!([0, 1, 2, 9].iter().all(|&s| cache.get(s).is_some()));
+        assert!(!cache.is_empty());
+    }
 
     /// A valid 1 × 1 single-channel f16 lat-lon `.tfgrid`, compressed with ruzstd.
     fn tiny_tfgrid() -> Vec<u8> {
