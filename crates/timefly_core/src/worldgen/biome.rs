@@ -49,18 +49,37 @@ pub fn biome_from_koppen(code: u8) -> Option<BiomeClass> {
     })
 }
 
+/// Most the snowline drops in a glacial era (m).
+pub const MAX_GLACIAL_SNOWLINE_DROP_M: f64 = 1200.0;
+/// The snowline drop per metre of negative sea-level anomaly: 1,000 m at the Last Glacial
+/// Maximum's -120 m.
+pub const SNOWLINE_DROP_PER_ANOMALY_M: f64 = 1000.0 / 120.0;
+
 /// Height of the permanent snowline: 5,500 m up to 20 degrees of latitude, then 70 m lower per
-/// degree, never below sea level.
-pub fn snowline_m(lat_deg: f64) -> f64 {
-    (5500.0 - 70.0 * (lat_deg.abs() - 20.0).max(0.0)).max(0.0)
+/// degree, lowered in glacial eras, never below sea level.
+///
+/// Ruling R18: ICE-6G's 1-degree grid misses mountain glaciers (the Alps at 21 ka have zero ice
+/// fraction), so a glacial era lowers the snowline by `1000 m × (anomaly / −120 m)`, clamped to
+/// `0..=1,200 m`: no change for a positive anomaly. `sea_level_anomaly_m` is the era's (0 in deep
+/// eras). Mirrored by `snowline_m` in `snowline.wesl`.
+pub fn snowline_m(lat_deg: f64, sea_level_anomaly_m: f64) -> f64 {
+    let drop = (-sea_level_anomaly_m * SNOWLINE_DROP_PER_ANOMALY_M)
+        .clamp(0.0, MAX_GLACIAL_SNOWLINE_DROP_M);
+    (5500.0 - 70.0 * (lat_deg.abs() - 20.0).max(0.0) - drop).max(0.0)
 }
 
-/// The zonal rule for deep time, from paleolatitude (degrees), effective elevation (m) and
-/// distance to the coast (km). Bands are `[lower, upper)` in |latitude|; a distance threshold
-/// belongs to its wetter side ("within 500 km" includes 500).
-pub fn zonal_biome(paleolat_deg: f64, elevation_m: f64, coast_distance_km: f64) -> BiomeClass {
+/// The zonal rule for deep time, from paleolatitude (degrees), effective elevation (m),
+/// distance to the coast (km) and the era's sea-level anomaly (m, for [`snowline_m`]; 0 in deep
+/// eras). Bands are `[lower, upper)` in |latitude|; a distance threshold belongs to its wetter
+/// side ("within 500 km" includes 500).
+pub fn zonal_biome(
+    paleolat_deg: f64,
+    elevation_m: f64,
+    coast_distance_km: f64,
+    sea_level_anomaly_m: f64,
+) -> BiomeClass {
     let lat = paleolat_deg.abs();
-    if elevation_m > snowline_m(lat) {
+    if elevation_m > snowline_m(lat, sea_level_anomaly_m) {
         return if lat > 60.0 {
             BiomeClass::IceCap
         } else {
@@ -386,7 +405,7 @@ mod tests {
     #[test]
     fn zonal_rule_bands() {
         use BiomeClass::*;
-        let z = zonal_biome;
+        let z = |lat, e, c| zonal_biome(lat, e, c, 0.0);
         for lat in [0.0, 5.0, -9.9] {
             assert_eq!(z(lat, 100.0, 1500.0), TropicalRainforest);
             assert_eq!(z(lat, 100.0, 1500.1), MonsoonSavanna);
@@ -414,20 +433,60 @@ mod tests {
         assert_eq!(z(0.0, 5500.1, 0.0), Alpine);
         assert_eq!(z(0.0, 5500.0, 0.0), TropicalRainforest);
         assert_eq!(z(45.0, 5500.0 - 70.0 * 25.0 + 1.0, 0.0), Alpine);
-        assert_eq!(z(61.0, snowline_m(61.0) + 1.0, 0.0), IceCap);
-        assert_eq!(z(-80.0, snowline_m(80.0) + 1.0, 0.0), IceCap);
-        assert_eq!(z(60.0, snowline_m(60.0) + 1.0, 0.0), Alpine);
+        assert_eq!(z(61.0, snowline_m(61.0, 0.0) + 1.0, 0.0), IceCap);
+        assert_eq!(z(-80.0, snowline_m(80.0, 0.0) + 1.0, 0.0), IceCap);
+        assert_eq!(z(60.0, snowline_m(60.0, 0.0) + 1.0, 0.0), Alpine);
     }
 
     #[test]
     fn snowline() {
-        assert_eq!(snowline_m(0.0), 5500.0);
-        assert_eq!(snowline_m(20.0), 5500.0);
-        assert_eq!(snowline_m(-20.0), 5500.0);
-        assert!((snowline_m(30.0) - 4800.0).abs() < 1e-9);
-        assert!((snowline_m(-30.0) - 4800.0).abs() < 1e-9);
-        assert!((snowline_m(60.0) - 2700.0).abs() < 1e-9);
-        assert!(snowline_m(90.0) >= 0.0);
-        assert_eq!(snowline_m(90.0), 600.0);
+        assert_eq!(snowline_m(0.0, 0.0), 5500.0);
+        assert_eq!(snowline_m(20.0, 0.0), 5500.0);
+        assert_eq!(snowline_m(-20.0, 0.0), 5500.0);
+        assert!((snowline_m(30.0, 0.0) - 4800.0).abs() < 1e-9);
+        assert!((snowline_m(-30.0, 0.0) - 4800.0).abs() < 1e-9);
+        assert!((snowline_m(60.0, 0.0) - 2700.0).abs() < 1e-9);
+        assert!(snowline_m(90.0, 0.0) >= 0.0);
+        assert_eq!(snowline_m(90.0, 0.0), 600.0);
+    }
+
+    /// Ruling R18: glacial eras lower the snowline by 1,000 m per -120 m of sea-level anomaly,
+    /// clamped to 0..1,200 m, so mountain glaciers too small for ICE-6G's 1-degree grid show.
+    #[test]
+    fn snowline_drops_in_glacial_eras() {
+        for lat in [0.0, 20.0, -35.0, 46.5, 60.0, 63.0] {
+            let base = snowline_m(lat, 0.0);
+            // -120 m: 1,000 m lower; -60 m: 500 m lower.
+            assert!(
+                (snowline_m(lat, -120.0) - (base - 1000.0)).abs() < 1e-9,
+                "{lat}"
+            );
+            assert!(
+                (snowline_m(lat, -60.0) - (base - 500.0)).abs() < 1e-9,
+                "{lat}"
+            );
+            // -150 m would be 1,250 m: clamped to 1,200 m, and so is anything deeper.
+            assert!(
+                (snowline_m(lat, -150.0) - (base - 1200.0)).abs() < 1e-9,
+                "{lat}"
+            );
+            assert!(
+                (snowline_m(lat, -400.0) - (base - 1200.0)).abs() < 1e-9,
+                "{lat}"
+            );
+            // Positive anomalies (warm eras) never raise it.
+            assert_eq!(snowline_m(lat, 8.96), base, "{lat}");
+            assert_eq!(snowline_m(lat, 50.0), base, "{lat}");
+        }
+        // The Alps at the Last Glacial Maximum: 3,645 m today, 2,645 m at -120 m.
+        assert!((snowline_m(46.5, -120.0) - 2645.0).abs() < 1e-9);
+        // Never below sea level.
+        assert_eq!(snowline_m(85.0, -120.0), 0.0);
+        // The zonal rule takes the anomaly too: alpine 1,000 m lower at -120 m.
+        assert_eq!(
+            zonal_biome(45.0, 3000.0, 0.0, 0.0),
+            BiomeClass::TemperateBroadleaf
+        );
+        assert_eq!(zonal_biome(45.0, 3000.0, 0.0, -120.0), BiomeClass::Alpine);
     }
 }

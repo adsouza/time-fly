@@ -301,6 +301,18 @@ pub fn frames_needed(timeline: &Timeline, age_myr: f64) -> Vec<usize> {
     out
 }
 
+/// The sea-level anomaly (m) a region at `age_myr` uses for its snowline (ruling R18): the
+/// timeline's anomaly for recent and bridge snapshots, 0 for deep ones, whose frames carry their
+/// own sea level.
+pub fn snapshot_sea_level_anomaly_m(timeline: &Timeline, age_myr: f64) -> f64 {
+    match timeline.select_frames(age_myr) {
+        FrameSelection::Recent(_) | FrameSelection::Bridge { .. } => {
+            timeline.sea_level_anomaly_m(age_myr)
+        }
+        FrameSelection::Deep(_) => 0.0,
+    }
+}
+
 /// Builds the coarse field for `age_myr`. `frame(i)` returns timeline frame `i`'s CPU grid; it
 /// is called only for [`frames_needed`]. `fallback` says some inner tile the region needs is
 /// missing (`tiles.missing(&field.tiles_needed(&frame))` is not empty); the apron's use of the
@@ -366,6 +378,23 @@ pub fn snapshot_field<'a>(
 mod tests {
     use super::*;
     use crate::worldgen::testkit::*;
+
+    #[test]
+    fn snowline_anomaly_is_the_timeline_s_in_recent_eras_and_zero_in_deep_ones() {
+        let s = timeline();
+        // Recent (ICE-6G) and bridge snapshots: the timeline's curve.
+        for age in [0.0, 0.021, 0.026076, 0.028] {
+            let want = s.sea_level_anomaly_m(age);
+            assert_eq!(snapshot_sea_level_anomaly_m(&s, age), want, "{age}");
+        }
+        assert!(snapshot_sea_level_anomaly_m(&s, 0.021) < -30.0);
+        assert_eq!(snapshot_sea_level_anomaly_m(&s, 0.0), 0.0);
+        // Deep snapshots: zero, even inside the curve's taper toward 4.47 Ma.
+        assert!(s.sea_level_anomaly_m(1.0) < -10.0);
+        for age in [0.03, 1.0, 50.0, 100.0] {
+            assert_eq!(snapshot_sea_level_anomaly_m(&s, age), 0.0, "{age}");
+        }
+    }
 
     #[test]
     fn bridge_crossfade_blends_recent_into_deep() {

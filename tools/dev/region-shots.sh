@@ -15,6 +15,7 @@ filter="${3:-}"
 # name  LAT,LON,AGE_YEARS
 shots=(
   "bench-alps-0ka           46.5,10,0"
+  "alps-21ka-glacial        46.5,10,21000"
   "bench-scandinavia-21ka   63,15,21000"
   "bench-pangaea-250ma      -22,-18,250000000"
   "era-540ma-barren         -16,0,540000000"

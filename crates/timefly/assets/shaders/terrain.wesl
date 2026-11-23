@@ -19,6 +19,7 @@ import package::terrain_cdlod::{
     TerrainBuffer, TerrainParams, cdlod_vertex, grid_index_of, terrain_normal,
 };
 import package::noise::gradient_noise3;
+import package::snowline::snowline_m;
 import bevy_pbr::render::mesh_functions::get_tag;
 import bevy_pbr::render::view_transformations::position_world_to_clip;
 import bevy_pbr::render::pbr_fragment::pbr_input_from_standard_material;
@@ -30,7 +31,7 @@ struct TerrainLook {
     shadow: vec4<f32>,
     // x: full-sun illumination; y: ramp amount; z: brush strength; w: centre latitude (deg).
     light: vec4<f32>,
-    // x: relief exaggeration for shading.
+    // x: relief exaggeration for shading; y: the era's sea-level anomaly (m), for the snowline.
     relief: vec4<f32>,
 }
 
@@ -156,12 +157,6 @@ fn octave_weight(footprint_m: f32, scale_m: f32) -> f32 {
     return 1.0 - smoothstep(0.25, 0.6, footprint_m / scale_m);
 }
 
-// `snowline_m` (timefly_core::worldgen::biome): 5,500 m up to 20 degrees, 70 m lower per degree
-// beyond, never below sea level.
-fn snowline_m(lat_deg: f32) -> f32 {
-    return max(5500.0 - 70.0 * max(abs(lat_deg) - 20.0, 0.0), 0.0);
-}
-
 // The painted albedo (linear) at xz for the true height, the flat-terrain slope (rise over run)
 // and the pixel footprint (m).
 fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprint: f32) -> vec3<f32> {
@@ -207,7 +202,7 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     // Snow: the ice byte, sharpened per pixel by the snowline at the pixel's latitude (north is
     // -z), shed by cliffs, with a painted edge.
     let lat = look.light.w - xz.y / METRES_PER_DEGREE;
-    let line = snowline_m(lat);
+    let line = snowline_m(lat, look.relief.y);
     let above = smoothstep(line - 150.0, line + 150.0, height + 140.0 * n400 + 40.0 * n60);
     let cliff = smoothstep(0.9, 1.4, slope);
     let snow_amount = max(ice * (1.0 - 0.6 * cliff), above * step(0.0, height) * (1.0 - cliff));

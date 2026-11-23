@@ -10,6 +10,8 @@
 //!   `blended_height_m` and `curvature_drop_m`, fed through the shell's own buffer packing.
 //! - `wesl_normal_matches_rust` runs `terrain_normal` (the per-pixel lighting normal, with the
 //!   curvature tilt) against `timefly_core::terrain::surface_normal`.
+//! - `wesl_snowline_matches_rust` runs `snowline.wesl` (with ruling R18's glacial lowering)
+//!   against `timefly_core::worldgen::biome::snowline_m`.
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -667,4 +669,125 @@ fn wesl_normal_matches_rust() {
         queries.len()
     );
     assert!(worst_tilt_deg > 10.0);
+}
+
+const SNOWLINE: &str = include_str!("../assets/shaders/snowline.wesl");
+
+const SNOWLINE_ENTRY: &str = r#"
+@group(0) @binding(0) var<storage, read> queries: array<vec2<f32>>;   // (lat, anomaly)
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&out)) {
+        return;
+    }
+    out[n] = snowline_m(queries[n].x, queries[n].y);
+}
+"#;
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_snowline_matches_rust() {
+    use timefly_core::worldgen::biome::snowline_m;
+    let lats = [
+        -90.0f32, -63.0, -46.5, -20.0, 0.0, 10.0, 20.0, 20.5, 30.0, 46.5, 60.0, 63.0, 80.0, 85.0,
+        90.0,
+    ];
+    let anomalies = [
+        50.0f32, 8.96, 0.0, -10.0, -60.0, -120.0, -125.0, -144.0, -150.0, -400.0,
+    ];
+    let queries: Vec<[f32; 2]> = lats
+        .iter()
+        .flat_map(|&lat| anomalies.iter().map(move |&a| [lat, a]))
+        .collect();
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("snowline parity"),
+        source: wgpu::ShaderSource::Wgsl(format!("{SNOWLINE}\n{SNOWLINE_ENTRY}").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("snowline parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let query_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("queries"),
+        contents: bytemuck::cast_slice(&queries),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bytes = (queries.len() * 4) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(queries.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<f32> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    // f32 against f64 on values up to 5,500 m: a few thousandths of a metre.
+    let mut worst = 0.0f64;
+    for (q, g) in queries.iter().zip(&got) {
+        let want = snowline_m(f64::from(q[0]), f64::from(q[1]));
+        let diff = (f64::from(*g) - want).abs();
+        worst = worst.max(diff);
+        assert!(
+            diff < 0.01,
+            "lat {} anomaly {}: gpu {g} vs rust {want}",
+            q[0],
+            q[1]
+        );
+    }
+    println!("{} snowlines: worst diff {worst:.2e} m", queries.len());
 }

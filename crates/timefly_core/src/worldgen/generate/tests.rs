@@ -40,6 +40,7 @@ fn spec_at(centre: RenderDir, ma: f64, inner_res: u32, apron_res: u32) -> Region
         seed: 7,
         inner_res,
         apron_res,
+        sea_level_anomaly_m: 0.0,
     }
 }
 
@@ -504,6 +505,53 @@ fn recent_adds_ice_delta() {
         assert!(*h >= 1.0 && (h - 20.0).abs() < 10.0, "{h}");
         assert_eq!(s[3], SURFACE_SHORE * u8::from((*h as f64) <= SHORE_BAND_M));
     }
+}
+
+#[test]
+fn glacial_eras_lower_the_snowline() {
+    // Ruling R18: 3,200 m ground at the Alps' latitude is below today's 3,645 m snowline and
+    // above the Last Glacial Maximum's 2,645 m one (sea 120 m lower).
+    let centre = dir(46.5, 10.0);
+    let field = FnField {
+        f: |_| 3200.0,
+        spacing_m: 1000.0,
+        koppen: Some(26), // Dfb: temperate broadleaf, so only the snowline decides the ice
+    };
+    let today = generate(spec_at(centre, 0.021, 33, 17), &field);
+    assert!(
+        today.inner.surface.iter().all(|s| s[2] == 0),
+        "no ice today"
+    );
+    let lgm = RegionSpec {
+        sea_level_anomaly_m: -120.0,
+        ..spec_at(centre, 0.021, 33, 17)
+    };
+    let glacial = generate(lgm, &field);
+    assert!(
+        glacial.inner.surface.iter().all(|s| s[2] == 255),
+        "snow at the LGM"
+    );
+    // The biome is the data's either way; only the ice byte changes.
+    assert!(
+        glacial
+            .inner
+            .surface
+            .iter()
+            .all(|s| s[0] == BiomeClass::TemperateBroadleaf as u8)
+    );
+    // The zonal rule (no Köppen class) turns the ground alpine under the lowered snowline.
+    let zonal = FnField {
+        koppen: None,
+        ..field
+    };
+    let glacial = generate(lgm, &zonal);
+    assert!(
+        glacial
+            .inner
+            .surface
+            .iter()
+            .all(|s| s[0] == BiomeClass::Alpine as u8)
+    );
 }
 
 #[test]

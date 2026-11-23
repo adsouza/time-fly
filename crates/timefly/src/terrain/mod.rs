@@ -71,6 +71,7 @@ pub fn look_for(grid: &RegionGrid) -> TerrainLook {
         Vec3::new(z.red, z.green, z.blue),
         view::full_sun_illumination(),
         crate::sky::centre_lat_deg(grid),
+        grid.spec.sea_level_anomaly_m as f32,
     )
 }
 

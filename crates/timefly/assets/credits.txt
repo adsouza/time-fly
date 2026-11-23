@@ -59,6 +59,8 @@ Climate classes for region worlds
 Data notes
   Biomes in deep-time eras are zonal approximations, not reconstructions.
   Biomes in ice-age eras use the present-day climate.
+  Mountain glaciers smaller than ICE-6G's 1-degree grid are approximated by a lowered
+  snowline in glacial eras.
 
 SOFTWARE
 

@@ -14,7 +14,7 @@ use timefly_core::deep_time::YearsBp;
 use timefly_core::formats::Grid;
 use timefly_core::geo::RenderDir;
 use timefly_core::surface::Timeline;
-use timefly_core::worldgen::coarse::frames_needed;
+use timefly_core::worldgen::coarse::{frames_needed, snapshot_sea_level_anomaly_m};
 #[cfg(not(target_arch = "wasm32"))]
 use timefly_core::worldgen::generate::RegionGrid;
 use timefly_core::worldgen::generate::RegionSpec;
@@ -140,8 +140,14 @@ pub(super) struct RegionJob {
     stage: Stage,
 }
 
-/// The spec a request asks for, or `None` for a direction that is not one.
-pub(super) fn spec_for(request: &RegionRequested, settings: &RegionSettings) -> Option<RegionSpec> {
+/// The spec a request asks for, or `None` for a direction that is not one. Its sea-level
+/// anomaly (for the glacial snowline, ruling R18) is the timeline's at the snapshot
+/// ([`snapshot_sea_level_anomaly_m`]: 0 in deep eras).
+pub(super) fn spec_for(
+    request: &RegionRequested,
+    settings: &RegionSettings,
+    timeline: &Timeline,
+) -> Option<RegionSpec> {
     let center = request.era_dir.0.normalize_or_zero();
     (center != bevy::math::DVec3::ZERO && center.is_finite()).then_some(RegionSpec {
         center: RenderDir(center),
@@ -149,6 +155,7 @@ pub(super) fn spec_for(request: &RegionRequested, settings: &RegionSettings) -> 
         seed: REGION_SEED,
         inner_res: settings.inner_res,
         apron_res: settings.apron_res,
+        sea_level_anomaly_m: snapshot_sea_level_anomaly_m(timeline, request.snapshot.myr()),
     })
 }
 
@@ -200,7 +207,7 @@ pub(super) fn start_region_request(
         );
         return;
     };
-    let Some(spec) = spec_for(&request, &settings) else {
+    let Some(spec) = spec_for(&request, &settings, &globe.timeline) else {
         warn!(
             ?request,
             "region requested at an invalid direction; ignored"
@@ -620,22 +627,59 @@ pub(super) fn poll_generation(
 #[cfg(test)]
 mod tests {
     use bevy::math::DVec3;
+    use timefly_core::surface::{FrameMeta, FrameSource};
 
     use super::*;
+
+    /// ICE-6G frames at 0 and 21 ka, the bridge at 30 ka and a PaleoDEM at 100 Ma; the sea
+    /// stood 120 m lower at 21 ka.
+    fn timeline() -> Timeline {
+        let frame = |i: u32, age_myr: f64, source| FrameMeta {
+            age_myr,
+            source,
+            image_slot: i,
+        };
+        let deep = |age| FrameSource::PaleoDem {
+            source_rotation_age_myr: age,
+        };
+        Timeline::new(
+            vec![
+                frame(0, 0.0, FrameSource::Ice6g),
+                frame(1, 0.021, FrameSource::Ice6g),
+                frame(2, 0.03, deep(0.0)),
+                frame(3, 100.0, deep(100.0)),
+            ],
+            vec![(0.0, 0.0), (0.021, -120.0), (0.03, -100.0)],
+        )
+        .unwrap()
+    }
 
     #[test]
     fn requests_become_specs_only_at_real_directions() {
         let settings = RegionSettings::default();
+        let timeline = timeline();
         let at = |v: DVec3| RegionRequested {
             era_dir: RenderDir(v),
             snapshot: YearsBp(21.0e3),
         };
-        let spec = spec_for(&at(DVec3::new(0.0, 0.0, 2.0)), &settings).unwrap();
+        let spec = spec_for(&at(DVec3::new(0.0, 0.0, 2.0)), &settings, &timeline).unwrap();
         assert_eq!(spec.center, RenderDir(DVec3::Z));
         assert_eq!(spec.snapshot, YearsBp(21.0e3));
         assert_eq!(spec.seed, REGION_SEED);
         assert_eq!((spec.inner_res, spec.apron_res), (1025, 513));
-        assert!(spec_for(&at(DVec3::ZERO), &settings).is_none());
-        assert!(spec_for(&at(DVec3::new(f64::NAN, 0.0, 1.0)), &settings).is_none());
+        // The glacial snowline's anomaly: the timeline's at 21 ka, none in deep time.
+        assert_eq!(spec.sea_level_anomaly_m, -120.0);
+        let deep = RegionRequested {
+            snapshot: YearsBp(100.0e6),
+            ..at(DVec3::Z)
+        };
+        assert_eq!(
+            spec_for(&deep, &settings, &timeline)
+                .unwrap()
+                .sea_level_anomaly_m,
+            0.0
+        );
+        assert!(spec_for(&at(DVec3::ZERO), &settings, &timeline).is_none());
+        assert!(spec_for(&at(DVec3::new(f64::NAN, 0.0, 1.0)), &settings, &timeline).is_none());
     }
 }

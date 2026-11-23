@@ -74,10 +74,16 @@ pub struct RegionSpec {
     pub seed: u32,
     pub inner_res: u32,
     pub apron_res: u32,
+    /// The snapshot's sea-level anomaly (m; negative when the sea stood lower):
+    /// [`snapshot_sea_level_anomaly_m`](crate::worldgen::coarse::snapshot_sea_level_anomaly_m),
+    /// 0 in deep eras. It lowers the snowline in glacial eras (ruling R18, [`snowline_m`]); the
+    /// heights already carry the sea level through the coarse field.
+    pub sea_level_anomaly_m: f64,
 }
 
 impl RegionSpec {
-    /// A spec at the standard resolutions ([`REGION_RES`], [`APRON_RES`]).
+    /// A spec at the standard resolutions ([`REGION_RES`], [`APRON_RES`]), with no sea-level
+    /// anomaly.
     pub fn new(center: RenderDir, snapshot: YearsBp, seed: u32) -> RegionSpec {
         RegionSpec {
             center,
@@ -85,6 +91,7 @@ impl RegionSpec {
             seed,
             inner_res: REGION_RES,
             apron_res: APRON_RES,
+            sea_level_anomaly_m: 0.0,
         }
     }
 
@@ -575,11 +582,16 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
         let lat = self.field.paleolat(dir);
         let biome = match coarse.koppen.and_then(biome_from_koppen) {
             Some(b) => b,
-            None => zonal_biome(lat, h, f64::from(self.coast_km_at(dir))),
+            None => zonal_biome(
+                lat,
+                h,
+                f64::from(self.coast_km_at(dir)),
+                self.spec.sea_level_anomaly_m,
+            ),
         };
         let biome = effective_biome(self.era, biome);
         let snow = if h > 0.0 {
-            let line = snowline_m(lat);
+            let line = snowline_m(lat, self.spec.sea_level_anomaly_m);
             smoothstep(line - SNOW_RAMP_M, line + SNOW_RAMP_M, h)
         } else {
             0.0
