@@ -6,11 +6,15 @@
 //! what gets saved: window-surface screenshots of a process started from an agent's shell come
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
-//! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]`
-//! (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are found). The
-//! region defaults to the Alps at the present (`46.5,10,0`) and the prefix to `cdlod`, giving
-//! `<prefix>-shaded.png` and `<prefix>-wire.png`. Exits with an error if the region never
-//! appears. Set a fresh `TIMEFLY_LOG_DIR` per run.
+//! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
+//! [shaded]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! found). The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
+//! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
+//! skips the wireframe shot. Exits with an error if the region never appears. Set a fresh
+//! `TIMEFLY_LOG_DIR` per run.
+//!
+//! `tools/dev/region-shots.sh` runs it over the Task 8 set (the bench regions and one region
+//! per vegetation era).
 
 use std::path::PathBuf;
 
@@ -48,6 +52,7 @@ struct Tour {
     prefix: String,
     size: (u32, u32),
     target: Option<Handle<Image>>,
+    wire: bool,
     step: Step,
     since: f32,
     frames: u32,
@@ -128,7 +133,10 @@ fn tour(
             }
         }
         Step::Shaded => {
-            if tour.frames >= WIRE_FRAMES {
+            if !tour.wire && tour.frames >= WIRE_FRAMES {
+                tour.step = Step::Done;
+                tour.frames = 0;
+            } else if tour.frames >= WIRE_FRAMES {
                 // The real toggle: press F2 for one frame.
                 keys.press(WIREFRAME_KEY);
                 tour.step = Step::Wire;
@@ -167,6 +175,7 @@ fn main() -> AppExit {
         return AppExit::error();
     };
     let prefix = args.get(3).cloned().unwrap_or_else(|| "cdlod".to_string());
+    let wire = args.get(4).map(String::as_str) != Some("shaded");
     if let Err(e) = std::fs::create_dir_all(&out) {
         eprintln!("cannot create {}: {e}", out.display());
         return AppExit::error();
@@ -182,6 +191,7 @@ fn main() -> AppExit {
         prefix,
         size,
         target: None,
+        wire,
         step: Step::WaitRegion,
         since: 0.0,
         frames: 0,
