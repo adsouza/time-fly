@@ -166,7 +166,7 @@ Run the game normally (`cargo run -p timefly`, or the release build). Wait for t
 - [ ] Climbing slows near 60 km and stops there.
 - [ ] Scrolling and dragging do not turn the (hidden) globe while in the region: after leaving,
       the globe is where the region was, not somewhere the mouse took it.
-- [ ] `Backspace` fades back to the globe, centred on the region, close in. Dragging and
+- [ ] `Backspace` fades back to the globe, centred on the region, at the closest zoom. Dragging and
       scrolling the globe work again at once.
 
 ### 12. Leaving at the edge

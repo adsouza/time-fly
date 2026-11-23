@@ -794,7 +794,7 @@ docs/testing/region-m2/              screenshots, performance.md
   needs 54% as many slices at 12 ms (523 → 282), so it projects to about 340 slices, 5.7 s. A
   12 ms slice plus the globe's own frame must stay under 16.7 ms, or the page drops to 30 Hz and
   the gain halves. The gated real-Chrome run (8d7c427, Chrome 158 on the M4) held 60 Hz while descending: every first entry was within 8 s, the slowest being Japan at 4.45 s. The Aegean itself is no longer benched (R26).
-- **Entering a region is abrupt.** The globe camera stops at about 955 km (the minimum orbit)
+- **Entering a region is abrupt.** The globe camera stops at about 11,100 km (the minimum orbit, 2.74 Earth radii; it was 955 km before 2026-11-23)
   and the view fades through haze over 0.8 s to the fly camera 8 km above the ground. The smooth
   descent is M3's zoom-and-swap (owner decision, 2026-11-23).
 - **Paint follows the morphing geometry.** Beach, mat and snow thresholds use the interpolated
