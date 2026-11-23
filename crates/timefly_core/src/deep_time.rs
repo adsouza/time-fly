@@ -101,10 +101,9 @@ pub fn format_years_bp(y: YearsBp) -> String {
             format!("{whole}.{frac} million years ago")
         }
     } else {
-        format!(
-            "{} million years ago",
-            (tenths as f64 / 10.0).round() as u64
-        )
+        // Round the age itself, not the tenths: rounding twice turns 42.4985 Ma into
+        // 425 tenths and then 43 million.
+        format!("{} million years ago", (v / 1.0e6).round() as u64)
     }
 }
 
@@ -193,6 +192,8 @@ mod tests {
         assert_eq!(l(9_949_999.0), "9.9 million years ago");
         assert_eq!(l(9_950_000.0), "10 million years ago");
         assert_eq!(l(10_000_000.0), "10 million years ago");
+        // Rounded once, not via tenths (425 tenths would round on to 43).
+        assert_eq!(l(42_498_528.9), "42 million years ago");
     }
     #[test]
     fn snapshots_ascending_and_prev_from_oldest() {

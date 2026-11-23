@@ -9,3 +9,6 @@ ruzstd = "0.9"
 half = "2"
 # For `#[instrument]` on coarse entry points only (spec §20); no log statements in bodies.
 tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1.12"

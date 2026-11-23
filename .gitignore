@@ -34,3 +34,7 @@ __pycache__/
 .DS_Store
 .claude/settings.local.json
 crates/timefly/tests/assets/data/globe/bake.log
+
+# Test tooling output
+.coverage
+.hypothesis/
