@@ -37,6 +37,14 @@ fn main() -> AppExit {
 
 #[cfg(target_arch = "wasm32")]
 fn main() -> AppExit {
+    #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/favicon.js")]
+    extern "C" {
+        #[wasm_bindgen::prelude::wasm_bindgen(js_name = setFavicon)]
+        fn set_favicon(svg: &str);
+    }
+    set_favicon(include_str!(
+        "../../../packaging/linux/io.github.adsouza.TimeFly.svg"
+    ));
     diagnostics::start_web(launch_args(), |session| {
         wasm_bindgen_futures::spawn_local(async move {
             if let Some(mode) = session.probe().filter(|m| m.is_headless()) {
