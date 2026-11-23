@@ -807,6 +807,15 @@ docs/testing/region-m2/              screenshots, performance.md
   almost nothing on them.
 - **Browser numbers are provisional.** As in M1, Chrome is measured on an Apple M4, faster than
   the spec's M1-class reference.
+- **Shaded snow is too dark and too blue (art pass; owner, 2026-11-23).** `paint_light`
+  (`terrain.wesl`) gives every surface the same ramp floor (0.16) and the same zenith hue shift
+  (`SHADOW_HUE_STRENGTH` 0.30). That reads well on rock and forest. On near-white snow, shaded
+  hollows go navy-grey, where real shaded snow is about half as bright as sunlit snow and pale
+  blue, because of the skylight it reflects.
+  - Seen in the Chrome bench, and visible in `bench-rockies-21ka-shaded.png`.
+  - Suggested fix: make the shade floor and the hue strength snow-aware (floor about 0.45, about
+    half the hue shift where the pixel is snow).
+  - It joins the other art-pass items: foam bands and featureless deserts.
 
 ---
 
