@@ -1,6 +1,8 @@
 //! The deep eras' coarse field: the globe's rendered surface, with the modern-terrain bridge
 //! frame read from the tiles (ruling R5).
 
+use std::sync::Arc;
+
 use bevy_math::{DQuat, DVec3};
 
 use crate::formats::Grid;
@@ -11,7 +13,10 @@ use crate::globe::{
     plate_rotations, rendered_surface, shell_surface_m,
 };
 use crate::surface::{DeepBracket, FrameSource, Timeline};
+use crate::worldgen::frame::RegionFrame;
 use crate::worldgen::tiles::{SourceLevel, TILE_SPACING_M, TileSet};
+
+use super::modern::{PresentRead, SupportCache, support_cube_size};
 
 use super::{
     CoarseField, CoarseSample, DEEP_SPACING_M, FieldError, KeyKind, LatticeKey, check_cube,
@@ -20,25 +25,37 @@ use super::{
 
 /// The deep eras: the plate renderer's CPU reference at the snapshot's PaleoDEM bracket. Each
 /// endpoint is read through its own sampler: the modern-terrain bridge frame reads the ETOPO
-/// tiles (falling back to its cube frame where a tile is missing), every other endpoint its
-/// cube frame. Sea level applies per endpoint as `elev − anomaly`, inside the globe functions.
+/// data (a tile, the overview, else its cube frame), every other endpoint its cube frame. Sea
+/// level applies per endpoint as `elev − anomaly`, inside the globe functions.
+///
+/// - Where the PaleoDEM dominates (source spacing 111 km), samples are the reference itself,
+///   read at overview level: tiles would add nothing at that spacing, and the field reads none.
+/// - Where the bridge frame dominates (1,852 m), samples take the two-level path of
+///   the `modern` module: the reference on a 27.75 km support lattice, the ETOPO term per
+///   sample at the plate's present-day position. [`CoarseField::tiles_needed`] lists the tiles
+///   those reads touch.
 #[derive(Clone, Debug)]
 pub struct DeepField<'a> {
-    crust: &'a CrustModel,
-    tiles: &'a TileSet,
-    sampling: DeepSampling,
+    pub(super) crust: &'a CrustModel,
+    pub(super) tiles: &'a TileSet,
+    pub(super) sampling: DeepSampling,
     /// Indexed by plate index.
-    rotations: Vec<PlateRotations>,
+    pub(super) rotations: Vec<PlateRotations>,
     /// Each plate's era-to-plate-fixed rotation at the snapshot age, indexed by plate index:
     /// exactly the rotation [`CrustModel::resolve`] inverts.
-    to_plate: Vec<Option<DQuat>>,
+    pub(super) to_plate: Vec<Option<DQuat>>,
+    /// Each plate's read of the ETOPO endpoint from an era direction, indexed by plate index.
+    pub(super) present: Vec<PresentRead>,
     /// `(plate id, plate index)` sorted by id.
     by_id: Vec<(PlateId, PlateIndex)>,
     /// `[younger, older]` cube frames (R = elevation, G = coverage).
-    frames: [&'a Grid; 2],
+    pub(super) frames: [&'a Grid; 2],
     /// Which endpoints are the modern-terrain bridge frame.
-    etopo: [bool; 2],
+    pub(super) etopo: [bool; 2],
     fallback: bool,
+    /// The two-level path's support lattice size and node cache.
+    pub(super) support_n: u32,
+    pub(super) support: Arc<SupportCache>,
 }
 
 impl<'a> DeepField<'a> {
@@ -57,7 +74,7 @@ impl<'a> DeepField<'a> {
         let sampling = DeepSampling::from_bracket(timeline, age_myr, bracket);
         let table = crust.rotations();
         let plates = table.plate_ids.len() as u32;
-        let rotations = (0..plates)
+        let rotations: Vec<PlateRotations> = (0..plates)
             .map(|p| plate_rotations(table, PlateIndex(p), &sampling))
             .collect();
         let to_plate = (0..plates)
@@ -79,16 +96,24 @@ impl<'a> DeepField<'a> {
                         source_rotation_age_myr: 0.0,
                     })
         });
+        let star = if etopo[0] { 0 } else { 1 };
+        let present = rotations
+            .iter()
+            .map(|r: &PlateRotations| PresentRead::of(r.sources[star], r.current))
+            .collect();
         Ok(DeepField {
             crust,
             tiles,
             sampling,
             rotations,
             to_plate,
+            present,
             by_id,
             frames,
             etopo,
             fallback,
+            support_n: support_cube_size(),
+            support: Arc::new(SupportCache::default()),
         })
     }
 
@@ -109,7 +134,12 @@ impl<'a> DeepField<'a> {
 
     /// Endpoint `e` at a direction in its published frame (present-day geography for the
     /// bridge frame, which reads a tile, the overview or its cube, by `level`).
-    fn endpoint_sample(&self, e: usize, dir: RenderDir, level: SourceLevel) -> FrameSample {
+    pub(super) fn endpoint_sample(
+        &self,
+        e: usize,
+        dir: RenderDir,
+        level: SourceLevel,
+    ) -> FrameSample {
         let [cube_elevation, coverage] = cube_bilinear(self.frames[e], dir, [0, 1]);
         let elevation_m = if self.etopo[e] {
             let (lat, lon) = lat_lon(dir);
@@ -125,7 +155,7 @@ impl<'a> DeepField<'a> {
         }
     }
 
-    fn plate_index(&self, id: PlateId) -> Option<PlateIndex> {
+    pub(super) fn plate_index(&self, id: PlateId) -> Option<PlateIndex> {
         self.by_id
             .binary_search_by_key(&id, |&(i, _)| i)
             .ok()
@@ -137,7 +167,7 @@ impl<'a> DeepField<'a> {
         Some((q * era).normalize())
     }
 
-    fn tracked_or_era_fixed(&self, era: DVec3) -> LatticeKey {
+    pub(super) fn tracked_or_era_fixed(&self, era: DVec3) -> LatticeKey {
         // No visible land: the lowest valid source ID, as the globe's resolve rule says.
         match self
             .crust
@@ -240,11 +270,27 @@ impl<'a> DeepField<'a> {
 
 impl CoarseField for DeepField<'_> {
     fn sample(&self, era_dir: RenderDir) -> CoarseSample {
-        self.sample_with(era_dir, SourceLevel::Tiles)
+        if self.is_modern() {
+            self.modern_sample(era_dir, SourceLevel::Tiles)
+        } else {
+            self.sample_with(era_dir, SourceLevel::Overview)
+        }
     }
 
     fn sample_overview(&self, era_dir: RenderDir) -> CoarseSample {
-        self.sample_with(era_dir, SourceLevel::Overview)
+        if self.is_modern() {
+            self.modern_sample(era_dir, SourceLevel::Overview)
+        } else {
+            self.sample_with(era_dir, SourceLevel::Overview)
+        }
+    }
+
+    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+        if self.is_modern() {
+            self.modern_tiles_needed(frame)
+        } else {
+            Vec::new()
+        }
     }
 
     fn source_spacing_m(&self) -> f64 {
@@ -398,5 +444,100 @@ mod tests {
             }
         }
         assert!(land > 0 && gap > 0 && ocean > 0, "{land} {gap} {ocean}");
+    }
+
+    /// The rift at 1 Ma (78% modern terrain): PaleoDEMs from a smooth function, ETOPO from a
+    /// smooth overview, so the two-level path runs at overview level everywhere.
+    fn modern_fixture() -> (CrustModel, Vec<Grid>, TileSet) {
+        let crust = rift(0);
+        let fr = frames(|_, d| {
+            let p = d.0 * 3.0;
+            (
+                (900.0 * (p.x.sin() + p.y.cos() * p.z.cos()) - 400.0) as f32,
+                d.0.y > -0.8,
+            )
+        });
+        let mut tiles = TileSet::new();
+        tiles
+            .set_overview(crate::worldgen::tiles::tests::overview_from(
+                2,
+                |lat, lon| {
+                    let e = 600.0 * (lat * 0.11).sin() * (lon * 0.07).cos() + 150.0;
+                    (e as f32, 26)
+                },
+            ))
+            .unwrap();
+        (crust, fr, tiles)
+    }
+
+    #[test]
+    fn modern_path_reproduces_the_reference_at_support_nodes() {
+        let (crust, fr, tiles) = modern_fixture();
+        let f = deep_at(&crust, &fr, &tiles, 1.0);
+        assert!(f.is_modern() && f.etopo_weight() > 0.7);
+        let n = f.support_n;
+        let (mut checked, mut land) = (0, 0);
+        for face in crate::cube::CubeFace::ALL {
+            for row in (0..n).step_by(23) {
+                for col in (0..n).step_by(23) {
+                    let d = crate::cube::texel_center_dir(face, col, row, n);
+                    let reference = f.sample_with(d, SourceLevel::Overview);
+                    let modern = f.modern_sample(d, SourceLevel::Overview);
+                    // Land on both or neither: plate water uses the plate's own (negative)
+                    // value, the globe's shell its depth, so only the sign must agree there.
+                    assert_eq!(
+                        modern.elevation_m > 0.0,
+                        reference.elevation_m > 0.0,
+                        "{d:?}: {modern:?} vs {reference:?}"
+                    );
+                    if reference.elevation_m > 0.0 {
+                        land += 1;
+                        let diff = (modern.elevation_m - reference.elevation_m).abs();
+                        assert!(diff < 1e-6, "{d:?}: {modern:?} vs {reference:?}");
+                        assert_eq!(modern.lattice.kind(), reference.lattice.kind());
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(land > 50 && checked - land > 50, "{land} of {checked}");
+    }
+
+    #[test]
+    fn modern_path_tracks_the_reference_between_nodes() {
+        // Between support nodes the PaleoDEM part is bilinear on a quarter of its spacing and the
+        // ETOPO part is read in full: on interior plate land the two-level sample stays close to
+        // the reference (which reads both endpoints directly).
+        let (crust, fr, tiles) = modern_fixture();
+        let f = deep_at(&crust, &fr, &tiles, 1.0);
+        let (mut worst, mut count, mut edge_worst) = (0.0f64, 0, 0.0f64);
+        for lat in (-600..=600).step_by(7) {
+            for lon in (-1800..1800).step_by(13) {
+                let d = dir(f64::from(lat) / 10.0, f64::from(lon) / 10.0);
+                let reference = f.sample_with(d, SourceLevel::Overview);
+                if reference.elevation_m < 200.0 {
+                    continue; // away from coasts and plate water
+                }
+                let modern = f.modern_sample(d, SourceLevel::Overview);
+                let carriers: Vec<_> = crate::cube::bilinear_taps(d, f.support_n)
+                    .iter()
+                    .map(|&((face, col, row), _)| f.support(face, col, row).carrier)
+                    .collect();
+                let diff = (modern.elevation_m - reference.elevation_m).abs();
+                if carriers.iter().all(|&c| c.is_some() && c == carriers[0]) {
+                    worst = worst.max(diff);
+                    count += 1;
+                } else {
+                    // Within one support cell of a plate edge or gap the taps mix carriers.
+                    edge_worst = edge_worst.max(diff);
+                }
+            }
+        }
+        println!(
+            "interior worst {worst:.2} m over {count} points; plate-edge worst {edge_worst:.1} m"
+        );
+        assert!(count > 1000, "{count}");
+        assert!(worst < 1.0, "worst {worst} m over {count} points");
+        assert!(edge_worst < 500.0, "edge worst {edge_worst} m");
     }
 }

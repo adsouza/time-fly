@@ -12,6 +12,7 @@
 //! [`snapshot_field`] picks the right one for an age from [`Timeline::select_frames`].
 
 mod deep;
+mod modern;
 mod recent;
 
 pub use deep::DeepField;
@@ -28,7 +29,7 @@ use crate::formats::{Grid, GridKind};
 use crate::geo::{RenderDir, geo_to_latlon, render_to_geo};
 use crate::geodynamics::{CrustModel, PlateId};
 use crate::surface::{DeepBracket, FrameSelection, FrameSource, Timeline};
-use crate::worldgen::frame::EARTH_RADIUS_M;
+use crate::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
 use crate::worldgen::tiles::TileSet;
 
 /// Source spacing of the deep (PaleoDEM) frames: about 1°.
@@ -107,6 +108,15 @@ pub trait CoarseField: Sync {
             KeyKind::Geographic => LatticeKey::Geographic(era_dir.0),
             KeyKind::Tracked(_) | KeyKind::EraFixed => LatticeKey::EraFixed(era_dir.0),
         }
+    }
+
+    /// Every tile the inner field around `frame` reads, sorted. Callers load exactly these,
+    /// and set the field's `fallback` when any is missing ([`TileSet::missing`]). The default is
+    /// the era-frame square ([`TileSet::needed_for`]); fields whose reads move (a plate's
+    /// present-day position in the deep eras) or that read no tiles override it. Independent of
+    /// which tiles are loaded.
+    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+        TileSet::needed_for(frame)
     }
 }
 
@@ -216,6 +226,14 @@ impl CoarseField for CrossfadeField<'_> {
             self.deep.lattice_key(era_dir, nearest)
         }
     }
+
+    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+        let mut out = self.recent.tiles_needed(frame);
+        out.extend(self.deep.tiles_needed(frame));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 /// The coarse field of a snapshot, as [`Timeline::select_frames`] picks it.
@@ -258,6 +276,14 @@ impl CoarseField for SnapshotField<'_> {
             SnapshotField::Bridge(f) => f.lattice_key(era_dir, nearest),
         }
     }
+
+    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+        match self {
+            SnapshotField::Recent(f) => f.tiles_needed(frame),
+            SnapshotField::Deep(f) => f.tiles_needed(frame),
+            SnapshotField::Bridge(f) => f.tiles_needed(frame),
+        }
+    }
 }
 
 /// The timeline frames [`snapshot_field`] reads at `age_myr`, ascending: the selection's
@@ -277,7 +303,10 @@ pub fn frames_needed(timeline: &Timeline, age_myr: f64) -> Vec<usize> {
 
 /// Builds the coarse field for `age_myr`. `frame(i)` returns timeline frame `i`'s CPU grid; it
 /// is called only for [`frames_needed`]. `fallback` says some inner tile the region needs is
-/// missing ([`TileSet::missing_for`] is not empty); the apron's use of the overview is not one.
+/// missing (`tiles.missing(&field.tiles_needed(&frame))` is not empty); the apron's use of the
+/// overview is not one. `tiles_needed` does not depend on `fallback` or on the tiles loaded, so
+/// a caller can ask a field built with `fallback = false`, load the tiles, then build the field
+/// again with the right flag.
 #[instrument(level = "debug", skip_all, fields(age_myr), err)]
 pub fn snapshot_field<'a>(
     timeline: &Timeline,

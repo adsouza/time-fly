@@ -37,6 +37,15 @@ frames at 21 ka.
 | Deep, 10°N 60°E | 0.09 s | 0.56 s |
 | Recent, 46°N 8°E (54 tiles, 2.29 M lattice nodes) | 0.28 s | 0.65 s |
 | Recent, at a cube corner (48 tiles, 4.11 M lattice nodes, the worst case) | 0.57 s | 0.96 s |
+| Deep 1 Ma (ETOPO-dominant, 1,852 m), 46°N 8°E, before fix round 1 | 6.01 s | 6.35 s |
+| Deep 1 Ma, at a cube corner, before fix round 1 | 10.91 s | 11.26 s |
+| Deep 1 Ma, 46°N 8°E, two-level path (fix round 1) | 0.46 s | 0.81 s |
+| Deep 1 Ma, at a cube corner, two-level path (fix round 1) | 0.79 s | 1.14 s |
+
+Fix round 1: ETOPO-dominant deep snapshots (50 ka, 100 ka, 1 Ma) used to resolve plates at
+every 463 m node (about 4 µs each). They now run the globe's reference only on a 27.75 km
+support lattice and read the ETOPO term per node (about 0.2 µs), so they cost about the same as
+recent regions. Times are single-threaded with a cold support cache.
 
 Design targets: ≤ 3 s native (parallel), ≤ 8 s web. Single-threaded native is already under
 1 s, so the web budget has about 8× headroom for wasm's slowdown. `new` runs before any row
@@ -59,6 +68,8 @@ above, `RegionPrep::new` takes under 0.01 ms:
 | Deep (150 plates, about 3.9 µs per node) | 1.0 ms | 4.0 ms | 15.4 ms | 0.73 ms |
 | Recent, mid-latitude (about 0.15 µs per node) | 0.05 ms | 0.16 ms | 0.57 ms | 0.73 ms |
 | Recent, cube corner | 0.06 ms | 0.18 ms | 0.70 ms | 0.74 ms |
+| Deep 1 Ma, mid-latitude (fix round 1, cold cache) | 0.36 ms | 0.66 ms | 1.24 ms | 1.37 ms |
+| Deep 1 Ma, cube corner (fix round 1, cold cache) | 0.45 ms | 0.77 ms | 1.38 ms | 1.37 ms |
 
 For the 6 ms web budget: loop `step(256)` until the frame's budget is spent (each call is at most
 about 1 ms deep, natively), or call `step(1024)` once per frame (at most about 4 ms deep). Wasm is

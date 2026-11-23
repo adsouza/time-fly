@@ -232,6 +232,44 @@ fn overlap_agreement() {
         assert_eq!(ha.to_bits(), hb.to_bits(), "probe {k}");
         assert_eq!(sa[1..], sb[1..]);
     }
+    // Deep and ETOPO-dominant (the two-level path at 1 Ma), with every tile loaded: heights and
+    // all bytes but the biome agree, inner and apron.
+    {
+        let crust = rift(0);
+        let frames = rift_frames(|d| (hilly(d) as f32, true));
+        let mut tiles = TileSet::new();
+        for r in 15..21 {
+            for c in 12..24 {
+                tiles
+                    .insert(
+                        r,
+                        c,
+                        crate::worldgen::tiles::tests::tile_from(r, c, |lat, lon| {
+                            (
+                                (200.0 + 150.0 * (lat * 3.0).sin() * (lon * 2.0).cos()) as f32,
+                                3,
+                            )
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        tiles.set_overview(flat_overview(250.0, 3)).unwrap();
+        let field = rift_deep(&crust, &frames, &tiles, 1.0);
+        let c = dir(0.0, -88.0);
+        let d = RegionFrame { center: c }.local_to_dir(100_000.0, 0.0);
+        let ga = RegionGenerator::new(spec_at(c, 1.0, 33, 17), &field);
+        let gb = RegionGenerator::new(spec_at(d, 1.0, 33, 17), &field);
+        for k in 0..20 {
+            let p = RegionFrame { center: c }.local_to_dir(f64::from(k) * 6_000.0, 30_000.0);
+            for kind in [FieldKind::Inner, FieldKind::Apron] {
+                let (ha, sa) = ga.sample_point_in(kind, p);
+                let (hb, sb) = gb.sample_point_in(kind, p);
+                assert_eq!(ha.to_bits(), hb.to_bits(), "1 Ma {kind:?} probe {k}");
+                assert_eq!(sa[1..], sb[1..]);
+            }
+        }
+    }
     // Grid texels are exactly sample_point at their own directions.
     let grid = generate(spec_at(a, 100.0, 33, 17), &field);
     let frame = RegionFrame { center: a };
@@ -593,6 +631,74 @@ fn apron_reads_the_overview_not_tiles() {
     assert!(grid.inner.elevation_m.iter().all(|&h| h == 100.0));
 }
 
+#[test]
+fn deep_tiles_needed_cover_every_inner_read() {
+    // At 1 Ma plate 101 has turned 0.9 degrees, so its present-day reads sit about 100 km west
+    // of the era square: centred at lon -88, the carried square crosses into the tile column
+    // west of -90 that the era square does not touch.
+    let crust = rift(0);
+    let frames = rift_frames(|_| (500.0, true));
+    let centre = dir(0.0, -88.0);
+    let frame = RegionFrame { center: centre };
+    let overview = || flat_overview(300.0, 0);
+    let probe = TileSet::new();
+    let field = rift_deep(&crust, &frames, &probe, 1.0);
+    let needed = field.tiles_needed(&frame);
+    let era_square = TileSet::needed_for(&frame);
+    assert!(era_square.iter().all(|t| needed.contains(t)));
+    assert!(
+        needed.len() > era_square.len(),
+        "{needed:?} vs {era_square:?}"
+    );
+    // Tiles at 100 m, the overview at 300 m: any inner read that misses a tile shows.
+    let with = |tiles: &[(u8, u8)]| {
+        let mut set = TileSet::new();
+        for &(r, c) in tiles {
+            set.insert(
+                r,
+                c,
+                crate::worldgen::tiles::tests::tile_from(r, c, |_, _| (100.0, 1)),
+            )
+            .unwrap();
+        }
+        set.set_overview(overview()).unwrap();
+        set
+    };
+    let exact = with(&needed);
+    assert!(exact.missing(&needed).is_empty(), "fallback stays false");
+    let mut everything: Vec<(u8, u8)> = Vec::new();
+    for r in 15..21 {
+        for c in 12..24 {
+            everything.push((r, c));
+        }
+    }
+    let all = with(&everything);
+    let era_only = with(&era_square);
+    assert!(
+        !era_only.missing(&needed).is_empty(),
+        "the era square alone reports fallback"
+    );
+    let spec = spec_at(centre, 1.0, 33, 17);
+    let grid = |tiles: &TileSet| {
+        let field = rift_deep(&crust, &frames, tiles, 1.0);
+        assert!(
+            field.tiles_needed(&frame) == needed,
+            "independent of the loaded tiles"
+        );
+        bits(&RegionGenerator::new(spec, &field).finish())
+    };
+    let (g_exact, g_all, g_era) = (grid(&exact), grid(&all), grid(&era_only));
+    assert_eq!(
+        g_exact, g_all,
+        "exactly the needed tiles read like every tile"
+    );
+    assert_ne!(
+        g_era.0, g_all.0,
+        "the era square alone misses carried reads"
+    );
+    assert_eq!(g_era.2, g_all.2, "the apron reads only the overview");
+}
+
 /// Steps a prep through with `max_nodes` per step; returns (slowest step before the last,
 /// the last step (the coast-distance transform), number of steps), in seconds.
 fn prep_profile<F: CoarseField>(spec: RegionSpec, field: &F, max_nodes: u32) -> (f64, f64, u64) {
@@ -610,15 +716,18 @@ fn prep_profile<F: CoarseField>(spec: RegionSpec, field: &F, max_nodes: u32) -> 
     }
 }
 
-fn print_profile<F: CoarseField>(label: &str, spec: RegionSpec, field: &F) {
+/// Profiles step sizes, each on a field fresh from `make` (so field-side caches start cold).
+fn print_profile<F: CoarseField>(label: &str, spec: RegionSpec, make: impl Fn() -> F) {
+    let field = make();
     let t = std::time::Instant::now();
-    let _ = RegionPrep::new(spec, field);
+    let _ = RegionPrep::new(spec, &field);
     println!(
         "  {label}: RegionPrep::new {:.3} ms",
         t.elapsed().as_secs_f64() * 1e3
     );
     for max_nodes in [256, 1024, 4096] {
-        let (worst, last, steps) = prep_profile(spec, field, max_nodes);
+        let field = make();
+        let (worst, last, steps) = prep_profile(spec, &field, max_nodes);
         println!(
             "  {label}: step({max_nodes}): {steps} steps, slowest {:.2} ms, final transform {:.2} ms",
             worst * 1e3,
@@ -650,7 +759,34 @@ fn generation_timing() {
         t_new.as_secs_f64(),
         t_all.as_secs_f64()
     );
-    print_profile("deep", spec, &field);
+    print_profile("deep", spec, || rift_deep(&crust, &frames, &tiles, 100.0));
+    // Deep, ETOPO-dominant (1 Ma: 78% modern terrain, 1,852 m spacing), mid-latitude and at a
+    // cube corner, on the 150-plate model.
+    for (label, centre) in [
+        ("deep 1 Ma mid-latitude", dir(46.0, 8.0)),
+        ("deep 1 Ma cube corner", RenderDir(DVec3::ONE.normalize())),
+    ] {
+        let mut tiles = flat_tiles(centre, 700.0, 26);
+        tiles
+            .set_overview(crate::worldgen::tiles::tests::overview_from(12, |_, _| {
+                (700.0, 26)
+            }))
+            .unwrap();
+        let field = rift_deep(&crust, &frames, &tiles, 1.0);
+        assert_eq!(field.source_spacing_m(), 1852.0);
+        let spec = RegionSpec::new(centre, YearsBp::from_myr(1.0), 1);
+        let t0 = std::time::Instant::now();
+        let g = RegionGenerator::new(spec, &field);
+        let t_new = t0.elapsed();
+        let grid = g.finish();
+        println!(
+            "{label}: new {:.3} s, total {:.3} s (single thread)",
+            t_new.as_secs_f64(),
+            t0.elapsed().as_secs_f64()
+        );
+        assert_finite(&grid, label);
+        print_profile(label, spec, || rift_deep(&crust, &frames, &tiles, 1.0));
+    }
     // Recent regions with tiles: mid-latitude, and at a cube corner, where lattice nodes are
     // densest (the worst case for `new`).
     let (era, present) = (ice_frame(1500.0, 0.5), ice_frame(1200.0, 0.0));
@@ -684,10 +820,8 @@ fn generation_timing() {
             t0.elapsed().as_secs_f64()
         );
         assert_finite(&grid, "timing recent");
-        print_profile(
-            label,
-            RegionSpec::new(centre, YearsBp(21_000.0), 1),
-            &recent,
-        );
+        print_profile(label, RegionSpec::new(centre, YearsBp(21_000.0), 1), || {
+            recent
+        });
     }
 }

@@ -17,6 +17,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::formats::{Grid, GridKind};
+use bevy_math::DQuat;
+
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
 use crate::worldgen::REGION_SIZE_M;
 use crate::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
@@ -190,29 +192,42 @@ impl TileSet {
         Some(EARTH_RADIUS_M * (1.0f64).to_radians() / per_deg)
     }
 
-    /// Tiles an inner field around `frame` needs that are not loaded. Empty means the inner field
-    /// reads tiles everywhere; otherwise generation falls back (overview, then cube frames).
-    pub fn missing_for(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
-        TileSet::needed_for(frame)
-            .into_iter()
+    /// The tiles of `needed` that are not loaded. `needed` is what the field will read,
+    /// [`CoarseField::tiles_needed`](crate::worldgen::coarse::CoarseField::tiles_needed); a
+    /// non-empty result means the region falls back (`fallback = true`).
+    pub fn missing(&self, needed: &[(u8, u8)]) -> Vec<(u8, u8)> {
+        needed
+            .iter()
+            .copied()
             .filter(|&(r, c)| !self.contains(r, c))
             .collect()
     }
 
-    /// Every tile the inner field ([`REGION_SIZE_M`]) around `frame` can read, widened by
-    /// [`TILE_MARGIN_M`] on every side, sorted. The apron reads only the overview. At most one
-    /// row of 72 tiles when the field contains a pole, and fewer elsewhere.
+    /// Every tile the inner field ([`REGION_SIZE_M`]) around `frame` can read where the data is
+    /// read in the era frame itself (the recent eras), widened by [`TILE_MARGIN_M`] on every
+    /// side, sorted. At most one row of 72 tiles when the field contains a pole, and fewer
+    /// elsewhere. Callers ask the field instead
+    /// ([`CoarseField::tiles_needed`](crate::worldgen::coarse::CoarseField::tiles_needed)),
+    /// which also covers reads moved by plate rotations.
     pub fn needed_for(frame: &RegionFrame) -> Vec<(u8, u8)> {
-        Self::covering(frame, REGION_SIZE_M)
+        Self::covering(frame, REGION_SIZE_M, DQuat::IDENTITY)
     }
 
-    /// The tiles a square of side `size_m` (plus the margin) touches. The square's latitude and
-    /// longitude extremes lie on its boundary unless it contains a pole, in which case it takes
-    /// whole rows of tiles.
-    fn covering(frame: &RegionFrame, size_m: f64) -> Vec<(u8, u8)> {
+    /// [`needed_for`](Self::needed_for) for reads at `q · d` instead of `d`: the inner field
+    /// carried rigidly by the rotation `q` (a plate's era-to-present rotation).
+    pub fn needed_for_rotated(frame: &RegionFrame, q: DQuat) -> Vec<(u8, u8)> {
+        Self::covering(frame, REGION_SIZE_M, q)
+    }
+
+    /// The tiles the square of side `size_m` (plus the margin), carried by the rotation `q`,
+    /// touches. The image's latitude and longitude extremes lie on its boundary unless it
+    /// contains a pole, in which case it takes whole rows of tiles.
+    fn covering(frame: &RegionFrame, size_m: f64, q: DQuat) -> Vec<(u8, u8)> {
         let half = size_m / 2.0 + TILE_MARGIN_M;
         let basis = frame.basis();
-        let (_, centre_lon) = geo_to_latlon(render_to_geo(RenderDir(basis.center)));
+        let q = q.normalize();
+        let image = |d: RenderDir| RenderDir((q * d.0).normalize());
+        let (_, centre_lon) = geo_to_latlon(render_to_geo(image(RenderDir(basis.center))));
         // Boundary samples every ~1 km (at least 64 per edge).
         let steps = ((2.0 * half / 1000.0).ceil() as usize).max(64);
         let (mut lat_min, mut lat_max) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -220,7 +235,7 @@ impl TileSet {
         for k in 0..=steps {
             let t = -half + 2.0 * half * k as f64 / steps as f64;
             for (x, z) in [(t, -half), (t, half), (-half, t), (half, t)] {
-                let (lat, lon) = geo_to_latlon(render_to_geo(basis.local_to_dir(x, z)));
+                let (lat, lon) = geo_to_latlon(render_to_geo(image(basis.local_to_dir(x, z))));
                 lat_min = lat_min.min(lat);
                 lat_max = lat_max.max(lat);
                 let rel = wrap_lon(lon - centre_lon);
@@ -231,7 +246,7 @@ impl TileSet {
         let inside = |lat: f64| {
             let pole = geo_to_render(latlon_to_geo(lat, 0.0));
             basis
-                .dir_to_local(pole)
+                .dir_to_local(RenderDir((q.inverse() * pole.0).normalize()))
                 .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
         };
         // Pad by a sample, so a point a hair outside the sampled extremes still finds its tile.
@@ -445,7 +460,7 @@ pub(crate) mod tests {
                 crate::worldgen::APRON_SIZE_M,
             ] {
                 let frame = frame_at(lat, lon);
-                let needed = TileSet::covering(&frame, size);
+                let needed = TileSet::covering(&frame, size, DQuat::IDENTITY);
                 if size == crate::worldgen::REGION_SIZE_M {
                     assert_eq!(needed, TileSet::needed_for(&frame));
                 }
@@ -573,12 +588,45 @@ pub(crate) mod tests {
         );
         assert_eq!(set.lookup(12.0, 7.0, SourceLevel::Tiles), Some((300.0, 9)));
         // Missing inner tiles are what makes a region fall back.
-        let frame = frame_at(7.0, 7.0);
+        let needed = TileSet::needed_for(&frame_at(7.0, 7.0));
         assert!(
-            set.missing_for(&frame).is_empty(),
+            set.missing(&needed).is_empty(),
             "{:?}",
-            set.missing_for(&frame)
+            set.missing(&needed)
         );
-        assert!(!TileSet::new().missing_for(&frame).is_empty());
+        assert_eq!(TileSet::new().missing(&needed), needed);
+    }
+
+    #[test]
+    fn rotated_coverage_follows_the_rotation() {
+        // Reads carried 3 degrees east by a rotation about the pole land in the tiles 3 degrees
+        // east, and every carried point of the square is covered.
+        let frame = frame_at(-31.0, 116.0);
+        let q = DQuat::from_rotation_y(3f64.to_radians());
+        let needed = TileSet::needed_for_rotated(&frame, q);
+        let half = REGION_SIZE_M / 2.0 + TILE_MARGIN_M * 0.99;
+        for a in 0..=40 {
+            for b in 0..=40 {
+                let x = -half + 2.0 * half * f64::from(a) / 40.0;
+                let z = -half + 2.0 * half * f64::from(b) / 40.0;
+                let d = q * frame.local_to_dir(x, z).0;
+                let (lat, lon) = geo_to_latlon(render_to_geo(RenderDir(d)));
+                assert!(
+                    needed.binary_search(&tile_of(lat, lon)).is_ok(),
+                    "({lat},{lon})"
+                );
+            }
+        }
+        assert_eq!(
+            TileSet::needed_for_rotated(&frame, DQuat::IDENTITY),
+            TileSet::needed_for(&frame)
+        );
+        assert_ne!(needed, TileSet::needed_for(&frame));
+        // A rotation that carries the field over a pole still takes whole rows only.
+        let polar = TileSet::needed_for_rotated(
+            &frame_at(60.0, 0.0),
+            DQuat::from_rotation_x(-30f64.to_radians()),
+        );
+        assert!(polar.len() <= 80, "{}", polar.len());
     }
 }
