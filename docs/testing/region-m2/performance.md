@@ -47,9 +47,17 @@ every 463 m node (about 4 µs each). They now run the globe's reference only on 
 support lattice and read the ETOPO term per node (about 0.2 µs), so they cost about the same as
 recent regions. Times are single-threaded with a cold support cache.
 
-Design targets: ≤ 3 s native (parallel), ≤ 8 s web. Single-threaded native is already under
-1 s, so the web budget has about 8× headroom for wasm's slowdown. `new` runs before any row
-and is not time-sliced: on the web it is one 0.1–0.6 s step. Lattice nodes take 8 bytes each
+Design targets: ≤ 3 s native (parallel), ≤ 8 s web. On the web the generation is not just
+slower code: it runs in time-boxed slices of 6 ms per frame (`WEB_GEN_BUDGET_MS`), so at 60 Hz
+it gets 6 of every 16.7 ms and the wall time is about 2.8 × its CPU time (about 1.4 × with the
+12 ms slices taken while the fade overlay covers the view, `WEB_GEN_COVERED_BUDGET_MS`; a first
+entry from the globe generates behind the visible globe, so it gets 6 ms). The 8 s target
+therefore leaves about 2.9 s of wasm CPU time, not 8 s: these synthetic regions (under 1 s
+single-threaded) keep about 3× headroom for wasm's slowdown, but the real ETOPO-dominant deep
+regions take 0.9–3.4 s single-threaded natively (the Aegean worst, see the final fix wave
+below), which at a 1.5–2.5× wasm slowdown projects to about 12–20 s on the web for the Aegean's
+first entry. The web region bench gates every region's first entry against 8 s for that reason.
+(Before ruling R8, `new` ran before any row as one untimed step; it is now incremental.) Lattice nodes take 8 bytes each
 (33 MB at the worst case), freed when the generator drops.
 
 Tiles a region reads (`TileSet::needed_for`, inner field only, 5 km margin): 2–4 up to 60°
@@ -226,6 +234,60 @@ search in 250 m steps).
   709.2, 709.2, 721.8, 722.0, 722.0, 709.7, 709.9 MiB on the globe; worst of 2–10 +0.1% of
   cycle 1 (limit +10%); in the region 798.3–800.4 MiB. Summary `result: PASS`, exit 0.
 
+### Final fix wave, native, 2026-11-23
+
+Release build of `952ea91`'s tree (the binary reports `7a10889`, the commit before; the build
+was made from the working tree that became `952ea91`), same M4, display and command, at
+**1920 × 951** (R21). Summary block, verbatim:
+
+```text
+regions (R14 frame rate): Alps PASS, Scandinavia PASS, Pangaea interior PASS, Aegean PASS
+first-region worst frame (R11 gate <= 250 ms, request to first path frame, overview decode included): 24.73 ms -> PASS (native: reported only, the gate applies in Chrome WebGPU)
+warm generation (10 re-entries of Alps, target <= 3000 ms): median 449 ms, max 467 ms -> PASS
+first entries (cold tiles; reported only natively): Alps 681 ms, Scandinavia 416 ms, Pangaea interior 332 ms, Aegean 2382 ms
+memory cycles (phys_footprint, includes GPU allocations on Apple silicon, on the globe after each leave): 1: 744.1 MiB, 2: 744.2 MiB, 3: 756.8 MiB, 4: 756.9 MiB, 5: 757.0 MiB, 6: 744.6 MiB, 7: 744.7 MiB, 8: 744.8 MiB, 9: 757.4 MiB, 10: 757.5 MiB; worst of cycles 2-10 is +1.8% of cycle 1 (limit +10%) -> PASS
+  in the region: 1: 834.3 MiB, 2: 834.4 MiB, 3: 834.5 MiB, 4: 833.8 MiB, 5: 833.9 MiB, 6: 834.8 MiB, 7: 834.8 MiB, 8: 835.0 MiB, 9: 834.3 MiB, 10: 834.4 MiB
+result: PASS
+```
+
+| Region | Generation (first entry) | Tiles fetched | Load: request to first path frame | Load worst frame | Flight median / p95 / worst | Missed (> 25 ms) | Result |
+|---|---|---|---|---|---|---|---|
+| Alps | 681 ms (cold) | 2 (270,951 B) | 2.53 s | 24.7 ms | 16.71 / 18.26 / 20.30 ms | 0 of 3,600 | PASS |
+| Scandinavia | 416 ms | 2 (270,945 B) | 2.25 s | 24.3 ms | 16.70 / 18.27 / 31.29 ms | 1 of 3,601 (0.03%) | PASS |
+| Pangaea | 332 ms | 0 | 2.17 s | 24.9 ms | 16.71 / 18.29 / 22.01 ms | 0 of 3,601 | PASS |
+| Aegean | 2,382 ms | 2 (305,816 B) | 4.22 s | 22.9 ms | 16.71 / 18.31 / 20.05 ms | 0 of 3,600 | PASS |
+
+- **First-region worst frame (R11) and the pipeline warm-up.** The region shaders were made cold
+  for one pair of runs by a temporary no-op edit to `terrain.wesl`, `terrain_prepass.wesl`,
+  `water.wesl` and `sky.wesl` (Metal's shader cache is per user and shared, so it was not
+  cleared; a changed source misses it). Without the warm-up: **1,151.5 ms** (as Task 10's
+  1,125.8 ms on a new binary). With it: **27.0 ms**. With the warm cache: 84.7–85.3 ms before,
+  24.7–25.2 ms after. The globe's first interactive frame came 2.2 s after launch with the cold
+  region shaders (0.8 s without the warm-up), and 0.4–0.9 s with a warm cache.
+- **Memory.** The first version drew the stand-in to the window and cast its shadows during
+  loading: it left about 110 MiB resident for the session (817–830 MiB on the globe after
+  leaves). The stand-in now draws into a 1 × 1 target and casts shadows only once the globe is
+  interactive: 744–757 MiB, against 705–720 MiB without a warm-up; in the region 834 MiB
+  against 798 MiB.
+- **Aegean generation:** 2,382 ms (2,216 ms before the wave): the two-level path now takes the
+  plate's own terms within 150 m of sea level (finding 4).
+- **Scrub bench** (M1, the same binary, `--scrub-bench`): PASS; see the final fix report.
+
+#### The two-level deep path on the real bake (finding 4)
+
+`cargo test --release -p timefly_core --test real_bake_region modern_path_on_the_real_bake -- --ignored --nocapture`
+(single-threaded generation, then land/sea against the globe's reference where
+|reference| > 150 m, about 8,300–12,900 checks per region):
+
+| Age | East Mediterranean | Alps | Scandinavia | Aegean |
+|---|---|---|---|---|
+| 50 ka | 2.23 s | 1.30 s | 1.08 s | 3.44 s |
+| 100 ka | 2.34 s | 1.35 s | 1.11 s | 3.44 s |
+| 1 Ma | 2.20 s | 1.26 s | 0.95 s | 2.93 s |
+| 2 Ma | 2.51 s | 1.48 s | 0.96 s | 3.25 s |
+
+0 sign misses at every age (8 before the fix: 2 at 1 Ma, 6 at 2 Ma).
+
 ### Chrome WebGPU (controller, ruling R20)
 
 _To be run by the controller in the in-app browser pane._ Build and serve from
@@ -243,7 +305,10 @@ interior, Aegean) and one `===== Time Fly region bench summary =====` block, eac
 (target 30 fps, display-paced rule). The Aegean block shows the slowest generation (2.2 s
 natively) and the close-range shoreline (the Task 8 Chrome/Tint water watch). The R11
 line, `first-region worst frame (R11 gate <= 250 ms, …)`, is in the Alps block and the summary,
-and on the web it decides the result. Generation target ≤ 8,000 ms (warm). The memory cycles use
+and on the web it decides the result. Generation target ≤ 8,000 ms, for the warm re-entries
+and, since the final fix wave, for every region's first entry (each block's `first-entry
+generation (web gate <= 8000 ms)` line and the summary's `first entries` line; the Aegean is the
+one to watch, see the duty-cycle note under Task 4 above): a region over it fails. The memory cycles use
 the wasm linear memory (it never shrinks, so the check is that it stops growing); the JS heap
 (`performance.memory`, Chrome only) is reported beside it.
 

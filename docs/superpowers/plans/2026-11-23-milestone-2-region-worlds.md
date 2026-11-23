@@ -686,7 +686,11 @@ docs/testing/region-m2/              screenshots, performance.md
   the same fill later.
 - **Glacial ice in mountains (R18).** ICE-6G_C's 1° grid has no Alpine ice at 21 ka, so a lowered
   snowline stands in for mountain glaciers: summits and ridges are iced, but not the
-  valley-filling ice network of the Last Glacial Maximum. The credits say so.
+  valley-filling ice network of the Last Glacial Maximum. The credits say so. The anomaly is the
+  one a region's heights carry: the timeline's for recent and bridge snapshots, and for the deep
+  brackets that read the modern-terrain bridge frame (50 ka to about 4 Ma) that frame's anomaly
+  by its weight in the blend (final fix wave), so the Alps keep a lowered snowline past 21 ka
+  and it fades toward the 4.47 Ma PaleoDEM; 0 from the first PaleoDEM bracket on.
 - **The overview decodes on the web's main thread (R11).** The 12.4 MB overview is checked
   (SHA-256) and decoded (37 MB) in one piece on the first region of a session. Ruling R11 gates
   it: no frame of the first region's load may exceed 250 ms in Chrome WebGPU on the M4
@@ -703,10 +707,15 @@ docs/testing/region-m2/              screenshots, performance.md
 - **The two-level deep path near plate edges (Task 4, flagged for the final review).**
   ETOPO-dominant deep snapshots (50 ka to about 2 Ma) run the globe's reference only on a
   27.75 km support lattice. Support points match it to 1e-6 m on land and plate interiors to
-  0.12 m, but within one support cell of a plate edge heights err by up to 109 m. The anti-goal
-  "land where the globe shows sea" was checked only at 1 Ma: 0 misses in 52,167 synthetic
-  samples, and 2 of 25,541 on the real bake, both within 2 m of sea level (`shell_sample`
-  returns the raw shell surface without a sea check). `deep_matches_globe` runs only at 100 Ma.
+  0.12 m, but within one support cell of a plate edge heights err by up to 109 m. Land and sea
+  are checked against the globe's reference (|reference| > 150 m) at 50 ka, 100 ka, 1 Ma and
+  2 Ma: 0 misses in 51,689–57,238 synthetic samples per age, and, since the final fix wave,
+  0 on the real bake (four regions per age, 8,340–12,949 samples each; it had 8 misses at 1 and
+  2 Ma, where a one-plate cell's bilinear PaleoDEM residual put a sample a few metres above sea
+  level over plate water the globe draws as the −200 m crack fill). A one-plate sample within
+  150 m of sea level now takes its plate's own terms (about 7% more generation time). Heights
+  between nodes still carry the bilinear error away from the coast. `deep_matches_globe` runs
+  only at 100 Ma.
 - **The plate ranker (R19, Task 9).** A snapshot change carries the camera with the plate the
   globe draws, ranked from the old snapshot's cached frames. For the bridge endpoint it reads
   the cube frame (what the globe draws), not ETOPO. If the "from" frames were evicted from the
@@ -714,13 +723,41 @@ docs/testing/region-m2/              screenshots, performance.md
 - **Failed loads are not retried (Task 5).** If the tile manifest or the overview fails to load,
   it is not fetched again for the session: regions fall back to the globe frames (with a `warn`
   at the failure, none per region).
+- **Loads time out (final fix wave).** A load that neither arrives nor fails within 20 s (the
+  manifest's size at 4 Mbit/s when longer: about 25 s for the overview) is abandoned with a
+  `warn`: a tile counts as missing (the region falls back), the manifest or the overview as
+  failed for the session, and a frame fails the request back to the globe. On a connection
+  slower than about 4 Mbit/s the overview can time out though it would have arrived; the aprons
+  then use the globe frames for the session.
+- **The fallback notice (Review Focus 2, final fix wave).** A region with a missing or corrupt
+  tile shows "terrain detail unavailable here" near the top of the view for 3 s after it
+  appears; the job logs a `warn` per tile. A region without the overview (aprons on the globe
+  frames) or without the manifest shows no notice when every inner tile it reads is present:
+  the notice follows `RegionGenerated.fallback`, which concerns the inner field.
 - **Offshore islands (Task 4).** The coastline's corner rule takes corners from the upsampled
   coarse lattice, so small offshore islands can appear within about spacing/4 of deep-era coasts.
 - **The haze holds through a snapshot change (Task 9).** The pale fade overlay stays at full
-  cover for the whole generation of the new region (0.6 s natively, longer on the web), and
-  "Descending..." can show on a slow change. `Backspace` or a missing-crust re-carry during a
+  cover for the whole generation of the new region (0.6 s natively, longer on the web; the web
+  takes 12 ms slices while it covers, against 6 ms otherwise), and "Descending..." can show on a
+  slow change. `Backspace` or a missing-crust re-carry during a
   change restarts the leave fade, so the stale region can flash for about 0.4 s; `Backspace`
   during the entering fade is ignored.
+- **`--region` / `?region=` waits for the interactive globe (final fix wave),** as the bench
+  does: the launch region is requested once `GlobeRenderStatus::Interactive` is reached, never
+  under the loading screen.
+- **Region pipelines compile at startup (R11, final fix wave).** While the globe's pipelines
+  compile, a stand-in region (one patch, the sea and the sky, the region camera's components
+  and sun, a 1 × 1 `Rgba8UnormSrgb` target, its own render layer) draws the main-pass
+  pipelines; the globe's "interactive" waits for them, so a cold load grows by their compile
+  time (natively about 1.4 s on a cold Metal shader cache, under 0.1 s on a warm one). Once the
+  globe is interactive the stand-in's sun casts shadows until the shadow pipelines have compiled
+  (about 0.1 s natively; on the web one compile on the idle, just-loaded globe), then it is
+  removed with every asset it made. Native first-region worst frame: 1,151 ms → 27 ms with the
+  region shaders cold, 85 ms → 25 ms warm. Costs: about 36 MiB more `phys_footprint` for the
+  session on the M4 (744–757 MiB on the globe after leaves, against 705–720; the cause of the
+  remainder was not found), and the target format assumes an 8-bit sRGB window (true of Metal,
+  Vulkan and WebGPU surfaces here); on another surface format the warm-up would compile unused
+  pipelines and the first region would compile its own as before.
 - **Bench caveats (R20, R21).** The native M4 bench ran at 1920 × 951 (the 1080p display clamps
   the requested window); the 2560 × 1440 desktop measurement is part of the owner's Linux run
   (`docs/testing/linux-vulkan.md`, section 7). The Chrome WebGPU bench, with ruling R11's
@@ -730,8 +767,19 @@ docs/testing/region-m2/              screenshots, performance.md
   a non-uniform discard (Task 8) and a dynamic const-array index in the noise (Task 2). Per-pixel
   terrain normals cost 32 texture reads per fragment (a web performance watch).
 - **Generation is mostly sequential.** The region prep (70–80% of native generation) runs on one
-  thread; only the rows are parallel. Native regions take under 1 s, so this is headroom, not a
-  problem. A cancelled native job runs to completion in the background before it is dropped.
+  thread; only the rows are parallel. Native regions take under 1 s, except the ETOPO-dominant
+  deep coasts (the Aegean at 1 Ma: about 2.2 s), so this is headroom natively. A cancelled
+  native job runs to completion in the background before it is dropped, so rapid `]` presses
+  stack native generations (no cancel flag; deferred).
+- **The web's generation duty cycle (final fix wave).** On the web a region generates in
+  time-boxed slices on the main thread: 6 ms per frame (wall time about 2.8 × CPU time at 60 Hz)
+  while anything worth a smooth frame is on screen, 12 ms while the fade overlay fully covers
+  the view (a snapshot change held at its midpoint, about 1.4 ×). A first entry from the globe
+  generates while the globe stays in view (the orbit eases in), so it gets 6 ms: the Aegean at
+  1 Ma (about 3 s single-threaded natively) projects to 12–20 s there, over the 8 s target. The
+  web region bench gates every region's first entry at 8 s and is the measurement that decides;
+  if the Aegean fails it, the next steps are covering the descent once the orbit has settled
+  (12 ms slices), or a parallel or cheaper prep.
 - **Paint follows the morphing geometry.** Beach, mat and snow thresholds use the interpolated
   CDLOD height, so snowlines and beach edges crawl slightly as patches morph. Foam is a solid pale
   band from high up (an art-pass item).
