@@ -4,6 +4,8 @@
 
 Explore the last 540 million years of Earth's history on an interactive 3D globe. Drag the globe to rotate it, scroll to zoom, and move the time slider to watch continents drift, coastlines shift, and ice sheets retreat.
 
+[Play Time Fly in a WebGPU browser](https://adsouza.github.io/time-fly/).
+
 ## Run from source
 
 Time Fly uses Rust and Bevy. With `rustup` and `uv` installed, run these commands from the repository root to fetch the datasets, build the globe, and launch the desktop app.

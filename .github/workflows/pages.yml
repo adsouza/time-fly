@@ -1,0 +1,70 @@
+name: GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - '.github/workflows/pages.yml'
+      - 'packaging/web/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/bake/uv.lock
+
+      - name: Build the WebGPU app
+        run: cargo build --locked --profile web-release --target wasm32-unknown-unknown -p timefly
+
+      - name: Generate browser bindings
+        run: |
+          version=$(cargo tree --locked --target wasm32-unknown-unknown -p wasm-bindgen --depth 0 --prefix none | awk '{print substr($2, 2)}')
+          cli="wasm-bindgen-${version}-x86_64-unknown-linux-musl"
+          url="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/${cli}.tar.gz"
+          cd "$RUNNER_TEMP"
+          mkdir -p gh-release
+          curl -fsSL "$url" -o "gh-release/$cli.tar.gz"
+          curl -fsSL "$url.sha256sum" | sha256sum -c -
+          tar -xzf "gh-release/$cli.tar.gz"
+          "$cli/wasm-bindgen" --target web --no-typescript --out-dir "$GITHUB_WORKSPACE/_site" \
+            "$GITHUB_WORKSPACE/target/wasm32-unknown-unknown/web-release/timefly.wasm"
+
+      - name: Assemble the site with the production globe
+        run: |
+          cp packaging/web/index.html _site/
+          cp packaging/linux/io.github.adsouza.TimeFly.svg _site/favicon.svg
+          cp -R crates/timefly/assets _site/
+          cd tools/bake
+          uv run --locked timefly-fetch --sources ../../data/sources.json --raw ../../data/raw
+          uv run --locked timefly-bake --raw ../../data/raw --out ../../_site/assets/data/globe
+          rm ../../_site/assets/data/globe/bake.log
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency: github-pages
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - id: publish
+        uses: actions/deploy-pages@v5
