@@ -50,7 +50,7 @@ recent regions. Times are single-threaded with a cold support cache.
 Design targets: ≤ 3 s native (parallel), ≤ 8 s web. On the web the generation is not just
 slower code: it runs in time-boxed slices of 6 ms per frame (`WEB_GEN_BUDGET_MS`), so at 60 Hz
 it gets 6 of every 16.7 ms and the wall time is about 2.8 × its CPU time (about 1.4 × with the
-12 ms slices taken while the fade overlay covers the view, `WEB_GEN_COVERED_BUDGET_MS`; a first
+12 ms slices taken while the fade overlay covers the view, `WEB_GEN_LARGE_BUDGET_MS`; a first
 entry from the globe generates behind the visible globe, so it gets 6 ms). The 8 s target
 therefore leaves about 2.9 s of wasm CPU time, not 8 s: these synthetic regions (under 1 s
 single-threaded) keep about 3× headroom for wasm's slowdown, but the real ETOPO-dominant deep
@@ -306,7 +306,37 @@ resized (2338 × 1237 to 2567 × 1237).
 
 0 sign misses at every age (8 before the fix: 2 at 1 Ma, 6 at 2 Ma).
 
-### Chrome WebGPU (controller, ruling R20)
+### Chrome WebGPU, in-app pane (indicative, ruling R23), 2026-11-23
+
+Build `4f36589`, Chrome 156 in the Claude desktop app's browser pane, 1280 × 720, target 30 fps,
+two runs. **Indicative only:** the pane paused `requestAnimationFrame` for 20–45 s at a time
+(stalls ended by user input) while `document.visibilityState` stayed `visible`.
+
+- **R11 first-region worst frame:** 218 ms and 225 ms: PASS (≤ 250 ms), the overview decode
+  included.
+- **Alps, Scandinavia, Pangaea:** flights PASS; first entries 2.1–3.2 s: PASS.
+- **Aegean first entry: FAIL** against the 8 s web target: 613 and 628 time-boxed slices
+  (`longest_ms=8.5`), a stall-free floor of about 628 × 16.7 ms ≈ 10.5 s. First entries
+  generate on the globe (`NavPhase::Globe` for the bench, `Descending` for a double-click),
+  where the overlay is clear, so the budget stayed 6 ms.
+- **A load-timeout false positive:** during a pane stall the memory cycles' Alps re-entry
+  timed out a frame (`data/globe/frames/f0000.tfgrid: the load timed out after 20 s`) although
+  the GET returned 200: the timeout compared wall-clock seconds.
+
+**Fixes (Chrome-bench fix round).** (1) A region generating while none is on screen (a first
+entry on the globe or descending, or a fade held at full cover) takes the 12 ms budget
+(`WEB_GEN_LARGE_BUDGET_MS`, `LargeGenBudget`); flying keeps 6 ms. Natively, the time-boxed path
+on the Aegean at 1 Ma (`cargo test --release -p timefly --test region_loading -- --ignored
+aegean_time_boxed_slices --nocapture`, release, warm tiles): 523 slices at 6 ms (4.3 s of
+work), 282 at 12 ms (4.2 s). Scaling Chrome's 628 slices by 282/523 gives about 340 slices,
+**about 5.7 s at 60 Hz**, inside 8 s if each 12 ms slice plus the globe's frame fits a 16.7 ms
+frame. (2) Loads time out after 20 s of running frames, on a clock that adds each frame's real
+delta clamped to 0.25 s. (3) Each region block reports host stalls (frames over 1,000 ms,
+"page paused or throttled?") for the load window and the flight; no pass rule reads them.
+
+**Pending:** the gated Chrome measurement is a re-run in real Chrome with the window in front.
+
+### Chrome WebGPU, real Chrome (gated; pending)
 
 _To be run by the controller in the in-app browser pane._ Build and serve from
 `crates/timefly`:

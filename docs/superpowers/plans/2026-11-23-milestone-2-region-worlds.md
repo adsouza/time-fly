@@ -723,8 +723,10 @@ docs/testing/region-m2/              screenshots, performance.md
 - **Failed loads are not retried (Task 5).** If the tile manifest or the overview fails to load,
   it is not fetched again for the session: regions fall back to the globe frames (with a `warn`
   at the failure, none per region).
-- **Loads time out (final fix wave).** A load that neither arrives nor fails within 20 s (the
-  manifest's size at 4 Mbit/s when longer: about 25 s for the overview) is abandoned with a
+- **Loads time out (final fix wave).** A load that neither arrives nor fails within 20 s of
+  running frames (the load clock adds each frame's real delta clamped to 0.25 s, so a paused or
+  throttled page does not time out its loads; Chrome-bench fix round) (the manifest's size at
+  4 Mbit/s when longer: about 25 s for the overview) is abandoned with a
   `warn`: a tile counts as missing (the region falls back), the manifest or the overview as
   failed for the session, and a frame fails the request back to the globe. On a connection
   slower than about 4 Mbit/s the overview can time out though it would have arrived; the aprons
@@ -773,15 +775,18 @@ docs/testing/region-m2/              screenshots, performance.md
   deep coasts (the Aegean at 1 Ma: about 2.2 s), so this is headroom natively. A cancelled
   native job runs to completion in the background before it is dropped, so rapid `]` presses
   stack native generations (no cancel flag; deferred).
-- **The web's generation duty cycle (final fix wave).** On the web a region generates in
-  time-boxed slices on the main thread: 6 ms per frame (wall time about 2.8 × CPU time at 60 Hz)
-  while anything worth a smooth frame is on screen, 12 ms while the fade overlay fully covers
-  the view (a snapshot change held at its midpoint, about 1.4 ×). A first entry from the globe
-  generates while the globe stays in view (the orbit eases in), so it gets 6 ms: the Aegean at
-  1 Ma (about 3 s single-threaded natively) projects to 12–20 s there, over the 8 s target. The
-  web region bench gates every region's first entry at 8 s and is the measurement that decides;
-  if the Aegean fails it, the next steps are covering the descent once the orbit has settled
-  (12 ms slices), or a parallel or cheaper prep.
+- **The web's generation duty cycle (final fix wave, Chrome-bench fix round).** On the web a
+  region generates in time-boxed slices on the main thread: 6 ms per frame (wall time about
+  2.8 × CPU time at 60 Hz) while a region is flown or shows through a fade, and 12 ms when no
+  region is on screen (about 1.4 ×): a first entry (on the globe or descending) or a snapshot
+  change held under the fade overlay. In the browser pane the Aegean's first entry took 613 and
+  628 slices at 6 ms (about 10.5 s at 60 Hz, over the 8 s target); natively the time-boxed path
+  needs 54% as many slices at 12 ms (523 → 282), so it projects to about 340 slices, 5.7 s. A
+  12 ms slice plus the globe's own frame must stay under 16.7 ms, or the page drops to 30 Hz and
+  the gain halves; the gated real-Chrome run decides.
+- **Entering a region is abrupt.** The globe camera stops at about 955 km (the minimum orbit)
+  and the view fades through haze over 0.8 s to the fly camera 8 km above the ground. The smooth
+  descent is M3's zoom-and-swap (owner decision, 2026-11-23).
 - **Paint follows the morphing geometry.** Beach, mat and snow thresholds use the interpolated
   CDLOD height, so snowlines and beach edges crawl slightly as patches morph. Foam is a solid pale
   band from high up (an art-pass item).
@@ -831,6 +836,7 @@ was decided, why, and the cost if it proves wrong.
 - Ruling R20: T10 split as in M1 (R3): the implementer builds the region bench, runs it natively on the M4, makes the CI/Pages/packaging/docs/plan-appendix edits and commits locally. The controller runs the Chrome WebGPU bench in the in-app browser pane (including R11's 250 ms first-region frame gate) and, only with the owner's OK, pushes and dispatches CI. — Subagents lack the browser pane, and pushes need the owner. — Cost if wrong: none.
 - Ruling R21: the native 2560×1440 measurement moves to the owner's Linux run (spec §15 measures the desktop target on the Linux machine). The M4 reports at its display's size (1920×951 now), labelled as such. — No code can fix a 1080p display. — Cost if wrong: M4 GPU headroom at 1440p unknown until the Linux run.
 - Ruling R22: add a fourth bench region over the Aegean, era-frame 38.0, 24.5 at 1 Ma: coastlines throughout the inner field (close-range water, foam and shore shading for the T8 Chrome/Tint watch) and T4's slowest real generation case (≈ 2.9 s single-thread). The coast segment uses it. — The plan's three regions never bench a shoreline up close. — Cost if wrong: about 60 s more bench time.
+- Ruling R23: Chrome numbers measured in the Claude desktop app's browser pane are indicative only — the pane can pause rAF for tens of seconds with visibilityState "visible"; the gated web measurement is the owner's real-Chrome run. — Cost if wrong: one more manual Chrome run.
 
 **Other deviations from the plan text**
 
