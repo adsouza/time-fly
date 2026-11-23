@@ -42,6 +42,8 @@ use timefly::time::{GlobeTime, OLDER_KEY};
 const SETTLE_SECS: f32 = 6.0;
 /// Frames between a shot and the next change, and between toggling the wireframe and its shot.
 const WIRE_FRAMES: u32 = 20;
+/// Frames after the last shot before exiting.
+const DONE_FRAMES: u32 = 240;
 /// Seconds to wait for the region.
 const GIVE_UP_SECS: f32 = 180.0;
 /// The scripted flight: seconds diving forward and down, then cruising forward.
@@ -268,8 +270,9 @@ fn tour(
             }
         }
         Step::Done => {
-            // Let the screenshots reach the disk.
-            if tour.frames >= WIRE_FRAMES {
+            // Let the screenshots reach the disk: the readback and the PNG encode take more
+            // than WIRE_FRAMES frames when frames are fast.
+            if tour.frames >= DONE_FRAMES {
                 exit.write(AppExit::Success);
             }
         }

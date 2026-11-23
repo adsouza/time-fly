@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Renders the region look screenshots (M2 Task 8) with examples/region_tour.rs: the three bench
-# regions and one region per vegetation era, from 8 km above each centre looking north.
+# Renders the region look screenshots (M2 Task 8) with examples/region_tour.rs: the bench regions
+# (the pre-R24 ones too) and one region per vegetation era, from 8 km above each centre looking
+# north.
 #
 #   tools/dev/region-shots.sh [out_dir] [WxH] [name-filter]
 #
@@ -24,6 +25,12 @@ shots=(
   "era-100ma-flowering      47,-42,100000000"
   "era-10ma-modern          35,36,10000000"
   "sahara-0ka               23,10,0"
+  "bench-himalayas-0ka      28,86.9,0"
+  "bench-sundaland-21ka     5,107,21000"
+  "bench-japan-1ma          36,138.5,1000000"
+  "bench-beringia-21ka      62,-175,21000"
+  "bench-rockies-21ka       48.5,-113.5,21000"
+  "bench-panama-3ma         9,-79.5,3000000"
 )
 
 cargo build -q -p timefly --example region_tour
