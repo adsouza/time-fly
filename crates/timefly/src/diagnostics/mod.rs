@@ -492,6 +492,28 @@ pub fn show_web_message(session: &Session, text: &str) {
 #[derive(Resource, Clone)]
 pub(crate) struct DiagnosticsHandle(pub Arc<Shared>);
 
+/// Records the session as ended when the `App`'s world is torn down. On macOS a quit (Cmd+Q,
+/// Quit in the app or Dock menu) ends the app from winit's `applicationWillTerminate:`:
+/// bevy_winit's `exiting()` runs `world.clear_all()`, dropping this, and then AppKit calls
+/// `exit()`. No `AppExit` is written and `run()` never returns, so `Session::finish` never
+/// runs. Not `Clone`, so only the world's own copy marks the end.
+///
+/// It applies the same transition as a successful exit ([`session::finish_status`]), which
+/// never downgrades a crash: `record_app_exits` has already recorded an error exit, and the
+/// panic hook records a panic before unwinding drops the world.
+#[derive(Resource)]
+struct EndOnTeardown(Arc<Shared>);
+
+impl Drop for EndOnTeardown {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        self.0
+            .update_record(|r| r.status = session::finish_status(r.status, &AppExit::Success));
+    }
+}
+
 /// Global filter: everything any layer wants. `timefly*` at `debug` feeds the flight recorder;
 /// the console and session-file layers narrow it down.
 fn global_filter() -> String {
@@ -594,6 +616,7 @@ impl DiagnosticsPlugin {
 impl Plugin for DiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DiagnosticsHandle(self.shared.clone()))
+            .insert_resource(EndOnTeardown(self.shared.clone()))
             .insert_resource(SessionInfo::of(&self.shared))
             .init_resource::<DiagnosticsContext>()
             .add_systems(Startup, log_findings)
@@ -861,6 +884,48 @@ mod tests {
         assert_eq!(
             lock(&shared.record).status,
             SessionStatus::Crashed { panicked: true }
+        );
+    }
+
+    /// What bevy_winit does when macOS quits the app (Cmd+Q, Quit in the menu or the Dock):
+    /// winit's `applicationWillTerminate:` calls `exiting()`, which runs `world.clear_all()`,
+    /// then AppKit calls `exit()`. No `AppExit` is written and `run()` never returns, so
+    /// `Session::finish` never runs.
+    fn status_after_teardown(before: SessionStatus, exit: Option<AppExit>) -> SessionStatus {
+        let shared = test_shared();
+        shared.update_record(|r| r.status = before);
+        let session = Session {
+            shared: shared.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            guard: None,
+        };
+        let mut app = App::new();
+        app.add_plugins(DiagnosticsPlugin::headless(&session));
+        if let Some(exit) = exit {
+            app.world_mut().write_message(exit);
+        }
+        app.update();
+        app.world_mut().clear_all();
+        lock(&shared.record).status
+    }
+
+    #[test]
+    fn a_quit_that_tears_down_the_world_without_run_returning_is_clean() {
+        assert_eq!(
+            status_after_teardown(SessionStatus::Running, None),
+            SessionStatus::Clean
+        );
+    }
+
+    #[test]
+    fn tearing_down_the_world_keeps_a_crash() {
+        assert_eq!(
+            status_after_teardown(SessionStatus::Crashed { panicked: true }, None),
+            SessionStatus::Crashed { panicked: true }
+        );
+        assert_eq!(
+            status_after_teardown(SessionStatus::Running, Some(AppExit::error())),
+            SessionStatus::Crashed { panicked: false }
         );
     }
 

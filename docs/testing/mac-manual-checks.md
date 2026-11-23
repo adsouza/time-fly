@@ -26,7 +26,8 @@ is how the notices look and what the buttons do.
 - [ ] `cargo run -p timefly` shows a system dialog **before** the game window, with the notice
       text, the `crash.txt` path (home shown as `~`) and the buttons **Show log** and **Not now**.
 - [ ] **Show log** reveals `crash.txt` in Finder, then the game window opens.
-- [ ] Quit the game and run `cargo run -p timefly` again: no dialog, no overlay.
+- [ ] Quit the game with **Cmd+Q** and run `cargo run -p timefly` again: no dialog, no overlay.
+      (Cmd+Q ends the app without `App::run()` returning; `EndOnTeardown` records it clean.)
 - [ ] Repeat the probe and answer **Not now**: the game opens, and the next launch after that
       shows nothing.
 
