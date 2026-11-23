@@ -3,6 +3,7 @@
 #
 #   lib/time-fly/time-fly                    the game binary
 #   lib/time-fly/assets/data/globe/...       baked globe data (bake.log and other files left out)
+#   lib/time-fly/assets/data/tiles/...       baked region tiles: manifest, overview, listed tiles
 #   bin/time-fly                             wrapper: exec <dir>/time-fly "$@"
 #   share/applications/io.github.adsouza.TimeFly.desktop
 #   share/icons/hicolor/scalable/apps/io.github.adsouza.TimeFly.svg
@@ -28,14 +29,16 @@ binary=$1 assets=$2 out=$3
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 globe="$assets/data/globe"
+tiles="$assets/data/tiles"
 
 [ -f "$binary" ] && [ -x "$binary" ] || die "binary not found or not executable: $binary"
 [ -f "$globe/manifest.json" ] || die "no baked data: $globe/manifest.json (run timefly-bake)"
+[ -f "$tiles/manifest.json" ] || die "no baked tiles: $tiles/manifest.json (run timefly-bake tiles)"
 [ -f "$assets/credits.txt" ] || die "missing $assets/credits.txt"
 if [ -e "$out" ] && [ -n "$(ls -A "$out")" ]; then die "output directory is not empty: $out"; fi
 
 lib="$out/lib/time-fly"
-mkdir -p "$lib/assets/data/globe/frames" "$out/bin" \
+mkdir -p "$lib/assets/data/globe/frames" "$lib/assets/data/tiles" "$out/bin" \
   "$out/share/applications" "$out/share/icons/hicolor/scalable/apps" \
   "$out/share/metainfo" "$out/share/doc/time-fly"
 
@@ -77,6 +80,41 @@ print(len(frames))
 PYTHON
 )
 
+# Region tiles, by the same allowlist rule: the tile manifest, the overview and every tile it
+# lists (`region/tiles.rs`), each checked against the manifest's size. bake.log is left out.
+n_tiles=$(python3 - "$tiles" "$lib/assets/data/tiles" <<'PYTHON'
+import json
+from pathlib import Path
+import shutil
+import sys
+
+source, dest = map(Path, sys.argv[1:])
+manifest = (source / "manifest.json").read_bytes()
+data = json.loads(manifest)
+
+
+def copy(name, size):
+    if (source / name).stat().st_size != size:
+        sys.exit(f"{name}: size differs from the tile manifest")
+    shutil.copyfile(source / name, dest / name)
+    (dest / name).chmod(0o644)
+
+
+if not data.get("tiles"):
+    sys.exit("tile manifest lists no tiles")
+if not data.get("overview"):
+    sys.exit("tile manifest lists no overview")
+copy("overview.tfgrid", data["overview"]["bytes"])
+for tile in data["tiles"]:
+    row, col = int(tile["row"]), int(tile["col"])
+    if not (0 <= row < 36 and 0 <= col < 72):
+        sys.exit(f"tile outside the tile map: {row}, {col}")
+    copy(f"r{row:02}c{col:02}.tfgrid", tile["bytes"])
+(dest / "manifest.json").write_bytes(manifest)
+print(len(data["tiles"]))
+PYTHON
+)
+
 cat >"$out/bin/time-fly" <<'WRAPPER'
 #!/bin/sh
 # Runs Time Fly from its install directory, where Bevy finds assets/ beside the binary.
@@ -103,9 +141,9 @@ GNU Affero General Public License as published by the Free Software Foundation, 
 version 3 of the License, or (at your option) any later version (full text at the end of
 this file).
 
-The baked globe data in assets/data/globe is derived from the datasets credited below. Each
-is redistributed in baked form only, under the terms stated with it; the original files are
-not included. Provenance, checksums and licence notes: data/README.md in the source.
+The baked globe data in assets/data/globe and the region tiles in assets/data/tiles are
+derived from the datasets credited below. Each is redistributed in baked form only, under the
+terms stated with it; the original files are not included. Provenance, checksums and licence notes: data/README.md in the source.
 
 ================================================================================
 HEAD
@@ -125,9 +163,12 @@ RUN
   Force Vulkan:     WGPU_BACKEND=vulkan time-fly
                     flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly
   Scrub benchmark:  time-fly --scrub-bench --target-fps 60 --window 2560x1440
+  Region benchmark: time-fly --region-bench --target-fps 60 --window 2560x1440
   Crash probe:      time-fly --diagnostics-probe=panic   (then launch normally)
 
   Controls: drag to orbit, scroll to zoom, [ and ] to step older or younger, Esc for credits.
+  Regions:  double-click the globe to enter; W A S D move, drag to look, Space / E climb,
+            Ctrl / Q descend, Shift boosts; Backspace returns to the globe.
 
 LOGS
   Each run writes a session directory with its log:
@@ -143,4 +184,4 @@ Licences and data citations: copyright (this directory).
 README
 chmod 0644 "$doc/README"
 
-echo "stage.sh: staged $(basename "$binary") with $n_frames frames into $out"
+echo "stage.sh: staged $(basename "$binary") with $n_frames frames and $n_tiles tiles into $out"

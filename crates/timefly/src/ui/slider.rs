@@ -6,6 +6,11 @@
 //!
 //! The slider UI fades to [`IDLE_OPACITY`] after [`IDLE_FADE_END_SECS`] without input and comes
 //! back at once on hover, drag, scroll or a key press.
+//!
+//! On the globe the slider is continuous. While a region is generating or shown it snaps (parent
+//! spec §6.2): a drag moves the thumb and previews the snapshot it will land on in the label,
+//! and on release the time changes once, to the snapshot nearest in slider position. Region
+//! navigation then regenerates the region for it.
 
 use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::picking::hover::Hovered;
@@ -19,7 +24,8 @@ use timefly_core::deep_time::{YearsBp, format_years_bp, slider_to_years, years_t
 
 use super::credits::CreditsOpen;
 use super::{BlocksCamera, GUTTER_PX, PANEL_COLOR, TEXT_COLOR};
-use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
+use crate::region::RegionState;
+use crate::time::{GlobeTime, TimeChangeCause, TimeChanged, nearest_snapshot};
 
 /// Opacity of the idle UI.
 pub const IDLE_OPACITY: f32 = 0.3;
@@ -100,7 +106,14 @@ impl Plugin for SliderUiPlugin {
             .init_resource::<SliderDrag>()
             .add_systems(Startup, spawn_slider)
             .add_observer(on_slider_change)
-            .add_systems(Update, (track_idle, hide_under_credits, log_slider_drags))
+            .add_systems(
+                Update,
+                (
+                    track_idle,
+                    hide_under_credits,
+                    (log_slider_drags, apply_snapped_slider).chain(),
+                ),
+            )
             .add_systems(
                 PostUpdate,
                 (sync_slider_to_time, position_thumb, apply_opacity)
@@ -233,10 +246,17 @@ fn spawn_slider(mut commands: Commands, time: Option<Res<GlobeTime>>) {
         });
 }
 
-/// The age when the current slider drag started, if one is in progress.
+/// The age when the current slider drag started, if one is in progress, and (while the slider
+/// snaps) the widget value waiting for the pointer's release.
 #[derive(Resource, Default)]
 struct SliderDrag {
     started: Option<YearsBp>,
+    pending: Option<f32>,
+}
+
+/// Whether the slider snaps to snapshots: while a region is generating or shown.
+fn snapping(region: Option<&State<RegionState>>) -> bool {
+    region.is_some_and(|s| *s.get() != RegionState::Globe)
 }
 
 /// A drag log line: `TimeChanged` logs each drag frame at `debug`, so the drag's ends log at
@@ -280,11 +300,14 @@ fn log_slider_drags(
     }
 }
 
-/// Dragging (or clicking) the slider sets the globe time.
+/// Dragging (or clicking) the slider sets the globe time; while it snaps, it only previews.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn on_slider_change(
     change: On<ValueChange<f32>>,
     sliders: Query<&SliderDragState, With<TimeSlider>>,
-    drag: Res<SliderDrag>,
+    mut drag: ResMut<SliderDrag>,
+    region: Option<Res<State<RegionState>>>,
+    mut labels: Query<&mut Text, With<AgeLabel>>,
     mut commands: Commands,
     mut time: ResMut<GlobeTime>,
     mut changes: MessageWriter<TimeChanged>,
@@ -294,6 +317,16 @@ fn on_slider_change(
     };
     let value = change.value.clamp(0.0, 1.0);
     commands.entity(change.source).insert(SliderValue(value));
+    if snapping(region.as_deref()) {
+        drag.pending = Some(value);
+        let preview = format_years_bp(nearest_snapshot(years_for(f64::from(value))));
+        for mut text in &mut labels {
+            if text.0 != preview {
+                text.0.clone_from(&preview);
+            }
+        }
+        return;
+    }
     let from = time.years;
     let to = years_for(f64::from(value));
     if to != from {
@@ -309,6 +342,58 @@ fn on_slider_change(
             to,
             cause: TimeChangeCause::Slider,
         });
+    }
+}
+
+/// While the slider snaps: once the pointer is released (no drag, no button held), sets the
+/// time to the snapshot nearest the pending value, or puts the thumb and label back if that is
+/// the snapshot already shown.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
+fn apply_snapped_slider(
+    mut drag: ResMut<SliderDrag>,
+    region: Option<Res<State<RegionState>>>,
+    mouse: Option<Res<ButtonInput<MouseButton>>>,
+    sliders: Query<(Entity, &SliderDragState), With<TimeSlider>>,
+    mut labels: Query<&mut Text, With<AgeLabel>>,
+    mut commands: Commands,
+    mut time: ResMut<GlobeTime>,
+    mut changes: MessageWriter<TimeChanged>,
+) {
+    let Some(value) = drag.pending else {
+        return;
+    };
+    if !snapping(region.as_deref()) {
+        drag.pending = None;
+        return;
+    }
+    let held = sliders.iter().any(|(_, d)| d.dragging)
+        || mouse.is_some_and(|m| m.pressed(MouseButton::Left));
+    if held {
+        return;
+    }
+    drag.pending = None;
+    let from = time.years;
+    let to = nearest_snapshot(years_for(f64::from(value)));
+    if to != from {
+        info!(from_years = from.0, to_years = to.0, "slider snapped");
+        time.years = to;
+        changes.write(TimeChanged {
+            from,
+            to,
+            cause: TimeChangeCause::Slider,
+        });
+        return;
+    }
+    // The same snapshot: the time does not change, so put the preview back by hand.
+    let value = widget_value_for(from) as f32;
+    for (entity, _) in &sliders {
+        commands.entity(entity).insert(SliderValue(value));
+    }
+    let label = format_years_bp(from);
+    for mut text in &mut labels {
+        if text.0 != label {
+            text.0.clone_from(&label);
+        }
     }
 }
 
@@ -428,7 +513,7 @@ mod tests {
     use bevy::time::TimeUpdateStrategy;
 
     use super::*;
-    use crate::time::TimePlugin;
+    use crate::time::{TimePlugin, nearest_snapshot};
 
     fn app() -> App {
         let mut app = App::new();
@@ -516,6 +601,101 @@ mod tests {
         assert_eq!(years(&app), 0.0, "present at the right");
         drag_to(&mut app, 0.0);
         assert!((years(&app) - 540.0e6).abs() < 1.0, "{}", years(&app));
+    }
+
+    /// Inside a region the slider snaps (parent spec §6.2): a drag only previews the snapshot it
+    /// will land on, and the time changes once, to that snapshot, on release.
+    #[test]
+    fn slider_snaps_on_release_inside_a_region() {
+        use bevy::state::app::StatesPlugin;
+
+        use crate::region::RegionState;
+        #[derive(Resource, Default)]
+        struct Seen(Vec<TimeChanged>);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin))
+            .init_state::<RegionState>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Seen>()
+            .add_plugins((TimePlugin, SliderUiPlugin))
+            .add_systems(
+                Last,
+                |mut seen: ResMut<Seen>, mut r: MessageReader<TimeChanged>| {
+                    seen.0.extend(r.read().copied());
+                },
+            );
+        app.update();
+        app.world_mut()
+            .resource_mut::<NextState<RegionState>>()
+            .set(RegionState::InRegion);
+        app.update();
+        let entity = slider(&mut app);
+        let label = |app: &mut App| {
+            app.world_mut()
+                .query_filtered::<&Text, With<AgeLabel>>()
+                .single(app.world())
+                .unwrap()
+                .0
+                .clone()
+        };
+        let changes = |app: &mut App| std::mem::take(&mut app.world_mut().resource_mut::<Seen>().0);
+
+        // Mid-drag: the thumb follows, the label previews, the time holds.
+        app.world_mut()
+            .get_mut::<SliderDragState>(entity)
+            .unwrap()
+            .dragging = true;
+        drag_to(&mut app, 0.5);
+        drag_to(&mut app, 0.52);
+        assert_eq!(years(&app), 0.0);
+        assert!(changes(&mut app).is_empty());
+        assert_eq!(widget_value(&mut app), 0.52);
+        let target = nearest_snapshot(years_for(0.52));
+        assert_eq!(target, YearsBp(100e3));
+        assert_eq!(label(&mut app), format_years_bp(target));
+
+        // Release: one change, straight to the snapshot; the thumb sits on it.
+        app.world_mut()
+            .get_mut::<SliderDragState>(entity)
+            .unwrap()
+            .dragging = false;
+        app.update();
+        assert_eq!(years(&app), 100e3);
+        assert_eq!(
+            changes(&mut app),
+            vec![TimeChanged {
+                from: YearsBp(0.0),
+                to: YearsBp(100e3),
+                cause: TimeChangeCause::Slider,
+            }]
+        );
+        app.update();
+        let v = widget_value(&mut app);
+        assert!(
+            (f64::from(v) - widget_value_for(YearsBp(100e3))).abs() < 1e-6,
+            "{v}"
+        );
+
+        // A click (no drag) that snaps back to the same snapshot changes nothing and puts the
+        // thumb and label back.
+        drag_to(&mut app, widget_value_for(YearsBp(120e3)) as f32);
+        app.update();
+        assert_eq!(years(&app), 100e3);
+        assert!(changes(&mut app).is_empty());
+        assert_eq!(label(&mut app), format_years_bp(YearsBp(100e3)));
+        let v = widget_value(&mut app);
+        assert!(
+            (f64::from(v) - widget_value_for(YearsBp(100e3))).abs() < 1e-6,
+            "{v}"
+        );
+
+        // Back on the globe the slider is continuous again.
+        app.world_mut()
+            .resource_mut::<NextState<RegionState>>()
+            .set(RegionState::Globe);
+        app.update();
+        drag_to(&mut app, 0.5);
+        assert!((years(&app) - 164_266.77).abs() < 0.01, "{}", years(&app));
     }
 
     #[test]

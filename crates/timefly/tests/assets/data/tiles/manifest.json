@@ -1,0 +1,39 @@
+{
+  "overview": {
+    "bytes": 6229,
+    "sha256": "4a6d47e289d3f9a88a057c99e8df4b7541e0e86eb995a9adcf271a438d331381"
+  },
+  "samples": 301,
+  "sources": {
+    "etopo": "synthetic (tests/region_loading.rs)",
+    "koppen": "synthetic"
+  },
+  "tile_deg": 5,
+  "tiles": [
+    {
+      "bytes": 6591,
+      "col": 35,
+      "row": 17,
+      "sha256": "30bd2399fe0a1a847feb05b3c4ac2f694c0e67f11a4ead0cf14ce1012abf3ccf"
+    },
+    {
+      "bytes": 5158,
+      "col": 36,
+      "row": 17,
+      "sha256": "2be7e84ff0f40f3b8c863da8bc1c8f2785d1aa17c950760f7a86b492da6ecb42"
+    },
+    {
+      "bytes": 5007,
+      "col": 35,
+      "row": 18,
+      "sha256": "92175295c63556692c99970a717d80e4c58deffa1e2a541dc584dcca55c41e0c"
+    },
+    {
+      "bytes": 6632,
+      "col": 36,
+      "row": 18,
+      "sha256": "046eee3a2231713f1350b065e9feb6c44a6bace703defac1de6841298e97336a"
+    }
+  ],
+  "version": 1
+}

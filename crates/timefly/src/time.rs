@@ -1,7 +1,9 @@
 //! Globe time: the age shown, keyboard snapshot stepping and the `TimeChanged` domain event.
 
 use bevy::prelude::*;
-use timefly_core::deep_time::{YearsBp, next_snapshot, prev_snapshot};
+use timefly_core::deep_time::{
+    STANDARD_SNAPSHOTS, YearsBp, next_snapshot, prev_snapshot, years_to_slider,
+};
 
 use crate::diagnostics::DiagnosticsContext;
 use crate::diagnostics::aspects::{DiagnosticsAppExt, DomainEventLevel};
@@ -26,6 +28,8 @@ pub enum TimeChangeCause {
     Key,
     Slider,
     Bench,
+    /// Snapped to the nearest snapshot on entering a region (M2 design §6.1).
+    Snap,
 }
 
 /// Domain event: the globe time changed.
@@ -42,7 +46,7 @@ impl DomainEventLevel for TimeChanged {
     /// for 40 s: `trace`, below even the flight recorder (its phases and result log at `info`).
     fn log_level(&self) -> bevy::log::Level {
         match self.cause {
-            TimeChangeCause::Key => bevy::log::Level::INFO,
+            TimeChangeCause::Key | TimeChangeCause::Snap => bevy::log::Level::INFO,
             TimeChangeCause::Slider => bevy::log::Level::DEBUG,
             TimeChangeCause::Bench => bevy::log::Level::TRACE,
         }
@@ -76,6 +80,20 @@ pub fn key_step(current: YearsBp, older: bool, younger: bool) -> Option<YearsBp>
         _ => return None,
     };
     (next != current).then_some(next)
+}
+
+/// The standard snapshot nearest `age` in slider position (parent spec §6.2, §11.2), the
+/// younger one on a tie.
+pub fn nearest_snapshot(age: YearsBp) -> YearsBp {
+    let s = years_to_slider(age);
+    let distance = |y: f64| (years_to_slider(YearsBp(y)) - s).abs();
+    YearsBp(
+        STANDARD_SNAPSHOTS
+            .iter()
+            .copied()
+            .min_by(|a, b| distance(*a).total_cmp(&distance(*b)))
+            .unwrap_or(0.0),
+    )
 }
 
 fn step_time_on_keys(
@@ -125,6 +143,25 @@ mod tests {
         // recorder even at debug: trace (its phases and result block log at info).
         assert_eq!(change(TimeChangeCause::Slider).log_level(), Level::DEBUG);
         assert_eq!(change(TimeChangeCause::Bench).log_level(), Level::TRACE);
+    }
+
+    #[test]
+    fn nearest_snapshot_by_slider_position() {
+        let at = |y: f64| years_to_slider(YearsBp(y));
+        // 30 ka lies between 21 ka and 50 ka; 21 ka is nearer on the slider.
+        let (to_21, to_50) = (at(30e3) - at(21e3), at(50e3) - at(30e3));
+        assert!((to_21 - 0.02198).abs() < 5e-5, "{to_21}");
+        assert!((to_50 - 0.03150).abs() < 5e-5, "{to_50}");
+        assert_eq!(nearest_snapshot(YearsBp(30e3)), YearsBp(21e3));
+        // 400 ka: nearer 100 ka in years but nearer 1 Ma on the (log) slider.
+        assert!(at(1e6) - at(400e3) < at(400e3) - at(100e3));
+        assert_eq!(nearest_snapshot(YearsBp(400e3)), YearsBp(1e6));
+        // Snapshots map to themselves; the ends hold.
+        for s in STANDARD_SNAPSHOTS {
+            assert_eq!(nearest_snapshot(YearsBp(s)), YearsBp(s));
+        }
+        assert_eq!(nearest_snapshot(YearsBp(10.0)), YearsBp(0.0));
+        assert_eq!(nearest_snapshot(YearsBp(600e6)), YearsBp(540e6));
     }
 
     #[test]

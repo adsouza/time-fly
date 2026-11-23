@@ -4,10 +4,12 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "numpy",
- "netCDF4",
- "zstandard",
- "pygplates>=1.0",
- "cryptography>=50.0.2",
+    "netCDF4",
+    "zstandard",
+    "pygplates>=1.0",
+    "cryptography>=50.0.2",
+    "tifffile>=2026.11.16",
+    "imagecodecs>=2026.11.11",
 ]
 
 [project.scripts]

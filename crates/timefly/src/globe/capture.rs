@@ -146,7 +146,12 @@ impl CaptureSession {
                 .disable::<WinitPlugin>()
                 .disable::<bevy::log::LogPlugin>(),
         )
-        .add_plugins((TimePlugin, GlobeDataPlugin::default(), GlobePlugin))
+        .add_plugins((
+            crate::clusters::NoClusteringPlugin,
+            TimePlugin,
+            GlobeDataPlugin::default(),
+            GlobePlugin,
+        ))
         .insert_resource(GlobeDebugView(verification_view));
         while app.plugins_state() == PluginsState::Adding {
             bevy::tasks::tick_global_task_pools_on_main_thread();

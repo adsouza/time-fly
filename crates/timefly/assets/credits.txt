@@ -44,6 +44,24 @@ Global sea level, 798,000 years ago to the present
   Terms: NOAA NCEI public data; cite the publication and the dataset DOI.
 
 
+Terrain and bathymetry for region worlds
+  ETOPO 2022 15 Arc-Second Global Relief Model, NOAA National Centers for
+  Environmental Information (2022). https://doi.org/10.25921/fd45-gt74
+  (the 60 arc-second product, surface elevation)
+  Terms: NOAA NCEI public data; cite the dataset DOI.
+
+Climate classes for region worlds
+  Beck, H.E., McVicar, T.R., Vergopolan, N., Berg, A., Lutsko, N.J., Dufour, A.,
+  Zeng, Z., Jiang, X., van Dijk, A.I.J.M. & Miralles, D.G. (2023). High-resolution
+  (1 km) Koppen-Geiger maps for 1901-2099 based on constrained CMIP6 projections.
+  Scientific Data 10, 724. Licence: CC BY 4.0.
+
+Data notes
+  Biomes in deep-time eras are zonal approximations, not reconstructions.
+  Biomes in ice-age eras use the present-day climate.
+  Mountain glaciers smaller than ICE-6G's 1-degree grid are approximated by a lowered
+  snowline in glacial eras.
+
 SOFTWARE
 
 Built with the Bevy game engine (https://bevyengine.org, MIT or Apache-2.0) and the

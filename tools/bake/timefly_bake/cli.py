@@ -29,6 +29,7 @@ import logging
 import math
 import re
 import shutil
+import sys
 import tempfile
 import time
 import zipfile
@@ -37,7 +38,8 @@ from pathlib import Path, PurePosixPath
 
 import numpy as np
 
-from timefly_bake import ages, cube, formats, ice6g, log, paleodem, plates, sealevel
+from timefly_bake import ages, cube, etopo, formats, ice6g, koppen, log, paleodem, plates
+from timefly_bake import sealevel, tiles
 from timefly_bake.log import traced
 
 MANIFEST_VERSION = 2
@@ -424,9 +426,97 @@ def _bake_staged(raw, out, cube_size, ages_path, paleodem_step_myr, footprint_di
     return manifest
 
 
+TILES_MANIFEST_VERSION = 1
+ETOPO_RAW = "etopo/ETOPO_2022_v1_60s_N90W180_surface.nc"
+KOPPEN_RAW = "koppen/koppen_geiger_tif.zip"
+OVERVIEW_NAME = "overview.tfgrid"
+
+
+@traced
+def write_tiles(elev, koppen_codes, out, sources: dict, per_deg: int = tiles.PER_DEG) -> dict:
+    """Write every tile as ``r{row:02}c{col:02}.tfgrid``, the 5 arc-minute ``overview.tfgrid``
+    and ``manifest.json`` into ``out`` and return the manifest. ``sources`` maps ``"etopo"`` and ``"koppen"`` to the raw files' SHA-256."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for row, col, tile in tiles.split_tiles(elev, koppen_codes, per_deg):
+        path = out / f"r{row:02}c{col:02}.tfgrid"
+        formats.write_tfgrid(path, "latlon", tile)
+        blob = path.read_bytes()
+        entries.append(
+            {"row": row, "col": col, "bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
+        )
+    path = out / OVERVIEW_NAME
+    formats.write_tfgrid(path, "latlon", tiles.overview(elev, koppen_codes, per_deg))
+    blob = path.read_bytes()
+    manifest = {
+        "version": TILES_MANIFEST_VERSION,
+        "tile_deg": tiles.TILE_DEG,
+        "samples": tiles.TILE_DEG * per_deg + 1,
+        "sources": dict(sources),
+        "tiles": entries,
+        "overview": {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()},
+    }
+    staged = out / ".manifest.json.tmp"
+    staged.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
+    staged.replace(out / MANIFEST_NAME)
+    return manifest
+
+
+@traced
+def bake_tiles(raw, out) -> dict:
+    """Bake the ETOPO 2022 and Koppen-Geiger tiles from ``raw`` into ``out``; returns the manifest."""
+    raw, out = Path(raw), Path(out)
+    etopo_path, koppen_path = raw / ETOPO_RAW, raw / KOPPEN_RAW
+    for p in (etopo_path, koppen_path):
+        if not p.is_file():
+            raise FileNotFoundError(f"missing {p}")
+    started = time.perf_counter()
+    sources = {"etopo": _sha256(etopo_path), "koppen": _sha256(koppen_path)}
+    for name, digest in sources.items():
+        _log.debug("input %s sha256 %s", name, digest)
+    elev = etopo.load(etopo_path)
+    kop = koppen.load(koppen_path)
+    manifest = write_tiles(elev, kop, out, sources)
+    sizes = [t["bytes"] for t in manifest["tiles"]]
+    _log.info(
+        "tiles done in %.1f s: %d tiles, %.2f MB, largest %d bytes; overview %d bytes",
+        time.perf_counter() - started,
+        len(sizes),
+        sum(sizes) / 1e6,
+        max(sizes),
+        manifest["overview"]["bytes"],
+    )
+    return manifest
+
+
+def _tiles_main(argv) -> int:
+    p = argparse.ArgumentParser(
+        prog="timefly-bake tiles", description="Bake 5 degree ETOPO 2022 + Koppen-Geiger tiles."
+    )
+    p.add_argument("--raw", type=Path, required=True, help="raw download tree (data/raw)")
+    p.add_argument("--out", type=Path, required=True, help="output directory")
+    p.add_argument("--log-level", default="INFO", help="stderr log level (bake.log is DEBUG)")
+    args = p.parse_args(argv)
+    log.configure(args.out, args.log_level)
+    try:
+        try:
+            bake_tiles(args.raw, args.out)
+        except Exception as exc:  # already logged with its traceback by @traced
+            _log.error("tile bake failed: %s", exc)
+            return 1
+        return 0
+    finally:
+        log.configure(None, args.log_level)
+
+
 @traced
 def main(argv=None) -> int:
-    """Entry point of ``timefly-bake``; returns the process exit code."""
+    """Entry point of ``timefly-bake``; returns the process exit code. ``timefly-bake tiles ...``
+    bakes the region-world tiles; anything else bakes the globe set."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "tiles":
+        return _tiles_main(argv[1:])
     parser = _parser()
     args = parser.parse_args(argv)
     log.configure(args.out, args.log_level)

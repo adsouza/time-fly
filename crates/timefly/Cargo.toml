@@ -6,8 +6,13 @@ edition = "2024"
 [features]
 default = ["system-spans"]
 # Bevy's `trace` feature wraps every system and schedule in a span (spec §20); `debug` gives the
-# spans their system names. Task 10 measures the cost.
-system-spans = ["bevy/trace", "bevy/debug"]
+# spans their system names. Task 10 measures the cost. Native only (ruling R29): on wasm,
+# bevy_log's tracing-wasm layer writes a `performance.mark` and `performance.measure` for every
+# span, about 130k of each a second, which the browser never frees (about 50 MB/s). Features
+# cannot depend on the target, so the spans go through a native-only dependency on
+# `bevy_internal` (what `bevy/trace` and `bevy/debug` enable; already in the tree under `bevy`):
+# its features unify with bevy's natively and do not exist on wasm.
+system-spans = ["dep:bevy_internal", "bevy_internal/trace", "bevy_internal/debug"]
 
 [dependencies]
 bevy = { version = "0.20", features = ["ktx2", "zstd_rust", "bevy_ui_widgets"] }
@@ -21,6 +26,9 @@ tracing = "0.1"
 # does not have, so it is enabled on native targets only.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy = { version = "0.20", features = ["basis-universal"] }
+# Bevy's internal crate (one copy in the lock file, under `bevy`), only to carry `system-spans`
+# (see [features]).
+bevy_internal = { version = "0.20", default-features = false, optional = true }
 # The appender's non-blocking writer runs a worker thread, which wasm32 does not have; the web
 # keeps its log in localStorage instead.
 tracing-appender = "0.2"
@@ -71,3 +79,5 @@ web-sys = { version = "0.3", features = [
 ruzstd = "0.9"
 # Edits f16 frame texels in the globe fixture test (already a timefly_core dependency).
 half = "2"
+# The fly camera's clearance property test (already a timefly_core dev-dependency).
+proptest = "1.12"
