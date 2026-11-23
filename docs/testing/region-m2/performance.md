@@ -446,7 +446,7 @@ frame. (2) Loads time out after 20 s of running frames, on a clock that adds eac
 delta clamped to 0.25 s. (3) Each region block reports host stalls (frames over 1,000 ms,
 "page paused or throttled?") for the load window and the flight; no pass rule reads them.
 
-**Pending:** the gated Chrome measurement is a re-run in real Chrome with the window in front.
+**Done:** the gated re-run in real Chrome passed every gate (see "Chrome WebGPU, real Chrome (gated)" below).
 
 ### Web memory: trace spans (ruling R29) and cluster buffers (ruling R28), 2026-11-23
 
@@ -486,15 +486,54 @@ None`). `ClusterConfig::None` alone would still have allocated the GPU path's 26
 list each frame (its size is the clustering capacity, not the cluster count); the CPU path left
 running still makes each active view's cluster buffers every frame, at their minimum size.
 Native renders are unchanged (region_tour shots of the Himalayas, the Rockies and Pangaea
-pixel-identical before and after). The post-fix Chrome measurement is the controller's.
+pixel-identical before and after).
+
+**After the fix (controller, `8d7c427`, in-app pane, visible, 60 fps, in the Alps region at
+0 ka):**
+- The page's renderer held at 530–561 MB over 62 s; before, it grew 45–55 MB/s.
+- The GPU process was steady at about 840 MB, and the JS heap at 12 MB.
+- The page had 346 performance marks in all: about 5 a second while loading, then none while flying.
+
+The real-Chrome bench below also shows the wasm memory flat across all 10 memory cycles.
 
 The bench's web memory gate reads only the wasm linear memory, so it could see neither
 (plan appendix).
 
-### Chrome WebGPU, real Chrome (gated; pending)
+### Chrome WebGPU, real Chrome (gated), 2026-11-23
 
-_To be run by the controller in the in-app browser pane._ Build and serve from
-`crates/timefly`:
+**Result: PASS on every gate.**
+
+| | |
+|---|---|
+| Who ran it | the owner, in an isolated Chrome window in front, hands off |
+| Browser and machine | Chrome 158 on the M4 (Metal behind WebGPU) |
+| Build | `8d7c427` (wasm32, `web-release`, no features: system spans off, R29) |
+| Render size | 3200 × 1800 (a 1600 × 900 window at 2×) |
+| Session | `44e29db1`; the log was copied from the page's localStorage |
+
+| Stop | First entry | Tiles / frames fetched | Load worst | Flight median / p95 / worst | Missed (> 50 ms) | Result |
+|---|---|---|---|---|---|---|
+| Pangaea interior (250 Ma) | 1,427 ms | 0 / 2 | **231.67 ms** (R11 ≤ 250: PASS) | 16.95 / 19.59 / 27.33 ms | 0 | PASS |
+| Red Sea (0 ka) | 1,474 ms | 2 / 1 | 29.18 ms | 16.57 / 18.25 / 19.83 ms | 0 | PASS |
+| Himalayas (0 ka) | 1,191 ms | 1 / 0 | 28.22 ms (reported only) | 17.40 / 19.45 / 22.45 ms | 0 | PASS |
+| Sundaland (21 ka) | 1,177 ms | 2 / 2 | 27.74 ms | 16.74 / 18.56 / 21.61 ms | 0 | PASS |
+| Japan (1 Ma) | **4,453 ms** | 4 / 2 | 25.43 ms | 16.60 / 18.60 / 23.27 ms | 0 | PASS |
+| Beringia (21 ka) | 1,287 ms | 2 / 1 | 28.97 ms | 16.61 / 18.50 / 20.67 ms | 0 | PASS |
+| Globe pan (8 s, 480 frames) | — | — | — | 16.62 / 18.32 / 19.43 ms | — | PASS |
+| Rockies ice margin (21 ka) | 1,886 ms | 2 / 0 | 29.98 ms | 16.99 / 19.58 / 27.54 ms | 0 | PASS |
+| Panama (3 Ma) | 1,192 ms | 0 / 1 | 32.58 ms | 16.57 / 18.39 / 19.99 ms | 0 | PASS |
+
+Summary gates:
+- First entries are all within 8,000 ms.
+  - The slowest is Japan at 4.45 s, generated with the large budget while descending (fix 1).
+  - The in-app pane's Aegean took 15.1 s with 6 ms slices before that fix. The Aegean is no longer benched (R26), and its projection at 12 ms was about 5.7 s.
+- Warm generation, over 10 re-entries of the Himalayas: median 1,185 ms, max 1,189 ms (≤ 8,000: PASS).
+- Memory cycles: wasm linear memory 294.4 MiB in every cycle, on the globe and in the region (+0.0%: PASS).
+- JS heap peak: 34.8 MiB.
+- No host stalls, and no stall over 66.7 ms, in any flight, load window or the pan.
+- Every flight and the pan were display-paced at about 60 Hz, against the 30 fps target.
+
+To repeat it, build and serve from `crates/timefly`:
 
 ```sh
 cd crates/timefly
@@ -502,18 +541,30 @@ PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo run --profile web-release -p tim
   --target wasm32-unknown-unknown
 ```
 
-Open `http://127.0.0.1:1334/?region-bench` and leave the page alone for about five minutes. The
-console prints four `===== Time Fly region bench: …` blocks (Alps, Scandinavia, Pangaea
-interior, Aegean) and one `===== Time Fly region bench summary =====` block, each as one message
-(target 30 fps, display-paced rule). The Aegean block shows the slowest generation (2.2 s
-natively) and the close-range shoreline (the Task 8 Chrome/Tint water watch). The R11
-line, `first-region worst frame (R11 gate <= 250 ms, …)`, is in the Alps block and the summary,
-and on the web it decides the result. Generation target ≤ 8,000 ms, for the warm re-entries
-and, since the final fix wave, for every region's first entry (each block's `first-entry
-generation (web gate <= 8000 ms)` line and the summary's `first entries` line; the Aegean is the
-one to watch, see the duty-cycle note under Task 4 above): a region over it fails. The memory cycles use
-the wasm linear memory (it never shrinks, so the check is that it stops growing); the JS heap
-(`performance.memory`, Chrome only) is reported beside it.
+Open `http://127.0.0.1:1334/?region-bench` in a Chrome window with no other tabs. Keep the window
+in front and leave the page alone for about 11 minutes, until the banner reads `Region bench
+finished: PASS` (or `FAIL`).
+
+Don't use the Claude desktop app's browser pane for gated numbers (R23): it can pause
+`requestAnimationFrame` for tens of seconds while the page still reports itself visible.
+
+**What the console prints:** one `===== Time Fly region bench: …` block per region, then a
+`===== Time Fly region bench summary =====` block. The target is 30 fps under the display-paced
+rule. Lines to look for:
+- **R11:** `first-region worst frame (R11 gate <= 250 ms, …)`, in the first region's block
+  (Pangaea) and in the summary. On the web it decides the result.
+- **Generation:** target ≤ 8,000 ms, for the warm re-entries and for every region's first entry
+  (each block's `first-entry generation (web gate <= 8000 ms)` line and the summary's `first
+  entries` line). A region over it fails.
+- **Memory cycles:** these read the wasm linear memory. It never shrinks, so the check is that it
+  stops growing. The JS heap (`performance.memory`, Chrome only) is reported beside it.
+
+**To copy the whole log**, run this in DevTools → Console before closing the window (a Guest
+window deletes its storage when it closes):
+
+```js
+copy(Object.keys(localStorage).filter(k => k.startsWith('timefly.log.')).map(k => localStorage.getItem(k)).filter(t => t.includes('region bench summary')).pop())
+```
 
 Checked by the implementer with curl against that server (`web-release` build, wasm-bindgen
 output 64.97 MB): `/?region-bench`, `assets/data/tiles/manifest.json` (353,054 B),
