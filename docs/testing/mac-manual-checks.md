@@ -125,3 +125,58 @@ it feels with a real mouse and keyboard. Run `cargo run --release -p timefly`.
       the sea-level stack (Spratt & Lisiecki 2016, NOAA NCEI).
 - [ ] The scroll wheel scrolls the credits (and does not zoom the globe while they are open).
 - [ ] `Esc` again closes them.
+
+## Regions: entering, flying, snapshots and leaving (M2 Task 9)
+
+Run the game normally (`cargo run -p timefly`, or the release build). Wait for the globe.
+
+### 11. Enter and leave
+
+- [ ] Double-click a continent on the globe. The slider snaps to the nearest snapshot (from
+      30 ka it lands on 21 ka, not 50 ka), the globe eases in toward the spot, and within a few
+      seconds the view fades through a pale haze into the region: about 8 km up, looking north
+      and a little down, the place you clicked in the middle.
+- [ ] A slow double-click (more than about a third of a second between the clicks) or one
+      where the pointer moves between the clicks does not enter a region.
+- [ ] `W` `A` `S` `D` move (forward follows the view), dragging looks around, `Space` / `E`
+      climb, `Ctrl` / `Q` descend, `Shift` boosts. Higher up the camera moves faster.
+- [ ] Fly low and fast with `Shift` over mountains and over the sea: the camera never goes
+      into the ground or under the sea surface, and never jumps through a ridge.
+- [ ] Climbing slows near 60 km and stops there.
+- [ ] Scrolling and dragging do not turn the (hidden) globe while in the region: after leaving,
+      the globe is where the region was, not somewhere the mouse took it.
+- [ ] `Backspace` fades back to the globe, centred on the region, close in. Dragging and
+      scrolling the globe work again at once.
+
+### 12. Leaving at the edge
+
+- [ ] Fly straight out (east, say) with `Shift` held. Past the region's edge (150 km out) the
+      camera is pushed back: it slows and settles a little way out instead of flying on.
+- [ ] Press `Backspace` out there: the globe comes back centred on the region (not on where
+      the camera drifted).
+
+### 13. A snapshot change keeps the place
+
+- [ ] Enter the Alps at 10 ka (double-click 46.5° N, 10° E with the slider at 10,000 years ago,
+      or launch with `--region=46.5,10,10000`). Fly to a recognisable valley or peak.
+- [ ] Press `[`: the view fades out, holds while the region regenerates, and fades back in at
+      21 ka over the same place (the same ridges and valleys), at about the same height above
+      the ground, facing the same way.
+- [ ] The same at 63° N, 15° E (central Sweden): from 10 ka to 21 ka the ground rises about
+      1.9 km onto the ice sheet, and the camera rises with it rather than ending up inside the
+      ice.
+- [ ] Drag the slider while in the region: the label shows the snapshot it will land on, the
+      region does not change during the drag, and on release it changes once, to that
+      snapshot. Releasing on the snapshot already shown changes nothing.
+- [ ] Changing to an era where the crust under the camera does not exist (for example from a
+      present-day region over a young ocean floor to 250 Ma) fades back to the globe at the new
+      age instead of showing a blank or stale region.
+
+### 14. The "Descending..." caption
+
+- [ ] Entering a region that generates quickly shows no caption at all.
+- [ ] When generation takes more than a second (the first region of a session, a deep-time era,
+      or the web build), "Descending..." appears in the middle of the screen after about a
+      second and disappears when the view fades in.
+- [ ] Press `Backspace` while "Descending..." shows: the descent is cancelled, the caption
+      goes, and the globe stays usable.
