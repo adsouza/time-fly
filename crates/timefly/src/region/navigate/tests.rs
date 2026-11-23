@@ -294,6 +294,39 @@ fn only_a_fade_at_its_midpoint_covers_the_view() {
 }
 
 #[test]
+fn generation_takes_the_large_budget_only_while_no_region_is_on_screen() {
+    let changing = |fade: Fade| NavPhase::ChangingSnapshot {
+        fade,
+        to: YearsBp(1e3),
+        requested: RenderDir(DVec3::Z),
+        agl_m: 100.0,
+        generated: false,
+        placed: false,
+    };
+    // First entries: from the globe (a launch region or the bench) and while descending.
+    assert!(NavPhase::Globe.allows_large_gen_budget());
+    assert!(
+        NavPhase::Descending {
+            target: RenderDir(DVec3::Z),
+            since_s: 0.0,
+            started: true,
+        }
+        .allows_large_gen_budget()
+    );
+    // A snapshot change held under the fade overlay.
+    let held = Fade::new(SNAPSHOT_FADE_S).advance(2.0, true);
+    assert!(changing(held).allows_large_gen_budget());
+    // Flying, or a fade with the region still showing through: the small budget.
+    assert!(!NavPhase::Flying.allows_large_gen_budget());
+    assert!(!changing(Fade::new(SNAPSHOT_FADE_S).advance(0.3, true)).allows_large_gen_budget());
+    let entering = NavPhase::Entering {
+        fade: Fade::new(ENTER_FADE_S).advance(0.6, false),
+        placed: true,
+    };
+    assert!(!entering.allows_large_gen_budget());
+}
+
+#[test]
 fn the_fallback_notice_shows_for_three_seconds_after_a_fallback_region() {
     // A region that fell back starts it; one that did not clears it; no region keeps it.
     assert_eq!(fallback_since(None, Some(true), 5.0), Some(5.0));

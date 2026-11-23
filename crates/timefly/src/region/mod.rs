@@ -16,8 +16,9 @@
 //! 3. **Generation.** Native: the prep on an
 //!    [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool) task, then the rows
 //!    across the pool. Web: time-boxed slices of [`WEB_GEN_BUDGET_MS`] per frame, or
-//!    [`WEB_GEN_COVERED_BUDGET_MS`] while the fade overlay fully covers the view
-//!    ([`RegionViewCovered`], [`gen_budget`]).
+//!    [`WEB_GEN_LARGE_BUDGET_MS`] while no region is on screen to keep smooth: a first entry
+//!    from the globe, or a snapshot change held under the fade overlay ([`LargeGenBudget`],
+//!    [`gen_budget`]).
 //!
 //! Then [`ActiveRegion`] is inserted, [`RegionGenerated`] and [`RegionEntered`] (or
 //! [`RegionSnapshotChanged`], when it replaces a region at another snapshot) are sent, and the
@@ -44,6 +45,7 @@ use timefly_core::worldgen::{APRON_RES, REGION_RES};
 
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use frames::{CpuGrid, CpuGridLoader, FrameCache};
+pub use job::{LOAD_CLOCK_MAX_DELTA_S, LOAD_TIMEOUT_S, LoadClock, advance_load_clock};
 use job::{
     TileIndex, advance_frames, advance_tiles, leave_region, poll_generation, poll_overview,
     poll_tile_manifest, start_region_request,
@@ -52,11 +54,13 @@ use tiles::{TileCache, TileManifest, TileManifestLoader};
 
 /// The web's generation budget per frame (design spec §6.1).
 pub const WEB_GEN_BUDGET_MS: f64 = 6.0;
-/// The web's generation budget per frame while the fade overlay fully covers the view (a
-/// snapshot change held at its midpoint): nothing worth a smooth frame is on screen, so the run
-/// takes most of a 60 Hz frame. At 6 ms a slice gets about a third of each 16.7 ms frame (wall
-/// time ≈ 2.8 × CPU time); at 12 ms about two thirds (≈ 1.4 ×).
-pub const WEB_GEN_COVERED_BUDGET_MS: f64 = 12.0;
+/// The web's generation budget per frame while no region is on screen to keep smooth (a first
+/// entry, generated while the globe stays in view, or a snapshot change held under the fade
+/// overlay): the run takes most of a 60 Hz frame. At 6 ms a slice gets about a third of each
+/// 16.7 ms frame (wall time ≈ 2.8 × CPU time); at 12 ms about two thirds (≈ 1.4 ×). The
+/// Aegean's first entry took 628 slices of 6 ms in Chrome (≈ 10.5 s); at 12 ms about half as
+/// many.
+pub const WEB_GEN_LARGE_BUDGET_MS: f64 = 12.0;
 /// The region camera's starting height above the ground at the region centre (design §6.1).
 pub const CAMERA_START_ALTITUDE_M: f32 = 8_000.0;
 /// The detail seed of every region: a region is a function of its centre and snapshot.
@@ -139,19 +143,20 @@ pub fn web_budget() -> Duration {
 }
 
 /// The slice budget for a time-boxed run started with `base`: at least
-/// [`WEB_GEN_COVERED_BUDGET_MS`] while the view is fully covered, `base` otherwise.
-pub fn gen_budget(base: Duration, view_covered: bool) -> Duration {
-    if view_covered {
-        base.max(Duration::from_secs_f64(WEB_GEN_COVERED_BUDGET_MS / 1000.0))
+/// [`WEB_GEN_LARGE_BUDGET_MS`] when it may take the large budget, `base` otherwise.
+pub fn gen_budget(base: Duration, large: bool) -> Duration {
+    if large {
+        base.max(Duration::from_secs_f64(WEB_GEN_LARGE_BUDGET_MS / 1000.0))
     } else {
         base
     }
 }
 
-/// Whether the fade overlay fully covers the view (written by region navigation each frame;
-/// `false` without it). A time-boxed generation then takes a larger slice ([`gen_budget`]).
+/// Whether a time-boxed generation may take the large budget ([`gen_budget`]): no region is on
+/// screen to keep smooth. Written by region navigation each frame
+/// (`NavPhase::allows_large_gen_budget`); `false` without it.
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct RegionViewCovered(pub bool);
+pub struct LargeGenBudget(pub bool);
 
 impl GenMode {
     /// The web's time box.
@@ -208,7 +213,8 @@ impl Plugin for RegionPlugin {
             .init_resource::<FrameCache>()
             .init_resource::<TileIndex>()
             .init_resource::<RegionSettings>()
-            .init_resource::<RegionViewCovered>()
+            .init_resource::<LargeGenBudget>()
+            .init_resource::<LoadClock>()
             .add_logged_state::<RegionState>()
             .add_domain_event::<RegionRequested>()
             .add_domain_event::<RegionGenerated>()
@@ -218,6 +224,7 @@ impl Plugin for RegionPlugin {
             .add_systems(
                 Update,
                 (
+                    job::tick_load_clock,
                     leave_region,
                     start_region_request,
                     poll_tile_manifest,
@@ -238,14 +245,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_covered_view_doubles_the_web_budget() {
+    fn the_large_budget_doubles_the_web_budget() {
         let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
         assert_eq!(gen_budget(web_budget(), false), ms(WEB_GEN_BUDGET_MS));
-        assert_eq!(
-            gen_budget(web_budget(), true),
-            ms(WEB_GEN_COVERED_BUDGET_MS)
-        );
-        assert_eq!(WEB_GEN_COVERED_BUDGET_MS, 2.0 * WEB_GEN_BUDGET_MS);
+        assert_eq!(gen_budget(web_budget(), true), ms(WEB_GEN_LARGE_BUDGET_MS));
+        assert_eq!(WEB_GEN_LARGE_BUDGET_MS, 2.0 * WEB_GEN_BUDGET_MS);
         // A larger base (a test's) is never shrunk.
         assert_eq!(gen_budget(ms(20.0), true), ms(20.0));
         assert_eq!(gen_budget(ms(0.5), false), ms(0.5));

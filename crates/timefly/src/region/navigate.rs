@@ -51,8 +51,8 @@ use tracing::instrument;
 
 use super::frames::FrameCache;
 use super::{
-    ActiveRegion, RegionEntered, RegionGenerated, RegionLeft, RegionRequested,
-    RegionSnapshotChanged, RegionState, RegionSystems, RegionViewCovered,
+    ActiveRegion, LargeGenBudget, RegionEntered, RegionGenerated, RegionLeft, RegionRequested,
+    RegionSnapshotChanged, RegionState, RegionSystems,
 };
 use crate::camera::{
     MAX_LATITUDE_DEG, MIN_DISTANCE_KM, OrbitCameraSystems, OrbitState, ease_toward,
@@ -318,6 +318,15 @@ impl NavPhase {
     /// slice of the frame (`crate::region::gen_budget`).
     pub fn covers_view(&self) -> bool {
         self.overlay_alpha() >= 1.0 - 1e-3
+    }
+
+    /// Whether a region generating now may take the large web budget
+    /// (`crate::region::gen_budget`): no region is on screen to keep smooth. That is a first
+    /// entry (from the globe, where the launch region and the bench enter, or while descending,
+    /// with the globe in view and nothing else heavy running) or a fade held at full cover. While
+    /// a region is flown or shows through a fade, the small budget keeps its frames smooth.
+    pub fn allows_large_gen_budget(&self) -> bool {
+        matches!(self, NavPhase::Globe | NavPhase::Descending { .. }) || self.covers_view()
     }
 }
 
@@ -900,7 +909,7 @@ fn navigate(
     mut orbit: ResMut<OrbitState>,
     mut terrain: ResMut<TerrainSettings>,
     mut ui: NavUi,
-    covered: Option<ResMut<RegionViewCovered>>,
+    large_budget: Option<ResMut<LargeGenBudget>>,
 ) {
     let now_s = real.elapsed_secs_f64();
     let dt_s = real.delta_secs();
@@ -997,10 +1006,10 @@ fn navigate(
     if terrain.visible != shown {
         terrain.visible = shown;
     }
-    if let Some(mut covered) = covered
-        && covered.0 != phase.covers_view()
+    if let Some(mut large) = large_budget
+        && large.0 != phase.allows_large_gen_budget()
     {
-        covered.0 = phase.covers_view();
+        large.0 = phase.allows_large_gen_budget();
     }
     let hold = matches!(phase, NavPhase::ChangingSnapshot { placed: false, .. });
     if terrain.hold_swap != hold {

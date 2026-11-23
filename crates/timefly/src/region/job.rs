@@ -28,16 +28,38 @@ use super::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, TileManifest, t
 #[cfg(target_arch = "wasm32")]
 use super::web_budget;
 use super::{
-    ActiveRegion, GenMode, REGION_SEED, RegionEntered, RegionGenerated, RegionLeft,
-    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState, RegionViewCovered,
-    gen_budget,
+    ActiveRegion, GenMode, LargeGenBudget, REGION_SEED, RegionEntered, RegionGenerated, RegionLeft,
+    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState, gen_budget,
 };
 use crate::data::{GlobeData, describe_load_error};
 
-/// A load that has not finished after this long (real seconds) is abandoned, so a stalled fetch
-/// (not a 404, which fails at once) never leaves "Descending..." up: a tile or the overview
-/// counts as missing, the manifest as unavailable, and a frame fails the request.
+/// A load that has not finished after this long is abandoned, so a stalled fetch (not a 404,
+/// which fails at once) never leaves "Descending..." up: a tile or the overview counts as
+/// missing, the manifest as unavailable, and a frame fails the request. Measured on the
+/// [`LoadClock`]: 20 s of running frames, so a paused or throttled page (a hidden tab, a laptop
+/// asleep, a host that stops `requestAnimationFrame`) does not time out its loads.
 pub const LOAD_TIMEOUT_S: f64 = 20.0;
+/// The most one frame adds to the [`LoadClock`] (Bevy's `Time<Virtual>` convention).
+pub const LOAD_CLOCK_MAX_DELTA_S: f64 = 0.25;
+
+/// The [`LoadClock`] after a frame whose real delta was `real_delta_s`: at most
+/// [`LOAD_CLOCK_MAX_DELTA_S`] more, never less.
+pub fn advance_load_clock(elapsed_s: f64, real_delta_s: f64) -> f64 {
+    elapsed_s + real_delta_s.clamp(0.0, LOAD_CLOCK_MAX_DELTA_S)
+}
+
+/// The clock loads time out on: the sum of each frame's real delta clamped to
+/// [`LOAD_CLOCK_MAX_DELTA_S`]. A long stall counts as one short frame; the game never pauses or
+/// scales it.
+#[derive(Resource, Copy, Clone, Debug, Default, PartialEq)]
+pub struct LoadClock {
+    pub elapsed_s: f64,
+}
+
+/// Advances the [`LoadClock`]; first in the region systems.
+pub(super) fn tick_load_clock(real: Res<Time<Real>>, mut clock: ResMut<LoadClock>) {
+    clock.elapsed_s = advance_load_clock(clock.elapsed_s, real.delta_secs_f64());
+}
 /// The slowest transfer a large file is allowed before it times out (bytes per second, about
 /// 4 Mbit/s): the 12.4 MB overview gets about 25 s, the tiles (about 100 kB) the plain
 /// [`LOAD_TIMEOUT_S`].
@@ -50,12 +72,12 @@ pub fn load_timeout_s(bytes: Option<u64>) -> f64 {
     })
 }
 
-/// Whether a load started at `started_s` has timed out at `now_s` (real seconds).
+/// Whether a load started at `started_s` has timed out at `now_s` ([`LoadClock`] seconds).
 pub fn load_timed_out(started_s: f64, now_s: f64, bytes: Option<u64>) -> bool {
     now_s - started_s >= load_timeout_s(bytes)
 }
 
-/// A load in flight: its handle and when it started (real seconds).
+/// A load in flight: its handle and when it started ([`LoadClock`] seconds).
 struct Loading<A: Asset> {
     handle: Handle<A>,
     started_s: f64,
@@ -229,9 +251,9 @@ pub(super) fn start_region_request(
     mut frame_cache: ResMut<FrameCache>,
     active: Option<Res<ActiveRegion>>,
     mut next: ResMut<NextState<RegionState>>,
-    real: Res<Time<Real>>,
+    clock: Res<LoadClock>,
 ) {
-    let now_s = real.elapsed_secs_f64();
+    let now_s = clock.elapsed_s;
     let Some(request) = requests.read().last().copied() else {
         return;
     };
@@ -295,7 +317,7 @@ pub(super) fn poll_tile_manifest(
     mut index: ResMut<TileIndex>,
     server: Res<AssetServer>,
     mut manifests: ResMut<Assets<TileManifest>>,
-    real: Res<Time<Real>>,
+    clock: Res<LoadClock>,
 ) {
     let ManifestState::Loading(Loading { handle, started_s }) = &index.manifest else {
         return;
@@ -321,7 +343,7 @@ pub(super) fn poll_tile_manifest(
             );
             ManifestState::Failed
         }
-        _ if load_timed_out(*started_s, real.elapsed_secs_f64(), None) => {
+        _ if load_timed_out(*started_s, clock.elapsed_s, None) => {
             warn!(
                 path = TILE_MANIFEST_PATH,
                 timeout_s = LOAD_TIMEOUT_S,
@@ -345,9 +367,9 @@ pub(super) fn poll_overview(
     server: Res<AssetServer>,
     mut grids: ResMut<Assets<CpuGrid>>,
     mut cache: ResMut<TileCache>,
-    real: Res<Time<Real>>,
+    clock: Res<LoadClock>,
 ) {
-    let now_s = real.elapsed_secs_f64();
+    let now_s = clock.elapsed_s;
     let next = match &index.overview {
         OverviewState::Idle => match &index.manifest {
             ManifestState::Ready(manifest) => match &manifest.overview {
@@ -437,9 +459,9 @@ pub(super) fn advance_frames(
     index: Res<TileIndex>,
     cache: Res<TileCache>,
     mut next: ResMut<NextState<RegionState>>,
-    real: Res<Time<Real>>,
+    clock: Res<LoadClock>,
 ) {
-    let now_s = real.elapsed_secs_f64();
+    let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
     let spec = job.spec;
     let Stage::Frames {
@@ -573,9 +595,9 @@ pub(super) fn advance_tiles(
     settings: Res<RegionSettings>,
     mut commands: Commands,
     mut next: ResMut<NextState<RegionState>>,
-    real: Res<Time<Real>>,
+    clock: Res<LoadClock>,
 ) {
-    let now_s = real.elapsed_secs_f64();
+    let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
     let spec = job.spec;
     let Stage::Tiles {
@@ -654,7 +676,7 @@ pub(super) fn poll_generation(
     mut entered: MessageWriter<RegionEntered>,
     mut changed: MessageWriter<RegionSnapshotChanged>,
     mut next: ResMut<NextState<RegionState>>,
-    covered: Option<Res<RegionViewCovered>>,
+    large_budget: Option<Res<LargeGenBudget>>,
 ) {
     let Some(mut job) = job else { return };
     let job = &mut *job;
@@ -671,12 +693,12 @@ pub(super) fn poll_generation(
         #[cfg(not(target_arch = "wasm32"))]
         Running::Task(task) => bevy::tasks::futures::check_ready(task),
         Running::Budgeted(run) => {
-            let covered = covered.is_some_and(|c| c.0);
-            let budget = gen_budget(run.base_budget(), covered);
+            let large = large_budget.is_some_and(|c| c.0);
+            let budget = gen_budget(run.base_budget(), large);
             if run.budget() != budget {
                 debug!(
                     budget_ms = budget.as_secs_f64() * 1e3,
-                    covered, "region generation budget"
+                    large, "region generation budget"
                 );
                 run.set_budget(budget);
             }
@@ -745,6 +767,24 @@ mod tests {
             vec![(0.0, 0.0), (0.021, -120.0), (0.03, -100.0)],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_load_clock_counts_running_frames_not_stalls() {
+        assert_eq!(advance_load_clock(10.0, 0.016), 10.016);
+        // A 60 s stall (a paused page) counts as one long frame at most.
+        assert_eq!(
+            advance_load_clock(10.0, 60.0),
+            10.0 + LOAD_CLOCK_MAX_DELTA_S
+        );
+        assert_eq!(advance_load_clock(10.0, -1.0), 10.0);
+        // 20 s of 60 Hz frames still reach the timeout.
+        let mut t = 0.0;
+        for _ in 0..(LOAD_TIMEOUT_S * 60.0) as usize + 1 {
+            t = advance_load_clock(t, 1.0 / 60.0);
+        }
+        assert!(load_timed_out(0.0, t, None));
+        assert!(!load_timed_out(0.0, advance_load_clock(0.0, 60.0), None));
     }
 
     #[test]

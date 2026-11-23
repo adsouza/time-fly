@@ -27,8 +27,9 @@ use timefly::region::frames::{CpuGrid, FRAME_CACHE_SLOTS, FrameCache};
 use timefly::region::generate::{BudgetedRun, GenInputs, generate_parallel, tiles_needed};
 use timefly::region::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, tile_path};
 use timefly::region::{
-    ActiveRegion, GenMode, RegionEntered, RegionGenerated, RegionLeft, RegionPlugin,
-    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState,
+    ActiveRegion, GenMode, LOAD_TIMEOUT_S, LargeGenBudget, LoadClock, RegionEntered,
+    RegionGenerated, RegionLeft, RegionPlugin, RegionRequested, RegionSettings,
+    RegionSnapshotChanged, RegionState,
 };
 use timefly_core::deep_time::YearsBp;
 use timefly_core::formats::{Grid, read_tfgrid};
@@ -265,8 +266,9 @@ fn record(
     }
 }
 
-/// Asset paths (relative to the asset root) whose reads never finish: a stalled fetch, not a
-/// 404. Shared with the reader, so a test can stall a path after the globe has loaded.
+/// Asset paths (relative to the asset root) whose reads do not finish while listed: a stalled
+/// fetch, not a 404. Shared with the reader, so a test can stall a path after the globe has
+/// loaded, or release it.
 type Stalls = Arc<Mutex<Vec<PathBuf>>>;
 
 /// The file reader, except that reads of the [`Stalls`] paths hang forever.
@@ -277,9 +279,9 @@ struct StallingReader {
 
 impl AssetReader for StallingReader {
     async fn read<'a>(&'a self, path: &'a Path) -> Result<impl Reader + 'a, AssetReaderError> {
-        let stalled = self.stalls.lock().unwrap().iter().any(|p| p == path);
-        if stalled {
-            std::future::pending::<()>().await;
+        while self.stalls.lock().unwrap().iter().any(|p| p == path) {
+            std::thread::sleep(Duration::from_millis(1));
+            bevy::tasks::futures_lite::future::yield_now().await;
         }
         self.inner.read(path).await
     }
@@ -521,6 +523,45 @@ fn a_stalled_tile_times_out_and_falls_back() {
         "{warnings:?}"
     );
     assert!(!app.world().resource::<TileCache>().contains((18, 36)));
+}
+
+/// A paused page (one 60 s frame, as when a host stops requestAnimationFrame) does not time out
+/// a load that finishes afterwards: the load clock counts running frames.
+#[test]
+fn a_long_pause_does_not_time_out_loads() {
+    let (mut app, stalls) = stalling_region_app(&tiny_root(), SMALL);
+    let tile = tile_path(18, 36);
+    stalls.lock().unwrap().push(tile.clone().into());
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+        16,
+    )));
+    request(&mut app, 0.0, 0.0, 0.0);
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    while app
+        .world()
+        .resource::<AssetServer>()
+        .get_handle::<CpuGrid>(tile.clone())
+        .is_none()
+    {
+        app.update();
+        assert!(Instant::now() < deadline, "the tile never started loading");
+    }
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(60)));
+    app.update();
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+        16,
+    )));
+    stalls.lock().unwrap().clear();
+    run_until(&mut app, RegionState::InRegion);
+    let event = generated(&app);
+    assert!(!event.fallback, "{event:?}");
+    assert_eq!(event.tiles_fetched, 4);
+    let warnings = warnings_naming(&tile);
+    assert!(
+        warnings.iter().all(|w| !w.contains("timed out")),
+        "{warnings:?}"
+    );
+    assert!(app.world().resource::<LoadClock>().elapsed_s < LOAD_TIMEOUT_S);
 }
 
 #[test]
@@ -970,6 +1011,33 @@ fn budgeted_generation_matches_parallel() {
     );
 }
 
+/// The job applies the large budget to a time-boxed run's slices while `LargeGenBudget` says so
+/// (navigation sets it during first entries and covered snapshot changes).
+#[test]
+fn the_large_budget_reaches_the_time_boxed_slices() {
+    let tiny_budget = RegionSettings {
+        mode: GenMode::Budgeted {
+            budget: Duration::from_micros(200),
+        },
+        ..SMALL
+    };
+    let mut updates = Vec::new();
+    for large in [false, true] {
+        let mut app = region_app(&tiny_root(), tiny_budget);
+        app.insert_resource(LargeGenBudget(large));
+        request(&mut app, 0.0, 0.0, 0.0);
+        updates.push(run_until(&mut app, RegionState::InRegion));
+    }
+    println!(
+        "updates to generate: small budget {}, large {}",
+        updates[0], updates[1]
+    );
+    assert!(
+        updates[1] * 3 < updates[0],
+        "a 12 ms slice should need far fewer frames than a 0.2 ms one: {updates:?}"
+    );
+}
+
 /// The generation inputs for a present-day region at (0°, 0°), read straight from the files.
 fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
     let data = app.world().resource::<GlobeData>();
@@ -1107,4 +1175,47 @@ fn real_region_timing() {
         app.world_mut().write_message(RegionLeft);
         app.update();
     }
+}
+
+/// The Aegean at 1 Ma (the slowest bench region) through the web's time-boxed path, natively, at
+/// the small and the large slice budgets: the slice counts behind the web first-entry
+/// projection (slices × 16.7 ms at 60 Hz). Prints for performance.md.
+#[test]
+#[ignore = "needs the real bake and tiles under assets/; prints slice counts"]
+fn aegean_time_boxed_slices() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    if !root.join(TILE_MANIFEST_PATH).exists() {
+        eprintln!("no real tiles under {}; skipped", root.display());
+        return;
+    }
+    let mut app = region_app(&root, RegionSettings::default());
+    // Warm the tile cache and overview first, so both runs time the generation alone.
+    request(&mut app, 38.0, 24.5, 1.0e6);
+    run_until(&mut app, RegionState::InRegion);
+    let mut counts = Vec::new();
+    for budget_ms in [6.0, 12.0] {
+        app.world_mut().write_message(RegionLeft);
+        app.update();
+        app.world_mut().resource_mut::<RegionSettings>().mode = GenMode::Budgeted {
+            budget: Duration::from_secs_f64(budget_ms / 1000.0),
+        };
+        app.world_mut().resource_mut::<Seen>().states.clear();
+        request(&mut app, 38.0, 24.5, 1.0e6);
+        let updates = run_until(&mut app, RegionState::InRegion);
+        let line = logs()
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|l| l.contains("time-boxed slices"))
+            .cloned()
+            .expect("a time-boxed run");
+        println!("{budget_ms} ms slices: {updates} updates; {line}");
+        counts.push(updates);
+    }
+    println!(
+        "projected wall time at 60 Hz: {:.1} s (6 ms), {:.1} s (12 ms)",
+        counts[0] as f64 * 16.7e-3,
+        counts[1] as f64 * 16.7e-3
+    );
 }
