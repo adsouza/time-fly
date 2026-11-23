@@ -17,7 +17,7 @@ pub struct LaunchArgs {
     pub diagnostics_probe: Option<ProbeMode>,
     /// `--scrub-bench` (web: `?scrub-bench`): run the automated scrub benchmark and report.
     pub scrub_bench: bool,
-    /// `--region-bench` (web: `?region-bench`): fly the scripted path in the three bench regions,
+    /// `--region-bench` (web: `?region-bench`): fly the scripted path in the four bench regions,
     /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`
     /// and `--region`.
     pub region_bench: bool,

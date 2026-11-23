@@ -140,23 +140,30 @@ Both packages ship the region tiles (`assets/data/tiles`: 2,592 tiles, the overv
 manifest, about 257 MB). Run this section with each package, using the launch command from its
 section above (`time-fly`, or `flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly`).
 
-### Region bench
+### Region bench at 2560 × 1440 (the desktop target, ruling R21)
+
+This is the milestone's 2560 × 1440 desktop measurement (spec §15): the Mac's display was too
+small for it, so it is taken here. Use a display of at least 2560 × 1440 so the window is not
+clamped, and check the block's `render resolution: 2560x1440` line.
 
 ```sh
-time-fly --region-bench --target-fps 60 --window 2560x1440
+WGPU_BACKEND=vulkan time-fly --region-bench --target-fps 60 --window 2560x1440
 flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly \
   --region-bench --target-fps 60 --window 2560x1440
 ```
 
-It waits for the globe, then enters the three bench regions in turn: the Alps at the present
-(46.5° N, 10° E), Scandinavia at 21 ka (63° N, 15° E) and the Pangaea interior at 250 Ma
-(era-frame 22° S, 18° W). In each it flies a 60 s path (a low pass at 300 m, a climb to 30 km, a
-run along or toward the coast, a sweep toward the apron), then leaves. Then it re-enters the Alps
-ten times to measure warm generation and memory. It prints one block per region and a summary
-block, then exits: 0 on PASS, 3 on FAIL. A run takes about four minutes. Leave the mouse and
-keyboard alone while it runs, and paste all four blocks back unedited.
+It waits for the globe, then enters the four bench regions in turn: the Alps at the present
+(46.5° N, 10° E), Scandinavia at 21 ka (63° N, 15° E), the Pangaea interior at 250 Ma
+(era-frame 22° S, 18° W) and the Aegean at 1 Ma (era-frame 38° N, 24.5° E, coastlines
+throughout). In each it flies a 60 s path (a low pass at 300 m, a climb to 30 km, a run along or
+toward the coast, a sweep toward the apron), then leaves. Then it re-enters the Alps ten times to
+measure warm generation and memory. It prints one block per region and a summary block, then
+exits: 0 on PASS, 3 on FAIL. A run takes about five minutes. Leave the mouse and keyboard alone
+while it runs, and paste all five blocks back unedited.
 
-- [ ] Each region block ends `result: PASS` (ruling R14, as in section 5).
+- [ ] Each block shows `render resolution: 2560x1440`.
+- [ ] Each region block ends `result: PASS` (ruling R14, as in section 5). The Aegean block's
+      `the run stays within … km of the coastline` line confirms it flew a real shore.
 - [ ] The summary: warm generation at most 3,000 ms, and memory cycles within +10% of the first.
       The first-region worst-frame line (ruling R11) is informational on native.
 
@@ -183,8 +190,8 @@ Launch normally. To go straight into a region, add `--region=LAT,LON,AGE_YEARS`,
 - [ ] **Pangaea, 250 Ma.** Step to 250 million years ago and double-click the interior of the
       supercontinent: a hot, dry desert (`bench-pangaea-250ma-shaded.png`). Leave.
 - [ ] Enter and leave a few more times. The game stays responsive, and `session.log` shows
-      `region tiles ready` and `RegionGenerated` lines with no `warn` about missing or corrupt
-      tiles.
+      `region tiles ready` and `region generated in parallel` lines with no `warn` about missing
+      or corrupt tiles.
 
 ## 8. Uninstall
 
@@ -210,8 +217,9 @@ into `data/README.md` (Performance and memory) next to the Mac numbers.
 ## Acceptance (Milestone 2)
 
 Regions are accepted on Linux when, in both packages, the region checks in section 7 pass on
-Vulkan on a hardware GPU, and the `.deb` region bench summary ends `result: PASS` against 60 fps
-(every region under ruling R14, warm generation at most 3 s, memory cycles within +10%). The
+Vulkan on a hardware GPU, and the `.deb` region bench at 2560 × 1440 ends its summary with
+`result: PASS` against 60 fps (every region under ruling R14, warm generation at most 3 s, memory
+cycles within +10%). The
 Flatpak's blocks are recorded too. Results go into `docs/testing/region-m2/performance.md` next
 to the Mac numbers.
 
@@ -224,7 +232,7 @@ _Not run yet._
 | `.deb` | | | | | | | | |
 | Flatpak | | | | | | | | |
 
-| Package (regions) | GPU / driver | Region checks | Alps median / p95 / missed | Scandinavia | Pangaea | Warm generation max | Memory cycles | Summary |
-|---|---|---|---|---|---|---|---|---|
-| `.deb` | | | | | | | | |
-| Flatpak | | | | | | | | |
+| Package (regions, 2560 × 1440) | GPU / driver | Region checks | Alps median / p95 / missed | Scandinavia | Pangaea | Aegean | Warm generation max | Memory cycles | Summary |
+|---|---|---|---|---|---|---|---|---|---|
+| `.deb` | | | | | | | | | |
+| Flatpak | | | | | | | | | |

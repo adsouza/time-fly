@@ -247,6 +247,42 @@ pub fn find_coast(ground: &impl Fn(f32, f32) -> f32) -> Coast {
     }
 }
 
+/// Rings and rays of [`distance_to_coast`]'s search.
+const COAST_RING_STEP_M: f32 = 250.0;
+const COAST_RING_RAYS: usize = 32;
+
+/// How far `p` is from the nearest sea-land crossing, searched on [`COAST_RING_RAYS`] rays in
+/// rings [`COAST_RING_STEP_M`] apart out to `reach` (so within one ring step); `None` when the
+/// ground keeps `p`'s side throughout.
+pub fn distance_to_coast(ground: &impl Fn(f32, f32) -> f32, p: Vec2, reach: f32) -> Option<f32> {
+    let land = |q: Vec2| ground(q.x, q.y) > 0.0;
+    let here = land(p);
+    let rings = (reach / COAST_RING_STEP_M).ceil() as u32;
+    (1..=rings)
+        .map(|i| i as f32 * COAST_RING_STEP_M)
+        .find(|&r| {
+            (0..COAST_RING_RAYS).any(|k| {
+                let a = k as f32 * TAU / COAST_RING_RAYS as f32;
+                land(p + Vec2::new(a.sin(), -a.cos()) * r) != here
+            })
+        })
+}
+
+/// The farthest the run along the coast (the coast run's last 9 s) gets from a coastline, for a
+/// coast in the inner field; `None` for a coast in the apron, no coast, or a run point with no
+/// coast within 20 km.
+pub fn coast_run_distance(path: &BenchPath, ground: impl Fn(f32, f32) -> f32) -> Option<f32> {
+    if !matches!(path.coast, Coast::InField { .. }) {
+        return None;
+    }
+    let mut worst = 0.0f32;
+    for i in 0..=36 {
+        let p = path.run_start.lerp(path.run_end, i as f32 / 36.0);
+        worst = worst.max(distance_to_coast(&ground, p, 20_000.0)?);
+    }
+    Some(worst)
+}
+
 /// Distance along the heading at `t` (0–30 s): 600 m/s, then speeding up to 4,000 m/s.
 fn along(t: f32) -> f32 {
     let quarter = SCRIPT_SECS / 4.0;
@@ -539,6 +575,39 @@ mod tests {
         assert_eq!(Segment::at(15.0), Segment::Climb);
         assert_eq!(Segment::at(44.99), Segment::CoastRun);
         assert_eq!(Segment::at(60.0), Segment::ApronSweep);
+    }
+
+    /// Islands and inlets everywhere, like the Aegean: the coast run stays near a real coast.
+    fn archipelago(x: f32, z: f32) -> f32 {
+        -60.0 + 400.0 * (x / 9_000.0 + 0.7).sin() * (z / 12_000.0 + 0.3).cos()
+    }
+
+    #[test]
+    fn the_coast_run_follows_a_coast_in_the_field() {
+        for ground in [coastal as fn(f32, f32) -> f32, archipelago] {
+            let path = BenchPath::plan(ground);
+            assert!(
+                matches!(path.coast, Coast::InField { .. }),
+                "{:?}",
+                path.coast
+            );
+            let worst = coast_run_distance(&path, ground).expect("a coast near the run");
+            assert!(worst <= 10_000.0, "{worst} m from the coast");
+        }
+        // No coast in the field: nothing to measure.
+        assert_eq!(coast_run_distance(&BenchPath::plan(inland), inland), None);
+        assert_eq!(
+            coast_run_distance(&BenchPath::plan(far_coast), far_coast),
+            None
+        );
+        // The distance search itself.
+        assert!(distance_to_coast(&coastal, Vec2::ZERO, 50_000.0).is_some());
+        assert_eq!(distance_to_coast(&inland, Vec2::ZERO, 50_000.0), None);
+        let d = distance_to_coast(&far_coast, Vec2::ZERO, 400_000.0).unwrap();
+        assert!(
+            (d - (280_000f32.hypot(300_000.0) - 120_000.0)).abs() < 4_000.0,
+            "{d}"
+        );
     }
 
     #[test]

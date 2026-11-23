@@ -126,8 +126,9 @@ most one prep step or one row. Wasm timings belong to Task 10's web benchmark.
 ## Region bench (Task 10)
 
 `--region-bench` (web `?region-bench`) waits for the interactive globe, then enters the Alps
-(46.5° N, 10° E, present), Scandinavia (63° N, 15° E, 21 ka) and the Pangaea interior (era-frame
-22° S, 18° W, 250 Ma) in turn. In each it flies a 60 s scripted path (`bench/region/path.rs`): a
+(46.5° N, 10° E, present), Scandinavia (63° N, 15° E, 21 ka), the Pangaea interior (era-frame
+22° S, 18° W, 250 Ma) and, since ruling R22, the Aegean (era-frame 38° N, 24.5° E, 1 Ma) in
+turn. In each it flies a 60 s scripted path (`bench/region/path.rs`): a
 low pass at 300 m above the ground, a climb to 30 km, a run along the coast (or, when the
 nearest coast lies in the apron, along the field's edge looking at it), and a sweep toward the
 apron. Then it re-enters the Alps ten times for the warm-generation and memory cycles. One block
@@ -145,13 +146,20 @@ Release build of `a27355a` plus the Task 10 changes (thin LTO), macOS 27.2.1, 60
 `AutoNoVsync` was requested, but frames stayed paced to the display (median 16.70 ms), so ruling
 R14's display-paced rule decided.
 
-**Resolution caveat.** The main display was a 1920 × 1080 monitor that day, so macOS clamped the
-requested 2560 × 1440 window to **1920 × 951** physical pixels. M1's numbers were taken at
-2560 × 1440 on a larger display. A rerun at 2560 × 1440 (the built-in Retina display, or a
-1440p monitor) is still owed; the GPU was not the limit at this size (p95 18.2–18.7 ms with no
-missed frames).
+**Resolution (ruling R21).** These M4 runs are at **1920 × 951**, the display's size: the main
+display was a 1920 × 1080 monitor, so macOS clamped the requested 2560 × 1440 window. M1's
+numbers were taken at 2560 × 1440 on a larger display. The milestone's 2560 × 1440 desktop
+measurement is taken on the owner's Linux machine (spec §15), as an explicit step of
+`docs/testing/linux-vulkan.md` section 7:
 
-Two identical runs. Run 1 was the first launch of the new binary; run 2 followed it.
+```sh
+WGPU_BACKEND=vulkan time-fly --region-bench --target-fps 60 --window 2560x1440
+```
+
+At 1920 × 951 the GPU was not the limit (p95 18.2–18.7 ms, no missed frames).
+
+The first two runs below predate the Aegean region (three regions each); the fix-round run
+after them has all four. Two identical three-region runs. Run 1 was the first launch of the new binary; run 2 followed it.
 
 | Region | Generation (first entry) | Tiles fetched | Load: request to first path frame | Load worst frame | Flight median / p95 / worst | Missed (> 25 ms) | Result |
 |---|---|---|---|---|---|---|---|
@@ -193,6 +201,31 @@ Memory returns to the first cycle's level within 2% (limit 10%): PASS. The two l
 and the in-region footprint is flat across the ten entries. Peak footprint over a run:
 863–868 MiB. Summary: `result: PASS`, exit 0, both runs.
 
+### Four regions with the Aegean (ruling R22), 2026-11-23
+
+Release build of `4e682af` plus the fix-round changes, same M4 and display, **1920 × 951**
+(R21). The Aegean's coast search finds a coast 4.9 km from the centre, inside the inner field,
+and the run along it stays within 1.0 km of a coastline (sampled every 375 m along the run, ring
+search in 250 m steps).
+
+| Region | Generation (first entry) | Tiles fetched | Load: request to first path frame | Load worst frame | Flight median / p95 / worst | Missed (> 25 ms) | Result |
+|---|---|---|---|---|---|---|---|
+| Alps | 683 ms (cold) | 2 (270,951 B) | 2.53 s | 84.7 ms | 16.70 / 18.30 / 21.18 ms | 0 of 3,601 | PASS |
+| Scandinavia | 432 ms | 2 (270,945 B) | 2.27 s | 24.4 ms | 16.70 / 18.33 / 31.91 ms | 2 of 3,600 (0.06%) | PASS |
+| Pangaea | 332 ms | 0 | 2.17 s | 23.7 ms | 16.69 / 18.31 / 20.78 ms | 0 of 3,600 | PASS |
+| **Aegean** | **2,216 ms** | 2 (305,816 B) | 4.03 s | 24.5 ms | 16.70 / 18.28 / 20.18 ms | 0 of 3,601 | PASS |
+
+- **Aegean generation:** 2,216 ms natively on its first entry, the slowest real case (the
+  ETOPO-dominant two-level deep path), still under the 3 s native target. On the web's
+  time-boxed path it is the region to watch against the 8 s target.
+- **Aegean flight:** the coast run (900 frames along the shore, water, foam and beach in view)
+  had a median of 16.72 ms and a worst frame of 19.40 ms, no slower than the other segments.
+- **First-region worst frame (R11):** 84.7 ms. The new binary's shaders were unchanged, so
+  Metal's cache from the earlier runs still held them.
+- **Warm generation:** median 449 ms, max 467 ms. **Memory cycles:** 721.4, 721.5, 709.1,
+  709.2, 709.2, 721.8, 722.0, 722.0, 709.7, 709.9 MiB on the globe; worst of 2–10 +0.1% of
+  cycle 1 (limit +10%); in the region 798.3–800.4 MiB. Summary `result: PASS`, exit 0.
+
 ### Chrome WebGPU (controller, ruling R20)
 
 _To be run by the controller in the in-app browser pane._ Build and serve from
@@ -204,9 +237,11 @@ PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo run --profile web-release -p tim
   --target wasm32-unknown-unknown
 ```
 
-Open `http://127.0.0.1:1334/?region-bench` and leave the page alone for about four minutes. The
-console prints three `===== Time Fly region bench: …` blocks and one `===== Time Fly region
-bench summary =====` block, each as one message (target 30 fps, display-paced rule). The R11
+Open `http://127.0.0.1:1334/?region-bench` and leave the page alone for about five minutes. The
+console prints four `===== Time Fly region bench: …` blocks (Alps, Scandinavia, Pangaea
+interior, Aegean) and one `===== Time Fly region bench summary =====` block, each as one message
+(target 30 fps, display-paced rule). The Aegean block shows the slowest generation (2.2 s
+natively) and the close-range shoreline (the Task 8 Chrome/Tint water watch). The R11
 line, `first-region worst frame (R11 gate <= 250 ms, …)`, is in the Alps block and the summary,
 and on the web it decides the result. Generation target ≤ 8,000 ms (warm). The memory cycles use
 the wasm linear memory (it never shrinks, so the check is that it stops growing); the JS heap

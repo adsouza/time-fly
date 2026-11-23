@@ -64,9 +64,11 @@ pub struct BenchRegion {
     pub arg: RegionArg,
 }
 
-/// The three bench regions (M2 design §8). The Pangaea centre is pinned in the era's frame at
-/// 250 Ma: inland, a hot desert (Task 8).
-pub const BENCH_REGIONS: [BenchRegion; 3] = [
+/// The bench regions: the design's three (M2 design §8) and the Aegean (ruling R22). The Pangaea
+/// centre is pinned in the era's frame at 250 Ma: inland, a hot desert (Task 8). The Aegean at
+/// 1 Ma (era frame) has coastlines throughout the inner field, so its coast run flies a real
+/// shore up close, and it is Task 4's slowest real generation (about 2.9 s single-threaded).
+pub const BENCH_REGIONS: [BenchRegion; 4] = [
     BenchRegion {
         name: "Alps",
         arg: RegionArg {
@@ -89,6 +91,14 @@ pub const BENCH_REGIONS: [BenchRegion; 3] = [
             lat_deg: -22.0,
             lon_deg: -18.0,
             years: 250.0e6,
+        },
+    },
+    BenchRegion {
+        name: "Aegean",
+        arg: RegionArg {
+            lat_deg: 38.0,
+            lon_deg: 24.5,
+            years: 1.0e6,
         },
     },
 ];
@@ -788,6 +798,17 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     }
     if let Some(path) = &r.path {
         out.push(format!("coast: {}", path.coast.describe()));
+        if let (Some(active), Coast::InField { .. }) = (game.region.as_deref(), path.coast) {
+            let grid = &active.grid;
+            let ground = |x: f32, z: f32| blended_height_m(grid, f64::from(x), f64::from(z));
+            out.push(match path::coast_run_distance(path, ground) {
+                Some(m) => format!(
+                    "  the run stays within {:.1} km of the coastline",
+                    m / 1000.0
+                ),
+                None => "  the run strays over 20 km from the coastline".to_string(),
+            });
+        }
     }
     out.push(format!(
         "memory ({}): before entering {}, peak in region {}, lifetime peak {}",
@@ -1064,7 +1085,7 @@ mod tests {
     #[test]
     fn the_bench_regions_are_pinned() {
         let names: Vec<_> = BENCH_REGIONS.iter().map(|r| r.name).collect();
-        assert_eq!(names, ["Alps", "Scandinavia", "Pangaea interior"]);
+        assert_eq!(names, ["Alps", "Scandinavia", "Pangaea interior", "Aegean"]);
         let arg = |lat_deg, lon_deg, years| RegionArg {
             lat_deg,
             lon_deg,
@@ -1073,8 +1094,14 @@ mod tests {
         assert_eq!(BENCH_REGIONS[0].arg, arg(46.5, 10.0, 0.0));
         assert_eq!(BENCH_REGIONS[1].arg, arg(63.0, 15.0, 21_000.0));
         assert_eq!(BENCH_REGIONS[2].arg, arg(-22.0, -18.0, 250.0e6));
+        // Ruling R22: coastlines throughout the inner field, Task 4's slowest real region.
+        assert_eq!(
+            BENCH_REGIONS.get(3).map(|r| r.arg),
+            Some(arg(38.0, 24.5, 1.0e6))
+        );
         assert_eq!(after_region(0, 10), Next::Region(1));
-        assert_eq!(after_region(2, 10), Next::Cycle(0));
-        assert_eq!(after_region(2, 0), Next::Summary);
+        assert_eq!(after_region(2, 10), Next::Region(3));
+        assert_eq!(after_region(3, 10), Next::Cycle(0));
+        assert_eq!(after_region(3, 0), Next::Summary);
     }
 }

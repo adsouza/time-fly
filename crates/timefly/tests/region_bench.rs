@@ -93,7 +93,7 @@ fn region_bench_reports_all_regions() {
     }
     let bench = app.world().resource::<RegionBench>();
     let reports = bench.reports();
-    assert_eq!(reports.len(), 3, "{reports:#?}");
+    assert_eq!(reports.len(), 4, "{reports:#?}");
     for (report, region) in reports.iter().zip(&BENCH_REGIONS) {
         let title = format!("===== Time Fly region bench: {} (", region.name);
         assert!(report.starts_with(&title), "{report}");
@@ -133,7 +133,7 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Alps PASS, Scandinavia PASS, Pangaea interior PASS",
+        "regions (R14 frame rate): Alps PASS, Scandinavia PASS, Pangaea interior PASS, Aegean PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Alps",
         "first entries (cold tiles): Alps ",
@@ -163,4 +163,70 @@ fn a_failed_globe_ends_the_region_bench() {
         "{summary}"
     );
     assert_eq!(exits(&mut app), vec![bench_exit(false)]);
+}
+
+/// Ruling R22: the Aegean at 1 Ma, generated from the real bake at full resolution: the bench
+/// path's coast run must fly along a real coast inside the inner field. Needs the real bake and
+/// tiles under `assets/` (not in CI); run by hand with
+/// `cargo test -p timefly --test region_bench -- --ignored`.
+#[test]
+#[ignore = "needs the real bake and tiles under assets/"]
+fn aegean_coast_run_follows_a_real_coast() {
+    use timefly::bench::region::path::coast_run_distance;
+    use timefly::bench::region::{BenchPath, Coast};
+    use timefly::region::launch::launch_request;
+    use timefly::region::{ActiveRegion, RegionState};
+    use timefly_core::terrain::blended_height_m;
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    assert!(
+        root.join("data/tiles/manifest.json").exists(),
+        "no real bake under {}",
+        root.display()
+    );
+    let mut app = App::new();
+    app.add_plugins((
+        MinimalPlugins,
+        AssetPlugin {
+            file_path: root.to_string_lossy().into_owned(),
+            meta_check: AssetMetaCheck::Never,
+            ..default()
+        },
+        ImagePlugin::default(),
+        StatesPlugin,
+        GlobeDataPlugin::default(),
+        RegionPlugin,
+    ));
+    let deadline = Instant::now() + WALL_LIMIT;
+    while *app.world().resource::<State<GlobeLoadState>>().get() != GlobeLoadState::Ready {
+        app.update();
+        assert!(Instant::now() < deadline, "the globe data did not load");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let aegean = BENCH_REGIONS.iter().find(|r| r.name == "Aegean").unwrap();
+    app.world_mut().write_message(launch_request(&aegean.arg));
+    loop {
+        app.update();
+        if *app.world().resource::<State<RegionState>>().get() == RegionState::InRegion {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the Aegean did not generate");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let grid = app.world().resource::<ActiveRegion>().grid.clone();
+    let ground = |x: f32, z: f32| blended_height_m(&grid, f64::from(x), f64::from(z));
+    let path = BenchPath::plan(ground);
+    let Coast::InField { point, .. } = path.coast else {
+        panic!(
+            "the Aegean's nearest coast should be in the field: {:?}",
+            path.coast
+        );
+    };
+    let worst = coast_run_distance(&path, ground).expect("a coast near the run");
+    println!(
+        "Aegean coast {:.1} km from the centre; the run stays within {:.0} m of a coastline",
+        point.length() / 1000.0,
+        worst
+    );
+    assert!(worst <= 10_000.0, "{worst} m from the coast");
 }

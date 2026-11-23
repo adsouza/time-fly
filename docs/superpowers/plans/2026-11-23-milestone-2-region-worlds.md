@@ -700,9 +700,35 @@ docs/testing/region-m2/              screenshots, performance.md
 - **Ice-age biomes use the present-day climate.** Recent snapshots (21 ka and so on) read the
   1991–2020 Köppen-Geiger classes; only ice, sea level and the snowline change with the age. The
   credits carry the data note.
-- **Plate overlaps after a cache eviction (R19).** A snapshot change carries the camera with the
-  plate the globe draws, ranked from the old snapshot's cached frames. If those frames were
-  evicted from the 4-slot frame cache, the overlap falls back to the lowest plate ID.
+- **The two-level deep path near plate edges (Task 4, flagged for the final review).**
+  ETOPO-dominant deep snapshots (50 ka to about 2 Ma) run the globe's reference only on a
+  27.75 km support lattice. Support points match it to 1e-6 m on land and plate interiors to
+  0.12 m, but within one support cell of a plate edge heights err by up to 109 m. The anti-goal
+  "land where the globe shows sea" was checked only at 1 Ma: 0 misses in 52,167 synthetic
+  samples, and 2 of 25,541 on the real bake, both within 2 m of sea level (`shell_sample`
+  returns the raw shell surface without a sea check). `deep_matches_globe` runs only at 100 Ma.
+- **The plate ranker (R19, Task 9).** A snapshot change carries the camera with the plate the
+  globe draws, ranked from the old snapshot's cached frames. For the bridge endpoint it reads
+  the cube frame (what the globe draws), not ETOPO. If the "from" frames were evicted from the
+  4-slot frame cache, the overlap falls back to the lowest plate ID (logged at `debug`).
+- **Failed loads are not retried (Task 5).** If the tile manifest or the overview fails to load,
+  it is not fetched again for the session: regions fall back to the globe frames (with a `warn`
+  at the failure, none per region).
+- **Offshore islands (Task 4).** The coastline's corner rule takes corners from the upsampled
+  coarse lattice, so small offshore islands can appear within about spacing/4 of deep-era coasts.
+- **The haze holds through a snapshot change (Task 9).** The pale fade overlay stays at full
+  cover for the whole generation of the new region (0.6 s natively, longer on the web), and
+  "Descending..." can show on a slow change. `Backspace` or a missing-crust re-carry during a
+  change restarts the leave fade, so the stale region can flash for about 0.4 s; `Backspace`
+  during the entering fade is ignored.
+- **Bench caveats (R20, R21).** The native M4 bench ran at 1920 × 951 (the 1080p display clamps
+  the requested window); the 2560 × 1440 desktop measurement is part of the owner's Linux run
+  (`docs/testing/linux-vulkan.md`, section 7). The Chrome WebGPU bench, with ruling R11's
+  first-region gate, is the controller's run and was pending when this appendix was written.
+- **Chrome/Tint paths unverified until that run.** Code paths Metal never compiles: the
+  prepass's `UNCLIPPED_DEPTH_ORTHO_EMULATION` branch (Task 7), the water shader's PBR call after
+  a non-uniform discard (Task 8) and a dynamic const-array index in the noise (Task 2). Per-pixel
+  terrain normals cost 32 texture reads per fragment (a web performance watch).
 - **Generation is mostly sequential.** The region prep (70–80% of native generation) runs on one
   thread; only the rows are parallel. Native regions take under 1 s, so this is headroom, not a
   problem. A cancelled native job runs to completion in the background before it is dropped.
@@ -753,6 +779,8 @@ was decided, why, and the cost if it proves wrong.
 - Ruling R18: glacial snowline depression. snowline_m gains the era's sea-level anomaly: snowline lowered by 1,000 m × (anomaly / −120 m), clamped to [0, 1,200] m of lowering, in core and the shader mirror. A credits data note says mountain glaciers below ICE-6G's 1° grid are approximated by a lowered snowline. Follow-up to T8 after the T9 review. — The Alps at the LGM were glaciated (spec anti-goal: ice must match era); a cheap physically motivated proxy (LGM ELA depression ≈ 1 km) beats bare peaks. — Cost if wrong: snow slightly too low or too high in glacial eras.
 - Ruling R19: carry_crust_position gains a `surface_for_candidate` closure (a deviation from the plan's signature), which the shell builds with rendered_surface's ranking from the `from` snapshot's CPU frames (FrameCache) and DeepSampling. Inside the geographic frame (recent) the carry stays the identity. — Spec §5.2's overlap rule must be the same everywhere; the plan's signature was the defect. — Cost if wrong: one more frame lookup per snapshot change.
 - Ruling R20: T10 split as in M1 (R3): the implementer builds the region bench, runs it natively on the M4, makes the CI/Pages/packaging/docs/plan-appendix edits and commits locally. The controller runs the Chrome WebGPU bench in the in-app browser pane (including R11's 250 ms first-region frame gate) and, only with the owner's OK, pushes and dispatches CI. — Subagents lack the browser pane, and pushes need the owner. — Cost if wrong: none.
+- Ruling R21: the native 2560×1440 measurement moves to the owner's Linux run (spec §15 measures the desktop target on the Linux machine). The M4 reports at its display's size (1920×951 now), labelled as such. — No code can fix a 1080p display. — Cost if wrong: M4 GPU headroom at 1440p unknown until the Linux run.
+- Ruling R22: add a fourth bench region over the Aegean, era-frame 38.0, 24.5 at 1 Ma: coastlines throughout the inner field (close-range water, foam and shore shading for the T8 Chrome/Tint watch) and T4's slowest real generation case (≈ 2.9 s single-thread). The coast segment uses it. — The plan's three regions never bench a shoreline up close. — Cost if wrong: about 60 s more bench time.
 
 **Other deviations from the plan text**
 
@@ -765,4 +793,5 @@ was decided, why, and the cost if it proves wrong.
   report. `--check-data` also loads the tiles beside the globe folder: the manifest, the overview
   and the three largest tiles, size- and SHA-256-checked. `--region-bench` takes precedence over
   `--scrub-bench` and `--region`. The bench's enter/leave memory cycles run inside the bench
-  (after the three regions) rather than as a separate tool, so the web run measures them too.
+  (after the regions) rather than as a separate tool, so the web run measures them too. The
+  bench has a fourth region, the Aegean at 1 Ma (R22).
