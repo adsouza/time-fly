@@ -8,7 +8,7 @@ use crate::geo::RenderDir;
 use crate::globe::EARTH_RADIUS_KM;
 use bevy_math::DVec3;
 
-const EARTH_RADIUS_M: f64 = EARTH_RADIUS_KM * 1000.0;
+pub(crate) const EARTH_RADIUS_M: f64 = EARTH_RADIUS_KM * 1000.0;
 
 /// Below this horizontal length of the centre (render X and Z) the centre counts as a pole.
 const POLE_EPS: f64 = 1e-12;
@@ -33,11 +33,43 @@ impl RegionFrame {
         (c.cross(east).normalize(), east)
     }
 
+    /// The centre and tangent basis, computed once. Generation projects about 1.3 million points
+    /// per region, so callers in a loop take the basis once and project through it.
+    pub fn basis(&self) -> FrameBasis {
+        let (north, east) = self.north_east();
+        FrameBasis {
+            center: self.center.0.normalize(),
+            north,
+            east,
+        }
+    }
+
     /// Era-frame direction of the point `x_m` metres east and `-z_m` metres north of the centre.
     pub fn local_to_dir(&self, x_m: f64, z_m: f64) -> RenderDir {
-        let c = self.center.0.normalize();
-        let (north, east) = self.north_east();
-        let offset = east * x_m - north * z_m;
+        self.basis().local_to_dir(x_m, z_m)
+    }
+
+    /// Local `(x, z)` metres of a direction, or `None` at the antipode, where the azimuth is
+    /// undefined. Every other direction projects, so the whole sphere is covered.
+    pub fn dir_to_local(&self, d: RenderDir) -> Option<(f64, f64)> {
+        self.basis().dir_to_local(d)
+    }
+}
+
+/// A [`RegionFrame`]'s unit centre and its `(north, east)` tangents, as [`RegionFrame::basis`]
+/// computes them. Projects exactly as the frame does.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FrameBasis {
+    pub center: DVec3,
+    pub north: DVec3,
+    pub east: DVec3,
+}
+
+impl FrameBasis {
+    /// See [`RegionFrame::local_to_dir`].
+    pub fn local_to_dir(&self, x_m: f64, z_m: f64) -> RenderDir {
+        let c = self.center;
+        let offset = self.east * x_m - self.north * z_m;
         let dist = offset.length();
         if dist == 0.0 {
             return RenderDir(c);
@@ -46,10 +78,9 @@ impl RegionFrame {
         RenderDir((c * angle.cos() + offset * (angle.sin() / dist)).normalize())
     }
 
-    /// Local `(x, z)` metres of a direction, or `None` at the antipode, where the azimuth is
-    /// undefined. Every other direction projects, so the whole sphere is covered.
+    /// See [`RegionFrame::dir_to_local`].
     pub fn dir_to_local(&self, d: RenderDir) -> Option<(f64, f64)> {
-        let c = self.center.0.normalize();
+        let c = self.center;
         let cos = c.dot(d.0);
         let tangent = d.0 - c * cos;
         let sin = tangent.length();
@@ -58,8 +89,7 @@ impl RegionFrame {
         }
         let angle = sin.atan2(cos);
         let offset = tangent * (angle * EARTH_RADIUS_M / sin);
-        let (north, east) = self.north_east();
-        Some((offset.dot(east), -offset.dot(north)))
+        Some((offset.dot(self.east), -offset.dot(self.north)))
     }
 }
 

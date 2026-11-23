@@ -3,8 +3,13 @@
 //! Pure functions only. `noise` is mirrored one-to-one in `assets/shaders/noise.wesl`.
 
 pub mod biome;
+pub mod coarse;
 pub mod frame;
+pub mod generate;
 pub mod noise;
+#[cfg(test)]
+mod testkit;
+pub mod tiles;
 
 /// Side of a region's inner field, in metres.
 pub const REGION_SIZE_M: f64 = 300_000.0;
