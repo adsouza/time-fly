@@ -1,11 +1,24 @@
-//! GPU golden test for the region shaders. Needs a GPU adapter:
+//! GPU golden tests for the region shaders. Need a GPU adapter:
 //! `cargo test -p timefly --test region_gpu -- --ignored`.
 //!
-//! Compiles `assets/shaders/noise.wesl` (plain WGSL, no imports) with a small compute entry point
-//! on a headless wgpu device, runs it over the golden inputs that the Rust implementation also
-//! checks (`timefly_core/tests/fixtures/noise_golden.json`) and compares the values.
+//! - `wesl_noise_matches_golden` compiles `assets/shaders/noise.wesl` (plain WGSL, no imports)
+//!   with a small compute entry point on a headless wgpu device, runs it over the golden inputs
+//!   that the Rust implementation also checks (`timefly_core/tests/fixtures/noise_golden.json`)
+//!   and compares the values.
+//! - `wesl_morph_matches_rust` does the same with `assets/shaders/terrain_cdlod.wesl`, the vertex
+//!   math every terrain pass runs, against `timefly_core::terrain`'s `morph_vertex`,
+//!   `blended_height_m` and `curvature_drop_m`, fed through the shell's own buffer packing.
 
+use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
+use timefly::terrain::material::{TerrainParams, patch_instances, terrain_buffer_bytes};
+use timefly_core::deep_time::YearsBp;
+use timefly_core::geo::{geo_to_render, latlon_to_geo};
+use timefly_core::terrain::{
+    LodSettings, blended_height_m, curvature_drop_m, morph_factor, morph_vertex, select_patches,
+};
+use timefly_core::worldgen::generate::{Field, RegionGrid, RegionSpec};
+use timefly_core::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
 use wgpu::util::DeviceExt;
 
 const NOISE: &str = include_str!("../assets/shaders/noise.wesl");
@@ -151,4 +164,335 @@ fn wesl_noise_matches_golden() {
         "largest Rust/WESL difference over {} rows: {worst:e}",
         want.len()
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// CDLOD morph and heights
+
+const CDLOD: &str = include_str!("../assets/shaders/terrain_cdlod.wesl");
+/// The floor of the xz tolerance (ruling R13).
+const XZ_TOLERANCE_M: f32 = 1e-3;
+/// The height: the Rust reference takes a few f64 steps that f32 can only follow to rounding.
+const HEIGHT_TOLERANCE_M: f32 = 0.5;
+/// Vertices checked, over [`MORPH_CAMERAS`] cameras.
+const MORPH_VERTICES: usize = 512;
+
+/// Cameras: low over the centre, over the blend edge, high and far out, and at the ceiling.
+const MORPH_CAMERAS: [[f32; 3]; 4] = [
+    [1_234.5, 150.0, -2_345.25],
+    [-131_000.0, 2_000.0, 140_500.0],
+    [149_000.0, 8_000.0, -98_765.0],
+    [-60_000.0, 60_000.0, 20_000.0],
+];
+
+const MORPH_ENTRY: &str = r#"
+@group(0) @binding(0) var<storage, read> terrain: TerrainBuffer;
+@group(0) @binding(1) var inner_height: texture_2d<f32>;
+@group(0) @binding(2) var apron_height: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> queries: array<vec4<u32>>;   // (i, j, slot, 0)
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>; // (x, z, height, y)
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&out)) {
+        return;
+    }
+    let q = queries[n];
+    let params = terrain.params;
+    // The grid mesh's own vertex position, through the vertex shader's snap.
+    let position = vec3<f32>(f32(q.x), 0.0, f32(q.y)) / params.lattice.w;
+    let v = cdlod_vertex(grid_index_of(position, params), terrain.patches[q.z], params, inner_height, apron_height);
+    out[n] = vec4<f32>(v.world.x, v.world.z, v.height, v.world.y);
+}
+"#;
+
+/// SplitMix64: a small deterministic generator, so the test needs no extra crate.
+struct SplitMix(u64);
+
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u32) -> u32 {
+        (self.next() % u64::from(n)) as u32
+    }
+
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// Rough terrain at full resolution: kilometre-scale ripples plus texel-scale noise, so the
+/// bilinear weights and both fields are exercised (about −3 to +4 km).
+fn rough_field(res: u32, size_m: f64, seed: u64) -> Field {
+    let mut rng = SplitMix(seed);
+    let mut elevation_m = Vec::with_capacity((res * res) as usize);
+    for row in 0..res {
+        for col in 0..res {
+            let (x, z) = (col as f32, row as f32);
+            let h = 500.0
+                + 2_500.0 * (x / 7.3).sin() * (z / 5.1).cos()
+                + 600.0 * (x * 1.7 + z * 2.3).sin()
+                + 200.0 * (rng.unit() - 0.5);
+            elevation_m.push(h);
+        }
+    }
+    Field {
+        res,
+        size_m,
+        surface: vec![[0; 4]; (res * res) as usize],
+        elevation_m,
+    }
+}
+
+fn r32_texture(device: &wgpu::Device, queue: &wgpu::Queue, field: &Field) -> wgpu::TextureView {
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("heights"),
+            size: wgpu::Extent3d {
+                width: field.res,
+                height: field.res,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        bytemuck::cast_slice(&field.elevation_m),
+    );
+    texture.create_view(&Default::default())
+}
+
+/// How far the shader's morphed coordinate may sit from `morph_vertex`'s: max(1 mm, two f32 ulps
+/// of the position measured from the root corner, `coordinate − root`).
+///
+/// Ruling R13 allows one ulp "at the coordinate" because the GPU may fuse `… × quad + root` into
+/// one rounding. But the rounding Rust does there is of the product, `(cell − odd·k·2^lod) ×
+/// quad`, which is the position from the root corner at −1,200 km, up to 2,400 km: one ulp of it
+/// is 1/8 m even where the coordinate itself is small. Metal does fuse it (the test counts how
+/// many differences match the fused sequence exactly). The second ulp covers the morph factor:
+/// WGSL allows division and `sqrt` a few ulps of error, and `k × 2^lod × quad` magnifies that.
+fn xz_tolerance_m(coordinate: f32, root: f32) -> f32 {
+    XZ_TOLERANCE_M.max(2.0 * ulp(coordinate - root))
+}
+
+/// One f32 ulp at `v`.
+fn ulp(v: f32) -> f32 {
+    let v = v.abs();
+    f32::from_bits(v.to_bits() + 1) - v
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_morph_matches_rust() {
+    let center = geo_to_render(latlon_to_geo(46.5, 10.0));
+    let grid = RegionGrid {
+        spec: RegionSpec::new(center, YearsBp(0.0), 1),
+        inner: rough_field(REGION_RES, REGION_SIZE_M, 1),
+        apron: rough_field(APRON_RES, APRON_SIZE_M, 2),
+    };
+    let settings = LodSettings::region();
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    println!("adapter: {:?}", adapter.get_info());
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cdlod parity"),
+        source: wgpu::ShaderSource::Wgsl(format!("{CDLOD}\n{MORPH_ENTRY}").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("cdlod parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let inner = r32_texture(&device, &queue, &grid.inner);
+    let apron = r32_texture(&device, &queue, &grid.apron);
+
+    let mut rng = SplitMix(0x7F1E_0007);
+    let per_camera = MORPH_VERTICES / MORPH_CAMERAS.len();
+    let (mut worst_xz, mut worst_xz_ulps, mut worst_h, mut worst_y) =
+        (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let (mut partial, mut odd, mut apron_far, mut checked) = (0, 0, 0, 0);
+    let (mut differing, mut fused_matches) = (0, 0);
+    let quad = settings.finest_quad_m() as f32;
+    let root = (-settings.extent_m() / 2.0) as f32;
+    for camera in MORPH_CAMERAS {
+        let patches = select_patches(DVec3::from(Vec3::from(camera)), &settings);
+        let instances = patch_instances(&patches, &settings);
+        let params = TerrainParams::new(&grid, &settings).with_camera(Vec3::from(camera));
+        let buffer_bytes = terrain_buffer_bytes(&params, &instances, instances.len());
+        // Random vertices, half of them on a patch edge (where neighbours must agree).
+        let queries: Vec<[u32; 4]> = (0..per_camera)
+            .map(|k| {
+                let slot = rng.below(instances.len() as u32);
+                let (mut i, mut j) = (rng.below(33), rng.below(33));
+                if k % 2 == 0 {
+                    if rng.below(2) == 0 {
+                        i = [0, 32][rng.below(2) as usize];
+                    } else {
+                        j = [0, 32][rng.below(2) as usize];
+                    }
+                }
+                [i, j, slot, 0]
+            })
+            .collect();
+
+        let storage = |label, data: &[u8]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: data,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        };
+        let terrain_buf = storage("terrain", &buffer_bytes);
+        let query_buf = storage("queries", bytemuck::cast_slice(&queries));
+        let bytes = (queries.len() * 16) as u64;
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out"),
+            size: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: terrain_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&inner),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&apron),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: query_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(queries.len().div_ceil(64) as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+        queue.submit([encoder.finish()]);
+        read_buf
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let got: Vec<[f32; 4]> =
+            bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+                .to_vec();
+
+        for (q, g) in queries.iter().zip(&got) {
+            let patch = &patches[q[2] as usize];
+            let [x, z] = morph_vertex([q[0], q[1]], patch, camera, &settings);
+            // The morph factor and cells, as `morph_vertex` computes them.
+            let cell = patch.origin_cells(&settings);
+            let step = 1u32 << patch.lod;
+            let p = |axis: usize| (cell[axis] + q[axis] * step) as f32 * quad + root;
+            let (px, pz) = (p(0) - camera[0], p(1) - camera[2]);
+            let k = morph_factor(
+                (px * px + camera[1] * camera[1] + pz * pz).sqrt(),
+                patch.morph_range_m,
+            );
+            for (axis, (gpu, rust)) in [(g[0], x), (g[1], z)].into_iter().enumerate() {
+                let d = (gpu - rust).abs();
+                let tolerance = xz_tolerance_m(rust, root);
+                assert!(
+                    d <= tolerance,
+                    "xz: gpu {gpu} vs rust {rust} (diff {d} > {tolerance}) at {q:?} of {patch:?}, camera {camera:?}"
+                );
+                worst_xz = worst_xz.max(d);
+                worst_xz_ulps = worst_xz_ulps.max(d / ulp(rust - root));
+                if d > 0.0 {
+                    differing += 1;
+                    // The Rust steps with only the last `× quad + root` fused into one rounding.
+                    let c = (cell[axis] + q[axis] * step) as f32;
+                    let slid = c - (q[axis] & 1) as f32 * k * step as f32;
+                    let fused = (f64::from(slid) * f64::from(quad) + f64::from(root)) as f32;
+                    fused_matches += usize::from(gpu == fused);
+                }
+            }
+            // Heights at the GPU's own xz, so an ulp of xz on a steep slope is not counted
+            // against the height function.
+            let (gx, gz) = (f64::from(g[0]), f64::from(g[1]));
+            let h = blended_height_m(&grid, gx, gz);
+            let dh = (g[2] - h).abs();
+            assert!(
+                dh <= HEIGHT_TOLERANCE_M,
+                "height: gpu {} vs rust {h} at ({gx}, {gz})",
+                g[2]
+            );
+            worst_h = worst_h.max(dh);
+            let horizontal =
+                ((gx - f64::from(camera[0])).powi(2) + (gz - f64::from(camera[2])).powi(2)).sqrt();
+            let y = h - curvature_drop_m(horizontal) as f32;
+            let dy = (g[3] - y).abs();
+            assert!(
+                dy <= HEIGHT_TOLERANCE_M,
+                "y: gpu {} vs rust {y} at ({gx}, {gz})",
+                g[3]
+            );
+            worst_y = worst_y.max(dy);
+
+            // Coverage of the cases that matter.
+            partial += usize::from(k > 0.0 && k < 1.0);
+            odd += usize::from(q[0] % 2 == 1 || q[1] % 2 == 1);
+            apron_far += usize::from(x.abs().max(z.abs()) > 524_288.0);
+            checked += 1;
+        }
+    }
+    println!(
+        "{checked} vertices ({partial} partly morphed, {odd} with an odd index, {apron_far} beyond 524 km): \
+         worst xz {worst_xz:e} m ({worst_xz_ulps} ulp of the position from the root corner), \
+         height {worst_h:e} m, displaced y {worst_y:e} m; {differing} coordinates differ, \
+         {fused_matches} of them exactly as a fused `× quad + root`"
+    );
+    assert_eq!(checked, MORPH_VERTICES);
+    assert!(partial >= 10, "only {partial} partly morphed vertices");
+    assert!(odd >= MORPH_VERTICES / 2, "only {odd} odd vertices");
+    assert!(apron_far >= 10, "only {apron_far} far apron vertices");
 }

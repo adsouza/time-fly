@@ -26,6 +26,7 @@
 pub mod frames;
 pub mod generate;
 mod job;
+pub mod launch;
 pub mod tiles;
 
 use std::sync::Arc;
@@ -38,16 +39,20 @@ use timefly_core::worldgen::frame::RegionFrame;
 use timefly_core::worldgen::generate::{RegionGrid, RegionSpec};
 use timefly_core::worldgen::{APRON_RES, REGION_RES};
 
+use crate::data::GlobeLoadState;
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use frames::{CpuGrid, CpuGridLoader, FrameCache};
 use job::{
     TileIndex, advance_frames, advance_tiles, leave_region, poll_generation, poll_overview,
     poll_tile_manifest, start_region_request,
 };
+use launch::{LaunchRegion, request_launch_region};
 use tiles::{TileCache, TileManifest, TileManifestLoader};
 
 /// The web's generation budget per frame (design spec §6.1).
 pub const WEB_GEN_BUDGET_MS: f64 = 6.0;
+/// The region camera's starting height above the ground at the region centre (design §6.1).
+pub const CAMERA_START_ALTITUDE_M: f32 = 8_000.0;
 /// The detail seed of every region: a region is a function of its centre and snapshot.
 pub const REGION_SEED: u32 = 0x7F1E_0002;
 
@@ -192,6 +197,10 @@ impl Plugin for RegionPlugin {
                     poll_generation,
                 )
                     .chain(),
+            )
+            .add_systems(
+                OnEnter(GlobeLoadState::Ready),
+                request_launch_region.run_if(resource_exists::<LaunchRegion>),
             );
     }
 }

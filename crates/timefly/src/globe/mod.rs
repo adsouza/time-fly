@@ -279,6 +279,11 @@ pub struct GlobeDebugView(pub bool);
 #[derive(Component)]
 pub struct GlobeCamera;
 
+/// Marks the globe's sun. The region has its own (`crate::terrain::view::TerrainSun`), which
+/// must not steer the globe materials' sun direction.
+#[derive(Component)]
+pub struct GlobeSun;
+
 /// The system that copies the globe camera's `Transform` and projection to the bridge cameras.
 /// Anything that moves the globe camera runs before it, so the bridge views never lag a frame.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -517,6 +522,7 @@ fn spawn_globe(
     ));
     commands.spawn((
         Name::new("Sun"),
+        GlobeSun,
         DirectionalLight {
             shadow_maps_enabled: false,
             ..default()
@@ -650,7 +656,7 @@ fn update_globe_view(
 
 /// Copies the sun light's direction into the materials when the light moves.
 fn sync_sun(
-    lights: Query<&GlobalTransform, (With<DirectionalLight>, Changed<GlobalTransform>)>,
+    lights: Query<&GlobalTransform, (With<GlobeSun>, Changed<GlobalTransform>)>,
     mut scene: ResMut<GlobeScene>,
     mut plates_m: ResMut<Assets<PlateMaterial>>,
     mut oceans_m: ResMut<Assets<OceanMaterial>>,
@@ -726,7 +732,8 @@ fn sync_bridge_cameras(
         *layers = wanted;
     }
     let bridging = mode == GlobeMode::Bridge;
-    let active = warming_up || bridging;
+    // Not while the globe camera is off (a region view replaces it).
+    let active = camera.is_active && (warming_up || bridging);
     if active
         && let Some(size) = camera.physical_target_size()
         && size != scene.target_size

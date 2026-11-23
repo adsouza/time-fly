@@ -1,9 +1,11 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--target-fps N` and `--window WxH`. A value may follow its flag as `--flag=value` or as the
+//! `--target-fps N`, `--window WxH` and `--region LAT,LON,AGE_YEARS`. A value may follow its flag as `--flag=value` or as the
 //! next argument; a next argument that starts with `--` is the next flag, never a value.
 //! `--check-data` takes its optional value only as `--check-data=DIR`.
+
+use timefly_core::deep_time::MAX_YEARS_BP;
 
 use crate::diagnostics::ProbeMode;
 
@@ -20,6 +22,9 @@ pub struct LaunchArgs {
     pub window: Option<(u32, u32)>,
     /// Hidden `--check-data[=DIR]` (native only): load the globe data headlessly and exit.
     pub check_data: Option<DataCheck>,
+    /// `--region=LAT,LON,AGE_YEARS` (web: `?region=LAT,LON,AGE_YEARS`): enter the region centred
+    /// there once the globe data is ready.
+    pub region: Option<RegionArg>,
     /// Unrecognized arguments. Diagnostics log only their count because URL query
     /// values and command-line arguments can contain private data.
     pub unknown: Vec<String>,
@@ -38,6 +43,39 @@ const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
+const REGION_FLAG: &str = "--region";
+
+/// Where `--region` asks to go: an era-frame latitude and longitude (degrees, as the globe shows
+/// them at that age) and an age in years before present.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct RegionArg {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub years: f64,
+}
+
+// `parse_region` only builds finite values, so equality is reflexive.
+impl Eq for RegionArg {}
+
+/// `LAT,LON,AGE_YEARS` with latitude in [−90, 90], longitude in [−180, 180] and the age in
+/// [0, 540 Ma]; every value finite, whitespace around each allowed.
+pub fn parse_region(text: &str) -> Option<RegionArg> {
+    let values: Vec<f64> = text
+        .split(',')
+        .map(|v| v.trim().parse::<f64>().ok().filter(|v| v.is_finite()))
+        .collect::<Option<_>>()?;
+    let [lat_deg, lon_deg, years] = values[..] else {
+        return None;
+    };
+    let ok = (-90.0..=90.0).contains(&lat_deg)
+        && (-180.0..=180.0).contains(&lon_deg)
+        && (0.0..=MAX_YEARS_BP).contains(&years);
+    ok.then_some(RegionArg {
+        lat_deg,
+        lon_deg,
+        years,
+    })
+}
 
 /// `WxH` with both sides at least 1, e.g. `2560x1440`.
 pub fn parse_window_size(text: &str) -> Option<(u32, u32)> {
@@ -80,7 +118,7 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
             }
             continue;
         }
-        let Some(flag) = [PROBE_FLAG, TARGET_FPS_FLAG, WINDOW_FLAG]
+        let Some(flag) = [PROBE_FLAG, TARGET_FPS_FLAG, WINDOW_FLAG, REGION_FLAG]
             .into_iter()
             .find(|f| arg == *f || arg.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
         else {
@@ -95,6 +133,7 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
             match flag {
                 PROBE_FLAG => ProbeMode::parse(v).map(|m| parsed.diagnostics_probe = Some(m)),
                 TARGET_FPS_FLAG => parse_fps(v).map(|f| parsed.target_fps = Some(f)),
+                REGION_FLAG => parse_region(v).map(|r| parsed.region = Some(r)),
                 _ => parse_window_size(v).map(|s| parsed.window = Some(s)),
             }
             .is_some()
@@ -335,6 +374,72 @@ mod tests {
         let parsed = parse_launch_args(args(&["--check-database"]));
         assert_eq!(parsed.check_data, None);
         assert_eq!(parsed.unknown, args(&["--check-database"]));
+    }
+
+    #[test]
+    fn region_flag() {
+        let want = Some(RegionArg {
+            lat_deg: 46.5,
+            lon_deg: 10.0,
+            years: 0.0,
+        });
+        assert_eq!(
+            parse_launch_args(args(&["--region=46.5,10,0"])).region,
+            want
+        );
+        let parsed = parse_launch_args(args(&["--region", "46.5,10,0"]));
+        assert_eq!(parsed.region, want);
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        // Negative values are values, not flags; whitespace around a number is allowed.
+        let parsed = parse_launch_args(args(&["--region", "-33.9, -151.25 ,2.5e8"]));
+        assert_eq!(
+            parsed.region,
+            Some(RegionArg {
+                lat_deg: -33.9,
+                lon_deg: -151.25,
+                years: 2.5e8,
+            })
+        );
+        // The edges of each range are accepted.
+        assert!(parse_region("90,180,540000000").is_some());
+        assert!(parse_region("-90,-180,0").is_some());
+    }
+
+    #[test]
+    fn malformed_region_is_rejected() {
+        for bad in [
+            "46.5,10",
+            "46.5,10,0,1",
+            "a,b,c",
+            "46.5,,0",
+            "",
+            "90.5,0,0",
+            "0,180.5,0",
+            "0,0,-1",
+            "0,0,540000001",
+            "NaN,0,0",
+            "0,inf,0",
+        ] {
+            let parsed = parse_launch_args(args(&[&format!("--region={bad}")]));
+            assert_eq!(parsed.region, None, "{bad}");
+            assert_eq!(parsed.unknown, vec![format!("--region={bad}")], "{bad}");
+        }
+        // A missing value: the next flag is not swallowed.
+        let parsed = parse_launch_args(args(&["--region", "--scrub-bench"]));
+        assert_eq!(parsed.region, None);
+        assert!(parsed.scrub_bench);
+        assert_eq!(parsed.unknown, args(&["--region"]));
+    }
+
+    #[test]
+    fn web_query_region() {
+        let want = parse_launch_args(args(&["--region=46.5,10,21000"])).region;
+        assert!(want.is_some());
+        assert_eq!(parse_query_args("?region=46.5,10,21000").region, want);
+        assert_eq!(parse_query_args("?region=46.5%2C10%2C21000").region, want);
+        let parsed = parse_query_args("?region=north");
+        assert_eq!(parsed.region, None);
+        assert_eq!(parsed.unknown, args(&["--region=north"]));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod diagnostics;
 pub mod globe;
 pub mod gpu;
 pub mod region;
+pub mod terrain;
 pub mod time;
 pub mod ui;
 
@@ -23,6 +24,8 @@ use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
 use globe::GlobePlugin;
 use region::RegionPlugin;
+use region::launch::LaunchRegion;
+use terrain::TerrainCdlodPlugin;
 use ui::GameUiPlugins;
 
 /// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
@@ -82,9 +85,13 @@ pub fn app(session: &Session) -> App {
         GlobeDataPlugin::default(),
         GlobePlugin,
         RegionPlugin,
+        TerrainCdlodPlugin,
         OrbitCameraPlugin,
         GameUiPlugins,
     ));
+    if let Some(region) = args.region {
+        app.insert_resource(LaunchRegion(region));
+    }
     if args.scrub_bench {
         let default_fps = if cfg!(target_arch = "wasm32") {
             bench::WEB_TARGET_FPS

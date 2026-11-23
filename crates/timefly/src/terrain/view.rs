@@ -1,0 +1,184 @@
+//! The region view: the [`RegionCamera`] and the region's sun, and the switch between them and
+//! the globe camera.
+//!
+//! The region lives in its own world units (1 unit = 1 m around the region centre, design
+//! §3) and its own render layer ([`TERRAIN_LAYER`]), so the globe (1 unit = 1 km, layers 0–3)
+//! never shows in it. While the terrain scene exists and [`TerrainSettings::visible`] is on, the
+//! region camera is active and draws the UI, and the globe camera is inactive (which also stops
+//! the globe's offscreen bridge cameras).
+//!
+//! Task 7's camera is a fixed debug view: [`CAMERA_START_ALTITUDE_M`] above the ground at the
+//! region centre, looking north and pitched down [`DEBUG_PITCH_DEG`]. Task 9 replaces it with
+//! the fly camera; the terrain follows whatever moves the `RegionCamera`'s `Transform`.
+
+use bevy::camera::visibility::RenderLayers;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::light::CascadeShadowConfigBuilder;
+use bevy::prelude::*;
+use timefly_core::terrain::blended_height_m;
+use timefly_core::worldgen::generate::RegionGrid;
+
+use super::{TERRAIN_LAYER, TerrainScene, TerrainSettings};
+use crate::globe::GlobeCamera;
+use crate::region::CAMERA_START_ALTITUDE_M;
+
+/// The debug camera's downward pitch.
+pub const DEBUG_PITCH_DEG: f32 = 20.0;
+/// The region camera's vertical field of view.
+pub const REGION_FOV_DEG: f32 = 60.0;
+/// Near plane (m). Depth is reversed-Z with an infinite far plane, so 1 m costs little.
+pub const REGION_NEAR_M: f32 = 1.0;
+/// Far plane (m), used for culling only: beyond the apron's corner seen from its centre.
+pub const REGION_FAR_M: f32 = 2_000_000.0;
+/// Shadow cascades cover the nearest 60 km (the camera's ceiling).
+pub const SHADOW_DISTANCE_M: f32 = 60_000.0;
+/// The first cascade's far bound.
+pub const FIRST_CASCADE_M: f32 = 2_500.0;
+/// Shadow cascades.
+pub const SHADOW_CASCADES: usize = 4;
+/// Direction toward the region's sun: west-south-west, 30° up, so relief reads across a
+/// north-facing view *(call; Task 8 tunes the look)*.
+pub const REGION_SUN_DIRECTION: Vec3 = Vec3::new(-0.70, 0.50, 0.51);
+/// The sun's illuminance (lux).
+pub const REGION_SUN_LUX: f32 = 10_000.0;
+/// The region camera's ambient light (cd/m²): enough to read shadowed slopes.
+pub const REGION_AMBIENT: f32 = 250.0;
+/// Clear colour behind the terrain until Task 8's sky.
+pub const REGION_SKY: Color = Color::srgb(0.55, 0.68, 0.82);
+/// Camera order: above the globe camera's, though only one of them is active at a time.
+pub const REGION_CAMERA_ORDER: isize = 1;
+
+/// The camera that views a region. Spawned with the terrain scene, inactive until the view
+/// switches to it.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct RegionCamera;
+
+/// The region's directional light (shadow-casting, on [`TERRAIN_LAYER`]). The globe's own sun
+/// is a different entity, with `crate::globe::GlobeSun`.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct TerrainSun;
+
+/// The debug camera over a grid: [`CAMERA_START_ALTITUDE_M`] above the higher of the ground and
+/// the sea at the centre, looking north (−z), pitched down [`DEBUG_PITCH_DEG`].
+pub fn debug_camera_transform(grid: &RegionGrid) -> Transform {
+    let ground = blended_height_m(grid, 0.0, 0.0).max(0.0);
+    Transform::from_xyz(0.0, ground + CAMERA_START_ALTITUDE_M, 0.0)
+        .with_rotation(Quat::from_rotation_x(-DEBUG_PITCH_DEG.to_radians()))
+}
+
+/// Spawns the region camera (inactive) and the region's sun; returns `(camera, sun)`.
+pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (Entity, Entity) {
+    let camera = commands
+        .spawn((
+            Name::new("Region camera"),
+            RegionCamera,
+            Camera3d::default(),
+            Camera {
+                is_active: false,
+                order: REGION_CAMERA_ORDER,
+                clear_color: ClearColorConfig::Custom(REGION_SKY),
+                ..default()
+            },
+            Projection::Perspective(PerspectiveProjection {
+                fov: REGION_FOV_DEG.to_radians(),
+                near: REGION_NEAR_M,
+                far: REGION_FAR_M,
+                near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -REGION_NEAR_M),
+                ..default()
+            }),
+            // A LUT-free tonemapper: the LUT ones need a feature this build may not carry.
+            Tonemapping::AcesFitted,
+            AmbientLight {
+                color: REGION_SKY,
+                brightness: REGION_AMBIENT,
+                ..default()
+            },
+            debug_camera_transform(grid),
+            RenderLayers::layer(TERRAIN_LAYER),
+        ))
+        .id();
+    let sun = commands
+        .spawn((
+            Name::new("Region sun"),
+            TerrainSun,
+            DirectionalLight {
+                illuminance: REGION_SUN_LUX,
+                shadow_maps_enabled: true,
+                ..default()
+            },
+            CascadeShadowConfigBuilder {
+                num_cascades: SHADOW_CASCADES,
+                first_cascade_far_bound: FIRST_CASCADE_M,
+                maximum_distance: SHADOW_DISTANCE_M,
+                ..default()
+            }
+            .build(),
+            Transform::from_translation(REGION_SUN_DIRECTION.normalize())
+                .looking_at(Vec3::ZERO, Vec3::Y),
+            RenderLayers::layer(TERRAIN_LAYER),
+        ))
+        .id();
+    debug!(?camera, ?sun, "region camera and sun spawned");
+    (camera, sun)
+}
+
+/// Whether the region camera should replace the globe camera.
+pub fn region_view_wanted(scene_exists: bool, settings: &TerrainSettings) -> bool {
+    scene_exists && settings.visible
+}
+
+/// Activates exactly one of the globe and region cameras, and gives it the UI.
+#[expect(clippy::type_complexity, reason = "camera queries")]
+pub(super) fn sync_region_view(
+    mut commands: Commands,
+    scene: Option<Res<TerrainScene>>,
+    settings: Res<TerrainSettings>,
+    mut globe: Query<
+        (Entity, &mut Camera, Has<IsDefaultUiCamera>),
+        (With<GlobeCamera>, Without<RegionCamera>),
+    >,
+    mut region: Query<
+        (Entity, &mut Camera, Has<IsDefaultUiCamera>),
+        (With<RegionCamera>, Without<GlobeCamera>),
+    >,
+) {
+    let wanted = region_view_wanted(scene.is_some(), &settings) && !region.is_empty();
+    let mut switch = |entity: Entity, camera: &mut Camera, has_ui: bool, active: bool| {
+        if camera.is_active != active {
+            camera.is_active = active;
+        }
+        if active && !has_ui {
+            commands.entity(entity).insert(IsDefaultUiCamera);
+        } else if !active && has_ui {
+            commands.entity(entity).remove::<IsDefaultUiCamera>();
+        }
+    };
+    let mut changed = false;
+    for (entity, mut camera, has_ui) in &mut region {
+        changed |= camera.is_active != wanted;
+        switch(entity, &mut camera, has_ui, wanted);
+    }
+    for (entity, mut camera, has_ui) in &mut globe {
+        switch(entity, &mut camera, has_ui, !wanted);
+    }
+    if changed {
+        info!(region_view = wanted, "view switched");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_view_needs_a_scene_and_visibility() {
+        let on = TerrainSettings::default();
+        let off = TerrainSettings {
+            visible: false,
+            ..on
+        };
+        assert!(region_view_wanted(true, &on));
+        assert!(!region_view_wanted(false, &on));
+        assert!(!region_view_wanted(true, &off));
+    }
+}
