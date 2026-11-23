@@ -673,3 +673,96 @@ docs/testing/region-m2/              screenshots, performance.md
   - The plan's appendix records every ruling and owner decision made during M2, so they survive
     the git-ignored ledger. This is M1's lesson.
 - [ ] **Step 5: Run the full suites,** `cargo fmt --check`, clippy, and the wasm check. Commit.
+
+---
+
+## Known limitations (accepted for Milestone 2)
+
+- **Deep-era biomes depend on the apron (R9).** Coast distance comes from each region's own
+  apron, so overlapping deep-time regions can differ in biome colour near distance thresholds.
+  Heights stay exact. The later fix is a global coast-distance precompute.
+- **Thin cracks between plate footprints (R17).** Within 50 km of plate land, a region shows the
+  source frame's land where the globe draws a one-pixel −200 m water line. The globe can adopt
+  the same fill later.
+- **Glacial ice in mountains (R18).** ICE-6G_C's 1° grid has no Alpine ice at 21 ka, so a lowered
+  snowline stands in for mountain glaciers: summits and ridges are iced, but not the
+  valley-filling ice network of the Last Glacial Maximum. The credits say so.
+- **The overview decodes on the web's main thread (R11).** The 12.4 MB overview is checked
+  (SHA-256) and decoded (37 MB) in one piece on the first region of a session. Ruling R11 gates
+  it: no frame of the first region's load may exceed 250 ms in Chrome WebGPU on the M4
+  (`--region-bench` reports it; see `docs/testing/region-m2/performance.md`). If it fails, the
+  overview is split into latitude bands in the bake or decoded in chunks.
+- **ETOPO detail steps at the 0.5 weight (R5).** A deep snapshot reads the ETOPO tiles only while
+  the ETOPO-backed bridge endpoint weighs at least 0.5; below that it reads the 5′ overview,
+  though ETOPO still carries up to 49% of the height. Detail changes in one step at that age.
+- **Deep-era biomes are zonal approximations.** They come from palaeolatitude, elevation and
+  coast distance, not from a climate model. The credits carry the data note.
+- **Ice-age biomes use the present-day climate.** Recent snapshots (21 ka and so on) read the
+  1991–2020 Köppen-Geiger classes; only ice, sea level and the snowline change with the age. The
+  credits carry the data note.
+- **Plate overlaps after a cache eviction (R19).** A snapshot change carries the camera with the
+  plate the globe draws, ranked from the old snapshot's cached frames. If those frames were
+  evicted from the 4-slot frame cache, the overlap falls back to the lowest plate ID.
+- **Generation is mostly sequential.** The region prep (70–80% of native generation) runs on one
+  thread; only the rows are parallel. Native regions take under 1 s, so this is headroom, not a
+  problem. A cancelled native job runs to completion in the background before it is dropped.
+- **Paint follows the morphing geometry.** Beach, mat and snow thresholds use the interpolated
+  CDLOD height, so snowlines and beach edges crawl slightly as patches morph. Foam is a solid pale
+  band from high up (an art-pass item).
+- **The geographic-frame limit is a constant.** `GEOGRAPHIC_FRAME_MAX_YEARS` (26,076 years)
+  matches the bake's ICE-6G_C coverage but is not read from the timeline.
+- **The packages grow by about 257 MB** for the region tiles (2,592 tiles of 244.0 MB, the 12.4 MB
+  overview and the manifest). The tiles are already zstd-compressed, so the `.deb`'s xz gains
+  almost nothing on them.
+- **Browser numbers are provisional.** As in M1, Chrome is measured on an Apple M4, faster than
+  the spec's M1-class reference.
+
+---
+
+## Appendix: Rulings and deviations
+
+The execution ledger (`.superpowers/sdd/2026-11-23-milestone-2-region-worlds/progress.md`) is
+git-ignored, so the rulings and owner decisions are copied here verbatim. Each ruling gives what
+was decided, why, and the cost if it proves wrong.
+
+**Owner decisions**
+
+- 2026-11-23: present-day elevation option B (ETOPO 2022 60″). "Go with your picks for the rest" (all other choices are controller calls, marked *(call)* in the design).
+- 2026-11-23: downloads approved: ETOPO_2022_v1_60s_N90W180_surface.nc (478,290,125 B) and koppen_geiger_tif.zip (130.6 MB, md5 7fc2f5a15d4f5fe0ce59c9a9b502aa09). The controller downloads; implementers never download.
+- Execution: subagent-driven. This is the controller's pick under "go with your picks"; the owner was told the recommendation.
+
+**Controller rulings**
+
+- Ruling R1: the region constants (`REGION_SIZE_M`, `APRON_SIZE_M`, `REGION_RES`, `APRON_RES`) live in `timefly_core::worldgen` (`worldgen/mod.rs`), added by T3. `PATCH_QUADS`, `MORPH_START` and `MORPH_END` live in `timefly_core::terrain` (T6). Camera and fade constants live in the shell (`fly_camera.rs` and `region/mod.rs`, T9). — No task named a home, and the core needs the sizes first. — Cost if wrong: a move.
+- Ruling R2: T4's `RegionGenerator` also exposes a pure `fn rows(&self, field: FieldKind, range: Range<u32>) -> FieldRows` (`FieldKind::{Inner, Apron}`; `FieldRows { elevation_m: Vec<f32>, surface: Vec<[u8; 4]> }`), plus `fn assemble(&self, inner: Vec<FieldRows>, apron: Vec<FieldRows>) -> RegionGrid`. `new` precomputes the coarse lattice and coast distance. `generate_rows` and `finish` remain as the sequential convenience, built on `rows`. — T5 needs parallel row ranges on native and time-boxed chunks on the web from one pure API. — Cost if wrong: an API reshuffle in T4 and T5.
+- Ruling R3: T5 writes its fixture tiles (`crates/timefly/tests/assets/data/tiles/`, four tiles plus a manifest) with a small, committed generator, either a test helper or a bake-tool call on synthetic input, whichever is simpler. — The plan didn't say who produces them. — Cost if wrong: none.
+- Ruling R4: T1's implementer does not download. The controller already did, and the dispatch carries the file paths and SHA-256s for `data/sources.json`. — Downloads need the owner's OK (M1 ruling R2). — Cost if wrong: none.
+- Ruling R5: there is no separate "bridge era" field. Real timeline: ICE-6G ≤ 26.076 ka; bridge frame (modern terrain, source rotation 0) at 30 ka; next PaleoDEM at 4.47 Ma, so the 50 ka/100 ka/1 Ma snapshots are `FrameSelection::Deep` brackets (bridge frame ↔ 4.47 Ma), and ages between 26.076 and 30 ka are `FrameSelection::Bridge`. DeepField samples each endpoint through a per-endpoint sampler: the modern-terrain bridge frame reads ETOPO tiles at the rotated direction (geographic, present-day), any other endpoint reads its cube frame. The M1 rule elev − anomaly still applies per endpoint (R11). `FrameSelection::Bridge` (26–30 ka): RecentField's last ICE-6G result crossfaded into that DeepField by `deep_weight`. source_spacing_m = 1,852 m when the ETOPO-backed endpoint's weight ≥ 0.5, else 111 km. BridgeField from the plan is dropped. — This matches M1's frame selection, so regions agree with the globe, and recent-ish deep snapshots get ETOPO detail. — Cost if wrong: one field reshaped.
+- Ruling R6: RecentField takes the ICE-6G bracket (two frames + older_weight) and the present-day frame: Topo_era = lerp(Topo_young, Topo_old, w); delta = Topo_era − Topo_present, where present is timeline frame 0. Ice = lerp of the B channels. — Most recent snapshots fall between ICE-6G frames (e.g. 21 ka = 0.021 Ma vs frames at 0.020076/0.021076). — Cost if wrong: none (single-frame is the w=0 case).
+- Ruling R7: the apron never reads tiles. A global 5′ overview grid (`assets/data/tiles/overview.tfgrid`, 2-channel F16 LatLon node lattice 2161 × 4321, lat 90→−90 and lon −180→+180 at 1/12°, elevation = mean of the 60″ nodes in each 5×5 block, Köppen = mode) is baked by `timefly-bake tiles` and listed in the manifest. TileSet gains `overview: Option<Arc<Grid>>`. Samples read a tile if one is loaded, else the overview, else the cube frames. `needed_for` covers the inner field only (+ margin). — This keeps every apron texel a pure function of its direction (overlap stays exact), bounds tile counts to the inner field (≤ ~80 even at the poles), improves the missing-tile fallback (9 km instead of ~78 km), and is one ~10–15 MB fetch on the web. — Cost if wrong: a coarser horizon than per-tile data.
+- Ruling R8: construction becomes incremental: `RegionPrep::new(spec, &field)` (cheap), `prep.step(max_nodes) -> bool` (true when done) and `prep.finish() -> RegionGenerator`. `RegionGenerator::new` stays as `prep.step(u32::MAX)` then finish. — Task 5's web path must stay within its 6 ms budget per frame; a 0.1–0.6 s (longer on wasm) block on entry would stall the transition. — Cost if wrong: API churn in T5.
+- Ruling R9: parked: deep-era biomes depend on each region's apron through coast distance, so overlapping regions may differ in biome colour near distance thresholds. Terrain heights stay exact. Accepted for M2 as a known limitation (plan appendix); a global coast-distance precompute is the later fix. — Spec §5.2 agreement is about the world surface; a small biome-colour shift between visits is not a coastline or ice disagreement. — Cost if wrong: a visible colour shift when re-entering an adjacent deep region.
+- Ruling R10: split now: `worldgen/coarse/{mod,recent,deep}.rs` and `worldgen/generate/{mod,lattice,detail}.rs` (tests stay in generate/tests.rs). — Over the ~600-line guide, and T5–T7 will read them. — Cost if wrong: churn.
+- Ruling R11: Important 2 split. Now in T5: bounded LRU cache of decoded CPU frames by image slot (≤ 4 slots); count prep.finish/assemble (and the probe) inside the slice timing so longest_ms tells the truth. Gate in T10: in Chrome WebGPU on the M4, no single frame during the first region's load may exceed 250 ms; if it does, split the overview into latitude bands in the bake (or decode it in chunks) and re-measure. — wasm has no worker pool, and the 12.4 MB overview is R7's own cost; the threshold gives T10 a pass/fail. — Cost if wrong: a visible hitch on the first web region.
+- Ruling R12: odd grid indices morph to the even index below (i − 1), standard CDLOD. The brief's "midpoint of its even neighbours" is the vertex's own xz position, so it was a wording error. T7 must mirror i − 1. — Cost if wrong: none (equivalent crack-free scheme).
+- Ruling R13: T7's GPU morph check tolerance on xz is max(1e-3 m, 1 f32 ulp at |coordinate|) (one ulp ≈ 0.06 m at 1.2 Mm), to allow fused multiply-adds. Height tolerance stays 0.5 m. — Cost if wrong: a looser parity check on far apron vertices only.
+- Ruling R14: finest patch 4,687.5 m (APRON_SIZE_M/512), not the brief's rounded 4,688 m, so ten levels tile ±1.2 Mm exactly. — Cost if wrong: none.
+- Ruling R15 (preflight miss): T7's eye check needs `--region` (owned by T9) and a camera in the region. T7 adds the `--region=LAT,LON,AGE_YEARS` / `?region=` launch arg (parse + startup RegionRequested once globe data is Ready) and a fixed debug camera at CAMERA_START_ALTITUDE_M (8,000 m) above the centre, looking north and pitched down 20°; T9 swaps in the fly camera and keeps the arg (its region_arg_parses test then extends T7's). Screenshots come from an offscreen `examples/region_tour.rs` (M1 ui_tour pattern: render to an image, save, exit by itself), never a windowed app killed by timeout. — T7 must be verifiable by eye before T9. — Cost if wrong: small churn in T9.
+- Ruling R16: T7's xz tolerance is max(1 mm, 2 ulps of (x − patch root)), replacing R13's "1 ulp at |coordinate|". The GPU fuses `cells × quad + root` into one rounding of an intermediate up to 2,400 km, so R13 can't pass on Metal; neighbours evaluate the identical expression, so GPU crack-freedom is unaffected (measured worst 1.375 such ulps; 198/199 differences match a fused model). — Cost if wrong: a looser CPU/GPU parity bound only.
+- Ruling R17: regions deliberately differ from the globe in thin era-fixed cracks (≤ 50 km from plate land): they show the source frame's land, where the globe draws a 1-pixel −200 m water line. The globe's line is itself an artefact of the crack between footprints; the spec's agreement rule concerns real coastlines. The globe can adopt the same fill later (follow-up). — Cost if wrong: a hairline mismatch with the globe at plate seams.
+- Ruling R18: glacial snowline depression. snowline_m gains the era's sea-level anomaly: snowline lowered by 1,000 m × (anomaly / −120 m), clamped to [0, 1,200] m of lowering, in core and the shader mirror. A credits data note says mountain glaciers below ICE-6G's 1° grid are approximated by a lowered snowline. Follow-up to T8 after the T9 review. — The Alps at the LGM were glaciated (spec anti-goal: ice must match era); a cheap physically motivated proxy (LGM ELA depression ≈ 1 km) beats bare peaks. — Cost if wrong: snow slightly too low or too high in glacial eras.
+- Ruling R19: carry_crust_position gains a `surface_for_candidate` closure (a deviation from the plan's signature), which the shell builds with rendered_surface's ranking from the `from` snapshot's CPU frames (FrameCache) and DeepSampling. Inside the geographic frame (recent) the carry stays the identity. — Spec §5.2's overlap rule must be the same everywhere; the plan's signature was the defect. — Cost if wrong: one more frame lookup per snapshot change.
+- Ruling R20: T10 split as in M1 (R3): the implementer builds the region bench, runs it natively on the M4, makes the CI/Pages/packaging/docs/plan-appendix edits and commits locally. The controller runs the Chrome WebGPU bench in the in-app browser pane (including R11's 250 ms first-region frame gate) and, only with the owner's OK, pushes and dispatches CI. — Subagents lack the browser pane, and pushes need the owner. — Cost if wrong: none.
+
+**Other deviations from the plan text**
+
+- Task 5: `GlobeData.timeline` and `.crust` became `Arc`s; the CPU frame loader is chosen by asset
+  type rather than a `#cpu` label; `RegionLeft` and `RegionSnapshotChanged` got their own
+  semantics (a request back at the shown snapshot ends in `RegionEntered`).
+- Task 9: `carry_crust_position` takes a `surface_for_candidate` closure (R19), so a carry follows
+  the plate the globe draws.
+- Task 10: `RegionGenerated` gained `bytes_fetched` (the tiles' file bytes) for the bench's
+  report. `--check-data` also loads the tiles beside the globe folder: the manifest, the overview
+  and the three largest tiles, size- and SHA-256-checked. `--region-bench` takes precedence over
+  `--scrub-bench` and `--region`. The bench's enter/leave memory cycles run inside the bench
+  (after the three regions) rather than as a separate tool, so the web run measures them too.
