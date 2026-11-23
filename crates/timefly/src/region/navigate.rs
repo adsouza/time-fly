@@ -57,6 +57,7 @@ use super::{
 use crate::camera::{
     MAX_LATITUDE_DEG, MIN_DISTANCE_KM, OrbitCameraSystems, OrbitState, ease_toward,
 };
+use crate::clock::LoadClock;
 use crate::data::GlobeData;
 use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState};
 use crate::globe::{EARTH_RADIUS_KM, GlobeCamera};
@@ -81,7 +82,8 @@ pub const FALLBACK_NOTICE_TEXT: &str = "terrain detail unavailable here";
 /// How long the fallback notice shows after the region appears.
 pub const FALLBACK_NOTICE_S: f64 = 3.0;
 /// A request the region plugin never starts on (it ignores requests it cannot serve, with a
-/// `warn`) stops the descent after this long.
+/// `warn`) stops the descent after this long, on the [`LoadClock`]: a hidden tab or paused page
+/// does not cancel it.
 pub const START_TIMEOUT_S: f64 = 2.0;
 /// The haze the views fade through.
 pub const FADE_COLOR: Color = Color::srgb(0.86, 0.89, 0.93);
@@ -258,7 +260,8 @@ pub fn fallback_notice_shown(since_s: Option<f64>, now_s: f64, region_up: bool) 
 pub enum NavPhase {
     Globe,
     /// A region was requested from the globe; the orbit camera eases toward `target`.
-    /// `started` once the region plugin has left `RegionState::Globe` for it.
+    /// `started` once the region plugin has left `RegionState::Globe` for it. `since_s` is on
+    /// the [`LoadClock`].
     Descending {
         target: RenderDir,
         since_s: f64,
@@ -343,6 +346,8 @@ pub struct TimeChange {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct NavInputs {
     pub now_s: f64,
+    /// The [`LoadClock`]: running time, which [`START_TIMEOUT_S`] is measured on.
+    pub load_s: f64,
     pub dt_s: f32,
     pub region_state: RegionState,
     pub time: YearsBp,
@@ -421,7 +426,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 }));
                 NavPhase::Descending {
                     target,
-                    since_s: i.now_s,
+                    since_s: i.load_s,
                     started: false,
                 }
             } else {
@@ -445,7 +450,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             } else if started && i.region_state == RegionState::Globe {
                 // The generation failed (the region plugin logged why).
                 NavPhase::Globe
-            } else if !started && i.now_s - since_s > START_TIMEOUT_S {
+            } else if !started && i.load_s - since_s > START_TIMEOUT_S {
                 NavPhase::Globe
             } else {
                 NavPhase::Descending {
@@ -634,6 +639,7 @@ pub struct RegionNavigationPlugin;
 
 impl Plugin for RegionNavigationPlugin {
     fn build(&self, app: &mut App) {
+        crate::clock::add_load_clock(app);
         app.init_resource::<Navigation>()
             .init_resource::<TerrainSettings>()
             .init_resource::<OrbitState>()
@@ -889,6 +895,7 @@ fn show_node(node: &mut Mut<Node>, shown: bool) {
 fn navigate(
     mut nav: ResMut<Navigation>,
     real: Res<Time<Real>>,
+    clock: Res<LoadClock>,
     region_state: Res<State<RegionState>>,
     input: NavInput,
     globe: Option<Res<GlobeData>>,
@@ -939,6 +946,7 @@ fn navigate(
     let changed = events.2.read().count() > 0;
     let inputs = NavInputs {
         now_s,
+        load_s: clock.elapsed_s,
         dt_s,
         region_state: state,
         time: time.years,

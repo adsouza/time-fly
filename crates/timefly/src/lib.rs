@@ -9,6 +9,7 @@ pub mod build_features;
 pub mod camera;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
+pub mod clock;
 pub mod clusters;
 pub mod data;
 pub mod diagnostics;
