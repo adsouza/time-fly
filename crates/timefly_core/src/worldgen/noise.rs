@@ -24,8 +24,9 @@ const GRADIENTS: [[f32; 3]; 12] = [
     [0.0, -1.0, -1.0],
 ];
 
-/// Scales raw gradient noise into [-1, 1]: with these gradients the raw value cannot exceed about
-/// 1.03 even for the worst-case gradient at every corner, so the result stays within 0.88.
+/// Scales raw gradient noise. The raw value cannot exceed about 1.03 (even with the worst gradient
+/// at every corner) and a dense scan reaches 0.99, so results lie within +-0.88 and reach about
+/// +-0.84. `noise_peak_is_pinned` holds both numbers.
 const NOISE_SCALE: f32 = 0.85;
 
 /// PCG3D-style integer hash of a lattice cell and a seed. Wrapping `u32` operations only.
@@ -57,11 +58,19 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Gradient noise at `frac` inside `cell`, in [-1, 1]. `frac` is each component in [0, 1].
+/// Gradient noise at `frac` inside `cell`, within +-0.88 (peaks reach about 0.84). `frac` is each component in [0, 1].
 pub fn gradient_noise3(cell: [i32; 3], frac: [f32; 3], seed: u32) -> f32 {
     // The dot product of the corner's gradient with the offset from that corner to the point.
     let corner = |dx: i32, dy: i32, dz: i32| -> f32 {
-        let h = hash3([cell[0] + dx, cell[1] + dy, cell[2] + dz], seed);
+        // Wrapping, like WGSL's i32 addition, so cells at the i32 extremes agree on both sides.
+        let h = hash3(
+            [
+                cell[0].wrapping_add(dx),
+                cell[1].wrapping_add(dy),
+                cell[2].wrapping_add(dz),
+            ],
+            seed,
+        );
         let g = GRADIENTS[((h >> 16) % 12) as usize];
         g[0] * (frac[0] - dx as f32) + g[1] * (frac[1] - dy as f32) + g[2] * (frac[2] - dz as f32)
     };
@@ -93,7 +102,7 @@ fn octave_seed(seed: u32, i: u32) -> u32 {
 }
 
 /// Fractal Brownian motion: `octaves` gradient-noise layers, each `lacunarity` times finer and
-/// `gain` times weaker than the last, normalised to [-1, 1].
+/// `gain` times weaker than the last, normalised by the total amplitude to within +-0.88.
 pub fn fbm(
     p_m: DVec3,
     base_cell_m: f64,
@@ -114,7 +123,7 @@ pub fn fbm(
 }
 
 /// Ridged multifractal (lacunarity 2, gain 0.5): sharp crests where the noise crosses zero,
-/// in [0, 1].
+/// in [0.0144, 1]: each octave contributes `(1 - |n|)^2` with |n| <= 0.88.
 pub fn ridged(p_m: DVec3, base_cell_m: f64, octaves: u32, seed: u32) -> f32 {
     let (mut sum, mut total, mut amp, mut cell_m) = (0.0f32, 0.0f32, 1.0f32, base_cell_m);
     for i in 0..octaves {
@@ -133,6 +142,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    const NOISE_PEAK_BOUND: f32 = 0.88;
+    const RIDGED_FLOOR: f32 = 0.0144;
     const GOLDEN: &str = include_str!("../../tests/fixtures/noise_golden.json");
 
     fn frac3() -> impl Strategy<Value = [f32; 3]> {
@@ -142,13 +153,13 @@ mod tests {
     proptest! {
         #[test]
         fn gradient_noise_is_bounded_and_continuous(
-            cell in prop::array::uniform3(-100_000i32..100_000),
+            cell in prop::array::uniform3(prop_oneof![-100_000i32..100_000, Just(i32::MAX), Just(i32::MIN)]),
             f in frac3(),
             seed in any::<u32>(),
             axis in 0usize..3,
             other in prop::array::uniform2(0.0f32..=1.0),
         ) {
-            prop_assert!(gradient_noise3(cell, f, seed).abs() <= 1.0);
+            prop_assert!(gradient_noise3(cell, f, seed).abs() <= NOISE_PEAK_BOUND);
             // The face x_axis = 1 of `cell` is the face x_axis = 0 of its neighbour.
             let (i, j) = match axis { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
             let mut a = [0.0f32; 3];
@@ -158,7 +169,7 @@ mod tests {
             a[axis] = 1.0;
             b[axis] = 0.0;
             let mut next = cell;
-            next[axis] += 1;
+            next[axis] = next[axis].wrapping_add(1);
             let d = (gradient_noise3(cell, a, seed) - gradient_noise3(next, b, seed)).abs();
             prop_assert!(d <= 1e-6, "face mismatch {d}");
         }
@@ -183,9 +194,9 @@ mod tests {
             seed in any::<u32>(),
         ) {
             let p = DVec3::from_array(p);
-            prop_assert!(fbm(p, 5_000.0, octaves, 2.0, 0.5, seed).abs() <= 1.0);
+            prop_assert!(fbm(p, 5_000.0, octaves, 2.0, 0.5, seed).abs() <= NOISE_PEAK_BOUND);
             let r = ridged(p, 5_000.0, octaves, seed);
-            prop_assert!((0.0..=1.0).contains(&r), "{r}");
+            prop_assert!((RIDGED_FLOOR - 1e-6..=1.0).contains(&r), "{r}");
         }
     }
 
@@ -198,18 +209,30 @@ mod tests {
         assert_ne!(hash3(c, 5), hash3([3, -7, 12], 5));
     }
 
-    #[test]
-    fn noise_peak_reaches_most_of_the_range() {
+    /// Peak |noise| over a dense sample of many cells and fractions.
+    fn dense_peak() -> f32 {
         let mut peak = 0.0f32;
-        for i in 0..4000u32 {
-            let f = [
-                (i % 16) as f32 / 15.0,
-                ((i / 16) % 16) as f32 / 15.0,
-                (i / 256) as f32 / 15.0,
-            ];
-            peak = peak.max(gradient_noise3([i as i32, 0, 1], f, 9).abs());
+        for i in 0..2000u32 {
+            for k in 0..4096u32 {
+                let f = [
+                    (k % 16) as f32 / 15.0,
+                    ((k / 16) % 16) as f32 / 15.0,
+                    (k / 256) as f32 / 15.0,
+                ];
+                peak = peak.max(gradient_noise3([i as i32, 7, -3], f, i).abs());
+            }
         }
-        assert!(peak > 0.5, "noise looks flat: peak {peak}");
+        peak
+    }
+
+    #[test]
+    fn noise_peak_is_pinned() {
+        let peak = dense_peak();
+        assert!(
+            peak <= NOISE_PEAK_BOUND,
+            "peak {peak} above the documented bound"
+        );
+        assert!(peak >= 0.80, "peak {peak}: noise lost range");
     }
 
     fn golden_rows() -> Vec<serde_json::Value> {
@@ -266,7 +289,15 @@ mod tests {
         };
         let mut rows = Vec::new();
         for _ in 0..256 {
-            let cell = [0, 0, 0].map(|_| (next() >> 8) as i32 % 2001 - 1000);
+            // Mostly +-1e6 (planet-scale cells are about 6.4e5 at 10 m), plus rows with
+            // negative, zero and i32-extreme words so the high bits of the hash input vary.
+            let n = rows.len();
+            let cell = [0, 0, 0].map(|_| match n {
+                0..=159 => (next() >> 8) as i32 % 2_000_001 - 1_000_000,
+                160..=199 => (next() >> 8) as i32 % 1_280_001 - 640_000,
+                _ => [i32::MIN, i32::MAX, -1, 0, i32::MIN + 1, i32::MAX - 1]
+                    [(next() >> 8) as usize % 6],
+            });
             let frac = [0, 0, 0].map(|_| (next() >> 8) as f32 / (1u32 << 24) as f32);
             let seed = next();
             let value = gradient_noise3(cell, frac, seed);

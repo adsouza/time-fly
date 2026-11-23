@@ -55,7 +55,8 @@ fn corner(cell: vec3<i32>, frac: vec3<f32>, d: vec3<i32>, seed: u32) -> f32 {
     return dot(g, frac - vec3<f32>(d));
 }
 
-// Gradient noise at `frac` inside `cell`, in [-1, 1].
+// Gradient noise at `frac` inside `cell`, within +-0.88 (peaks reach about 0.84), as pinned by
+// the Rust tests. i32 addition of neighbour offsets wraps, matching the Rust copy.
 fn gradient_noise3(cell: vec3<i32>, frac: vec3<f32>, seed: u32) -> f32 {
     let u = fade(frac.x);
     let v = fade(frac.y);
