@@ -457,6 +457,8 @@ mod tests {
         app.update();
         let entities = app.world().resource::<RegionWarmup>().entities.clone();
         assert_eq!(entities.len(), 5);
+        // Its camera has no clusters (ruling R28), without the app-wide observer.
+        crate::clusters::assert_no_clusters(app.world_mut());
         // Six textures (four fields, the palette, the 1 x 1 target), one mesh, one buffer, one
         // of each material.
         assert_eq!(asset_counts(&app), [6, 1, 1, 1, 1, 1]);

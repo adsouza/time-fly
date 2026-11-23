@@ -16,6 +16,7 @@ use bevy::camera::Exposure;
 use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::CascadeShadowConfigBuilder;
+use bevy::light::cluster::ClusterConfig;
 use bevy::prelude::*;
 use timefly_core::terrain::blended_height_m;
 use timefly_core::worldgen::generate::RegionGrid;
@@ -101,6 +102,9 @@ pub(super) fn region_camera() -> Camera {
 pub(super) fn region_camera_parts(grid: &RegionGrid) -> impl Bundle {
     (
         Camera3d::default(),
+        // No clustered lights in a region (one directional sun); on WebGPU Bevy 0.20 re-creates
+        // the cluster buffers every frame and they are never destroyed (ruling R28).
+        ClusterConfig::None,
         Projection::Perspective(PerspectiveProjection {
             fov: REGION_FOV_DEG.to_radians(),
             near: REGION_NEAR_M,

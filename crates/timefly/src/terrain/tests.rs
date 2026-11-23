@@ -313,6 +313,13 @@ fn the_region_camera_takes_over_while_the_terrain_is_shown() {
     app.update();
     app.update();
     assert_eq!(cameras(&mut app), (false, false, true, true));
+    // The region camera has no clusters (ruling R28; the pool app has no observer to add it).
+    let world = app.world_mut();
+    let region_camera = world.resource::<TerrainScene>().camera;
+    assert!(matches!(
+        world.get::<bevy::light::cluster::ClusterConfig>(region_camera),
+        Some(bevy::light::cluster::ClusterConfig::None)
+    ));
     // Hidden: the globe comes back and every patch hides.
     app.world_mut().resource_mut::<TerrainSettings>().visible = false;
     app.update();

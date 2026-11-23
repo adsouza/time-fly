@@ -366,6 +366,33 @@ delta clamped to 0.25 s. (3) Each region block reports host stalls (frames over 
 
 **Pending:** the gated Chrome measurement is a re-run in real Chrome with the window in front.
 
+### Web memory: per-frame cluster buffers (ruling R28), 2026-11-23
+
+Measured by the controller in Chrome WebGPU (build `4f36589`, in a region): the renderer process
+grew about 45 MB/s, to 5.6 GB in 105 s (9 GB in an earlier run), while the wasm memory
+(263 MiB) and the JS heap (16 MiB) stayed flat. Hooking `GPUDevice.createBuffer` showed 4.6 new
+buffers a frame, 26.7 MB/s, and no `destroy()` call:
+
+| Buffer | Per frame |
+|---|---|
+| `StorageBuffer<GpuClusterableObjectIndexListsStorage>` (mapped) | 262,144 B |
+| `StorageBuffer<GpuClusterOffsetsAndCountsStorage>` (mapped) | 117,504 B |
+| `UninitBufferVec<[UVec4; 2]>` | 117,504 B |
+| `UninitBufferVec<ClusterableObjectZSlice>` | 12,288 B |
+| "clustering Z slicing metadata buffer" | 48 B |
+
+Bevy 0.20 builds every view's cluster buffers afresh each frame; wgpu 30's WebGPU buffer `Drop`
+does not destroy them. The game has no clusterable objects, so every `Camera3d` now has
+`ClusterConfig::None` and GPU clustering is off (`GlobalClusterSettings::gpu_clustering =
+None`). `ClusterConfig::None` alone would still have allocated the GPU path's 262,144-byte index
+list each frame (its size is the clustering capacity, not the cluster count); the CPU path left
+running still makes each active view's cluster buffers every frame, at their minimum size.
+Native renders are unchanged (region_tour shots of the Himalayas, the Rockies and Pangaea
+pixel-identical before and after). The post-fix Chrome measurement is the controller's.
+
+The bench's web memory gate reads only the wasm linear memory, so it could not see this
+(plan appendix, R28).
+
 ### Chrome WebGPU, real Chrome (gated; pending)
 
 _To be run by the controller in the in-app browser pane._ Build and serve from

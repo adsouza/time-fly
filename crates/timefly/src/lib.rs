@@ -8,6 +8,7 @@ pub mod bench;
 pub mod camera;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
+pub mod clusters;
 pub mod data;
 pub mod diagnostics;
 pub mod fly_camera;
@@ -87,6 +88,7 @@ pub fn app(session: &Session) -> App {
     #[cfg(target_arch = "wasm32")]
     let plugins = plugins.disable::<bevy::app::PanicHandlerPlugin>();
     app.add_plugins(plugins).add_plugins((
+        clusters::NoClusteringPlugin,
         time::TimePlugin,
         GlobeDataPlugin::default(),
         GlobePlugin,
