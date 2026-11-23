@@ -760,8 +760,10 @@ docs/testing/region-m2/              screenshots, performance.md
   pipelines and the first region would compile its own as before.
 - **Bench caveats (R20, R21).** The native M4 bench ran at 1920 × 951 (the 1080p display clamps
   the requested window); the 2560 × 1440 desktop measurement is part of the owner's Linux run
-  (`docs/testing/linux-vulkan.md`, section 7). The Chrome WebGPU bench, with ruling R11's
-  first-region gate, is the controller's run and was pending when this appendix was written.
+  (`docs/testing/linux-vulkan.md`, section 7). In the final fix wave the M4 also ran at
+  2560 × 1440 on a 4K display (uncapped, PASS on all four regions; performance.md). The Chrome
+  WebGPU bench, with ruling R11's first-region gate, is the controller's run and was pending
+  when this appendix was written.
 - **Chrome/Tint paths unverified until that run.** Code paths Metal never compiles: the
   prepass's `UNCLIPPED_DEPTH_ORTHO_EMULATION` branch (Task 7), the water shader's PBR call after
   a non-uniform discard (Task 8) and a dynamic const-array index in the noise (Task 2). Per-pixel

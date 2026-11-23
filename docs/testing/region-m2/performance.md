@@ -273,6 +273,24 @@ result: PASS
   plate's own terms within 150 m of sea level (finding 4).
 - **Scrub bench** (M1, the same binary, `--scrub-bench`): PASS; see the final fix report.
 
+#### 2560 × 1440 on the M4 (`5396955`)
+
+The main display became a 3840 × 2160 monitor during the session, so the requested 2560 × 1440
+window fit. That display did not pace `AutoNoVsync` frames, so the uncapped rule (p95 ≤ 16.67 ms)
+decided. All four regions PASS, summary `result: PASS`:
+
+| Region | Generation (first entry) | Load worst frame | Flight median / p95 / worst | Stalls (> 33.3 ms) | Result |
+|---|---|---|---|---|---|
+| Alps | 725 ms (cold) | 33.8 ms (R11 line) | 10.35 / 13.00 / 28.69 ms | 0 | PASS |
+| Scandinavia | 440 ms | 16.9 ms | 11.19 / 15.74 / 87.96 ms | 5 | PASS |
+| Pangaea | 344 ms | 16.8 ms | 11.03 / 14.36 / 48.64 ms | 6 | PASS |
+| Aegean | 2,647 ms | 27.7 ms | 7.14 / 9.49 / 26.57 ms | 0 | PASS |
+
+Warm generation median 486 ms, max 537 ms. Memory cycles 1,142.7–1,153.8 MiB on the globe
+(+1.0%), 1,227.8–1,234.4 MiB in the region (larger window, so not comparable with the
+1920 × 951 runs). An earlier attempt was invalid: the display changed mid-run and the window
+resized (2338 × 1237 to 2567 × 1237).
+
 #### The two-level deep path on the real bake (finding 4)
 
 `cargo test --release -p timefly_core --test real_bake_region modern_path_on_the_real_bake -- --ignored --nocapture`
