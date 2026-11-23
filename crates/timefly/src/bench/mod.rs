@@ -480,7 +480,8 @@ fn header_lines_titled(
     }
     out.push(format!(
         "system spans: {}",
-        if cfg!(feature = "system-spans") {
+        // Spans run natively only (ruling R29).
+        if cfg!(all(feature = "system-spans", not(target_arch = "wasm32"))) {
             "on"
         } else {
             "off"

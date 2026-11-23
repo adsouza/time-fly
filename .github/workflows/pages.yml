@@ -49,6 +49,9 @@ jobs:
           enable-cache: true
           cache-dependency-glob: tools/bake/uv.lock
 
+      - name: No trace spans on wasm (ruling R29)
+        run: tools/dev/test-check-wasm-spans.sh
+
       - name: Build the WebGPU app
         run: cargo build --locked --profile web-release --target wasm32-unknown-unknown -p timefly
 

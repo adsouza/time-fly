@@ -408,12 +408,27 @@ delta clamped to 0.25 s. (3) Each region block reports host stalls (frames over 
 
 **Pending:** the gated Chrome measurement is a re-run in real Chrome with the window in front.
 
-### Web memory: per-frame cluster buffers (ruling R28), 2026-11-23
+### Web memory: trace spans (ruling R29) and cluster buffers (ruling R28), 2026-11-23
 
-Measured by the controller in Chrome WebGPU (build `4f36589`, in a region): the renderer process
-grew about 45 MB/s, to 5.6 GB in 105 s (9 GB in an earlier run), while the wasm memory
-(263 MiB) and the JS heap (16 MiB) stayed flat. Hooking `GPUDevice.createBuffer` showed 4.6 new
-buffers a frame, 26.7 MB/s, and no `destroy()` call:
+Measured by the controller in Chrome WebGPU (in a region): the renderer process grew about
+45–50 MB/s, to 5.6 GB in 105 s (the owner saw 9 GB), while the wasm memory (263 MiB) and the
+JS heap (16 MiB) stayed flat.
+
+**The cause: Bevy's trace spans on wasm (R29).** The default feature `system-spans` enabled
+`bevy/trace` in every web build (M1's and the Pages site included). On wasm, bevy_log installs
+`tracing_wasm::WASMLayer`, which writes a `performance.mark` and a `performance.measure` for
+every span enter and exit: measured at 60 fps, 131,581 marks and 131,581 measures a second (1.12
+million of each after about 10 s), each with a long span name, all kept by the browser: about
+50 MB/s. A minimal WebGPU control page in the same pane stayed flat at 22 MB, and with the game
+running, `performance.clearMarks()` and `clearMeasures()` every 0.5 s flattened the renderer
+(1,688 → 1,725 MB over 30 s). Spans are now native-only: `system-spans` enables `bevy_internal`'s
+`trace` and `debug` through a native-only dependency, so no wasm build enables `bevy_ecs`
+`trace` (`cargo tree -e features --target wasm32-unknown-unknown -p timefly -i bevy_ecs` shows
+none; the native tree still has it), the web build line no longer claims `system-spans`, and
+`tools/dev/check-wasm-spans.sh` guards it in the Pages workflow.
+
+**Secondary: per-frame cluster buffers (R28).** Hooking `GPUDevice.createBuffer` also showed
+4.6 new buffers a frame, 26.7 MB/s of buffer allocations, and no `destroy()` call:
 
 | Buffer | Per frame |
 |---|---|
@@ -424,16 +439,17 @@ buffers a frame, 26.7 MB/s, and no `destroy()` call:
 | "clustering Z slicing metadata buffer" | 48 B |
 
 Bevy 0.20 builds every view's cluster buffers afresh each frame; wgpu 30's WebGPU buffer `Drop`
-does not destroy them. The game has no clusterable objects, so every `Camera3d` now has
-`ClusterConfig::None` and GPU clustering is off (`GlobalClusterSettings::gpu_clustering =
+does not destroy them. This churn was real but not what grew the renderer (clearing the
+performance marks alone flattened it). The game has no clusterable objects, so every `Camera3d`
+has `ClusterConfig::None` and GPU clustering is off (`GlobalClusterSettings::gpu_clustering =
 None`). `ClusterConfig::None` alone would still have allocated the GPU path's 262,144-byte index
 list each frame (its size is the clustering capacity, not the cluster count); the CPU path left
 running still makes each active view's cluster buffers every frame, at their minimum size.
 Native renders are unchanged (region_tour shots of the Himalayas, the Rockies and Pangaea
 pixel-identical before and after). The post-fix Chrome measurement is the controller's.
 
-The bench's web memory gate reads only the wasm linear memory, so it could not see this
-(plan appendix, R28).
+The bench's web memory gate reads only the wasm linear memory, so it could see neither
+(plan appendix).
 
 ### Chrome WebGPU, real Chrome (gated; pending)
 
