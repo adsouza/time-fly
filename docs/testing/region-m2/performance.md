@@ -298,6 +298,45 @@ resized (2338 × 1237 to 2567 × 1237).
 While the bench runs, a translucent banner at the top centre shows the current stop (region,
 age, `k of 9` with the pan counted), `Next: …` on the globe, and at the end the result.
 
+#### With the Red Sea (R30), native M4, 2560 × 1440 (`07658ba`, 2026-11-23)
+
+The rerun after jobs 8 and 9 (native spans unchanged; the Red Sea second). This time the 4K
+display paced every flight at 60 Hz (medians 16.66–16.67 ms), so the display-paced rule decided
+everywhere, and **every gate passed**, Pangaea included: its earlier FAIL (below) came from a
+pacing switch halfway through its flight, which did not recur, so no banner-suppressed run was
+needed.
+
+| Stop | Generation (first entry) | Tiles / frames fetched | Load worst frame | Flight median / p95 / worst | Missed (> 25 ms) | Result |
+|---|---|---|---|---|---|---|
+| Pangaea interior | 582 ms | 0 / 2 | 18.1 ms (R11 line) | 16.67 / 17.36 / 39.45 ms | 7 of 3,601 (0.19%) | PASS |
+| Red Sea | 515 ms | 2 (275,711 B) / 1 | 18.5 ms | 16.66 / 17.44 / 28.28 ms | 4 (0.11%) | PASS |
+| Himalayas | 330 ms | 1 / 0 | 32.6 ms | 16.66 / 17.09 / 35.01 ms | 2 (0.06%) | PASS |
+| Sundaland | 330 ms | 2 / 2 | 31.5 ms | 16.67 / 17.03 / 18.83 ms | 0 | PASS |
+| Japan | 1,998 ms | 4 / 2 | 32.6 ms | 16.66 / 17.15 / 27.30 ms | 3 (0.08%) | PASS |
+| Beringia | 398 ms | 2 / 1 | 25.9 ms | 16.66 / 17.61 / 27.52 ms | 9 (0.24%) | PASS |
+| globe pan (8 s) | — | — | — | 16.67 / 17.53 / 18.06 ms (480 frames) | — | PASS |
+| Rockies ice margin | 631 ms | 2 / **0** | 18.9 ms | 16.67 / 17.09 / 19.50 ms | 0 | PASS |
+| Panama | 330 ms | 0 / 1 | 17.9 ms | 16.67 / 17.40 / 32.65 ms | 4 (0.11%) | PASS |
+
+The Red Sea's coast run followed a coast 6.8 km from the centre and stayed within 5.8 km of it.
+Frame reuse: the Himalayas (after the Red Sea, both 0 ka) and the Rockies (after Beringia)
+fetched none; Beringia fetched one, as before (Japan's 1 Ma frames evict one 21 ka slot of the
+4-slot cache), so inserting the Red Sea changed nothing there.
+
+```text
+===== Time Fly region bench summary =====
+build: 0.1.0 (07658ba, release, aarch64-apple-darwin; system-spans)
+regions (R14 frame rate): Pangaea interior PASS, Red Sea PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS
+first-region worst frame (R11 gate <= 250 ms, request to first path frame, overview decode included): 18.12 ms -> PASS (native: reported only, the gate applies in Chrome WebGPU)
+Himalayas load-window worst frame (cold tiles; reported only): 32.63 ms
+warm generation (10 re-entries of Himalayas, target <= 3000 ms): median 314 ms, max 331 ms -> PASS
+first entries (cold tiles; reported only natively): Pangaea interior 582 ms, Red Sea 515 ms, Himalayas 330 ms, Sundaland 330 ms, Japan 1998 ms, Beringia 398 ms, Rockies ice margin 631 ms, Panama 330 ms
+memory cycles (phys_footprint, includes GPU allocations on Apple silicon, on the globe after each leave): 1: 1093.1 MiB, 2: 1077.0 MiB, 3: 1077.4 MiB, 4: 1087.5 MiB, 5: 1077.8 MiB, 6: 1077.5 MiB, 7: 1088.9 MiB, 8: 1079.4 MiB, 9: 1079.1 MiB, 10: 1089.3 MiB; worst of cycles 2-10 is -0.3% of cycle 1 (limit +10%) -> PASS
+  in the region: 1: 1170.0 MiB, 2: 1170.7 MiB, 3: 1170.8 MiB, 4: 1164.0 MiB, 5: 1171.2 MiB, 6: 1171.2 MiB, 7: 1165.4 MiB, 8: 1172.8 MiB, 9: 1172.9 MiB, 10: 1165.9 MiB
+result: PASS
+===== end region bench summary =====
+```
+
 #### Final bench set, native M4, 2560 × 1440 (`5022c32`, 2026-11-23)
 
 The single run after the Chrome-bench round and jobs 2–7 (Himalayas, Beringia and the Rockies
