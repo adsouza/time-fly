@@ -8,3 +8,4 @@ pub mod geodynamics;
 pub mod globe;
 pub mod sha256;
 pub mod surface;
+pub mod worldgen;

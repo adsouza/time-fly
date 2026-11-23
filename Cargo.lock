@@ -5700,6 +5700,7 @@ dependencies = [
  "half",
  "proptest",
  "ruzstd",
+ "serde_json",
  "tracing",
 ]
 
