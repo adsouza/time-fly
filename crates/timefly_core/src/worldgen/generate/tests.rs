@@ -320,14 +320,22 @@ fn deep_matches_globe() {
     let rotations: Vec<PlateRotations> = (0..2)
         .map(|p| plate_rotations(crust.rotations(), PlateIndex(p), &sampling))
         .collect();
+    // The globe's land, plus the thin era-fixed cracks within 50 km of plate land where a
+    // region shows the frames' own land instead of the shell's crack fill (`sliver_land_m`).
+    let slivers = std::cell::Cell::new(0);
     let globe_land = |d: RenderDir| {
-        rendered_surface(&crust, d, &sampling, &rotations, |_, _| {
+        let land = rendered_surface(&crust, d, &sampling, &rotations, |_, _| {
             crate::globe::FrameSample {
                 elevation_m: 500.0,
                 covered: true,
             }
         })
-        .is_land()
+        .is_land();
+        if !land && deep.sliver_land_m(d).is_some() {
+            slivers.set(slivers.get() + 1);
+            return true;
+        }
+        land
     };
     // Straddling plate 202's western edge (render z ~ 0.3).
     let spec = spec_at(dir(0.0, 72.0), 100.0, 33, 33);
@@ -380,6 +388,97 @@ fn deep_matches_globe() {
     assert!(
         agreed > 1000 && land > 100 && sea > 100,
         "{agreed} {land} {sea}"
+    );
+    // The fixture's gap edge is such a crack along its first 50 km.
+    assert!(slivers.get() > 0);
+}
+
+#[test]
+fn thin_era_fixed_cracks_stay_land() {
+    // The 10 Ma Task 8 shot's straight channels: lattice nodes landing in a thin crack between
+    // plates read the globe's ocean shell, whose covered land is the -200 m crack fill, so rows
+    // of texels dipped below sea level across dry land.
+    let frames = rift_frames(|_| (400.0, true));
+    let tiles = TileSet::new();
+    for (gap_deg, label) in [(0.4f32, "thin"), (4.0, "wide")] {
+        let crust = sliver(gap_deg);
+        let field = rift_deep(&crust, &frames, &tiles, 100.0);
+        let SnapshotField::Deep(deep) = &field else {
+            panic!()
+        };
+        let sampling = *deep.sampling();
+        let rotations: Vec<PlateRotations> = (0..2)
+            .map(|p| plate_rotations(crust.rotations(), PlateIndex(p), &sampling))
+            .collect();
+        let mid = crack_dir(0.0, -f64::from(gap_deg) / 2.0);
+        let globe = rendered_surface(&crust, mid, &sampling, &rotations, |_, _| {
+            crate::globe::FrameSample {
+                elevation_m: 400.0,
+                covered: true,
+            }
+        });
+        assert_eq!(
+            globe,
+            crate::globe::RenderedSurface::Ocean,
+            "{label}: the globe's crack"
+        );
+        let grid = generate(spec_at(mid, 100.0, 65, 33), &field);
+        let lowest = |f: &Field| f.elevation_m.iter().copied().fold(f32::MAX, f32::min);
+        let g = RegionGenerator::new(spec_at(mid, 100.0, 65, 33), &field);
+        if label == "thin" {
+            // 44 km wide: every crack point is within 50 km of plate land.
+            assert_eq!(deep.sliver_land_m(mid), Some(400.0));
+            assert!(
+                lowest(&grid.inner) > 0.0,
+                "inner dips to {}",
+                lowest(&grid.inner)
+            );
+            assert!(
+                lowest(&grid.apron) > 0.0,
+                "apron dips to {}",
+                lowest(&grid.apron)
+            );
+        } else {
+            // 445 km wide: its middle is a real gap and keeps the globe's water.
+            assert_eq!(deep.sliver_land_m(mid), None);
+            assert!(g.sample_point(mid).0 < 0.0);
+            let edge = crack_dir(0.0, -0.1);
+            assert!(deep.sliver_land_m(edge).is_some(), "the gap's first 50 km");
+        }
+    }
+}
+
+#[test]
+fn detail_has_no_step_at_plate_boundaries() {
+    // Two plates meeting with no gap, over flat 400 m land: only the detail's seed changes
+    // across the boundary. Each key's detail is independent noise, so without blending the
+    // boundary was a step of hundreds of metres along a straight footprint edge: the dark lines
+    // of the 10 Ma Task 8 shot.
+    let crust = sliver(0.0);
+    let frames = rift_frames(|_| (400.0, true));
+    let tiles = TileSet::new();
+    let field = rift_deep(&crust, &frames, &tiles, 100.0);
+    let grid = generate(spec_at(crack_dir(0.0, 0.0), 100.0, 257, 9), &field);
+    let f = &grid.inner;
+    let n = f.res as usize;
+    let mut steps: Vec<f32> = Vec::new();
+    for r in 0..n {
+        for c in 0..n - 1 {
+            steps.push((f.elevation_m[r * n + c + 1] - f.elevation_m[r * n + c]).abs());
+        }
+    }
+    for r in 0..n - 1 {
+        for c in 0..n {
+            steps.push((f.elevation_m[(r + 1) * n + c] - f.elevation_m[r * n + c]).abs());
+        }
+    }
+    steps.sort_by(f32::total_cmp);
+    let p99 = steps[steps.len() * 99 / 100];
+    let worst = *steps.last().unwrap();
+    println!("neighbour steps: p99 {p99:.1} m, worst {worst:.1} m");
+    assert!(
+        worst < 3.0 * p99,
+        "a seam: worst step {worst} m vs p99 {p99} m"
     );
 }
 

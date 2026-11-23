@@ -92,6 +92,8 @@ pub(super) struct Coarse {
     pub(super) kind: KeyKind,
     /// The highest-weight tap with a Köppen code, if any.
     pub(super) koppen: Option<u8>,
+    /// Every tap's key kind and bilinear weight, so detail can blend across key boundaries.
+    pub(super) taps: [(KeyKind, f64); 4],
 }
 
 /// The global coarse lattice of one cube size and source level, with the nodes a region needs
@@ -237,8 +239,10 @@ impl Lattice {
         let (mut e, mut ice) = (0.0, 0.0);
         let (mut best_w, mut kind) = (-1.0, KeyKind::EraFixed);
         let (mut koppen_w, mut koppen) = (-1.0, None);
-        for ((face, col, row), w) in bilinear_taps(dir, self.n) {
+        let mut taps = [(KeyKind::EraFixed, 0.0); 4];
+        for (k, ((face, col, row), w)) in bilinear_taps(dir, self.n).into_iter().enumerate() {
             let node = self.node(field, face, col, row);
+            taps[k] = (node.kind, w);
             e += w * f64::from(node.elevation_m);
             ice += w * f64::from(node.ice) / 255.0;
             if w > best_w {
@@ -255,6 +259,7 @@ impl Lattice {
             ice,
             kind,
             koppen,
+            taps,
         }
     }
 

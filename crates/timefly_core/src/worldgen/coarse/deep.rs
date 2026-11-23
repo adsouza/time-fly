@@ -18,6 +18,13 @@ use crate::worldgen::tiles::{SourceLevel, TILE_SPACING_M, TileSet};
 
 use super::modern::{PresentRead, SupportCache, support_cube_size};
 
+/// How far from plate land an era-fixed crack may lie and still show the frames' land
+/// ([`DeepField::sliver_land_m`]).
+pub const SLIVER_RADIUS_M: f64 = 50_000.0;
+/// The rings and bearings probed for plate land around a crack.
+const SLIVER_RING_M: [f64; 2] = [SLIVER_RADIUS_M / 2.0, SLIVER_RADIUS_M];
+const SLIVER_BEARINGS: u32 = 8;
+
 use super::{
     CoarseField, CoarseSample, DEEP_SPACING_M, FieldError, KeyKind, LatticeKey, check_cube,
     cube_bilinear, koppen_code, lat_lon,
@@ -208,7 +215,114 @@ impl<'a> DeepField<'a> {
         koppen_code(self.tiles.lookup(lat, lon, level)?.1)
     }
 
-    fn sample_with(&self, era_dir: RenderDir, level: SourceLevel) -> CoarseSample {
+    /// The region's value where the globe shows the ocean shell: the shell's depth, except in
+    /// a thin era-fixed sliver ([`sliver_land_m`](Self::sliver_land_m)), which shows the frames'
+    /// own land.
+    pub(super) fn ocean_value_m(
+        &self,
+        era: RenderDir,
+        key: &LatticeKey,
+        level: SourceLevel,
+    ) -> f64 {
+        self.ocean_value(era, key, level).0
+    }
+
+    /// [`ocean_value_m`](Self::ocean_value_m) and whether the sliver rule gave it.
+    pub(super) fn ocean_value(
+        &self,
+        era: RenderDir,
+        key: &LatticeKey,
+        level: SourceLevel,
+    ) -> (f64, bool) {
+        let samples = [
+            self.endpoint_sample(0, era, level),
+            self.endpoint_sample(1, era, level),
+        ];
+        if matches!(key, LatticeKey::EraFixed(_))
+            && let Some(land) = self.sliver_land(era, samples, level)
+        {
+            return (land, true);
+        }
+        let shell = shell_surface_m(&self.sampling, samples);
+        // The globe shows water here, whatever the shell's blend says.
+        let depth = if shell.is_nan() {
+            OCEAN_GAP_FALLBACK_M
+        } else {
+            shell.min(0.0)
+        };
+        (depth, false)
+    }
+
+    /// The frames' own land at an era direction the globe shows as the ocean shell's crack fill,
+    /// or `None`. That is the case when no plate is valid there (an era-fixed point), the
+    /// endpoints' blend (sea level applied, coverage ignored) is land, and plate land lies within
+    /// [`SLIVER_RADIUS_M`].
+    ///
+    /// Why: plate footprints are cube cells in each plate's own frame, so after relative motion
+    /// they leave thin straight slivers between plates where no plate is valid. The frames'
+    /// coverage mask (a 128-cube texel, filtered) still says "covered" there, so the globe's
+    /// shell clamps the frames' land to a −200 m crack fill: a 1-pixel line on the globe, but a
+    /// long straight channel through dry land in a region (the 10 Ma Task 8 shot). In the real
+    /// bake such points are 0.04–1% of the globe and 94–100% of them lie within 50 km of plate
+    /// land. Wider gaps keep the globe's rule.
+    pub fn sliver_land_m(&self, era_dir: RenderDir) -> Option<f64> {
+        let era = RenderDir(era_dir.0.normalize());
+        let level = SourceLevel::Overview;
+        let surface = rendered_surface(
+            self.crust,
+            era_dir,
+            &self.sampling,
+            &self.rotations,
+            |e, d| self.endpoint_sample(e, d, level),
+        );
+        if surface != RenderedSurface::Ocean
+            || !matches!(self.tracked_or_era_fixed(era.0), LatticeKey::EraFixed(_))
+        {
+            return None;
+        }
+        let samples = [
+            self.endpoint_sample(0, era, level),
+            self.endpoint_sample(1, era, level),
+        ];
+        self.sliver_land(era, samples, level)
+    }
+
+    fn sliver_land(
+        &self,
+        era: RenderDir,
+        samples: [FrameSample; 2],
+        level: SourceLevel,
+    ) -> Option<f64> {
+        // The shell's blend with every sample treated as uncovered: the frames' own surface.
+        let own = shell_surface_m(
+            &self.sampling,
+            samples.map(|s| FrameSample {
+                covered: false,
+                ..s
+            }),
+        );
+        if own.is_nan() || own <= 0.0 {
+            return None;
+        }
+        let (north, east) = RegionFrame { center: era }.north_east();
+        let near_plate_land = SLIVER_RING_M.iter().any(|&r| {
+            (0..SLIVER_BEARINGS).any(|k| {
+                let t = f64::from(k) * std::f64::consts::TAU / f64::from(SLIVER_BEARINGS);
+                let angle = r / crate::worldgen::frame::EARTH_RADIUS_M;
+                let tangent = north * t.cos() + east * t.sin();
+                let d = RenderDir((era.0 * angle.cos() + tangent * angle.sin()).normalize());
+                matches!(
+                    rendered_surface(self.crust, d, &self.sampling, &self.rotations, |e, dd| {
+                        self.endpoint_sample(e, dd, level)
+                    }),
+                    RenderedSurface::Land { .. }
+                )
+            })
+        });
+        near_plate_land.then_some(own)
+    }
+
+    pub(super) fn sample_with(&self, era_dir: RenderDir, level: SourceLevel) -> CoarseSample {
         let era = era_dir.0.normalize();
         // The globe's input as given, so the result is bit-identical to the globe's.
         let surface = rendered_surface(
@@ -236,20 +350,8 @@ impl<'a> DeepField<'a> {
                 (elevation_m, self.tracked_or_era_fixed(era))
             }
             RenderedSurface::Ocean => {
-                let shell = shell_surface_m(
-                    &self.sampling,
-                    [
-                        self.endpoint_sample(0, RenderDir(era), level),
-                        self.endpoint_sample(1, RenderDir(era), level),
-                    ],
-                );
-                // The globe shows water here, whatever the shell's blend says.
-                let depth = if shell.is_nan() {
-                    OCEAN_GAP_FALLBACK_M
-                } else {
-                    shell.min(0.0)
-                };
-                (depth, self.tracked_or_era_fixed(era))
+                let key = self.tracked_or_era_fixed(era);
+                (self.ocean_value_m(RenderDir(era), &key, level), key)
             }
         };
         let plate = match lattice {
@@ -539,5 +641,47 @@ mod tests {
         assert!(count > 1000, "{count}");
         assert!(worst < 1.0, "worst {worst} m over {count} points");
         assert!(edge_worst < 500.0, "edge worst {edge_worst} m");
+    }
+
+    #[test]
+    fn modern_path_agrees_on_land_and_sea_off_nodes() {
+        // Everywhere, plate edges, gaps and coasts included: where the reference is clearly land
+        // or sea (|elevation| > 150 m) the two-level sample is on the same side.
+        let (crust, fr, tiles) = modern_fixture();
+        let f = deep_at(&crust, &fr, &tiles, 1.0);
+        let (mut checked, mut edge, mut worst_miss) = (0, 0, 0.0f64);
+        let mut misses = Vec::new();
+        for lat in (-890..=890).step_by(9) {
+            for lon in (-1800..1800).step_by(11) {
+                let d = dir(f64::from(lat) / 10.0, f64::from(lon) / 10.0);
+                let reference = f.sample_with(d, SourceLevel::Overview).elevation_m;
+                if reference.abs() <= 150.0 {
+                    continue;
+                }
+                let modern = f.modern_sample(d, SourceLevel::Overview).elevation_m;
+                let carriers: Vec<_> = crate::cube::bilinear_taps(d, f.support_n)
+                    .iter()
+                    .map(|&((face, col, row), _)| f.support(face, col, row).carrier)
+                    .collect();
+                if !carriers.iter().all(|&c| c == carriers[0]) {
+                    edge += 1;
+                }
+                if (modern > 0.0) != (reference > 0.0) {
+                    worst_miss = worst_miss.max(reference.abs());
+                    misses.push((lat, lon, reference, modern));
+                }
+                checked += 1;
+            }
+        }
+        println!(
+            "{checked} points ({edge} at plate edges or gaps), {} sign misses",
+            misses.len()
+        );
+        assert!(checked > 20_000 && edge > 100, "{checked} {edge}");
+        assert!(
+            misses.is_empty(),
+            "worst |ref| {worst_miss}: {:?}",
+            &misses[..misses.len().min(8)]
+        );
     }
 }

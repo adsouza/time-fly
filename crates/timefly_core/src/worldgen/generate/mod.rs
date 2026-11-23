@@ -40,7 +40,7 @@ use crate::worldgen::biome::{
     BiomeClass, VegetationEra, biome_from_koppen, effective_biome, snowline_m, vegetation_era,
     zonal_biome,
 };
-use crate::worldgen::coarse::CoarseField;
+use crate::worldgen::coarse::{CoarseField, KeyKind};
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
 use crate::worldgen::tiles::SourceLevel;
 use crate::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
@@ -530,13 +530,45 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
         let gx = ((c[0] + c[2]) - (c[1] + c[3])) / (2.0 * s);
         let gz = ((c[0] + c[1]) - (c[2] + c[3])) / (2.0 * s);
         let slope = gx.hypot(gz);
-        let key = self.field.lattice_key(dir, coarse.kind);
-        let detail = self
-            .detail
-            .detail_m(&key, coarse.elevation_m, slope, layer.octaves);
+        let detail = self.blended_detail_m(dir, &coarse, slope, layer.octaves);
         let h = coastline_clamp(coarse.elevation_m + detail, c);
         let h = if h.is_finite() { h } else { -1.0 };
         (h as f32, self.surface(dir, h, &coarse))
+    }
+
+    /// The detail at a texel. Detail is seeded per lattice key (a plate's fixed frame, or the
+    /// era-fixed key), so two keys give independent noise: where the cell's four taps carry
+    /// different keys (a plate boundary, a footprint crack), each key's detail is weighted by
+    /// its taps' bilinear weights, so detail crossfades over one lattice cell instead of
+    /// stepping by hundreds of metres along the boundary (the 10 Ma Task 8 shot's straight dark
+    /// lines). Cells with one key take that key's detail alone.
+    fn blended_detail_m(&self, dir: RenderDir, coarse: &Coarse, slope: f64, octaves: u32) -> f64 {
+        let detail = |kind| {
+            let key = self.field.lattice_key(dir, kind);
+            self.detail
+                .detail_m(&key, coarse.elevation_m, slope, octaves)
+        };
+        let first = coarse.taps[0].0;
+        if octaves == 0 || coarse.taps.iter().all(|&(k, _)| k == first) {
+            return detail(coarse.kind);
+        }
+        let mut kinds: Vec<(KeyKind, f64)> = Vec::with_capacity(4);
+        for &(k, w) in &coarse.taps {
+            match kinds.iter_mut().find(|(kk, _)| *kk == k) {
+                Some((_, total)) => *total += w,
+                None => kinds.push((k, w)),
+            }
+        }
+        let total: f64 = kinds.iter().map(|&(_, w)| w).sum();
+        if total <= 0.0 {
+            return detail(coarse.kind);
+        }
+        kinds
+            .iter()
+            .filter(|&&(_, w)| w > 0.0)
+            .map(|&(k, w)| w * detail(k))
+            .sum::<f64>()
+            / total
     }
 
     fn surface(&self, dir: RenderDir, h: f64, coarse: &Coarse) -> [u8; 4] {

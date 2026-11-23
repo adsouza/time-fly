@@ -15,7 +15,7 @@ mod deep;
 mod modern;
 mod recent;
 
-pub use deep::DeepField;
+pub use deep::{DeepField, SLIVER_RADIUS_M};
 pub use recent::RecentField;
 
 use std::f64::consts::FRAC_PI_2;

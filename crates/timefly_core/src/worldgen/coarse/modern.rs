@@ -85,13 +85,37 @@ impl PresentRead {
     }
 }
 
+/// Two plates meeting inside a support cell keep the two-level formula only where every node is
+/// at least this far from sea level, on the same side.
+const CLEAR_OF_SEA_LEVEL_M: f64 = 300.0;
+
+/// Whether a support cell's samples take the reference: plate nodes against shell nodes, or
+/// different plates with a node near sea level or nodes on both sides of it.
+fn needs_reference(carriers: [Option<PlateIndex>; 4], values: [f64; 4]) -> bool {
+    if carriers.iter().all(|&c| c == carriers[0]) {
+        return false;
+    }
+    if carriers.iter().any(|c| c.is_none()) {
+        return true;
+    }
+    let near = values
+        .iter()
+        .any(|v| v.abs() < CLEAR_OF_SEA_LEVEL_M || v.is_nan());
+    let both = values.iter().any(|&v| v > 0.0) && values.iter().any(|&v| v <= 0.0);
+    near || both
+}
+
 /// One support node: see the module doc.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) struct SupportNode {
+    /// The node's value (the reference's elevation, or its plate's raw value under water).
+    value_m: f64,
     residual_m: f64,
     etopo_weight: f64,
     /// The plate whose present position the ETOPO term is read at; `None` reads at `d`.
     pub(super) carrier: Option<PlateIndex>,
+    /// A shell node whose value is a thin crack's frame land (`DeepField::sliver_land_m`).
+    sliver: bool,
     kind: KeyKind,
 }
 
@@ -199,24 +223,20 @@ impl<'a> DeepField<'a> {
         {
             let kind = KeyKind::Tracked(self.crust.rotations().plate_ids[plate.0 as usize]);
             return SupportNode {
+                value_m: t.value_m,
                 residual_m: t.value_m - t.etopo_weight * t.etopo_term_m,
                 etopo_weight: t.etopo_weight,
                 carrier: Some(plate),
+                sliver: false,
                 kind,
             };
         }
-        // The ocean shell: both endpoints at the era direction, mixed by the older weight.
-        let shell = shell_surface_m(
-            &self.sampling,
-            [
-                self.endpoint_sample(0, dir, SourceLevel::Overview),
-                self.endpoint_sample(1, dir, SourceLevel::Overview),
-            ],
-        );
-        let value = match surface {
-            RenderedSurface::GapLand { elevation_m } => elevation_m,
-            _ if shell.is_nan() => OCEAN_GAP_FALLBACK_M,
-            _ => shell.min(0.0),
+        // The ocean shell (both endpoints at the era direction, mixed by the older weight), or
+        // the frames' land in a thin era-fixed sliver, as the reference path shows it.
+        let key = self.tracked_or_era_fixed(dir.0);
+        let (value, sliver) = match surface {
+            RenderedSurface::GapLand { elevation_m } => (elevation_m, false),
+            _ => self.ocean_value(dir, &key, SourceLevel::Overview),
         };
         let w = self.sampling.older_weight;
         let mix = [1.0 - w, w];
@@ -225,10 +245,12 @@ impl<'a> DeepField<'a> {
         let term =
             self.etopo_read(dir, SourceLevel::Overview).0 - self.sampling.anomalies_m()[star];
         SupportNode {
+            value_m: value,
             residual_m: value - etopo_weight * term,
             etopo_weight,
             carrier: None,
-            kind: self.tracked_or_era_fixed(dir.0).kind(),
+            sliver,
+            kind: key.kind(),
         }
     }
 
@@ -249,21 +271,42 @@ impl<'a> DeepField<'a> {
         node
     }
 
-    /// The two-level sample at `d` (see the module doc).
+    /// The two-level sample at `d` (see the module doc), by the support cell's taps:
+    /// - all on one plate: `bilerp(residual) + bilerp(weight) · T(d)`;
+    /// - all shell nodes, none a sliver: the globe's shell rule evaluated at `d` itself (both
+    ///   endpoints read there, so coverage-mask edges fall where the reference has them);
+    /// - where land and sea can change inside the cell for a reason the formula does not model
+    ///   (`needs_reference`: plate against shell, a thin crack's 50 km ring, or two plates
+    ///   meeting near sea level): the reference itself at overview level, so land and sea agree
+    ///   with it across the edge;
+    /// - two plates meeting on clearly dry (or clearly drowned) ground: the formula, with the
+    ///   nearest node's plate.
     pub(super) fn modern_sample(&self, era_dir: RenderDir, level: SourceLevel) -> CoarseSample {
         let d = RenderDir(era_dir.0.normalize());
         let (mut residual, mut weight) = (0.0, 0.0);
         let (mut best_w, mut nearest) = (-1.0, None);
-        for ((face, col, row), w) in bilinear_taps(d, self.support_n) {
+        let mut carriers = [None; 4];
+        let mut values = [0.0; 4];
+        let mut sliver = false;
+        for (k, ((face, col, row), w)) in bilinear_taps(d, self.support_n).into_iter().enumerate() {
             let node = self.support(face, col, row);
             residual += w * node.residual_m;
             weight += w * node.etopo_weight;
+            carriers[k] = node.carrier;
+            values[k] = node.value_m;
+            sliver |= node.sliver;
             if w > best_w {
                 best_w = w;
                 nearest = Some(node);
             }
         }
         let nearest = nearest.expect("four taps");
+        if sliver || needs_reference(carriers, values) {
+            return self.sample_with(era_dir, SourceLevel::Overview);
+        }
+        if carriers[0].is_none() {
+            return self.shell_sample(d, &nearest, level);
+        }
         let read = match nearest.carrier {
             Some(plate) => self.present[plate.0 as usize].apply(d),
             None => d,
@@ -274,6 +317,32 @@ impl<'a> DeepField<'a> {
             elevation_m: residual + weight * term,
             ice: 0.0,
             koppen,
+            lattice: <Self as super::CoarseField>::lattice_key(self, d, nearest.kind),
+        }
+    }
+
+    /// The shell rule at `d`, read at `level`: the globe's shell blend (gap land where uncovered
+    /// land shows, otherwise water, covered land at the crack fill).
+    fn shell_sample(
+        &self,
+        d: RenderDir,
+        nearest: &SupportNode,
+        level: SourceLevel,
+    ) -> CoarseSample {
+        let samples = [
+            self.endpoint_sample(0, d, level),
+            self.endpoint_sample(1, d, level),
+        ];
+        let shell = shell_surface_m(&self.sampling, samples);
+        let elevation_m = if shell.is_nan() {
+            OCEAN_GAP_FALLBACK_M
+        } else {
+            shell
+        };
+        CoarseSample {
+            elevation_m,
+            ice: 0.0,
+            koppen: self.etopo_read(d, level).1,
             lattice: <Self as super::CoarseField>::lattice_key(self, d, nearest.kind),
         }
     }

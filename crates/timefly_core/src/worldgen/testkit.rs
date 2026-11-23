@@ -212,3 +212,41 @@ pub fn frames(paleo: impl Fn(usize, RenderDir) -> (f32, bool)) -> Vec<Grid> {
 pub fn flat_overview(elevation_m: f32, koppen: u8) -> Grid {
     crate::worldgen::tiles::tests::overview_from(2, |_, _| (elevation_m, koppen))
 }
+
+/// Two plates meeting along the 0° meridian of their fixed frames on a cube-16 footprint grid
+/// (its cell edges run exactly along it on the +Z face): plate 0 (id 202) over `x >= 0`, plate 1
+/// (id 101) over `x < 0`. By 100 Ma plate 1 has turned `gap_deg` west about the pole relative to
+/// plate 0, and both have turned 45° about render +Z (lat 0, lon 0). That leaves a straight
+/// crack `gap_deg` wide where no plate is valid, running diagonally through lat 0, lon 0 in the
+/// era frame: the quantisation sliver of the real bake, in miniature. `crack_dir` gives the era
+/// direction at a plate-0-fixed latitude and longitude.
+pub fn sliver(gap_deg: f32) -> CrustModel {
+    let twist = Quat::from_rotation_z(45f32.to_radians());
+    let at = |t: f32| Some(Quat::IDENTITY.slerp(twist, t));
+    let plates = vec![
+        (202, vec![Some(Quat::IDENTITY), at(0.0447), at(1.0)]),
+        (
+            101,
+            vec![
+                Some(Quat::IDENTITY),
+                Some(at(0.0447).unwrap() * about_y(-gap_deg * 0.0447)),
+                Some(twist * about_y(-gap_deg)),
+            ],
+        ),
+    ];
+    let t = table(&[0.0, 4.47, 100.0], &plates);
+    let f = footprints(16, |d| {
+        if d.x >= 0.0 {
+            vec![(0, 0.0, 540.0)]
+        } else {
+            vec![(1, 0.0, 540.0)]
+        }
+    });
+    CrustModel::new(t, f).unwrap()
+}
+
+/// The era direction (at 100 Ma) of a point given in [`sliver`]'s plate-0-fixed frame.
+pub fn crack_dir(lat: f64, lon: f64) -> RenderDir {
+    let twist = bevy_math::DQuat::from_rotation_z(45f64.to_radians());
+    RenderDir(twist * dir(lat, lon).0)
+}
