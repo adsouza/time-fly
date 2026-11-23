@@ -53,8 +53,8 @@ Optional, for finer pruning: `cargo install cargo-sweep` (the guard uses it when
 
 ## Toolchain
 
-The project uses one toolchain: rustup's `1.98.1` (`rust-toolchain.toml`; it includes the
-`wasm32-unknown-unknown` std). Homebrew's standalone `cargo`/`rustc` is the same release, but
+The project uses one toolchain: rustup's `1.100.0` (`rust-toolchain.toml`; it includes the
+`wasm32-unknown-unknown` std). Homebrew's standalone `cargo`/`rustc` may be the same release, but
 its version string ends in "(Homebrew)", so cargo fingerprints it as a different compiler:
 alternating between the two rebuilds everything and leaves duplicate artifacts in `target/`.
 
@@ -67,4 +67,8 @@ PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo build -p timefly
 
 `target-guard.sh` does this itself. To make it the default in this directory, add
 `PATH_add /opt/homebrew/opt/rustup/bin` to your (git-ignored) direnv `.envrc`.
-Check with `cargo -vV` (no "(Homebrew)") and `rustc --print sysroot` (inside `~/.rustup/toolchains/1.98.1-*`).
+Check with `cargo -vV` (no "(Homebrew)") and `rustc --print sysroot` (inside `~/.rustup/toolchains/1.100.0-*`).
+
+To move to a new Rust release, run `cargo clean` first, then change `channel` in
+`rust-toolchain.toml`. A new compiler invalidates every artifact, and the old ones would stay in
+`target/` next to the new. CI's caches rebuild once, cold.

@@ -59,13 +59,15 @@ jobs:
           mkdir -p ../../ci-logs
           uv run --locked pytest -q 2>&1 | tee ../../ci-logs/pytest.txt
 
+      # Both test steps use the `ci-test` profile (Cargo.toml): dependencies unoptimized, so
+      # Bevy compiles far faster than at the dev profile's opt-level 3. The two steps share it.
       - name: Core tests
-        run: cargo test --locked -p timefly_core 2>&1 | tee ci-logs/cargo-test-timefly_core.txt
+        run: cargo test --locked --profile ci-test -p timefly_core 2>&1 | tee ci-logs/cargo-test-timefly_core.txt
 
       # CPU-only: the data loader on the tiny bake, the crash flow, `--check-data`. The GPU
       # globe test is #[ignore].
       - name: Game crate tests
-        run: cargo test --locked -p timefly 2>&1 | tee ci-logs/cargo-test-timefly.txt
+        run: cargo test --locked --profile ci-test -p timefly 2>&1 | tee ci-logs/cargo-test-timefly.txt
 
       - name: Upload test output
         if: always()

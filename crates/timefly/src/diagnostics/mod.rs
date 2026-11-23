@@ -488,7 +488,6 @@ pub fn log_plugin() -> LogPlugin {
         level: Level::INFO,
         custom_layer: diagnostics_layers,
         fmt_layer: console_layer,
-        ..default()
     }
 }
 

@@ -10,6 +10,16 @@ debug = "line-tables-only"
 opt-level = 3
 debug = false
 
+# CI test builds. Dependencies stay unoptimized: the tests are CPU-light, and compiling Bevy at
+# opt-level 3 (the dev profile's choice, so the game runs smoothly locally) dominated the test
+# job. Run with `cargo test --profile ci-test`.
+[profile.ci-test]
+inherits = "dev"
+
+[profile.ci-test.package."*"]
+opt-level = 0
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
