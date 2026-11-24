@@ -39,12 +39,14 @@ If both limits hold it does nothing. Otherwise it prunes, re-measuring after eac
    It also stops if a deletion raised free space by less than half the dir's size: the space is
    not being returned, usually because of APFS local snapshots or a process holding the files
    open, and deleting more builds would not help. The report says so; check with
-   `tmutil listlocalsnapshots /` and `lsof +L1`.
+   `tmutil listlocalsnapshots /` and `lsof +L1`. A dir that can't be deleted (permissions) is
+   reported as such and the next one is tried.
 
 Steps 3 and 4 are skipped while a `cargo` or `rustc` process is running. Steps 1-4 run under a
 lock, the directory `target/.guard-lock`, so overlapping hook runs don't prune at once. A run
 that finds the lock held skips pruning (the hook still warns about low free space). A lock older
-than 10 minutes is a leftover from a killed run and is taken over. If the lock can't be created
+than 10 minutes is a leftover from a killed run and is taken over atomically (renamed away;
+a run that loses that race skips pruning). If the lock can't be created
 and none exists (a full disk), the guard prunes without it. If free space is short
 of the minimum by more than all of `target/` holds, deleting builds would not fix it: the guard
 deletes nothing for free space (steps 1-3 still run for the budget) and instead lists the likely

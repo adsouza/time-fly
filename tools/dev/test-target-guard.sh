@@ -608,6 +608,17 @@ check "failed removal: release kept, next dirs removed until enough" test "$(lef
 check "failed removal: reported" grep -qi 'could not delete target/release' <<<"$out"
 check "failed removal: not misreported as space not returned" bash -c '! grep -qi "not being returned" <<<"$1"' _ "$out"
 
+echo "19. stale-lock takeover is atomic (mv); losing the race skips pruning"
+profiles 19a; mkdir "$ROOT/target/.guard-lock"; touch -t $OLD "$ROOT/target/.guard-lock"
+printf '#!/bin/sh\ncase "$*" in *.guard-lock*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v mv)" > "$FAKEBIN/mv"; chmod +x "$FAKEBIN/mv"
+out="$(lr 95)"
+rm -f "$FAKEBIN/mv"
+check "takeover mv fails (another run won): nothing deleted" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
+check "takeover mv fails: says the lock is held" grep -qi 'lock' <<<"$out"
+profiles 19b; mkdir "$ROOT/target/.guard-lock"; touch -t $OLD "$ROOT/target/.guard-lock"
+lr 95 >/dev/null
+check "takeover: pruned, no lock or renamed stale lock left" bash -c 'test "$1" = "scratch-a doc debug " && test -z "$(ls -A "$2/target" | grep guard-lock)"' _ "$(left)" "$ROOT"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
