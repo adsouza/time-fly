@@ -593,7 +593,9 @@ if ! free_ok; then
       # (APFS local snapshots, open files): deleting more builds would not help.
       size_kb="$(du -sk "$d" 2>/dev/null | awk '{ s = $1 + 0 } END { print s + 0 }')"
       free_before="$(free_kb)"
-      remove "$d" || continue   # reported via FAILED; try the next dir
+      # A failed rm -rf is usually partial and may still have freed enough. Either way no
+      # "space not returned" check: we don't know how much it was meant to free.
+      remove "$d" || { free_ok && break; continue; }
       LR_COUNT=$((LR_COUNT + 1))
       free_ok && break
       if [ $(($(free_kb) - free_before)) -lt $((size_kb / 2)) ]; then

@@ -619,6 +619,21 @@ profiles 19b; mkdir "$ROOT/target/.guard-lock"; touch -t $OLD "$ROOT/target/.gua
 lr 95 >/dev/null
 check "takeover: pruned, no lock or renamed stale lock left" bash -c 'test "$1" = "scratch-a doc debug " && test -z "$(ls -A "$2/target" | grep guard-lock)"' _ "$(left)" "$ROOT"
 
+echo "20. a partly failed removal still counts: stop as soon as free space is back"
+has() { (cd "$ROOT/target" && for d in release wasm32-unknown-unknown scratch-a doc debug; do [ -f "$d/x.bin" ] && printf '%s ' "$d"; done); }
+profiles 20a
+mkfile "$ROOT/target/release/locked/y" 0; chmod 555 "$ROOT/target/release/locked"   # rm -rf fails partway
+out="$(lr 97)"                                                                         # 3 MB short
+chmod -R u+w "$ROOT/target"
+check "partial failure that frees enough: x.bin gone, next dir kept" test "$(has)" = "wasm32-unknown-unknown scratch-a doc debug "
+check "partial failure: reported as could not delete" grep -qi 'could not delete target/release' <<<"$out"
+profiles 20b
+chmod 555 "$ROOT/target"   # every dir's contents go, the dirs themselves can't
+out="$(TIMEFLY_FAKE_FREE_MB=95 TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TMPDIR="$CUL" guard 2>&1)"
+chmod u+w "$ROOT/target"
+check "read-only target/: stops once free space is back (two dirs emptied, three kept)" test "$(has)" = "scratch-a doc debug "
+check "read-only target/: failures are not called 'space not returned'" bash -c '! grep -qi "not being returned" <<<"$1"' _ "$out"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
