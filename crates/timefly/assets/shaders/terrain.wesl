@@ -48,6 +48,7 @@ struct TerrainLook {
     frame_east: vec4<f32>,
     // xyz: the prevailing wind's 3D axis W (tangent at the centre). The dune phase is the
     // along-wind distance from the centre, dot(p, W), taken from local metres (desert_at).
+    // w: 1 when the dunes are drawn, 0 under --no-dunes (desert_at skips the dune work).
     wind: vec4<f32>,
     // x: main dune spacing (m); y: small dune spacing (m); z: main period (s); w: small period (s).
     dunes: vec4<f32>,
@@ -326,59 +327,63 @@ fn desert_at(xz: vec2<f32>, p: vec3<f32>, footprint: f32) -> Desert {
     d.gravel = 0.0;
     d.mottle = 0.0;
 
-    // The local frame: +x east, +z south, so a planet direction v moves region-local xz by
-    // (dot(v, east), -dot(v, north)). W is fixed per region (tangent at the centre); across the
-    // region it stays within a degree or two of the local tangent plane.
-    let east = look.frame_east.xyz;
-    let north = look.frame_north.xyz;
-    let wind = look.wind.xyz;
-    let t = globals.time;
-    // The crest phase's along-wind distance, dot(p, W) for a tangent axis W at the centre. With
-    // p = R (cos(a) centre + sin(a) / |xz| (east x - north z)) and a = |xz| / R, that is
-    // dot(xz, W's local xz) times sin(a) / a, taken from local metres so f32 never has to resolve
-    // metres against |p| of 6.4e6 m. It is the distance from the region centre, so the phase
-    // depends on the centre: crests shift between visits from different centres (a known
-    // limitation; M3 adds a per-region f64 phase offset from a global along-wind field).
-    let a = length(xz) / look.frame_center.w;
-    let sinc = select(sin(a) / a, 1.0 - a * a / 6.0, a < 1e-3);
+    // --no-dunes (wind.w = 0) skips all of it: one test of a uniform the whole frame shares, so
+    // every pixel takes the same branch. The sand sea stays (the mask above) as flat, still sand.
+    if look.wind.w > 0.5 {
+        // The local frame: +x east, +z south, so a planet direction v moves region-local xz by
+        // (dot(v, east), -dot(v, north)). W is fixed per region (tangent at the centre); across the
+        // region it stays within a degree or two of the local tangent plane.
+        let east = look.frame_east.xyz;
+        let north = look.frame_north.xyz;
+        let wind = look.wind.xyz;
+        let t = globals.time;
+        // The crest phase's along-wind distance, dot(p, W) for a tangent axis W at the centre. With
+        // p = R (cos(a) centre + sin(a) / |xz| (east x - north z)) and a = |xz| / R, that is
+        // dot(xz, W's local xz) times sin(a) / a, taken from local metres so f32 never has to resolve
+        // metres against |p| of 6.4e6 m. It is the distance from the region centre, so the phase
+        // depends on the centre: crests shift between visits from different centres (a known
+        // limitation; M3 adds a per-region f64 phase offset from a global along-wind field).
+        let a = length(xz) / look.frame_center.w;
+        let sinc = select(sin(a) / a, 1.0 - a * a / 6.0, a < 1e-3);
 
-    // Each octave's sharp profile fades out as its slip face (a fifth of a spacing, the sharpest
-    // feature) shrinks below a couple of pixels. The main crests then carry on as a sinusoid,
-    // which fades as a whole cycle gets that small, so from 40 km a sand sea is a faint
-    // corrugation; the small crests are gone by then.
-    let sharp_w = octave_weight(footprint, 0.2 * look.dunes.x);
-    let main_w = octave_weight(footprint, 0.5 * look.dunes.x);
-    let small_w = octave_weight(footprint, 0.2 * look.dunes.y);
-    if d.sea > 0.0 && main_w > 0.0 {
-        // The warp and its gradient (forward differences one step east and one step south).
-        let pe = p + east * DUNE_WARP_STEP_M;
-        let ps = p - north * DUNE_WARP_STEP_M;
-        let w0 = dune_warp(p);
-        let warp_grad = vec2<f32>(dune_warp(pe) - w0, dune_warp(ps) - w0) / DUNE_WARP_STEP_M;
-        let wind_xz = vec2<f32>(dot(wind, east), -dot(wind, north));
-        // Crest phase along the wind; only the phase moves, by one spacing per period.
-        let u = dot(xz, wind_xz) * sinc / look.dunes.x + w0 - t / look.dunes.z;
-        let big = mix(dune_profile_soft(u), dune_profile(u), sharp_w) * main_w;
-        let big_grad = wind_xz / look.dunes.x + warp_grad;
-        // The normal tilts away from the rise: minus height times dh/du times du/dxz.
-        d.gradient = -DUNE_HEIGHT_M * big.y * big_grad;
-        d.tone = big.x - 0.5 * main_w;
+        // Each octave's sharp profile fades out as its slip face (a fifth of a spacing, the sharpest
+        // feature) shrinks below a couple of pixels. The main crests then carry on as a sinusoid,
+        // which fades as a whole cycle gets that small, so from 40 km a sand sea is a faint
+        // corrugation; the small crests are gone by then.
+        let sharp_w = octave_weight(footprint, 0.2 * look.dunes.x);
+        let main_w = octave_weight(footprint, 0.5 * look.dunes.x);
+        let small_w = octave_weight(footprint, 0.2 * look.dunes.y);
+        if d.sea > 0.0 && main_w > 0.0 {
+            // The warp and its gradient (forward differences one step east and one step south).
+            let pe = p + east * DUNE_WARP_STEP_M;
+            let ps = p - north * DUNE_WARP_STEP_M;
+            let w0 = dune_warp(p);
+            let warp_grad = vec2<f32>(dune_warp(pe) - w0, dune_warp(ps) - w0) / DUNE_WARP_STEP_M;
+            let wind_xz = vec2<f32>(dot(wind, east), -dot(wind, north));
+            // Crest phase along the wind; only the phase moves, by one spacing per period.
+            let u = dot(xz, wind_xz) * sinc / look.dunes.x + w0 - t / look.dunes.z;
+            let big = mix(dune_profile_soft(u), dune_profile(u), sharp_w) * main_w;
+            let big_grad = wind_xz / look.dunes.x + warp_grad;
+            // The normal tilts away from the rise: minus height times dh/du times du/dxz.
+            d.gradient = -DUNE_HEIGHT_M * big.y * big_grad;
+            d.tone = big.x - 0.5 * main_w;
 
-        if small_w > 0.0 {
-            // The small crests: the wind turned by DUNE_SMALL_ANGLE in the tangent plane, the
-            // main warp (so they follow the big crests' wander) plus their own.
-            let side = cross(look.frame_center.xyz, wind);
-            let wind2 = wind * cos(DUNE_SMALL_ANGLE) + side * sin(DUNE_SMALL_ANGLE);
-            let wind2_xz = vec2<f32>(dot(wind2, east), -dot(wind2, north));
-            let ratio = look.dunes.x / look.dunes.y;
-            let s0 = dune_small_warp(p);
-            let small_warp_grad = vec2<f32>(dune_small_warp(pe) - s0, dune_small_warp(ps) - s0)
-                / DUNE_WARP_STEP_M;
-            let u2 = dot(xz, wind2_xz) * sinc / look.dunes.y + w0 * ratio + s0 - t / look.dunes.w;
-            let small = dune_profile(u2);
-            let small_grad = wind2_xz / look.dunes.y + warp_grad * ratio + small_warp_grad;
-            d.gradient -= DUNE_SMALL_HEIGHT_M * small_w * small.y * small_grad;
-            d.tone += 0.4 * (small.x - 0.5) * small_w;
+            if small_w > 0.0 {
+                // The small crests: the wind turned by DUNE_SMALL_ANGLE in the tangent plane, the
+                // main warp (so they follow the big crests' wander) plus their own.
+                let side = cross(look.frame_center.xyz, wind);
+                let wind2 = wind * cos(DUNE_SMALL_ANGLE) + side * sin(DUNE_SMALL_ANGLE);
+                let wind2_xz = vec2<f32>(dot(wind2, east), -dot(wind2, north));
+                let ratio = look.dunes.x / look.dunes.y;
+                let s0 = dune_small_warp(p);
+                let small_warp_grad = vec2<f32>(dune_small_warp(pe) - s0, dune_small_warp(ps) - s0)
+                    / DUNE_WARP_STEP_M;
+                let u2 = dot(xz, wind2_xz) * sinc / look.dunes.y + w0 * ratio + s0 - t / look.dunes.w;
+                let small = dune_profile(u2);
+                let small_grad = wind2_xz / look.dunes.y + warp_grad * ratio + small_warp_grad;
+                d.gradient -= DUNE_SMALL_HEIGHT_M * small_w * small.y * small_grad;
+                d.tone += 0.4 * (small.x - 0.5) * small_w;
+            }
         }
     }
 

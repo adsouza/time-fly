@@ -8,7 +8,8 @@
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
 //! [shaded|fly|time] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
-//! found). The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
+//! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
+//! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
 //! skips the wireframe shot. Exits with an error if the region never appears. Set a fresh
 //! `TIMEFLY_LOG_DIR` per run.
@@ -376,11 +377,14 @@ fn uncap_frames(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
 }
 
 fn main() -> AppExit {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `--no-dunes` may come anywhere; the rest are positional.
+    let (flags, args): (Vec<String>, Vec<String>) =
+        std::env::args().skip(1).partition(|a| a == "--no-dunes");
+    let no_dunes = !flags.is_empty();
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
-            "usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly|time] \
-             [AGL_M] [LATER_S]"
+            "usage: region_tour [--no-dunes] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
+             [shaded|fly|time] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -426,6 +430,7 @@ fn main() -> AppExit {
     let session = diagnostics::start(LaunchArgs {
         window: Some(size),
         region: Some(region),
+        no_dunes,
         ..default()
     });
     let mut app = timefly::app(&session);

@@ -748,6 +748,65 @@ mod tests {
     const TERRAIN_WESL: &str = include_str!("../../assets/shaders/terrain.wesl");
 
     /// `name: type` fields of a struct declared in `terrain_cdlod.wesl`, in order.
+    /// The block a `{` at `open` opens, up to its matching `}` (exclusive), as byte offsets.
+    fn block_after(text: &str, open: usize) -> (usize, usize) {
+        let mut depth = 0usize;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (open, open + i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after byte {open}");
+    }
+
+    #[test]
+    fn desert_skips_the_dunes_when_off() {
+        // `--no-dunes` (wind.w = 0) must skip every piece of dune work, with one test of a
+        // uniform the whole frame shares, while the sand-sea mask and the stony plain still run.
+        let start = TERRAIN_WESL.find("fn desert_at(").unwrap();
+        let (_, end) = block_after(
+            TERRAIN_WESL,
+            start + TERRAIN_WESL[start..].find('{').unwrap(),
+        );
+        let body = &TERRAIN_WESL[start..end];
+        let gate = body
+            .find("if look.wind.w > 0.5 {")
+            .expect("desert_at gates the dunes on look.wind.w");
+        let (open, close) = block_after(body, gate + body[gate..].find('{').unwrap());
+        let inside = &body[open..close];
+        for work in [
+            "let sharp_w",
+            "let main_w",
+            "let small_w",
+            "dune_warp(p)",
+            "dune_small_warp(p)",
+            "dune_profile(u)",
+            "let sinc",
+        ] {
+            assert!(inside.contains(work), "{work:?} runs outside the dune gate");
+            assert_eq!(
+                body.matches(work).count(),
+                inside.matches(work).count(),
+                "{work:?}"
+            );
+        }
+        assert!(
+            body[..gate].contains("let mask"),
+            "the sand-sea mask must run with dunes off"
+        );
+        assert!(
+            body[close..].contains("if d.sea < 1.0 {"),
+            "the stony plain must run with dunes off"
+        );
+    }
+
     fn wesl_fields(name: &str) -> Vec<(String, String)> {
         wesl_struct_fields(CDLOD_WESL, name)
     }
