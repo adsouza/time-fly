@@ -1,9 +1,11 @@
-//! The game's UI: the time slider, the loading/failure status and the credits overlay.
+//! The game's UI: the time slider, the loading/failure status, the credits overlay and the
+//! frame-rate readout.
 //!
 //! Each plugin keeps its decisions in pure functions (unit-tested directly); the systems only
 //! gather input, call them and apply the result.
 
 pub mod credits;
+pub mod fps;
 pub mod slider;
 pub mod status;
 
@@ -11,6 +13,7 @@ use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 
 pub use credits::CreditsPlugin;
+pub use fps::FpsOverlayPlugin;
 pub use slider::SliderUiPlugin;
 pub use status::StatusUiPlugin;
 
@@ -31,14 +34,20 @@ pub struct PointerOverUi(pub bool);
 #[require(Hovered)]
 pub struct BlocksCamera;
 
-/// Plugins: slider, status and credits, plus the pointer-over-UI tracking they share.
+/// Plugins: slider, status, credits and the frame-rate readout, plus the pointer-over-UI
+/// tracking they share.
 pub struct GameUiPlugins;
 
 impl Plugin for GameUiPlugins {
     fn build(&self, app: &mut App) {
-        app.add_plugins((SliderUiPlugin, StatusUiPlugin, CreditsPlugin))
-            .init_resource::<PointerOverUi>()
-            .add_systems(PreUpdate, track_pointer_over_ui);
+        app.add_plugins((
+            SliderUiPlugin,
+            StatusUiPlugin,
+            CreditsPlugin,
+            FpsOverlayPlugin,
+        ))
+        .init_resource::<PointerOverUi>()
+        .add_systems(PreUpdate, track_pointer_over_ui);
     }
 }
 

@@ -8,7 +8,7 @@
 use bevy::prelude::*;
 use timefly_core::deep_time::{YearsBp, format_years_bp};
 
-use super::{BENCH_REGIONS, CYCLE_REGION, RegionBench, SCRIPT_SECS, Segment, Stage, stop_count};
+use super::{BenchRegion, CYCLE_REGION, RegionBench, SCRIPT_SECS, Segment, Stage, stop_count};
 
 /// The banner's root node.
 #[derive(Component)]
@@ -36,49 +36,60 @@ pub enum BannerKey {
     Pan(usize),
     /// Memory cycle `u32` (0-based) of `cycles`.
     Cycle(u32, u32),
+    /// Leaving the last region of a run with no memory cycles, on the way to the summary.
+    Summary,
     /// The bench has finished: whether it passed.
     Finished(bool),
 }
 
-/// The stop number (1-based) of region `region`, the globe pans counted as stops.
-pub fn stop_number(region: usize) -> usize {
+/// The stop number (1-based) of region `region` in `regions`, the globe pans counted as stops.
+pub fn stop_number(region: usize, regions: &[BenchRegion]) -> usize {
     region
         + 1
-        + BENCH_REGIONS[..=region.min(BENCH_REGIONS.len() - 1)]
+        + regions[..=region.min(regions.len().saturating_sub(1))]
             .iter()
             .filter(|r| r.pan_from_previous)
             .count()
 }
 
 /// The stop shown for a region, as `Name · age · k of n`.
-fn stop(region: usize) -> String {
-    let r = &BENCH_REGIONS[region];
+fn stop(region: usize, regions: &[BenchRegion]) -> String {
+    let r = &regions[region];
     format!(
         "{} · {} · {} of {}",
         r.name,
         format_years_bp(YearsBp(r.arg.years)),
-        stop_number(region),
-        stop_count()
+        stop_number(region, regions),
+        stop_count(regions)
     )
 }
 
-/// The banner's lines for `key`: the main line and the optional second one.
-pub fn banner_lines(key: BannerKey) -> (String, Option<String>) {
+/// The banner's lines for `key` in a run over `regions`: the main line and the optional second
+/// one.
+pub fn banner_lines(key: BannerKey, regions: &[BenchRegion]) -> (String, Option<String>) {
     match key {
-        BannerKey::Next(region) => (format!("Next: {}", stop(region)), None),
-        BannerKey::In(region, segment) => (stop(region), segment.map(|s| s.label().to_string())),
+        BannerKey::Next(region) => (format!("Next: {}", stop(region, regions)), None),
+        BannerKey::In(region, segment) => (
+            stop(region, regions),
+            segment.map(|s| s.label().to_string()),
+        ),
         BannerKey::Pan(region) => (
             format!(
                 "Globe · {} → {}",
-                BENCH_REGIONS[region.saturating_sub(1)].name,
-                BENCH_REGIONS[region].name
+                regions[region.saturating_sub(1)].name,
+                regions[region].name
             ),
-            Some(format!("{} of {}", stop_number(region) - 1, stop_count())),
+            Some(format!(
+                "{} of {}",
+                stop_number(region, regions) - 1,
+                stop_count(regions)
+            )),
         ),
         BannerKey::Cycle(cycle, cycles) => (
             format!("Memory cycles · {CYCLE_REGION} · {} of {cycles}", cycle + 1),
             None,
         ),
+        BannerKey::Summary => ("Writing the summary".to_string(), None),
         BannerKey::Finished(pass) => (
             format!(
                 "Region bench finished: {}",
@@ -95,6 +106,7 @@ pub(super) fn banner_key(bench: &RegionBench) -> BannerKey {
     let next = |n: Next| match n {
         Next::Region(r) => BannerKey::Next(r),
         Next::Cycle(c) => BannerKey::Cycle(c, bench.config.cycles),
+        Next::Summary if bench.config.cycles == 0 => BannerKey::Summary,
         Next::Summary => {
             BannerKey::Cycle(bench.config.cycles.saturating_sub(1), bench.config.cycles)
         }
@@ -186,7 +198,7 @@ pub(super) fn update_banner(
     if *shown == Some(key) {
         return;
     }
-    let (line, second) = banner_lines(key);
+    let (line, second) = banner_lines(key, bench.regions());
     for mut text in &mut main {
         text.0.clone_from(&line);
     }
@@ -213,12 +225,45 @@ pub(super) fn segment_at(script_s: f32) -> Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::region::BENCH_REGIONS;
     use crate::bench::region::{RegionBenchConfig, RegionBenchPlugin};
 
     #[test]
+    fn a_single_region_run_never_shows_memory_cycles() {
+        use crate::args::RegionArg;
+        use crate::bench::region::Next;
+        let arg = RegionArg {
+            lat_deg: -22.0,
+            lon_deg: -18.0,
+            years: 250.0e6,
+        };
+        let mut bench = RegionBench::new(RegionBenchConfig::single(30, true, arg));
+        bench.stage = Stage::Leaving {
+            next: Next::Summary,
+            cycle: None,
+            since: 0.0,
+        };
+        assert_eq!(banner_key(&bench), BannerKey::Summary);
+        assert_eq!(
+            banner_lines(BannerKey::Summary, bench.regions()).0,
+            "Writing the summary"
+        );
+        // The full bench still shows its last cycle while it leaves for the summary.
+        let mut full = RegionBench::new(RegionBenchConfig::new(30, true));
+        full.stage = Stage::Leaving {
+            next: Next::Summary,
+            cycle: Some(9),
+            since: 0.0,
+        };
+        assert_eq!(banner_key(&full), BannerKey::Cycle(9, 10));
+    }
+
+    #[test]
     fn stops_count_the_pan() {
-        assert_eq!(stop_count(), 9);
-        let numbers: Vec<_> = (0..BENCH_REGIONS.len()).map(stop_number).collect();
+        assert_eq!(stop_count(&BENCH_REGIONS), 9);
+        let numbers: Vec<_> = (0..BENCH_REGIONS.len())
+            .map(|r| stop_number(r, &BENCH_REGIONS))
+            .collect();
         // Pangaea, Red Sea, Himalayas, Sundaland, Japan, Beringia, (pan = 7), Rockies, Panama.
         assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 8, 9]);
     }
@@ -226,42 +271,42 @@ mod tests {
     #[test]
     fn the_banner_names_each_stop() {
         assert_eq!(
-            banner_lines(BannerKey::In(3, None)),
+            banner_lines(BannerKey::In(3, None), &BENCH_REGIONS),
             (
                 "Sundaland · 21 thousand years ago · 4 of 9".to_string(),
                 None
             )
         );
         assert_eq!(
-            banner_lines(BannerKey::In(0, Some(Segment::Climb))).1,
+            banner_lines(BannerKey::In(0, Some(Segment::Climb)), &BENCH_REGIONS).1,
             Some(Segment::Climb.label().to_string())
         );
         assert_eq!(
-            banner_lines(BannerKey::Next(2)).0,
+            banner_lines(BannerKey::Next(2), &BENCH_REGIONS).0,
             "Next: Himalayas · Present · 3 of 9"
         );
         assert_eq!(
-            banner_lines(BannerKey::Pan(6)),
+            banner_lines(BannerKey::Pan(6), &BENCH_REGIONS),
             (
                 "Globe · Beringia → Rockies ice margin".to_string(),
                 Some("7 of 9".to_string())
             )
         );
         assert_eq!(
-            banner_lines(BannerKey::Cycle(2, 10)).0,
+            banner_lines(BannerKey::Cycle(2, 10), &BENCH_REGIONS).0,
             "Memory cycles · Himalayas · 3 of 10"
         );
         assert_eq!(
-            banner_lines(BannerKey::Finished(true)).0,
+            banner_lines(BannerKey::Finished(true), &BENCH_REGIONS).0,
             "Region bench finished: PASS"
         );
         assert_eq!(
-            banner_lines(BannerKey::Finished(false)).0,
+            banner_lines(BannerKey::Finished(false), &BENCH_REGIONS).0,
             "Region bench finished: FAIL"
         );
         // The ages come from the slider's formatter.
         assert!(
-            banner_lines(BannerKey::In(0, None))
+            banner_lines(BannerKey::In(0, None), &BENCH_REGIONS)
                 .0
                 .contains(&format_years_bp(YearsBp(250.0e6)))
         );

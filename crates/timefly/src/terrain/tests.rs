@@ -377,6 +377,48 @@ fn leaving_frees_the_terrain() {
 }
 
 #[test]
+fn every_region_look_keeps_the_dune_switch() {
+    assert!(TerrainOptions::default().dunes);
+    let grid = grid();
+    let mut deep = (*grid).clone();
+    deep.spec.snapshot = YearsBp(540.0e6);
+    for g in [&*grid, &deep] {
+        assert_eq!(look_for(g, TerrainOptions { dunes: false }).wind.w, 0.0);
+        assert_eq!(look_for(g, TerrainOptions::default()).wind.w, 1.0);
+    }
+}
+
+#[test]
+fn the_scene_takes_the_dune_switch_from_the_options() {
+    let grid = grid();
+    let mut app = pool_app();
+    app.insert_resource(TerrainOptions { dunes: false });
+    enter(&mut app, &grid);
+    for _ in 0..3 {
+        app.update();
+    }
+    let look = |app: &App| {
+        let world = app.world();
+        let scene = world.resource::<TerrainScene>();
+        world
+            .resource::<Assets<TerrainMaterial>>()
+            .get(&scene.material)
+            .unwrap()
+            .extension
+            .look
+    };
+    assert_eq!(look(&app).wind.w, 0.0);
+    // A snapshot change rebuilds the look; the switch survives it.
+    let mut deep = (*grid).clone();
+    deep.spec.snapshot = YearsBp(540.0e6);
+    enter(&mut app, &Arc::new(deep));
+    for _ in 0..3 {
+        app.update();
+    }
+    assert_eq!(look(&app).wind.w, 0.0);
+}
+
+#[test]
 fn sky_and_water_follow_the_scene() {
     use crate::sky::{RegionSky, SkyMaterial, add_sky_systems};
     use crate::water::{RegionWater, WaterMaterial, add_water_systems};
@@ -419,7 +461,7 @@ fn sky_and_water_follow_the_scene() {
             .unwrap()
             .extension
             .look;
-        assert_eq!(look, look_for(&grid));
+        assert_eq!(look, look_for(&grid, TerrainOptions::default()));
         (sky.dome, water.entity)
     };
 
@@ -458,7 +500,7 @@ fn sky_and_water_follow_the_scene() {
             .unwrap()
             .extension
             .look;
-        assert_eq!(look, look_for(&deep));
+        assert_eq!(look, look_for(&deep, TerrainOptions::default()));
     }
 
     // Leaving: both go, and their assets with them.
