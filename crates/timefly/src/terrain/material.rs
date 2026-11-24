@@ -84,6 +84,20 @@ pub const SNOW_SHADE_FLOOR: f32 = 0.30;
 /// it, so the shade stays clearly blue, though paler than other shade.
 pub const SNOW_HUE_FACTOR: f32 = 0.78;
 
+/// The main dunes' crest spacing (m) in sand seas: transverse crests across the wind.
+pub const DUNE_SPACING_M: f32 = 1000.0;
+/// The small dunes' crest spacing (m), riding on the main dunes.
+pub const DUNE_SMALL_SPACING_M: f32 = 200.0;
+/// Seconds for the main crests to creep one spacing downwind: 1 km an hour, about 17 m a minute.
+/// Divides [`crate::art::TIME_WRAP_S`], so the creep loops seamlessly at the clock's wrap.
+pub const DUNE_PERIOD_S: f32 = 3600.0;
+/// Seconds for the small crests to creep one small spacing (200 m in 10 min: twice as fast as
+/// the main crests, as small dunes are in nature). Divides [`crate::art::TIME_WRAP_S`].
+pub const DUNE_SMALL_PERIOD_S: f32 = 600.0;
+/// The sand-sea mask's noise scale (m): sand seas are tens of km across, the rest of the desert
+/// is stony plain.
+pub const SAND_SEA_SCALE_M: f32 = 40_000.0;
+
 /// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
 pub struct TerrainLook {
@@ -109,6 +123,11 @@ pub struct TerrainLook {
     /// sphere there, so a dune's crest phase is `dot(p, W)` for the planet position `p`; `w`:
     /// unused.
     pub wind: Vec4,
+    /// `x`: [`DUNE_SPACING_M`]; `y`: [`DUNE_SMALL_SPACING_M`]; `z`: [`DUNE_PERIOD_S`]; `w`:
+    /// [`DUNE_SMALL_PERIOD_S`].
+    pub dunes: Vec4,
+    /// `x`: [`SAND_SEA_SCALE_M`]; `yzw`: reserved for the rock bands (zero for now).
+    pub patterns: Vec4,
 }
 
 impl Default for TerrainLook {
@@ -150,6 +169,13 @@ pub fn terrain_look(
         frame_north: basis.north.as_vec3().extend(0.0),
         frame_east: basis.east.as_vec3().extend(0.0),
         wind: wind.as_vec3().extend(0.0),
+        dunes: Vec4::new(
+            DUNE_SPACING_M,
+            DUNE_SMALL_SPACING_M,
+            DUNE_PERIOD_S,
+            DUNE_SMALL_PERIOD_S,
+        ),
+        patterns: Vec4::new(SAND_SEA_SCALE_M, 0.0, 0.0, 0.0),
     }
 }
 
@@ -504,14 +530,53 @@ mod tests {
         assert_eq!(look.relief.w, 0.78);
     }
 
+    #[test]
+    fn dune_constants() {
+        assert_eq!(DUNE_SPACING_M, 1000.0);
+        assert_eq!(DUNE_SMALL_SPACING_M, 200.0);
+        assert_eq!(DUNE_PERIOD_S, 3600.0);
+        assert_eq!(DUNE_SMALL_PERIOD_S, 600.0);
+        assert_eq!(SAND_SEA_SCALE_M, 40_000.0);
+        crate::art::assert_divides_wrap(DUNE_PERIOD_S);
+        crate::art::assert_divides_wrap(DUNE_SMALL_PERIOD_S);
+        let look = TerrainLook::default();
+        assert_eq!(look.dunes, Vec4::new(1000.0, 200.0, 3600.0, 600.0));
+        assert_eq!(look.patterns.x, 40_000.0);
+        // The WESL mirror declares the same fields in the same order.
+        let names: Vec<String> = wesl_struct_fields(TERRAIN_WESL, "TerrainLook")
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "shadow",
+                "light",
+                "relief",
+                "frame_center",
+                "frame_north",
+                "frame_east",
+                "wind",
+                "dunes",
+                "patterns"
+            ]
+        );
+    }
+
     const CDLOD_WESL: &str = include_str!("../../assets/shaders/terrain_cdlod.wesl");
+    const TERRAIN_WESL: &str = include_str!("../../assets/shaders/terrain.wesl");
 
     /// `name: type` fields of a struct declared in `terrain_cdlod.wesl`, in order.
     fn wesl_fields(name: &str) -> Vec<(String, String)> {
-        let start = CDLOD_WESL
+        wesl_struct_fields(CDLOD_WESL, name)
+    }
+
+    /// `name: type` fields of a struct declared in the WESL source `src`, in order.
+    fn wesl_struct_fields(src: &str, name: &str) -> Vec<(String, String)> {
+        let start = src
             .find(&format!("struct {name} {{"))
-            .unwrap_or_else(|| panic!("struct {name} in terrain_cdlod.wesl"));
-        let body = &CDLOD_WESL[start..];
+            .unwrap_or_else(|| panic!("struct {name} in the WESL source"));
+        let body = &src[start..];
         let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
         body.lines()
             .map(|l| l.split("//").next().unwrap().trim())
