@@ -542,6 +542,30 @@ cargo_case yes 'meta="$(cargo metadata --format-version 1)"'
 cargo_case no  "bash -c 'echo cargo'"
 cargo_case no  "echo 'x=\$(cargo build)'"
 
+echo "15. a lock keeps concurrent guard runs from pruning at once"
+profiles 15a; mkdir "$ROOT/target/.guard-lock"
+out="$(lr 95)"
+check "lock held: nothing deleted" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
+check "lock held: says so" grep -qi 'lock' <<<"$out"
+check "lock held: someone else's lock is left alone" test -d "$ROOT/target/.guard-lock"
+out=$(hook_json 'cargo build' | TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook 2>&1)
+check "lock held, hook: nothing deleted" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
+check "lock held, hook: still warns about low free space" grep -q '95 MB free' <<<"$(ctx_of "$out")"
+profiles 15b; mkdir "$ROOT/target/.guard-lock"; touch -t $OLD "$ROOT/target/.guard-lock"
+lr 95 >/dev/null
+check "stale lock (> 10 min): taken over, pruning runs" test "$(left)" = "scratch-a doc debug "
+check "stale lock: released afterwards" test ! -e "$ROOT/target/.guard-lock"
+profiles 15c; lr 95 >/dev/null
+check "manual run: lock released" test ! -e "$ROOT/target/.guard-lock"
+profiles 15d
+hook_json 'cargo build' | TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook >/dev/null 2>&1
+check "hook run: pruned and lock released" bash -c 'test "$1" = "scratch-a doc debug " && test ! -e "$2/target/.guard-lock"' _ "$(left)" "$ROOT"
+profiles 15e   # mkdir of the lock fails (e.g. ENOSPC) and no lock exists: prune anyway
+printf '#!/bin/sh\ncase "$*" in *.guard-lock*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v mkdir)" > "$FAKEBIN/mkdir"; chmod +x "$FAKEBIN/mkdir"
+lr 95 >/dev/null
+rm -f "$FAKEBIN/mkdir"
+check "lock cannot be created (no lock present): pruning still runs" test "$(left)" = "scratch-a doc debug "
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
