@@ -12,6 +12,7 @@
 # Env: TIMEFLY_TARGET_BUDGET_MB (default 15360), TIMEFLY_MIN_FREE_MB (default 5120),
 #      TIMEFLY_WARN_FREE_MB (default 10240), TIMEFLY_XCTRACE_MIN_FREE_MB (default 10240).
 # Test-only: TIMEFLY_FAKE_FREE_MB (free space in MB; grows as the guard deletes in target/),
+#            TIMEFLY_FAKE_FREE_STATIC=1 (deletions don't raise the fake free space),
 #            TIMEFLY_GUARD_ROOT, TIMEFLY_RUSTUP_BIN.
 
 MODE=manual
@@ -254,7 +255,7 @@ target_kb() { du -sk "$TARGET" 2>/dev/null | awk '{ s = $1 + 0 } END { print s +
 free_kb() {
   if [ -n "${TIMEFLY_FAKE_FREE_MB:-}" ]; then
     local base=$(($(num_or TIMEFLY_FAKE_FREE_MB "$TIMEFLY_FAKE_FREE_MB" 0) * 1024))
-    if [ -n "${FAKE_START_KB:-}" ]; then echo $((base + FAKE_START_KB - $(target_kb))); else echo "$base"; fi
+    if [ -n "${FAKE_START_KB:-}" ] && [ "${TIMEFLY_FAKE_FREE_STATIC:-}" != 1 ]; then echo $((base + FAKE_START_KB - $(target_kb))); else echo "$base"; fi
     return
   fi
   # Unknown (df failed) reads as plenty: never delete or block on a guess.
@@ -520,10 +521,19 @@ if ! free_ok; then
   else
     LR_FREE="$(mb "$(free_kb)")"
     LR_COUNT=0
+    LR_STUCK=""
     while IFS= read -r d; do
       [ -n "$d" ] && [ -d "$d" ] && [ ! -L "$d" ] || continue
+      # If a deletion gives back less than half its size, the blocks are still held
+      # (APFS local snapshots, open files): deleting more builds would not help.
+      size_kb="$(du -sk "$d" 2>/dev/null | awk '{ s = $1 + 0 } END { print s + 0 }')"
+      free_before="$(free_kb)"
       remove "$d" && LR_COUNT=$((LR_COUNT + 1))
       free_ok && break
+      if [ $(($(free_kb) - free_before)) -lt $((size_kb / 2)) ]; then
+        LR_STUCK="${d#"$ROOT"/}"
+        break
+      fi
     done <<EOF3
 $(last_resort_dirs)
 EOF3
@@ -533,6 +543,7 @@ EOF3
         NOTE+="; every build dir had to go (the same as cargo clean)"
       NOTES+=("$NOTE")
     fi
+    [ -n "$LR_STUCK" ] && NOTES+=("deleting $LR_STUCK did not raise free space by even half its size, so the deleted space is not being returned (likely APFS local snapshots or a process holding the files open); stopped deleting. Check with tmutil listlocalsnapshots / and lsof +L1, and tell the owner")
   fi
 fi
 

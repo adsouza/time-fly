@@ -566,6 +566,16 @@ lr 95 >/dev/null
 rm -f "$FAKEBIN/mkdir"
 check "lock cannot be created (no lock present): pruning still runs" test "$(left)" = "scratch-a doc debug "
 
+echo "16. last resort stops when deleting doesn't return space (snapshots, open files)"
+profiles 16a
+out="$(TIMEFLY_FAKE_FREE_STATIC=1 lr 95)"
+check "deletions not returned: only the first dir (release) removed" test "$(left)" = "wasm32-unknown-unknown scratch-a doc debug "
+check "says the space isn't being returned" grep -qi 'not being returned\|was not returned' <<<"$out"
+check "suggests tmutil listlocalsnapshots /" grep -q 'tmutil listlocalsnapshots /' <<<"$out"
+profiles 16b
+out=$(hook_json 'cargo build' | TIMEFLY_FAKE_FREE_STATIC=1 TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook 2>&1)
+check "hook: same stop, reported to Claude" bash -c 'test "$1" = "wasm32-unknown-unknown scratch-a doc debug " && grep -q "tmutil listlocalsnapshots" <<<"$2"' _ "$(left)" "$(ctx_of "$out")"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
