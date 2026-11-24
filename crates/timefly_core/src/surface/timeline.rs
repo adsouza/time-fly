@@ -457,11 +457,55 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    /// A process-wide default subscriber that wants to hear about every callsite but enables
+    /// nothing. Without it, a callsite that another test thread reaches first, while `SpanLog`
+    /// is the only registered subscriber, takes its interest from that thread's default (the
+    /// no-op subscriber, tracing-core's `Rebuilder::JustOne`) and caches `Interest::never` for
+    /// the whole process, so `SpanLog` never sees it. With it, every thread's default says
+    /// "sometimes" and the scoped `SpanLog` decides per call.
+    struct InterestedEverywhere;
+
+    impl tracing::Subscriber for InterestedEverywhere {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn interested_everywhere() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Another test may already have set a global default; then that one decides.
+            let _ = tracing::subscriber::set_global_default(InterestedEverywhere);
+        });
+    }
+
     #[test]
     fn building_a_timeline_is_a_debug_span_that_records_its_error() {
         // Like `CrustModel::new`: the coarse entry point is traced (spec §20).
+        interested_everywhere();
         let log = SpanLog::default();
         tracing::subscriber::with_default(log.clone(), || {
+            // As a parallel test would: another thread, with no subscriber of its own, reaches
+            // the span and its error event first. Their callsites must not end up disabled for
+            // this thread.
+            std::thread::spawn(|| Timeline::new(vec![], vec![]))
+                .join()
+                .unwrap()
+                .unwrap_err();
             assert_eq!(Timeline::new(vec![], vec![]), Err(TimelineError::NoFrames));
         });
         assert_eq!(
