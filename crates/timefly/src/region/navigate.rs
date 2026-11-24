@@ -392,7 +392,13 @@ fn region_is(i: &NavInputs, requested: RenderDir, to: YearsBp) -> bool {
     }
 }
 
-fn same_region(centre: RenderDir, snapshot: YearsBp, requested: RenderDir, to: YearsBp) -> bool {
+/// Whether two region locations and snapshot ages identify the same flight destination.
+pub fn same_region(
+    centre: RenderDir,
+    snapshot: YearsBp,
+    requested: RenderDir,
+    to: YearsBp,
+) -> bool {
     snapshot == to && centre.0.normalize().dot(requested.0.normalize()) > 1.0 - 1e-12
 }
 

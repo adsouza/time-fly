@@ -3,6 +3,10 @@ name = "timefly"
 version = "0.1.0"
 edition = "2024"
 
+[[example]]
+name = "region_tour"
+test = true
+
 [features]
 default = ["system-spans"]
 # Bevy's `trace` feature wraps every system and schedule in a span (spec §20); `debug` gives the

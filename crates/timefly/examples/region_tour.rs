@@ -15,7 +15,8 @@
 //! `TIMEFLY_LOG_DIR` per run.
 //!
 //! A sixth argument `AGL_M` places the camera that many metres above `max(ground, 0)` at the
-//! region's centre instead of [`CAMERA_START_ALTITUDE_M`], for the low-altitude shots.
+//! region's centre instead of [`CAMERA_START_ALTITUDE_M`]. Heights outside the flight clearance
+//! and absolute ceiling at that centre cause the tour to exit with an error.
 //!
 //! A seventh argument `LATER_S` (with `shaded`) saves a second shot, `<prefix>-later.png`, that
 //! many seconds after the first, for motion such as the swash (each screenshot resolves a few
@@ -47,9 +48,12 @@ use bevy::window::{PresentMode, PrimaryWindow};
 use timefly::args::{LaunchArgs, parse_region, parse_window_size};
 use timefly::bench::frame_time_stats;
 use timefly::diagnostics;
-use timefly::fly_camera::FlyState;
-use timefly::region::navigate::{NavPhase, Navigation};
-use timefly::region::{ActiveRegion, CAMERA_START_ALTITUDE_M, RegionEntered, RegionState};
+use timefly::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems};
+use timefly::region::launch::launch_request;
+use timefly::region::navigate::{NavPhase, Navigation, same_region};
+use timefly::region::{
+    ActiveRegion, CAMERA_START_ALTITUDE_M, RegionEntered, RegionRequested, RegionState,
+};
 use timefly::terrain::view::RegionCamera;
 use timefly::terrain::{TerrainScene, WIREFRAME_KEY};
 use timefly::time::{GlobeTime, OLDER_KEY};
@@ -106,6 +110,7 @@ struct Tour {
     size: (u32, u32),
     target: Option<Handle<Image>>,
     mode: Mode,
+    requested: RegionRequested,
     /// Camera height above `max(ground, 0)` at the centre.
     agl_m: f32,
     /// Seconds after the shaded shot to save the `later` one (`shaded` mode only).
@@ -208,6 +213,38 @@ fn tour(
     if *state.get() == RegionState::Generating {
         tour.left_generating = true;
     }
+    let timed_flight = tour.mode == Mode::Time;
+    let on_course = *state.get() == RegionState::InRegion
+        && nav.phase == NavPhase::Flying
+        && region.as_ref().is_some_and(|r| {
+            same_region(
+                r.grid.spec.center,
+                r.grid.spec.snapshot,
+                tour.requested.era_dir,
+                tour.requested.snapshot,
+            )
+        });
+    if matches!(tour.step, Step::Settle | Step::Timing) {
+        if timed_flight && !on_course {
+            error!("region tour: left the selected region during the timing run");
+            exit.write(AppExit::error());
+            return;
+        }
+        if let Some(r) = region.as_ref() {
+            let surface = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
+            if !(CAMERA_CLEARANCE_M..=CAMERA_CEILING_M - surface).contains(&tour.agl_m) {
+                error!(
+                    requested_agl_m = tour.agl_m,
+                    min_agl_m = CAMERA_CLEARANCE_M,
+                    max_agl_m = CAMERA_CEILING_M - surface,
+                    "region tour: requested height is outside the flight limits"
+                );
+                exit.write(AppExit::error());
+                return;
+            }
+            fly.pos_m = Vec3::new(0.0, surface + tour.agl_m, 0.0);
+        }
+    }
     match tour.step {
         Step::WaitRegion => {
             let failed = tour.left_generating && *state.get() == RegionState::Globe;
@@ -216,19 +253,17 @@ fn tour(
                 exit.write(AppExit::error());
                 return;
             }
-            let ready = tour.target.is_some() || tour.mode == Mode::Time;
-            if entered.read().last().is_some() || scene.is_some() && ready {
+            let ready = if timed_flight {
+                on_course
+            } else {
+                entered.read().last().is_some() || scene.is_some() && tour.target.is_some()
+            };
+            if ready {
                 tour.step = Step::Settle;
                 tour.since = now;
             }
         }
         Step::Settle => {
-            // Hold the requested height above the centre until the shot (the region's start
-            // pose may be applied a frame or two after `RegionEntered`).
-            if let Some(r) = region.as_deref() {
-                let ground = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
-                fly.pos_m = Vec3::new(0.0, ground as f32 + tour.agl_m, 0.0);
-            }
             if now - tour.since >= SETTLE_SECS && tour.mode == Mode::Time {
                 info!(agl_m = tour.agl_m, "region tour: timing frames");
                 tour.step = Step::Timing;
@@ -332,10 +367,6 @@ fn tour(
             }
         }
         Step::Timing => {
-            if let Some(r) = region.as_deref() {
-                let ground = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
-                fly.pos_m = Vec3::new(0.0, ground as f32 + tour.agl_m, 0.0);
-            }
             let ms = real.delta_secs() * 1000.0;
             tour.frame_ms.push(ms);
             if now - tour.since >= TIME_SECS {
@@ -435,7 +466,12 @@ fn main() -> AppExit {
     });
     let mut app = timefly::app(&session);
     if mode == Mode::Time {
-        app.add_systems(Startup, uncap_frames);
+        app.add_systems(Startup, uncap_frames).add_systems(
+            Update,
+            tour.after(FlySystems::Step).before(FlySystems::Apply),
+        );
+    } else {
+        app.add_systems(PreUpdate, tour.after(bevy::input::InputSystems));
     }
     app.insert_resource(Tour {
         out,
@@ -443,6 +479,7 @@ fn main() -> AppExit {
         size,
         target: None,
         mode,
+        requested: launch_request(&region),
         agl_m,
         later_s,
         shot_at: 0.0,
@@ -453,9 +490,116 @@ fn main() -> AppExit {
         left_generating: false,
         frame_ms: Vec::new(),
     })
-    .add_systems(Update, render_offscreen)
-    .add_systems(PreUpdate, tour.after(bevy::input::InputSystems));
+    .add_systems(Update, render_offscreen);
     let exit = app.run();
     session.finish(&exit);
     exit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use timefly_core::worldgen::generate::{Field, RegionGrid, RegionSpec};
+
+    fn timing_app(agl_m: f32, ground: f32) -> App {
+        let request = launch_request(&parse_region("0,0,0").unwrap());
+        let spec = RegionSpec::new(request.era_dir, request.snapshot, 0);
+        let field = Field {
+            res: 2,
+            size_m: 1000.0,
+            elevation_m: vec![ground; 4],
+            surface: vec![[0; 4]; 4],
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<RegionEntered>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<GlobeTime>()
+            .init_resource::<FlyState>()
+            .insert_resource(Navigation {
+                phase: NavPhase::Flying,
+                ..default()
+            })
+            .insert_resource(State::new(RegionState::InRegion))
+            .insert_resource(ActiveRegion {
+                frame: spec.frame(),
+                grid: RegionGrid {
+                    spec,
+                    inner: field.clone(),
+                    apron: field,
+                }
+                .into(),
+            })
+            .insert_resource(Tour {
+                out: PathBuf::new(),
+                prefix: "test".into(),
+                size: (800, 600),
+                target: None,
+                mode: Mode::Time,
+                requested: request,
+                agl_m,
+                later_s: None,
+                shot_at: 0.0,
+                step: Step::Timing,
+                changing: false,
+                since: 0.0,
+                frames: 0,
+                left_generating: false,
+                frame_ms: Vec::new(),
+            })
+            .add_systems(Update, tour);
+        app
+    }
+
+    #[test]
+    fn interrupted_timing_exits_before_recording_another_sample() {
+        let interruptions: [fn(&mut App); 5] = [
+            |app| app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Globe,
+            |app| {
+                app.world_mut().remove_resource::<ActiveRegion>();
+            },
+            |app| {
+                app.insert_resource(State::new(RegionState::Generating));
+            },
+            |app| {
+                let mut region = app.world_mut().resource_mut::<ActiveRegion>();
+                std::sync::Arc::make_mut(&mut region.grid).spec.center =
+                    launch_request(&parse_region("10,20,0").unwrap()).era_dir;
+            },
+            |app| {
+                let mut region = app.world_mut().resource_mut::<ActiveRegion>();
+                std::sync::Arc::make_mut(&mut region.grid).spec.snapshot =
+                    launch_request(&parse_region("0,0,1000").unwrap()).snapshot;
+            },
+        ];
+        for interrupt in interruptions {
+            let mut app = timing_app(400.0, 0.0);
+            app.update();
+            assert_eq!(app.world().resource::<Tour>().frame_ms.len(), 1);
+            interrupt(&mut app);
+            app.update();
+            assert_eq!(app.should_exit(), Some(AppExit::error()));
+            assert_eq!(app.world().resource::<Tour>().frame_ms.len(), 1);
+        }
+    }
+
+    #[test]
+    fn requested_height_must_be_renderable_at_the_region_centre() {
+        for (agl, ground, expected_y) in [
+            (50.0, 0.0, None),
+            (59_001.0, 1000.0, None),
+            (59_000.0, 1000.0, Some(CAMERA_CEILING_M)),
+            (CAMERA_CLEARANCE_M, -500.0, Some(CAMERA_CLEARANCE_M)),
+        ] {
+            let mut app = timing_app(agl, ground);
+            app.update();
+            if let Some(y) = expected_y {
+                assert_eq!(app.should_exit(), None);
+                assert_eq!(app.world().resource::<FlyState>().pos_m.y, y);
+            } else {
+                assert_eq!(app.should_exit(), Some(AppExit::error()));
+                assert!(app.world().resource::<Tour>().frame_ms.is_empty());
+            }
+        }
+    }
 }

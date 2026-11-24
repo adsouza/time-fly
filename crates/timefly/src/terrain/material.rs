@@ -689,10 +689,6 @@ mod tests {
             "const DUNE_SLOPE: vec2<f32> = vec2<f32>({:?}, {:?});",
             DUNE_SLOPE[0], DUNE_SLOPE[1]
         )));
-        assert!(
-            TERRAIN_WESL
-                .contains("desert.sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope))")
-        );
         // A zero dune tilt stays exactly zero, whatever the terrain does.
         let sun = REGION_SUN_DIRECTION.normalize();
         for base in [Vec2::ZERO, Vec2::new(3.0, -2.0), Vec2::new(-5.0, 4.0)] {
@@ -764,6 +760,24 @@ mod tests {
             }
         }
         panic!("unbalanced braces after byte {open}");
+    }
+
+    #[test]
+    fn sloping_sand_seas_get_stony_plain_detail() {
+        // At raw_sea = 1 and slope > 0.07, the effective weight is zero.
+        // Both texture branches and the final blend must use that same weight.
+        let (_, desert) = TERRAIN_WESL.split_once("fn desert_at(").unwrap();
+        let (body, paint) = desert.split_once("return d;").unwrap();
+        let (_, adjusted) = body
+            .split_once("d.sea = raw_sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope));")
+            .unwrap();
+        assert!(adjusted.contains("if d.sea > 0.0 && main_w > 0.0"));
+        let (_, stony) = adjusted.split_once("if d.sea < 1.0 {").unwrap();
+        assert!(
+            stony.contains("d.gravel = smoothstep") && stony.contains("d.mottle = planet_noise")
+        );
+        assert!(paint.contains("let sea = desert.sea;"));
+        assert!(paint.contains("let plain = desert_ground * (1.0 - sea);"));
     }
 
     #[test]

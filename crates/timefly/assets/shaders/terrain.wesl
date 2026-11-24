@@ -317,11 +317,12 @@ struct Desert {
 }
 
 // xz is the region-local position, p its planet position; footprint the pixel's size (m).
-fn desert_at(xz: vec2<f32>, p: vec3<f32>, footprint: f32) -> Desert {
+fn desert_at(xz: vec2<f32>, p: vec3<f32>, footprint: f32, slope: f32) -> Desert {
     var d: Desert;
     let mask = planet_noise(p, look.patterns.x, 213u)
         + SAND_SEA_DETAIL * planet_noise(p, look.patterns.x / 3.0, 225u);
-    d.sea = smoothstep(SAND_SEA_EDGE.x, SAND_SEA_EDGE.y, mask);
+    let raw_sea = smoothstep(SAND_SEA_EDGE.x, SAND_SEA_EDGE.y, mask);
+    d.sea = raw_sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope));
     d.gradient = vec2<f32>(0.0);
     d.tone = 0.0;
     d.gravel = 0.0;
@@ -478,8 +479,8 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
         );
     }
     if desert_ground > 0.0 {
-        let desert = desert_at(xz, pp, footprint);
-        let sea = desert.sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope));
+        let desert = desert_at(xz, pp, footprint, slope);
+        let sea = desert.sea;
         dune_sea = desert_ground * sea;
         dune_gradient = desert.gradient;
         // Erg: the ground colour, lighter on crests and darker in the interdune troughs.

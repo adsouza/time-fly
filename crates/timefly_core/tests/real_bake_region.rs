@@ -24,7 +24,10 @@ fn data() -> PathBuf {
 }
 
 fn tile_dir() -> PathBuf {
-    let dir = data().join("tiles");
+    active_tile_dir(&data().join("tiles"))
+}
+
+fn active_tile_dir(dir: &Path) -> PathBuf {
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
     dir.join(manifest["generation"].as_str().unwrap_or(""))
@@ -39,8 +42,11 @@ struct Bake {
 fn bake(dir: &Path) -> Bake {
     let manifest: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
-    let footprints = read_tfplates(&fs::read(dir.join("plates.tfplates")).unwrap()).unwrap();
-    let rotations = read_tfrot(&fs::read(dir.join("rotations.tfrot")).unwrap()).unwrap();
+    let footprints =
+        read_tfplates(&fs::read(dir.join(manifest["footprints"].as_str().unwrap())).unwrap())
+            .unwrap();
+    let rotations =
+        read_tfrot(&fs::read(dir.join(manifest["rotations"].as_str().unwrap())).unwrap()).unwrap();
     let crust = CrustModel::new(rotations, footprints).unwrap();
     let frames = manifest["frames"].as_array().unwrap();
     let mut files = Vec::new();
@@ -771,6 +777,47 @@ fn dry_snowline_on_the_real_bake() {
     }
 }
 
+fn load_probe_tiles(tile_root: &Path, needed: &[(u8, u8)]) -> TileSet {
+    let dir = active_tile_dir(tile_root);
+    let read = |name: &str| read_tfgrid(&fs::read(dir.join(name)).unwrap()).unwrap();
+    let mut tiles = TileSet::new();
+    tiles.set_overview(read("overview.tfgrid")).unwrap();
+    for &(r, c) in needed {
+        tiles
+            .insert(r, c, read(&format!("r{r:02}c{c:02}.tfgrid")))
+            .unwrap();
+    }
+    tiles
+}
+
+#[test]
+fn art_probes_read_overview_and_tiles_from_the_published_generation() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../timefly/tests/assets/data/tiles");
+    let root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("art-probe-{}", std::process::id()));
+    let id = "a".repeat(64);
+    let generation = root.join(&id);
+    fs::create_dir_all(&generation).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.join("manifest.json")).unwrap()).unwrap();
+    manifest["version"] = 2.into();
+    manifest["generation"] = id.into();
+    fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    for name in ["overview.tfgrid", "r17c35.tfgrid"] {
+        fs::copy(fixture.join(name), generation.join(name)).unwrap();
+        fs::write(root.join(name), b"obsolete flat payload").unwrap();
+    }
+    for layout in [&fixture, &root] {
+        let tiles = load_probe_tiles(layout, &[(17, 35)]);
+        assert!(tiles.has_overview() && tiles.contains(17, 35));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// The inner field at `lat, lon` and 0 ka over the real bake (the Task 7 rock-banding probes).
 fn inner_field_at(lat: f64, lon: f64) -> timefly_core::worldgen::generate::Field {
     let globe = data().join("globe");
@@ -780,21 +827,14 @@ fn inner_field_at(lat: f64, lon: f64) -> timefly_core::worldgen::generate::Field
     for i in frames_needed(&b.timeline, age) {
         grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
     }
-    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
     let centre = geo_to_render(latlon_to_geo(lat, lon));
     let frame = RegionFrame { center: centre };
-    let mut tiles = TileSet::new();
-    tiles.set_overview(overview).unwrap();
-    let probe = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+    let empty = TileSet::new();
+    let probe = snapshot_field(&b.timeline, &b.crust, &empty, false, age, |i| {
         grids[i].as_ref().unwrap()
     })
     .unwrap();
-    for (r, c) in probe.tiles_needed(&frame) {
-        let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
-        tiles
-            .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
-            .unwrap();
-    }
+    let tiles = load_probe_tiles(&data().join("tiles"), &probe.tiles_needed(&frame));
     let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
         grids[i].as_ref().unwrap()
     })
