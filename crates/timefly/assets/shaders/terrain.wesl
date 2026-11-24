@@ -24,7 +24,7 @@ import package::noise::{gradient_noise3, hash3};
 import package::planet::planet_position_m;
 import package::snowline::{snowline_m, snowline_raise_from_byte};
 import bevy_pbr::render::mesh_functions::get_tag;
-import bevy_pbr::render::mesh_view_bindings::globals;
+import bevy_pbr::render::mesh_view_bindings::{globals, lights};
 import bevy_pbr::render::view_transformations::position_world_to_clip;
 import bevy_pbr::render::pbr_fragment::pbr_input_from_standard_material;
 import bevy_pbr::render::pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing};
@@ -252,6 +252,15 @@ const DUNE_WINDWARD: f32 = 0.8;
 const DUNE_SMALL_ANGLE: f32 = 0.35;
 // Forward-difference step (m) for the warp's gradient (the warp's finest scale is 600 m).
 const DUNE_WARP_STEP_M: f32 = 40.0;
+// Sand seas lie on flat ground: the erg fades out between these true slopes (rise over run) and
+// the desert there is stony plain, so the dunes' tilt never rides on a hillside's.
+const DUNE_SLOPE: vec2<f32> = vec2<f32>(0.03, 0.07);
+// How far the dunes may turn a face away from the sun: this share of the way from facing straight
+// up to the terminator, counting the terrain's own (exaggerated) tilt (bound_dune_tilt). At 0.25
+// a slip face turned from the sun keeps about three quarters of level ground's sunlight, above
+// the ramp's shade step, so it reads as soft shade and never as a black line (0.4-0.5 still
+// dropped into the step at the Grand Canyon plateau edge).
+const DUNE_AWAY_LIMIT: f32 = 0.25;
 const PI: f32 = 3.14159265;
 
 // The static warp of the main crests, in main cycles: crests wander and fork. Planet-fixed and
@@ -427,12 +436,13 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
             xz, look.frame_center.xyz, look.frame_north.xyz, look.frame_east.xyz, look.frame_center.w
         );
         let desert = desert_at(pp, footprint);
-        dune_sea = desert_ground * desert.sea;
+        let sea = desert.sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope));
+        dune_sea = desert_ground * sea;
         dune_gradient = desert.gradient;
         // Erg: the ground colour, lighter on crests and darker in the interdune troughs.
         let erg = 1.0 + 0.2 * desert.tone;
         // Stony plain: gravel patches toward the darker, greyer rock colour, and mottling.
-        let plain = desert_ground * (1.0 - desert.sea);
+        let plain = desert_ground * (1.0 - sea);
         let gravel = mix(c, surf.rock * 0.8, 0.35 * desert.gravel);
         let stony = gravel * (1.0 + 0.18 * desert.mottle);
         c = mix(c, stony, plain);
@@ -517,6 +527,28 @@ fn paint_light(lit: vec3<f32>, albedo: vec3<f32>, snow: f32) -> vec3<f32> {
     return c;
 }
 
+// The dunes' tilt, bounded so that with the terrain's shading tilt `base` it never turns a face
+// more than DUNE_AWAY_LIMIT of the way to the sun's terminator. Unnormalised, N.L is
+// sun.y + dot(tilt, sun.xz), so the terminator is dot(tilt, sun.xz) = -sun.y. Only the dune
+// tilt's component along sun.xz is limited, and only where it turns the face away; faces turned
+// toward the sun, and faces the terrain alone already turns further, keep their tilt (the dunes
+// then add nothing away from the sun). The sun is the region's one directional light.
+fn bound_dune_tilt(base: vec2<f32>, dune: vec2<f32>) -> vec2<f32> {
+    if lights.n_directional_lights == 0u {
+        return dune;
+    }
+    let to_sun = lights.directional_lights[0].direction_to_light;
+    let across = to_sun.xz;
+    let len2 = dot(across, across);
+    if to_sun.y <= 0.0 || len2 < 1e-6 {
+        return dune;
+    }
+    let lowest = -DUNE_AWAY_LIMIT * to_sun.y;
+    let along = dot(dune, across);
+    let allowed = max(along, min(0.0, lowest - dot(base, across)));
+    return dune + across * ((allowed - along) / len2);
+}
+
 // Distance to the nearest triangle edge in pixels: grid lines and the (i, j)-(i+1, j+1) diagonal.
 fn edge_pixels(grid: vec2<f32>) -> f32 {
     let f = fract(grid);
@@ -552,8 +584,10 @@ fn fragment(in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> F
     let height = in.world_position.y + dot(d, d) / (2.0 * params.lattice.z);
     let painted = paint(params, xz, height, slope, length(fwidth(xz)));
     // The dunes' tilt joins the shading tilt, so the PBR sun and the ramp light each dune face by
-    // its own slope (which face is lit depends on where the sun stands against the wind).
-    let shading = gradient * look.relief.x + curve + painted.dune_gradient;
+    // its own slope (which face is lit depends on where the sun stands against the wind). It is
+    // bounded so a slip face turned from the sun stays in soft shade.
+    let base_shading = gradient * look.relief.x + curve;
+    let shading = base_shading + bound_dune_tilt(base_shading, painted.dune_gradient);
     var mesh: VertexOutput;
     mesh.position = in.position;
     mesh.world_position = in.world_position;
