@@ -272,6 +272,11 @@ across the sea.
 - **Wet sand:** a narrow, darker, shinier band above the highest swash line on beaches.
   - It's a terrain-shader change keyed on height near 0 and the shore flag.
   - It is optional. If it can't be made to agree with the swash, it is dropped and noted.
+  - **Dropped (Task 8).** A terrain-shader band keyed on the swash's highest reach (same
+    amplitude, shore probe and reach factor as the water) rendered on the Red Sea and Panama
+    coasts as a thin dark strip with a hard straight edge that did not follow the water's edge,
+    with undarkened sand between it and the foam. That is a gap, which this section forbids, so
+    the code was reverted. Beaches keep their existing sand tint.
 - **At rest:** with the swash's mean at 0, the shoreline is still the height field's zero
   contour (anti-goal "a coastline that moves").
 
