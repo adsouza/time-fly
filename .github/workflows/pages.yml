@@ -43,7 +43,10 @@ jobs:
           key: raw-data-${{ hashFiles('data/sources.json') }}
 
       - run: rustup toolchain install
+      # Saved from main only: PR runs restore main's cache instead of storing their own copy.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
