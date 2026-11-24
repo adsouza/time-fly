@@ -4,8 +4,10 @@
 //! - **Mesh** ([`mesh`]): a slim tapered body (opaque) and four translucent wings, generated in
 //!   code. The two parts are separate entities under the [`Dragonfly`] root so the body draws
 //!   in the opaque pass and the wings blend at [`WING_ALPHA`].
-//! - **Flap** (`dragonfly.wesl`): the vertex stage rotates the wings about the body axis by
-//!   `sin(t × 2π × FLAP_HZ) × FLAP_AMPLITUDE_RAD`.
+//! - **Flap and rim** (`dragonfly.wesl`): the vertex stage rotates the wings about the body
+//!   axis by `sin(t × 2π × FLAP_HZ) × FLAP_AMPLITUDE_RAD`; the fragment stage lights the fly
+//!   with Bevy's PBR and adds a subtle rim light ([`RIM_COLOR`], [`RIM_STRENGTH`],
+//!   [`RIM_POWER`]) so it reads over dark ground.
 //! - **Pose** ([`FlyPose`]): whichever world is active writes it (the region's
 //!   `crate::fly_camera::apply_fly` today); [`follow_fly_pose`] copies it to the root's
 //!   transform, adding the bank. The bank ([`bank_step`]) and the idle bob ([`hover_offset`])
@@ -45,6 +47,14 @@ pub const FLAP_HZ: f32 = 25.0;
 pub const FLAP_AMPLITUDE_RAD: f32 = 0.6;
 /// The wings' opacity.
 pub const WING_ALPHA: f32 = 0.45;
+/// The rim light's colour (linear): a pale blue-green, so the fly's outline reads over dark
+/// forest *(call)*.
+pub const RIM_COLOR: Vec3 = Vec3::new(0.55, 0.9, 1.0);
+/// The rim light's strength where the surface is edge-on to the view, in the lit colour's units
+/// (sunlit white is about 2.2 there) *(call: subtle)*.
+pub const RIM_STRENGTH: f32 = 0.35;
+/// How tightly the rim hugs the outline: the brightening goes as `(1 − N·V)^power`.
+pub const RIM_POWER: f32 = 3.0;
 /// Bank (radians) per radian a second of turn *(call)*: the full arrow-key turn (60°/s) banks
 /// about 30°.
 pub const BANK_PER_YAW_RATE: f32 = 0.5;
@@ -120,17 +130,23 @@ pub fn hover_offset(t_s: f32, scale: f32) -> f32 {
 /// The dragonfly's material: `StandardMaterial` lighting with the flapping vertex stage.
 pub type DragonflyMaterial = ExtendedMaterial<StandardMaterial, DragonflyExtension>;
 
-/// The flap's parameters, as `dragonfly.wesl`'s `DragonflyLook`.
+/// The flap and rim parameters, as `dragonfly.wesl`'s `DragonflyLook`.
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
 pub struct DragonflyLook {
     /// x: frequency (Hz); y: amplitude (radians).
     pub flap: Vec4,
+    /// rgb: the rim colour; w: its strength.
+    pub rim: Vec4,
+    /// x: the rim's power.
+    pub rim_shape: Vec4,
 }
 
 impl Default for DragonflyLook {
     fn default() -> Self {
         DragonflyLook {
             flap: Vec4::new(FLAP_HZ, FLAP_AMPLITUDE_RAD, 0.0, 0.0),
+            rim: RIM_COLOR.extend(RIM_STRENGTH),
+            rim_shape: Vec4::new(RIM_POWER, 0.0, 0.0, 0.0),
         }
     }
 }
@@ -143,6 +159,9 @@ pub struct DragonflyExtension {
 
 impl MaterialExtension for DragonflyExtension {
     fn vertex_shader() -> ShaderRef {
+        DRAGONFLY_SHADER.into()
+    }
+    fn fragment_shader() -> ShaderRef {
         DRAGONFLY_SHADER.into()
     }
     // The fly is drawn at a scale that follows the chase distance (kilometres high up), so its
@@ -349,6 +368,21 @@ mod tests {
         app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = true;
         app.update();
         assert_eq!(visibility(&app), Visibility::Inherited);
+    }
+
+    #[test]
+    fn the_rim_light_brightens_the_outline() {
+        // A fragment stage of our own adds the rim to Bevy's lit colour, on body and wings.
+        assert!(
+            matches!(DragonflyExtension::fragment_shader(), ShaderRef::Handle(h) if h == DRAGONFLY_SHADER)
+        );
+        let look = DragonflyLook::default();
+        assert_eq!(look.rim, Vec4::new(0.55, 0.9, 1.0, 0.35));
+        assert_eq!(look.rim_shape.x, 3.0);
+        let wesl = include_str!("../../assets/shaders/dragonfly.wesl");
+        assert!(wesl.contains("@fragment"));
+        assert!(wesl.contains("pow(1.0 - facing, look.rim_shape.x) * look.rim.w"));
+        assert!(wesl.contains("apply_pbr_lighting(pbr_input)"));
     }
 
     #[test]

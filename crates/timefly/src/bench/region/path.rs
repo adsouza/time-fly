@@ -451,7 +451,7 @@ impl BenchPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, MAX_PITCH_DEG};
+    use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, MAX_PITCH_DEG, MIN_PITCH_DEG};
 
     /// Hills over a plane that falls to the east: the coast runs north-south near x = 20 km.
     fn coastal(x: f32, z: f32) -> f32 {
@@ -542,7 +542,7 @@ mod tests {
                 assert!(p.y >= floor + MIN_AGL_M - 1e-3, "{i}: {p} over {floor}");
                 assert!(p.y >= floor + CAMERA_CLEARANCE_M);
                 assert!(p.y <= CAMERA_CEILING_M);
-                assert!(f.pitch.abs() <= MAX_PITCH_DEG.to_radians());
+                assert!((MIN_PITCH_DEG..=MAX_PITCH_DEG).contains(&f.pitch.to_degrees()));
             }
             for (i, w) in frames.windows(2).enumerate() {
                 let (a, b) = (w[0].pos_m, w[1].pos_m);

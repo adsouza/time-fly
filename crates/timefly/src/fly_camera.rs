@@ -2,8 +2,9 @@
 //! [`FlyState`] is the **fly's** pose (M3): the keys steer it as they steered M2's free camera,
 //! and the region camera follows it from behind and above.
 //!
-//! The controls: `W` `A` `S` `D` move, a drag looks, `Space` /
-//! `E` climb and `Ctrl` / `Q` descend. The arrow keys also fly: `↑` / `↓` forward and back,
+//! The controls: `W` `A` `S` `D` move the fly level along its heading, a drag turns it and
+//! tilts the view (dragging down looks further down, as in M2; the pitch never tilts the
+//! flight path), `Space` / `E` climb and `Ctrl` / `Q` descend. The arrow keys also fly: `↑` / `↓` forward and back,
 //! `←` / `→` turn, and with `Shift` held `←` / `→` fly sideways instead. `Shift` with forward
 //! (`↑` or `W`) boosts; `Shift` alone, or with any other direction, does not.
 //!
@@ -76,8 +77,12 @@ pub const BOOST: f32 = 4.0;
 pub const LOOK_RADIANS_PER_PX: f32 = 0.003;
 /// How fast `←` / `→` turn the camera.
 pub const TURN_DEG_PER_S: f32 = 60.0;
-/// The pitch stops short of straight up or down, so the view's "up" stays defined.
-pub const MAX_PITCH_DEG: f32 = 89.0;
+/// The view pitch's range (degrees): exactly the pitches whose chase look stays within
+/// [`CHASE_LOOK_MIN_DEG`]..=[`CHASE_LOOK_MAX_DEG`], so a drag never has a dead zone. With a 60°
+/// view: −50° (looking 45° down) to 0° (looking 5° up).
+pub const MIN_PITCH_DEG: f32 = pitch_for_look_deg(CHASE_LOOK_MAX_DEG);
+/// See [`MIN_PITCH_DEG`].
+pub const MAX_PITCH_DEG: f32 = pitch_for_look_deg(CHASE_LOOK_MIN_DEG);
 /// A frame longer than this moves the camera only this far: a hitch never flings it.
 pub const MAX_STEP_S: f32 = 0.5;
 /// The longest horizontal move between two floor checks within a step.
@@ -90,20 +95,38 @@ pub const CHASE_SMOOTHING_S: f64 = 0.2;
 /// The chase camera's look-down pitch stays within this margin of the view's edge, so the fly
 /// (seen [`CHASE_ELEVATION_DEG`] below the horizontal) never leaves the frame.
 pub const CHASE_LOOK_MARGIN_DEG: f64 = 5.0;
+/// The chase view's look-down pitch at the start pitch (degrees): a little shallower than the
+/// fly's elevation, so the fly sits a little below the view's centre (M3 design §5.3).
+pub const CHASE_START_LOOK_DEG: f64 = CHASE_ELEVATION_DEG - 5.0;
+/// The shallowest chase look (degrees below the horizontal; negative looks up): the fly stays
+/// [`CHASE_LOOK_MARGIN_DEG`] inside the bottom of the frame.
+pub const CHASE_LOOK_MIN_DEG: f64 =
+    CHASE_ELEVATION_DEG - (REGION_FOV_DEG as f64 / 2.0 - CHASE_LOOK_MARGIN_DEG);
+/// The steepest chase look: the fly stays [`CHASE_LOOK_MARGIN_DEG`] inside the top of the frame.
+pub const CHASE_LOOK_MAX_DEG: f64 =
+    CHASE_ELEVATION_DEG + (REGION_FOV_DEG as f64 / 2.0 - CHASE_LOOK_MARGIN_DEG);
+
+/// The view pitch (degrees) whose chase look is `look_deg`: the inverse of
+/// [`chase_look_pitch_deg`].
+const fn pitch_for_look_deg(look_deg: f64) -> f32 {
+    (-(START_PITCH_DEG as f64) + CHASE_START_LOOK_DEG - look_deg) as f32
+}
+
 /// A chase camera more than this many chase distances from where it should be jumps there (a
 /// region entered, a scripted pose) instead of gliding.
 pub const CHASE_SNAP_DISTANCES: f64 = 4.0;
 
-/// How far below the horizontal the chase camera looks (degrees) for the view `pitch`:
-/// `CHASE_ELEVATION_DEG + pitch` (M3 brief, Task 3), so at `pitch = 0` it looks straight at the
-/// fly, and at the start pitch (−20°) it looks level, the fly about a third of the frame below
-/// the centre. Clamped so the fly stays in the frame.
+/// How far below the horizontal the chase camera looks (degrees) for the view `pitch`
+/// (radians, negative looks down): [`CHASE_START_LOOK_DEG`] at the start pitch, and one degree
+/// further down per degree the pitch drops, so dragging down looks further down, as in M2
+/// (controller ruling, fix round 1). The start pose looks 15° down with the fly 5° below the
+/// view's centre. [`fly_step`] keeps the pitch within [`MIN_PITCH_DEG`]..=[`MAX_PITCH_DEG`],
+/// which maps exactly onto [`CHASE_LOOK_MIN_DEG`]..=[`CHASE_LOOK_MAX_DEG`]; the clamp here only
+/// guards scripted poses.
 pub fn chase_look_pitch_deg(pitch: f32) -> f64 {
-    let half_fov = f64::from(REGION_FOV_DEG) / 2.0 - CHASE_LOOK_MARGIN_DEG;
-    (CHASE_ELEVATION_DEG + f64::from(pitch).to_degrees()).clamp(
-        CHASE_ELEVATION_DEG - half_fov,
-        CHASE_ELEVATION_DEG + half_fov,
-    )
+    let start = -f64::from(START_PITCH_DEG);
+    (CHASE_START_LOOK_DEG - (f64::from(pitch).to_degrees() - start))
+        .clamp(CHASE_LOOK_MIN_DEG, CHASE_LOOK_MAX_DEG)
 }
 
 /// One critically damped step of `dt_s` toward a fixed `target`, with time constant `tau_s`
@@ -148,9 +171,11 @@ pub fn region_chase_pose(fly: &FlyState, ground_m: impl Fn(f64, f64) -> f64) -> 
 /// Half the inner field: the soft edge starts here on either axis.
 pub const EDGE_M: f32 = (REGION_SIZE_M / 2.0) as f32;
 
-/// Where the camera is and where it looks: local metres in the region's frame (`+x` east, `−z`
-/// north, `+y` up from sea level), `yaw` about `+y` from north (positive turns west, as Bevy's
-/// rotations go) and `pitch` about the camera's right axis (negative looks down).
+/// Where the fly is and how the view looks: local metres in the region's frame (`+x` east, `−z`
+/// north, `+y` up from sea level), `yaw` (the fly's heading) about `+y` from north (positive
+/// turns west, as Bevy's rotations go) and `pitch`, the view's tilt (negative looks down; the
+/// chase camera reads it through [`chase_look_pitch_deg`]). [`FlyState::transform`] is the M2
+/// free-camera pose at that position, kept for scripted drivers and tests.
 #[derive(Resource, Copy, Clone, Debug, PartialEq)]
 pub struct FlyState {
     pub pos_m: Vec3,
@@ -228,19 +253,19 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
     } else {
         0.0
     };
-    let max_pitch = MAX_PITCH_DEG.to_radians();
     let turn = input.turn.clamp(-1.0, 1.0) * TURN_DEG_PER_S.to_radians() * dt;
     let yaw = state.yaw - input.look_delta.x * LOOK_RADIANS_PER_PX - turn;
-    let pitch =
-        (state.pitch - input.look_delta.y * LOOK_RADIANS_PER_PX).clamp(-max_pitch, max_pitch);
+    let pitch = (state.pitch - input.look_delta.y * LOOK_RADIANS_PER_PX)
+        .clamp(MIN_PITCH_DEG.to_radians(), MAX_PITCH_DEG.to_radians());
     let surface = |x: f32, z: f32| ground_m(x, z).max(0.0);
     let p = state.pos_m;
 
-    // The direction asked for, in world axes: forward along the view, strafing and climbing
-    // level. Diagonals are no faster than a single key.
+    // The direction asked for, in world axes: forward along the heading and strafing, both
+    // level (the pitch tilts only the chase view, M3 design §5.2); climbing straight up or down.
+    // Diagonals are no faster than a single key.
     let m = input.move_local.clamp(Vec3::splat(-1.0), Vec3::ONE);
     let heading = Quat::from_rotation_y(yaw);
-    let forward = heading * Quat::from_rotation_x(pitch) * Vec3::NEG_Z;
+    let forward = heading * Vec3::NEG_Z;
     let wish = heading * Vec3::X * m.x + Vec3::Y * m.y + forward * -m.z;
     let wish = if wish.length_squared() > 1.0 {
         wish.normalize()
@@ -596,7 +621,8 @@ mod tests {
                 prop_assert!(p.is_finite(), "{state:?}");
                 prop_assert!(p.y >= floor(&ground, p), "{p} under {}", floor(&ground, p));
                 prop_assert!(p.y <= CAMERA_CEILING_M, "{p} over the ceiling");
-                prop_assert!(state.pitch.abs() <= MAX_PITCH_DEG.to_radians() + 1e-6);
+                let deg = state.pitch.to_degrees();
+                prop_assert!((MIN_PITCH_DEG - 1e-3..=MAX_PITCH_DEG + 1e-3).contains(&deg));
             }
         }
     }
@@ -681,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn look_turns_and_stops_short_of_vertical() {
+    fn look_turns_and_stays_within_the_chase_range() {
         let s = FlyState::default();
         let look = |dx: f32, dy: f32| {
             fly_step(
@@ -698,22 +724,25 @@ mod tests {
         assert!(look(10.0, 0.0).yaw < s.yaw);
         // Dragging down looks down further.
         assert!(look(0.0, 10.0).pitch < s.pitch);
-        assert_eq!(look(0.0, 1.0e6).pitch, -MAX_PITCH_DEG.to_radians());
+        assert_eq!(look(0.0, 1.0e6).pitch, MIN_PITCH_DEG.to_radians());
         assert_eq!(look(0.0, -1.0e6).pitch, MAX_PITCH_DEG.to_radians());
         assert_eq!(look(0.0, 0.0).pos_m, s.pos_m);
     }
 
     #[test]
-    fn moves_follow_the_view_and_the_keys() {
+    fn moves_follow_the_heading_and_the_keys() {
+        // M3: the drag tilts the view, not the flight path (design §5.2, brief Task 3), so `W`
+        // flies level along the heading even while the view looks down. (M2 flew along the
+        // pitched view.)
         let s = FlyState {
             pos_m: Vec3::new(0.0, 5_000.0, 0.0),
             yaw: 0.0,
             pitch: -START_PITCH_DEG.to_radians(),
         };
         let step = |m: Vec3| fly_step(s, input(m, false, 0.1), flat(0.0)).pos_m - s.pos_m;
-        // W flies along the view: north and down.
+        // W flies north, level.
         let w = step(Vec3::new(0.0, 0.0, -1.0));
-        assert!(w.z < 0.0 && w.y < 0.0 && w.x.abs() < 1e-3, "{w}");
+        assert!(w.z < 0.0 && w.y.abs() < 1e-3 && w.x.abs() < 1e-3, "{w}");
         // D strafes east, level.
         let d = step(Vec3::X);
         assert!(d.x > 0.0 && d.y.abs() < 1e-3 && d.z.abs() < 1e-3, "{d}");
@@ -727,6 +756,105 @@ mod tests {
         let hitch = fly_step(s, input(Vec3::X, false, 5.0), flat(0.0)).pos_m - s.pos_m;
         let capped = fly_step(s, input(Vec3::X, false, MAX_STEP_S), flat(0.0)).pos_m - s.pos_m;
         assert!((hitch - capped).length() < 1e-2);
+    }
+
+    #[test]
+    fn forward_flight_is_level_whatever_the_view_pitch() {
+        let level = FlyState {
+            pos_m: Vec3::new(0.0, 5_000.0, 0.0),
+            yaw: 0.7,
+            pitch: 0.0,
+        };
+        let reference = fly_step(
+            level,
+            input(Vec3::new(0.0, 0.0, -1.0), false, 0.1),
+            flat(0.0),
+        );
+        for deg in [MIN_PITCH_DEG, -35.0, -START_PITCH_DEG, -5.0, MAX_PITCH_DEG] {
+            let s = FlyState {
+                pitch: deg.to_radians(),
+                ..level
+            };
+            for m in [
+                Vec3::new(0.0, 0.0, -1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, -1.0),
+            ] {
+                let moved = fly_step(s, input(m, true, 0.1), flat(0.0)).pos_m - s.pos_m;
+                assert!(moved.y.abs() < 1e-3, "pitch {deg}: {m} moved {moved}");
+                assert!(Vec2::new(moved.x, moved.z).length() > 1.0, "{deg}: {moved}");
+            }
+            // The same ground covered as with a level view.
+            let w = fly_step(s, input(Vec3::new(0.0, 0.0, -1.0), false, 0.1), flat(0.0));
+            assert!((w.pos_m - reference.pos_m).length() < 1e-2, "{deg}: {w:?}");
+        }
+    }
+
+    #[test]
+    fn dragging_down_looks_further_down() {
+        let s = FlyState::default();
+        let dragged = |dy: f32| {
+            fly_step(
+                s,
+                FlyInput {
+                    look_delta: Vec2::new(0.0, dy),
+                    dt_s: 0.016,
+                    ..default()
+                },
+                flat(0.0),
+            )
+        };
+        let start = chase_look_pitch_deg(s.pitch);
+        assert!(chase_look_pitch_deg(dragged(20.0).pitch) > start);
+        assert!(chase_look_pitch_deg(dragged(-20.0).pitch) < start);
+        // Monotonic over the whole range, and the range ends exactly at the look limits: no
+        // dead zone where the pitch moves but the view does not.
+        let mut last = f64::MIN;
+        for k in 0..=100 {
+            let deg = MAX_PITCH_DEG + (MIN_PITCH_DEG - MAX_PITCH_DEG) * k as f32 / 100.0;
+            let look = chase_look_pitch_deg(deg.to_radians());
+            assert!(look > last, "{deg}: {look} after {last}");
+            last = look;
+        }
+        assert!(
+            (chase_look_pitch_deg(MIN_PITCH_DEG.to_radians()) - CHASE_LOOK_MAX_DEG).abs() < 1e-4
+        );
+        assert!(
+            (chase_look_pitch_deg(MAX_PITCH_DEG.to_radians()) - CHASE_LOOK_MIN_DEG).abs() < 1e-4
+        );
+        assert_eq!((MIN_PITCH_DEG, MAX_PITCH_DEG), (-50.0, 0.0));
+    }
+
+    #[test]
+    fn at_the_start_pitch_the_fly_sits_a_little_below_centre() {
+        let s = FlyState::start(&RegionGrid {
+            spec: timefly_core::worldgen::generate::RegionSpec::new(
+                timefly_core::geo::geo_to_render(timefly_core::geo::latlon_to_geo(46.5, 10.0)),
+                timefly_core::deep_time::YearsBp(0.0),
+                1,
+            ),
+            inner: flat_field(timefly_core::worldgen::REGION_SIZE_M),
+            apron: flat_field(timefly_core::worldgen::APRON_SIZE_M),
+        });
+        let look = chase_look_pitch_deg(s.pitch);
+        assert!((look - CHASE_START_LOOK_DEG).abs() < 1e-4, "{look}");
+        let pose = region_chase_pose(&s, |_, _| 0.0);
+        // The target sits above the fly on its vertical, so the fly shows below the centre:
+        // by the elevation less the look, 5°.
+        assert!(pose.target.y > f64::from(s.pos_m.y), "{pose:?}");
+        let to_fly = (s.pos_m.as_dvec3() - pose.eye).normalize();
+        let to_target = (pose.target - pose.eye).normalize();
+        let below = to_fly.angle_between(to_target).to_degrees();
+        assert!((below - 5.0).abs() < 1e-3, "{below}");
+    }
+
+    fn flat_field(size_m: f64) -> timefly_core::worldgen::generate::Field {
+        timefly_core::worldgen::generate::Field {
+            res: 3,
+            size_m,
+            surface: vec![[0, 0, 0, 0]; 9],
+            elevation_m: vec![0.0; 9],
+        }
     }
 
     #[test]
@@ -1053,8 +1181,9 @@ mod tests {
                 "{below}"
             );
             assert!(below.abs() < REGION_FOV_DEG / 2.0, "out of view: {below}");
-            // Level, the camera looks straight at the fly.
-            app.world_mut().resource_mut::<FlyState>().pitch = 0.0;
+            // At a 25° drag down from level (look = elevation) the camera looks straight at
+            // the fly.
+            app.world_mut().resource_mut::<FlyState>().pitch = (-25f32).to_radians();
             for _ in 0..180 {
                 app.update();
             }

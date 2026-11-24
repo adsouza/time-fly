@@ -1,5 +1,7 @@
-// The dragonfly (M3 design §5.1): a vertex stage that flaps the wings, then Bevy's
-// StandardMaterial PBR fragment (the scene's sun and ambient light; the material turns fog off).
+// The dragonfly (M3 design §5.1): a vertex stage that flaps the wings, and a fragment stage that
+// lights it through Bevy's StandardMaterial PBR path (the scene's sun and ambient light; the
+// material turns fog off) and adds a subtle rim light, so the fly's outline reads over dark
+// forest: the rim colour × strength × (1 − N·V)^power, on the body and the wings alike.
 //
 // The wings flap about the body axis (the model's z) by sin(time × 2π × hz) × amplitude, mirrored
 // between the right (x > 0) and left wings. At 25 Hz the beats alias at any frame rate, which
@@ -8,13 +10,19 @@
 import bevy_pbr::render::mesh_functions;
 import bevy_pbr::render::view_transformations::position_world_to_clip;
 import bevy_pbr::render::mesh_view_bindings::globals;
-import bevy_pbr::render::forward_io::VertexOutput;
+import bevy_pbr::render::forward_io::{VertexOutput, FragmentOutput};
+import bevy_pbr::render::pbr_fragment::pbr_input_from_standard_material;
+import bevy_pbr::render::pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing};
 
 const TAU: f32 = 6.283185307179586;
 
 struct DragonflyLook {
     // x: flap frequency (Hz); y: flap amplitude (radians).
     flap: vec4<f32>,
+    // rgb: rim colour (linear); w: rim strength.
+    rim: vec4<f32>,
+    // x: rim power.
+    rim_shape: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<uniform> look: DragonflyLook;
@@ -60,5 +68,18 @@ fn vertex(v: DragonflyVertex) -> VertexOutput {
         v.instance_index,
         world_from_local[3],
     );
+    return out;
+}
+
+@fragment
+fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+    // N faces the viewer on both sides of a double-sided wing (Bevy flips it for back faces).
+    let pbr_input = pbr_input_from_standard_material(in, is_front);
+    var color = apply_pbr_lighting(pbr_input);
+    let facing = clamp(dot(pbr_input.N, pbr_input.V), 0.0, 1.0);
+    let rim = pow(1.0 - facing, look.rim_shape.x) * look.rim.w;
+    color = vec4<f32>(color.rgb + look.rim.rgb * rim, color.a);
+    var out: FragmentOutput;
+    out.color = main_pass_post_lighting_processing(pbr_input, color);
     return out;
 }
