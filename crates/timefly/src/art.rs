@@ -13,6 +13,41 @@ pub fn assert_divides_wrap(period_s: f32) {
     );
 }
 
+/// `name: type` fields of a struct declared in the WESL source `src`, in order, for tests that
+/// check a Rust uniform against its WESL mirror.
+#[cfg(test)]
+pub(crate) fn wesl_struct_fields(src: &str, name: &str) -> Vec<(String, String)> {
+    let start = src
+        .find(&format!("struct {name} {{"))
+        .unwrap_or_else(|| panic!("struct {name} in the WESL source"));
+    let body = &src[start..];
+    let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
+    body.lines()
+        .map(|l| l.split("//").next().unwrap().trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let (n, t) = l.trim_end_matches(',').split_once(':').unwrap();
+            (n.trim().to_string(), t.trim().to_string())
+        })
+        .collect()
+}
+
+/// The value of `const NAME: f32 = value;` in the WESL source `src`, for tests that check a WGSL
+/// constant against the Rust one it mirrors.
+#[cfg(test)]
+pub(crate) fn wesl_const_f32(src: &str, name: &str) -> f32 {
+    let decl = format!("const {name}: f32 = ");
+    let start = src
+        .find(&decl)
+        .unwrap_or_else(|| panic!("const {name} in the WESL source"))
+        + decl.len();
+    let end = start + src[start..].find(';').expect("the constant's semicolon");
+    src[start..end]
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("const {name}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

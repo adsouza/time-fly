@@ -16,6 +16,10 @@
 //! A sixth argument `AGL_M` places the camera that many metres above `max(ground, 0)` at the
 //! region's centre instead of [`CAMERA_START_ALTITUDE_M`], for the low-altitude shots.
 //!
+//! A seventh argument `LATER_S` (with `shaded`) saves a second shot, `<prefix>-later.png`, that
+//! many seconds after the first, for motion such as the swash (each screenshot resolves a few
+//! frames after its request, so the gap between the captured frames is about `LATER_S`).
+//!
 //! `tools/dev/region-shots.sh` runs it over the Task 8 set (the bench regions and one region
 //! per vegetation era).
 //!
@@ -89,6 +93,10 @@ struct Tour {
     mode: Mode,
     /// Camera height above `max(ground, 0)` at the centre.
     agl_m: f32,
+    /// Seconds after the shaded shot to save the `later` one (`shaded` mode only).
+    later_s: Option<f32>,
+    /// When the shaded shot was requested.
+    shot_at: f32,
     step: Step,
     /// The snapshot change has started (`Older`).
     changing: bool,
@@ -203,6 +211,7 @@ fn tour(
                 shoot(&mut commands, &tour, "shaded");
                 tour.step = Step::Shaded;
                 tour.frames = 0;
+                tour.shot_at = now;
             }
         }
         Step::Shaded => {
@@ -211,8 +220,23 @@ fn tour(
                 tour.step = Step::Dive;
                 tour.since = now;
             } else if tour.mode == Mode::Shaded && tour.frames >= WIRE_FRAMES {
-                tour.step = Step::Done;
-                tour.frames = 0;
+                match tour.later_s {
+                    Some(later) if now - tour.shot_at < later => {}
+                    Some(later) => {
+                        info!(
+                            seconds = now - tour.shot_at,
+                            requested = later,
+                            "region tour: later shot"
+                        );
+                        shoot(&mut commands, &tour, "later");
+                        tour.later_s = None;
+                        tour.frames = 0;
+                    }
+                    None => {
+                        tour.step = Step::Done;
+                        tour.frames = 0;
+                    }
+                }
             } else if tour.frames >= WIRE_FRAMES {
                 // The real toggle: press F2 for one frame.
                 keys.press(WIREFRAME_KEY);
@@ -294,7 +318,8 @@ fn main() -> AppExit {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
-            "usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly] [AGL_M]"
+            "usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly] [AGL_M] \
+             [LATER_S]"
         );
         return AppExit::error();
     };
@@ -322,6 +347,16 @@ fn main() -> AppExit {
             }
         },
     };
+    let later_s = match args.get(6) {
+        None => None,
+        Some(s) => match s.parse::<f32>() {
+            Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+            _ => {
+                eprintln!("bad LATER_S {s:?}: want a positive number of seconds");
+                return AppExit::error();
+            }
+        },
+    };
     if let Err(e) = std::fs::create_dir_all(&out) {
         eprintln!("cannot create {}: {e}", out.display());
         return AppExit::error();
@@ -339,6 +374,8 @@ fn main() -> AppExit {
         target: None,
         mode,
         agl_m,
+        later_s,
+        shot_at: 0.0,
         step: Step::WaitRegion,
         changing: false,
         since: 0.0,

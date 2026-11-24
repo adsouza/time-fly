@@ -63,6 +63,9 @@ pub const SNOWLINE_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d6
 
 /// `planet.wesl`: the planet-fixed position (`planet_position_m`), imported as `package::planet`.
 pub const PLANET_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e16");
+/// `waves.wesl`: the sea's swell and swash (`crate::water`), imported as `package::waves` by
+/// `water.wesl` (and the swash by `terrain.wesl`).
+pub const WAVES_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e17");
 
 /// How strongly shadowed light takes the sky's cool, era-tinted hue (0 = not at all).
 pub const SHADOW_HUE_STRENGTH: f32 = 0.30;
@@ -473,7 +476,8 @@ impl MaterialExtension for TerrainExtension {
 /// Adds the embedded terrain shaders to the shader assets, so the terrain renders from any
 /// asset root. `terrain_cdlod.wesl` registers as the WESL module `package::terrain_cdlod`,
 /// `noise.wesl` as `package::noise` (`import package::noise::gradient_noise3;`) and
-/// `snowline.wesl` as `package::snowline`, `planet.wesl` as `package::planet`.
+/// `snowline.wesl` as `package::snowline`, `planet.wesl` as `package::planet` and `waves.wesl`
+/// as `package::waves`.
 pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
     let noise = Shader::from_wesl(
         include_str!("../../assets/shaders/noise.wesl"),
@@ -486,6 +490,10 @@ pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
     let snowline = Shader::from_wesl(
         include_str!("../../assets/shaders/snowline.wesl"),
         "embedded://timefly/snowline.wesl",
+    );
+    let waves = Shader::from_wesl(
+        include_str!("../../assets/shaders/waves.wesl"),
+        "embedded://timefly/waves.wesl",
     );
     let cdlod = Shader::from_wesl(
         include_str!("../../assets/shaders/terrain_cdlod.wesl"),
@@ -502,6 +510,7 @@ pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
     let _ = shaders.insert(NOISE_SHADER.id(), noise);
     let _ = shaders.insert(PLANET_SHADER.id(), planet);
     let _ = shaders.insert(SNOWLINE_SHADER.id(), snowline);
+    let _ = shaders.insert(WAVES_SHADER.id(), waves);
     let _ = shaders.insert(TERRAIN_CDLOD_SHADER.id(), cdlod);
     let _ = shaders.insert(TERRAIN_SHADER.id(), terrain);
     let _ = shaders.insert(TERRAIN_PREPASS_SHADER.id(), prepass);
@@ -510,6 +519,7 @@ pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::art::wesl_struct_fields;
     use bevy::math::DVec3;
     use core::mem::{align_of, offset_of, size_of};
     use timefly_core::terrain::select_patches;
@@ -569,23 +579,6 @@ mod tests {
     /// `name: type` fields of a struct declared in `terrain_cdlod.wesl`, in order.
     fn wesl_fields(name: &str) -> Vec<(String, String)> {
         wesl_struct_fields(CDLOD_WESL, name)
-    }
-
-    /// `name: type` fields of a struct declared in the WESL source `src`, in order.
-    fn wesl_struct_fields(src: &str, name: &str) -> Vec<(String, String)> {
-        let start = src
-            .find(&format!("struct {name} {{"))
-            .unwrap_or_else(|| panic!("struct {name} in the WESL source"));
-        let body = &src[start..];
-        let body = &body[body.find('{').unwrap() + 1..body.find('}').unwrap()];
-        body.lines()
-            .map(|l| l.split("//").next().unwrap().trim())
-            .filter(|l| !l.is_empty())
-            .map(|l| {
-                let (n, t) = l.trim_end_matches(',').split_once(':').unwrap();
-                (n.trim().to_string(), t.trim().to_string())
-            })
-            .collect()
     }
 
     fn field(res: u32, size_m: f64) -> Field {

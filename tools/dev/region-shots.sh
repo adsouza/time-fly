@@ -7,6 +7,10 @@
 #
 # Any number of filters may follow; a scene runs if its name contains any of them.
 #
+# A scene with a fourth field LATER_S also saves `<name>-later.png` that many seconds after its
+# first shot: the coastal scenes take two, half the swash's 8 s period apart, so the water's edge
+# is at opposite ends of its travel up the beach.
+#
 # Each run gets a fresh TIMEFLY_LOG_DIR (a crash record from one run must not block the next).
 # Centres are era-frame LAT,LON (what a globe click gives) and ages in years.
 set -euo pipefail
@@ -15,7 +19,7 @@ out="${1:-docs/testing/region-m2}"
 size="${2:-1280x720}"
 filters=("${@:3}")
 
-# name  LAT,LON,AGE_YEARS  AGL_M (camera height above max(ground, 0) at the centre)
+# name  LAT,LON,AGE_YEARS  AGL_M (camera height above max(ground, 0) at the centre)  [LATER_S]
 shots=(
   "bench-alps-0ka           46.5,10,0 8000"
   "alps-21ka-glacial        46.5,10,21000 8000"
@@ -42,11 +46,18 @@ shots=(
   "beringia-21ka-low        62,-175,21000 400"
   "panama-3ma-low           9,-79.5,3000000 400"
   "rockies-21ka-low         48.5,-113.5,21000 1500"
+  # Centred on a shoreline (the low scenes above have no coast in frame), 400 m up, looking north
+  # along it. Panama 3 Ma and Beringia 21 ka are points on a north-south coast that the
+  # generated field crosses zero at (Beringia's is about 82 km west of the 62,-175 bench centre,
+  # on a near-flat shore: floor slope 0.0007).
+  "red-sea-coast-0ka-low    19.9,37.2,0 400 4"
+  "panama-coast-3ma-low     9.0,-79.312,3000000 400 4"
+  "beringia-coast-21ka-low  61.815,-176.516,21000 400 4"
 )
 
 cargo build -q -p timefly --example region_tour
 for entry in "${shots[@]}"; do
-  read -r name region agl <<<"$entry"
+  read -r name region agl later <<<"$entry"
   if ((${#filters[@]})); then
     match=0
     for f in "${filters[@]}"; do
@@ -55,7 +66,7 @@ for entry in "${shots[@]}"; do
     ((match)) || continue
   fi
   logs="$(mktemp -d "${TMPDIR:-/tmp}/timefly-shots.XXXXXX")"
-  echo "== $name ($region, ${agl} m AGL)"
+  echo "== $name ($region, ${agl} m AGL${later:+, again after ${later} s})"
   TIMEFLY_LOG_DIR="$logs" cargo run -q -p timefly --example region_tour -- \
-    "$out" "$size" "$region" "$name" shaded "$agl"
+    "$out" "$size" "$region" "$name" shaded "$agl" ${later:+"$later"}
 done
