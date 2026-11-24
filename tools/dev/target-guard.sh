@@ -469,6 +469,8 @@ PHYSICAL_TARGET="$(cd -P -- "$TARGET" && pwd -P)" || hook_done
 # One pruning run at a time: concurrent hooks would race over the same dirs. A lock older
 # than 10 minutes is a leftover from a killed run; it is taken over atomically by renaming
 # it (only one run's mv can succeed), and a run that loses that race skips pruning. If the
+# renamed dir turns out fresh (another run replaced the stale lock between our check and our
+# mv), it is someone's live lock: put it back and skip. If the
 # lock can't even be created and none exists (mkdir fails on a full disk), prune unlocked
 # rather than not at all.
 LOCK="$TARGET/.guard-lock"
@@ -478,10 +480,15 @@ take_lock() {
   trap 'exit 1' HUP INT TERM
 }
 lock_held() { warn "another target-guard run holds $LOCK; skipped pruning."; hook_done; }
+is_stale() { [ -n "$(find "$1" -maxdepth 0 -type d -mmin +10 2>/dev/null)" ]; }
 if ! take_lock; then
   if [ -e "$LOCK" ] || [ -L "$LOCK" ]; then
-    [ -n "$(find "$LOCK" -maxdepth 0 -type d -mmin +10 2>/dev/null)" ] || lock_held
+    is_stale "$LOCK" || lock_held
     mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null || lock_held
+    if ! is_stale "$LOCK.stale.$$"; then
+      mv "$LOCK.stale.$$" "$LOCK" 2>/dev/null
+      lock_held
+    fi
     rm -rf -- "$LOCK.stale.$$"
     take_lock || lock_held
   fi

@@ -643,6 +643,16 @@ xcase deny  20000 "echo \"\$(( (1 + 2) << 3 ))\"${NL}xctrace record --template X
 xcase allow 20000 "echo \$((1 << 2))${NL}cat <<EOF${NL}xctrace record --template X${NL}EOF"
 xcase allow 20000 "x=\"\$(echo \$((1<<2)); cat <<EOF${NL}xctrace record --template X${NL}EOF${NL})\""
 
+echo "22. a lock renamed in a race (fresh after the mv) is put back and counts as held"
+profiles 22a; mkdir "$ROOT/target/.guard-lock"   # fresh lock; fake find calls it stale only before the mv
+printf '#!/bin/sh\ncase "$*" in\n  *.guard-lock.stale.*) exit 0 ;;\n  *.guard-lock*-mmin*) echo "$1"; exit 0 ;;\nesac\nexec %s "$@"\n' "$(command -v find)" > "$FAKEBIN/find"; chmod +x "$FAKEBIN/find"
+out="$(lr 95)"
+rm -f "$FAKEBIN/find"
+check "race: nothing deleted" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
+check "race: lock moved back in place" test -d "$ROOT/target/.guard-lock"
+check "race: no renamed copy left" test -z "$(ls -A "$ROOT/target" | grep 'guard-lock\.stale')"
+check "race: says the lock is held" grep -qi 'lock' <<<"$out"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
