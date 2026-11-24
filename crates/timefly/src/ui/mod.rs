@@ -1,9 +1,10 @@
-//! The game's UI: the time slider, the loading/failure status, the credits overlay and the
-//! frame-rate readout.
+//! The game's UI: the time slider, the loading/failure status, the credits overlay, and the
+//! altitude and frame-rate readouts.
 //!
 //! Each plugin keeps its decisions in pure functions (unit-tested directly); the systems only
 //! gather input, call them and apply the result.
 
+mod altitude;
 pub mod credits;
 pub mod fps;
 pub mod slider;
@@ -34,7 +35,7 @@ pub struct PointerOverUi(pub bool);
 #[require(Hovered)]
 pub struct BlocksCamera;
 
-/// Plugins: slider, status, credits and the frame-rate readout, plus the pointer-over-UI
+/// Plugins: slider, status, credits and the readouts, plus the pointer-over-UI
 /// tracking they share.
 pub struct GameUiPlugins;
 
@@ -45,6 +46,7 @@ impl Plugin for GameUiPlugins {
             StatusUiPlugin,
             CreditsPlugin,
             FpsOverlayPlugin,
+            altitude::AltitudeOverlayPlugin,
         ))
         .init_resource::<PointerOverUi>()
         .add_systems(PreUpdate, track_pointer_over_ui);
