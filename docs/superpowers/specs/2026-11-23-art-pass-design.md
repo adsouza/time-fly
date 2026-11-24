@@ -140,6 +140,8 @@ Snow, foam and banding are shading changes under any approach.
 - **Builder's choice:**
   - how the snow weight reaches `paint_light` (plumbed from `paint` or derived);
   - the exact floor and hue values, within the target.
+- **As shipped:** floor 0.30 and hue factor 0.78 (rulings R5–R6), and deep shade takes its hue
+  from the albedo below l = 0.15 on every surface (R7). See the plan appendix.
 
 ### 5.2 Foam and the shallow tint
 
@@ -166,6 +168,8 @@ Snow, foam and banding are shading changes under any approach.
 - **Coverage:** the sand-sea share is the builder's choice, aiming at about a quarter to a third
   of desert ground. That's real-world-like: most of the Sahara is not sand sea.
 - **No dunes on:**
+  - slopes: as shipped, the sand sea fades out between true slopes of 0.03 and 0.07
+    (`DUNE_SLOPE`), and sloping desert is stony plain (plan appendix);
   - rock slopes (the slope test already paints rock);
   - snow;
   - beaches below the beach line;
@@ -182,6 +186,12 @@ Snow, foam and banding are shading changes under any approach.
   - a gentle, lit windward face;
   - a steep, shaded lee face (slip face).
   - The normal perturbs the terrain normal before lighting.
+  - **As shipped:** the lee faces stay lit. Under the fixed south-west sun, slip faces in the
+    trade-wind belts turn partly toward it, so they are only dimmer than the windward faces. The
+    owner's ruling was "Keep them lit". A tilt cap (`bound_dune_tilt`, `DUNE_AWAY_LIMIT` 0.25)
+    keeps any face from turning more than a quarter of the way to the terminator, so a slip face
+    is at most soft shade, never a dark line. See the plan appendix
+    (`plans/2026-11-23-art-pass.md`, "Rulings and deviations").
 - **Colour:** the desert's own palette ground colour, slightly lighter on crests and darker in
   troughs (interdunes).
 - **Altitude:**

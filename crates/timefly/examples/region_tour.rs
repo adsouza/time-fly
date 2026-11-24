@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|fly] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|fly|time] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
 //! skips the wireframe shot. Exits with an error if the region never appears. Set a fresh
@@ -28,6 +28,13 @@
 //! [`DIVE_SECS`], then `W` alone for [`CRUISE_SECS`], and saves `<prefix>-low.png`; then it
 //! presses `[` (the next older snapshot), waits for the region to regenerate around the
 //! camera's crust position and the fade to finish, and saves `<prefix>-older.png`.
+//!
+//! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
+//! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
+//! (as in the benches), the camera is held `AGL_M` above the centre, and after the settle it
+//! records [`TIME_SECS`] of frame deltas and logs one `region tour frame times` line (mean,
+//! median, p95 and worst), then exits. Run the same pose over two scenes to read a cost as a
+//! difference.
 
 use std::path::PathBuf;
 
@@ -35,7 +42,9 @@ use bevy::camera::RenderTarget;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+use bevy::window::{PresentMode, PrimaryWindow};
 use timefly::args::{LaunchArgs, parse_region, parse_window_size};
+use timefly::bench::frame_time_stats;
 use timefly::diagnostics;
 use timefly::fly_camera::FlyState;
 use timefly::region::navigate::{NavPhase, Navigation};
@@ -58,6 +67,8 @@ const DIVE_SECS: f32 = 4.5;
 const CRUISE_SECS: f32 = 1.5;
 /// Seconds after a snapshot change finishes before its shot (pipelines and shadows settle).
 const AFTER_CHANGE_SECS: f32 = 4.0;
+/// Seconds of frame deltas the `time` mode records after the settle.
+const TIME_SECS: f32 = 30.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -73,6 +84,8 @@ enum Step {
     Low,
     /// Waiting for the snapshot change to finish.
     Older,
+    /// Recording frame deltas (`time`).
+    Timing,
     Done,
 }
 
@@ -82,6 +95,7 @@ enum Mode {
     Wire,
     Shaded,
     Fly,
+    Time,
 }
 
 #[derive(Resource)]
@@ -103,6 +117,8 @@ struct Tour {
     since: f32,
     frames: u32,
     left_generating: bool,
+    /// Frame deltas recorded in `time` mode, milliseconds.
+    frame_ms: Vec<f32>,
 }
 
 fn shoot(commands: &mut Commands, tour: &Tour, name: &str) {
@@ -116,13 +132,17 @@ fn shoot(commands: &mut Commands, tour: &Tour, name: &str) {
         .observe(save_to_disk(path));
 }
 
-/// Points the region camera at an offscreen image the size of the window when it appears.
+/// Points the region camera at an offscreen image the size of the window when it appears
+/// (except in `time` mode, which draws to the window as the game does).
 fn render_offscreen(
     mut tour: ResMut<Tour>,
     mut images: ResMut<Assets<Image>>,
     cameras: Query<Entity, Added<RegionCamera>>,
     mut commands: Commands,
 ) {
+    if tour.mode == Mode::Time {
+        return;
+    }
     let (w, h) = tour.size;
     for camera in &cameras {
         let target = tour
@@ -195,7 +215,8 @@ fn tour(
                 exit.write(AppExit::error());
                 return;
             }
-            if entered.read().last().is_some() || scene.is_some() && tour.target.is_some() {
+            let ready = tour.target.is_some() || tour.mode == Mode::Time;
+            if entered.read().last().is_some() || scene.is_some() && ready {
                 tour.step = Step::Settle;
                 tour.since = now;
             }
@@ -207,7 +228,12 @@ fn tour(
                 let ground = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
                 fly.pos_m = Vec3::new(0.0, ground as f32 + tour.agl_m, 0.0);
             }
-            if now - tour.since >= SETTLE_SECS {
+            if now - tour.since >= SETTLE_SECS && tour.mode == Mode::Time {
+                info!(agl_m = tour.agl_m, "region tour: timing frames");
+                tour.step = Step::Timing;
+                tour.since = now;
+                tour.frame_ms.clear();
+            } else if now - tour.since >= SETTLE_SECS {
                 shoot(&mut commands, &tour, "shaded");
                 tour.step = Step::Shaded;
                 tour.frames = 0;
@@ -304,6 +330,34 @@ fn tour(
                 exit.write(AppExit::error());
             }
         }
+        Step::Timing => {
+            if let Some(r) = region.as_deref() {
+                let ground = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
+                fly.pos_m = Vec3::new(0.0, ground as f32 + tour.agl_m, 0.0);
+            }
+            let ms = real.delta_secs() * 1000.0;
+            tour.frame_ms.push(ms);
+            if now - tour.since >= TIME_SECS {
+                let s = frame_time_stats(&tour.frame_ms);
+                let mean = tour.frame_ms.iter().sum::<f32>() / tour.frame_ms.len().max(1) as f32;
+                info!(
+                    prefix = %tour.prefix,
+                    agl_m = tour.agl_m,
+                    frames = s.frames,
+                    mean_ms = mean,
+                    median_ms = s.median_ms,
+                    p95_ms = s.p95_ms,
+                    worst_ms = s.worst_ms,
+                    "region tour frame times"
+                );
+                println!(
+                    "region tour frame times: {} at {} m: {} frames, mean {:.2} ms, median {:.2} \
+                     ms, p95 {:.2} ms, worst {:.2} ms",
+                    tour.prefix, tour.agl_m, s.frames, mean, s.median_ms, s.p95_ms, s.worst_ms
+                );
+                exit.write(AppExit::Success);
+            }
+        }
         Step::Done => {
             // Let the screenshots reach the disk: the readback and the PNG encode take more
             // than WIRE_FRAMES frames when frames are fast.
@@ -314,12 +368,19 @@ fn tour(
     }
 }
 
+/// `time` mode: vsync off, as `--region-bench` sets it, so frame times show the real cost.
+fn uncap_frames(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
+    for mut window in &mut windows {
+        window.present_mode = PresentMode::AutoNoVsync;
+    }
+}
+
 fn main() -> AppExit {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
-            "usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly] [AGL_M] \
-             [LATER_S]"
+            "usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly|time] \
+             [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -335,6 +396,7 @@ fn main() -> AppExit {
     let mode = match args.get(4).map(String::as_str) {
         Some("shaded") => Mode::Shaded,
         Some("fly") => Mode::Fly,
+        Some("time") => Mode::Time,
         _ => Mode::Wire,
     };
     let agl_m = match args.get(5) {
@@ -367,6 +429,9 @@ fn main() -> AppExit {
         ..default()
     });
     let mut app = timefly::app(&session);
+    if mode == Mode::Time {
+        app.add_systems(Startup, uncap_frames);
+    }
     app.insert_resource(Tour {
         out,
         prefix,
@@ -381,6 +446,7 @@ fn main() -> AppExit {
         since: 0.0,
         frames: 0,
         left_generating: false,
+        frame_ms: Vec::new(),
     })
     .add_systems(Update, render_offscreen)
     .add_systems(PreUpdate, tour.after(bevy::input::InputSystems));

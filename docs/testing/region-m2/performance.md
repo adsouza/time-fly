@@ -573,6 +573,187 @@ output 64.97 MB): `/?region-bench`, `assets/data/tiles/manifest.json` (353,054 B
 `assets/data/tiles/overview.tfgrid` (12,430,497 B), `assets/data/tiles/r08c38.tfgrid`,
 `r05c39.tfgrid` and `assets/data/globe/manifest.json` all return 200.
 
+### Art pass (native rerun, the dune path, Chrome pending), 2026-11-23
+
+The art pass (`docs/superpowers/plans/2026-11-23-art-pass.md`, reference renders in
+`docs/testing/art-pass/`) adds work to the terrain and water shaders:
+- shaded snow and a deep-shade fix;
+- the foam fade;
+- sand dunes and stony plain;
+- swell displacement, light bands and swash;
+- rock banding.
+
+The design's gate is that the native and Chrome region benches still pass every M2 gate.
+
+#### Native M4, art pass (`fe37635`), 1920 × 951
+
+```sh
+TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=crates/timefly \
+  target/release/timefly --region-bench --target-fps 60 --window 2560x1440
+```
+
+- **Build:** the release build of `fe37635` (`release` profile: no LTO, debug info).
+- **Resolution:** the main display was the 1920 × 1080 monitor again, so the requested 2560 × 1440
+  window was clamped to **1920 × 951** (ruling R21), as in the Task 10 runs.
+- **Not like for like.** The `07658ba` comparison run was at 2560 × 1440 on the 4K display: 1.9×
+  the pixels here.
+- **Pacing:** the display paced `AutoNoVsync` at 60 Hz throughout (medians 16.67–16.69 ms), so
+  the display-paced rule decided everywhere.
+- **Result:** every gate passed. Exit 0, `result: PASS`.
+
+| Stop | Generation (first entry) | Tiles / frames fetched | Load worst frame | Flight median / p95 / worst | Missed (> 25 ms) | Result |
+|---|---|---|---|---|---|---|
+| Pangaea interior | 548 ms | 0 / 2 | 23.4 ms (R11 line) | 16.68 / 18.33 / 21.10 ms | 0 of 3,601 | PASS |
+| Red Sea | 482 ms | 2 (275,711 B) / 1 | 22.4 ms | 16.67 / 18.36 / **56.44 ms** | 2 (0.06%) | PASS |
+| Himalayas | 333 ms | 1 / 0 | 22.8 ms | 16.68 / 18.41 / 20.91 ms | 0 | PASS |
+| Sundaland | 332 ms | 2 / 2 | 22.2 ms | 16.69 / 18.38 / 20.48 ms | 0 | PASS |
+| Japan | 1,884 ms | 4 / 2 | 24.6 ms | 16.68 / 18.40 / 36.55 ms | 3 (0.08%) | PASS |
+| Beringia | 382 ms | 2 / 1 | 23.8 ms | 16.69 / 18.29 / 20.38 ms | 0 | PASS |
+| globe pan (8 s) | — | — | — | 16.73 / 18.48 / 20.04 ms (481 frames) | — | PASS |
+| Rockies ice margin | 616 ms | 2 / 0 | 22.6 ms | 16.69 / 18.33 / 20.22 ms | 0 | PASS |
+| Panama | 332 ms | 0 / 1 | 22.0 ms | 16.69 / 18.32 / 20.70 ms | 0 | PASS |
+
+**The Red Sea stop against `07658ba`:**
+
+| | `07658ba` (M2, 2560 × 1440) | `fe37635` (art pass, 1920 × 951) |
+|---|---|---|
+| Generation (first entry) | 515 ms | 482 ms |
+| Load worst frame | 18.5 ms | 22.4 ms |
+| Flight median / p95 / worst | 16.66 / 17.44 / 28.28 ms | 16.67 / 18.36 / 56.44 ms |
+| Missed (> 25 ms) | 4 (0.11%) | 2 (0.06%) |
+| Stalls (> 33.3 ms) | 0 | 1 |
+| Coast run | coast 6.8 km from the centre | the same coast, 6.8 km |
+
+- **Both are display-paced at 60 Hz, with medians on the interval.**
+- **The one stall** (56.44 ms) came in the Red Sea's low pass at 300 m. The other segments' worst
+  frames were 20.12 ms (climb), 20.50 ms (coast run) and 24.93 ms (apron sweep).
+  - It was a single frame: the display-paced rule counts it as one of the 2 missed frames, well
+    under 1 %.
+  - The run doesn't say what it was. It may be the low pass's first frames with the swell
+    displacement on (camera below 1 km). It may also be one of the occasional single hitches
+    every M2 run has had, such as Pangaea's 39.45 ms in `07658ba` and Japan's 36.55 ms here.
+  - A rerun would tell. The web bench is the one that decides (below).
+- **p95 is about 0.9 ms higher on every stop**, not only the Red Sea: Pangaea and the Himalayas
+  rise as much as the art-pass-heavy stops. So it is this display's pacing jitter (the
+  1920 × 1080 monitor; the Task 10 runs on it had p95 18.2–18.7 ms), not the art pass.
+
+Summary block, verbatim:
+
+```text
+===== Time Fly region bench summary =====
+build: 0.1.0 (fe37635, release, aarch64-apple-darwin; system-spans)
+system spans: on
+adapter: Apple M4 (Metal)
+os: macOS 27.2.1 (26B131), aarch64
+regions (R14 frame rate): Pangaea interior PASS, Red Sea PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS
+first-region worst frame (R11 gate <= 250 ms, request to first path frame, overview decode included): 23.39 ms -> PASS (native: reported only, the gate applies in Chrome WebGPU)
+Himalayas load-window worst frame (cold tiles; reported only): 22.82 ms
+warm generation (10 re-entries of Himalayas, target <= 3000 ms): median 316 ms, max 333 ms -> PASS
+first entries (cold tiles; reported only natively): Pangaea interior 548 ms, Red Sea 482 ms, Himalayas 333 ms, Sundaland 332 ms, Japan 1884 ms, Beringia 382 ms, Rockies ice margin 616 ms, Panama 332 ms
+memory cycles (phys_footprint, includes GPU allocations on Apple silicon, on the globe after each leave): 1: 663.7 MiB, 2: 652.7 MiB, 3: 652.7 MiB, 4: 665.4 MiB, 5: 665.5 MiB, 6: 653.0 MiB, 7: 665.6 MiB, 8: 665.8 MiB, 9: 653.3 MiB, 10: 653.6 MiB; worst of cycles 2-10 is +0.3% of cycle 1 (limit +10%) -> PASS
+  in the region: 1: 784.1 MiB, 2: 786.3 MiB, 3: 786.4 MiB, 4: 785.8 MiB, 5: 785.9 MiB, 6: 786.7 MiB, 7: 786.0 MiB, 8: 786.2 MiB, 9: 787.0 MiB, 10: 787.3 MiB
+result: PASS
+===== end region bench summary =====
+```
+
+**Every M2 gate:**
+- R14 frame rate: all 8 regions and the pan pass.
+- R11 first-region worst frame: 23.39 ms, against ≤ 250 ms (native reports it only).
+- Warm generation: median 316 ms, max 333 ms, against ≤ 3,000 ms.
+- Memory cycles: +0.3 %, against ≤ +10 %.
+- First entries are reported only natively. The slowest is Japan at 1,884 ms (1,998 ms in
+  `07658ba`).
+
+#### The dune path (ruling R8)
+
+The bench never shows a sand sea: the Red Sea stop's desert is stony plain. So the dune path was
+measured separately, over the Sahara erg. `examples/region_tour.rs` has a `time` mode for this.
+It works like this:
+- the region camera draws to the window, with vsync off as in the benches;
+- the camera is held at a fixed height above the centre, with the same pose as
+  `tools/dev/region-shots.sh`'s shots (looking north, pitched down 20°);
+- after a 6 s settle it records 30 s of frame deltas.
+
+```sh
+TIMEFLY_LOG_DIR="$(mktemp -d)" cargo run --release -p timefly --example region_tour -- \
+  /tmp/unused 2560x1440 23,10,0 sahara time 400
+```
+
+- **Scenes:**
+  - the Sahara at 23° N, 10° E, 0 ka: the sand sea fills the view at 400 m and at 8 km (see
+    `docs/testing/art-pass/after/sahara-0ka-low-shaded.png` and `sahara-0ka-shaded.png`);
+  - the reference is the Himalayas bench centre (28° N, 86.9° E, 0 ka): no desert, so no dune or
+    stony-plain work. It has snow, rock and forest, with the same water-free view.
+- **Setup:** the same M4, release build and window request as the bench (clamped by the 1920 ×
+  1080 display).
+- **Runs:** each scene and height ran four times, interleaved (Sahara 400 m, Himalayas 400 m,
+  Sahara 8 km, Himalayas 8 km, then again).
+- **GPU utilisation:** the display paces every frame at 60 Hz, so frame deltas can't show a
+  sub-interval GPU cost. The last two passes therefore also sampled the GPU's own utilisation
+  counters every 0.25 s (`ioreg -c IOAccelerator`, `PerformanceStatistics` "Device Utilization
+  %"), inside each 30 s window. The idle desktop read 0.1 %.
+
+Frame times, 30 s each, about 1,800 frames per run (ms):
+
+| Scene | Mean | Median | p95 | Worst (of 4 runs) |
+|---|---|---|---|---|
+| Sahara erg, 400 m | 16.67 | 16.64–16.74 | 18.25–18.80 | 21.25 |
+| Himalayas, 400 m | 16.67 | 16.69–16.74 | 18.20–18.51 | 22.50 |
+| Sahara erg, 8 km | 16.67 | 16.61–16.74 | 17.76–18.53 | 24.43 |
+| Himalayas, 8 km | 16.67 | 16.56–16.69 | 17.77–19.59 | 20.44 |
+
+GPU device utilisation (passes 3 and 4), with the equivalent GPU time per 16.67 ms frame:
+
+| Scene | Pass 3 | Pass 4 | ≈ GPU ms per frame |
+|---|---|---|---|
+| Sahara erg, 400 m | 12.3 % | 12.9 % | 2.05–2.15 |
+| Himalayas, 400 m | 12.3 % | 12.1 % | 2.02–2.05 |
+| Sahara erg, 8 km | 11.0 % | 12.4 % | 1.83–2.07 |
+| Himalayas, 8 km | 11.0 % | 10.9 % | 1.82–1.83 |
+
+- **Reading:** the dune path costs between nothing and about 0.25 ms of GPU time per frame at
+  this size.
+  - In each pass, Sahara minus Himalayas is 0.0 and +0.8 points at 400 m, and 0.0 and +1.5 points
+    at 8 km.
+  - Run-to-run spread for one scene is up to 1.4 points (the Sahara at 8 km).
+  - So the difference is within the noise.
+- **Frames:** paced at 60 Hz with no missed frame (> 25 ms) in any of the 16 runs.
+- **Caveats:**
+  - Utilisation is a share of busy time at whatever clock the GPU chose. It is an estimate, not
+    a timestamp.
+  - At 3200 × 1800 in Chrome (the gated web run's render size), the cost scales with about 3×
+    the pixels.
+  - So the web number for a sand sea is still unmeasured. A Chrome flight over the erg (or an
+    erg bench stop, which needs the owner: R8) would settle it.
+
+#### Chrome WebGPU, real Chrome: pending (owner's run)
+
+**Pending: owner's Chrome run.** The gated web bench (R23) needs a real Chrome window in front,
+hands off, which the implementer can't drive. To repeat it on the art-pass build:
+
+1. Build and serve the web release from `crates/timefly`:
+
+   ```sh
+   cd crates/timefly
+   PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo run --profile web-release -p timefly \
+     --target wasm32-unknown-unknown
+   ```
+
+2. Open `http://127.0.0.1:1334/?region-bench` in a Chrome window with no other tabs.
+3. Keep the window in front and leave it alone for about 11 minutes, until the banner reads
+   `Region bench finished: PASS` (or `FAIL`).
+4. Copy the log from DevTools → Console with the `copy(...)` one-liner under "Chrome WebGPU, real
+   Chrome (gated)" above.
+5. Record here:
+   - the summary block;
+   - the Red Sea row against the M2 run (16.57 / 18.25 / 19.83 ms, 0 missed);
+   - R11 (Pangaea, ≤ 250 ms);
+   - every first entry (≤ 8,000 ms);
+   - the warm generation (≤ 8,000 ms);
+   - the memory cycles.
+
+Don't use the Claude desktop app's browser pane for the gated numbers (R23).
+
 ## Sizes: packages and Pages (Task 10)
 
 | Item | Bytes |
