@@ -276,7 +276,8 @@ print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventNa
 # --- PreToolUse: block runaway xctrace recordings; allow everything else ---------
 if [ "$MODE" = prehook ]; then
   read_hook_input; cmd="$HOOK_CMD"
-  [ -n "$cmd" ] || exit 0
+  # Cheap keyword check first: the tokenizer is slow on huge commands.
+  case "$cmd" in *xctrace*) ;; *) exit 0 ;; esac
   recs="$(xctrace_records "$cmd")"
   [ -n "$recs" ] || exit 0
   free="$(free_kb)"
@@ -302,7 +303,8 @@ fi
 # --- hook pre-filter: prune only after cargo runs; warn after any command --------
 if [ "$MODE" = hook ]; then
   read_hook_input; cmd="$HOOK_CMD"
-  runs_cargo "$cmd" || hook_done
+  # Cheap keyword check first: the tokenizer is slow on huge commands.
+  case "$cmd" in *cargo*) runs_cargo "$cmd" || hook_done ;; *) hook_done ;; esac
 fi
 
 if [ -L "$TARGET" ]; then warn "$TARGET is a symlink; refusing to touch it."; hook_done; fi

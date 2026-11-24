@@ -485,6 +485,22 @@ h=json.load(open(sys.argv[1]))["hooks"]
 f=[x for e in h["PostToolUseFailure"] if e["matcher"]=="Bash" for x in e["hooks"]]
 assert any(x["type"]=="command" and x["command"].endswith("tools/dev/target-guard.sh --hook") for x in f)' "$SCRIPT_DIR/../../.claude/settings.json"
 
+echo "13. huge commands without the keyword skip the tokenizer"
+newroot 13
+BIG="$TMP/big.json"
+python3 -c 'import json,sys; json.dump({"tool_name":"Bash","tool_input":{"command":"echo \"some text; more | words && (x)\" \n" * 12000}}, open(sys.argv[1],"w"))' "$BIG"
+check "fixture is ~400 KB" test "$(wc -c < "$BIG")" -gt 400000
+for m in --pre-hook --hook; do
+  check "$m: 400 KB command without the keyword in under 1 s" python3 -c '
+import os,subprocess,sys,time
+env=dict(os.environ, TIMEFLY_WARN_FREE_MB="0", TIMEFLY_GUARD_ROOT=sys.argv[3])
+t0=time.monotonic()
+r=subprocess.run([sys.argv[1],sys.argv[2]],stdin=open(sys.argv[4],"rb"),env=env,capture_output=True)
+dt=time.monotonic()-t0
+assert r.returncode==0 and not r.stdout, r
+assert dt < 1.0, dt' "$GUARD" "$m" "$ROOT" "$BIG"
+done
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
