@@ -460,6 +460,31 @@ profiles 11h
 hook_json 'ls -la' | TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook >/dev/null 2>&1
 check "hook: no last resort after a non-cargo command" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
 
+echo "12. failed commands (PostToolUseFailure) get the same hook, answered under their own event"
+# hook_json_ev <event> <command>
+hook_json_ev() { python3 -c 'import json,sys; print(json.dumps({"hook_event_name":sys.argv[1],"tool_name":"Bash","tool_input":{"command":sys.argv[2]},"error":"exit 1","is_interrupt":False}))' "$1" "$2"; }
+event_of() { python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["hookEventName"])' <<<"$1" 2>/dev/null; }
+newroot 12
+mkfile "$ROOT/target/debug/d.bin" 1
+out=$(hook_json_ev PostToolUseFailure 'ls nope' | TIMEFLY_FAKE_FREE_MB=3000 TMPDIR="$CUL" guard --hook 2>&1)
+check "failure event, low free: warns" grep -q '3000 MB free' <<<"$(ctx_of "$out")"
+check "failure event, low free: hookEventName PostToolUseFailure" test "$(event_of "$out")" = PostToolUseFailure
+mkfile "$ROOT/target/debug/incremental/stale/x" 1; age "$ROOT/target/debug/incremental/stale" $OLD
+out=$(hook_json_ev PostToolUseFailure 'cargo test' | TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=0 TIMEFLY_WARN_FREE_MB=0 TIMEFLY_FAKE_FREE_MB=1000 guard --hook 2>&1)
+check "failure event, failed cargo command: pruned" test ! -e "$ROOT/target/debug/incremental/stale"
+check "failure event, prune report: hookEventName PostToolUseFailure" test "$(event_of "$out")" = PostToolUseFailure
+out=$(hook_json_ev PostToolUse 'ls' | TIMEFLY_FAKE_FREE_MB=3000 TMPDIR="$CUL" guard --hook 2>&1)
+check "PostToolUse event: answered as PostToolUse" test "$(event_of "$out")" = PostToolUse
+out=$(hook_json_ev SomethingElse 'ls' | TIMEFLY_FAKE_FREE_MB=3000 TMPDIR="$CUL" guard --hook 2>&1)
+check "unknown event: answered as PostToolUse" test "$(event_of "$out")" = PostToolUse
+out=$(hook_json 'ls' | TIMEFLY_FAKE_FREE_MB=3000 TMPDIR="$CUL" guard --hook 2>&1)
+check "missing event: answered as PostToolUse" test "$(event_of "$out")" = PostToolUse
+check ".claude/settings.json wires --hook under PostToolUseFailure for Bash" python3 -c '
+import json,sys
+h=json.load(open(sys.argv[1]))["hooks"]
+f=[x for e in h["PostToolUseFailure"] if e["matcher"]=="Bash" for x in e["hooks"]]
+assert any(x["type"]=="command" and x["command"].endswith("tools/dev/target-guard.sh --hook") for x in f)' "$SCRIPT_DIR/../../.claude/settings.json"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

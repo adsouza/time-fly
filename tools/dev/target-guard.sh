@@ -156,17 +156,31 @@ xctrace_records() {
 }
 
 # --- hook input --------------------------------------------------------------
-# hook_command: the Bash command from the hook JSON on stdin; empty if unparsable.
-hook_command() {
-  local input; input="$(cat)"
+# read_hook_input: parse the hook JSON on stdin into HOOK_CMD (the Bash command) and
+# HOOK_EVENT (PostToolUse or PostToolUseFailure; anything else reads as PostToolUse).
+# Both are empty/default if the input is unparsable or neither jq nor python3 exists.
+read_hook_input() {
+  local input out nl='
+'
+  input="$(cat)"
+  # "<event>\n<command>\n." keeps the command's trailing newlines through $(...).
   if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null
+    out="$(printf '%s' "$input" | jq -r '"\(.hook_event_name // "")\n\(.tool_input.command // "")\n."' 2>/dev/null)"
   elif command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$input" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("tool_input",{}).get("command",""))
-except Exception: pass' 2>/dev/null
+    out="$(printf '%s' "$input" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); t=d.get("tool_input") or {}
+    sys.stdout.write("%s\n%s\n.\n" % (d.get("hook_event_name") or "", t.get("command") or ""))
+except Exception: pass' 2>/dev/null)"
   fi
+  HOOK_EVENT=""; HOOK_CMD=""
+  case "$out" in *"$nl"*)
+    HOOK_EVENT="${out%%"$nl"*}"
+    HOOK_CMD="${out#*"$nl"}"; HOOK_CMD="${HOOK_CMD%.}"; HOOK_CMD="${HOOK_CMD%"$nl"}" ;;
+  esac
+  case "$HOOK_EVENT" in PostToolUse|PostToolUseFailure) ;; *) HOOK_EVENT=PostToolUse ;; esac
 }
+HOOK_EVENT=PostToolUse
 
 # --- measurements (KB internally) -------------------------------------------
 target_kb() { du -sk "$TARGET" 2>/dev/null | awk '{ s = $1 + 0 } END { print s + 0 }'; }
@@ -223,14 +237,15 @@ low_free_warning() {
   fi
   WARN_CTX+=" The guard never deletes anything outside target/: tell the owner what is using the space, and delete files outside target/ only with the owner's approval. See docs/dev/build-disk.md."
 }
-# emit_post <systemMessage> <additionalContext>: PostToolUse hook output.
+# emit_post <systemMessage> <additionalContext>: PostToolUse / PostToolUseFailure output,
+# answered under the event that called us (HOOK_EVENT).
 emit_post() {
   if command -v jq >/dev/null 2>&1; then
-    jq -n --arg s "$1" --arg c "$2" \
-      '{systemMessage:$s, hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$c}}'
+    jq -n --arg s "$1" --arg c "$2" --arg e "$HOOK_EVENT" \
+      '{systemMessage:$s, hookSpecificOutput:{hookEventName:$e, additionalContext:$c}}'
   elif command -v python3 >/dev/null 2>&1; then
     python3 -c 'import json,sys
-print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":sys.argv[2]}}))' "$1" "$2"
+print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventName":sys.argv[3],"additionalContext":sys.argv[2]}}))' "$1" "$2" "$HOOK_EVENT"
   fi
 }
 # culprit_lines: the culprit list as one sentence, for the manual report.
@@ -260,7 +275,7 @@ print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventNa
 
 # --- PreToolUse: block runaway xctrace recordings; allow everything else ---------
 if [ "$MODE" = prehook ]; then
-  cmd="$(hook_command)"
+  read_hook_input; cmd="$HOOK_CMD"
   [ -n "$cmd" ] || exit 0
   recs="$(xctrace_records "$cmd")"
   [ -n "$recs" ] || exit 0
@@ -286,7 +301,7 @@ fi
 
 # --- hook pre-filter: prune only after cargo runs; warn after any command --------
 if [ "$MODE" = hook ]; then
-  cmd="$(hook_command)"
+  read_hook_input; cmd="$HOOK_CMD"
   runs_cargo "$cmd" || hook_done
 fi
 
