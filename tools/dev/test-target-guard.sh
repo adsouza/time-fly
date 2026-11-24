@@ -289,7 +289,7 @@ h=d["hookSpecificOutput"]
 assert h["hookEventName"]=="PostToolUse" and h["additionalContext"]' <<<"$out"
 ctx="$(ctx_of "$out")"
 check "warning gives free space" grep -q '3000 MB free' <<<"$ctx"
-check "warning gives target/ size" grep -q 'target/: 2 MB' <<<"$ctx"
+check "non-cargo warning does not measure target/ (no du)" bash -c '! grep -q "target/: [0-9]" <<<"$1"' _ "$ctx"
 check "warning lists the ktrace culprit with its size" grep -q "900 MB $CUL/instrumentsA.ktrace" <<<"$ctx"
 check "culprits largest first" python3 -c '
 import sys
@@ -315,6 +315,7 @@ out=$(hook_json 'ls' | env -u TMPDIR TIMEFLY_FAKE_FREE_MB=3000 TIMEFLY_GUARD_ROO
 check "TMPDIR unset: exit 0, JSON only" bash -c 'test "$1" -eq 0 && python3 -c "import json,sys; json.load(sys.stdin)" <<<"$2"' _ "$rc" "$out"
 out=$(hook_json 'cargo test' | TIMEFLY_FAKE_FREE_MB=3000 TMPDIR="$CUL" guard --hook 2>&1)
 check "cargo command with nothing to prune: still warns" grep -q '3000 MB free' <<<"$(ctx_of "$out")"
+check "cargo command warning gives target/ size" grep -q 'target/: 2 MB' <<<"$(ctx_of "$out")"
 rm -rf "$ROOT/target"
 out=$(hook_json 'cargo test' | TIMEFLY_FAKE_FREE_MB=3000 TMPDIR="$CUL" guard --hook 2>&1)
 check "cargo command, missing target/: still warns" grep -q 'target/: absent' <<<"$(ctx_of "$out")"
@@ -329,6 +330,11 @@ done
 hook_json 'ls -la' | TIMEFLY_WARN_FREE_MB=0 guard --hook >/dev/null 2>&1
 check "cheap path: exactly one df call" test "$(grep -c '^df$' "$TOOLLOG")" -eq 1
 check "cheap path: no du call" bash -c '! grep -q "^du$" "$1"' _ "$TOOLLOG"
+: > "$TOOLLOG"
+out=$(hook_json 'ls -la' | TIMEFLY_WARN_FREE_MB=999999999 TMPDIR="$CUL" guard --hook 2>/dev/null)
+check "below-threshold warning path: warns" grep -q 'low disk space' <<<"$out"
+check "below-threshold warning path: exactly one df call" test "$(grep -c '^df$' "$TOOLLOG")" -eq 1
+check "below-threshold warning path: no du call" bash -c '! grep -q "^du$" "$1"' _ "$TOOLLOG"
 rm -f "$FAKEBIN/du" "$FAKEBIN/df"
 check "cheap path: under 0.5 s" python3 -c '
 import os,subprocess,sys,time

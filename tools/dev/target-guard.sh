@@ -245,6 +245,7 @@ except Exception: pass' 2>/dev/null)"
   case "$HOOK_EVENT" in PostToolUse|PostToolUseFailure) ;; *) HOOK_EVENT=PostToolUse ;; esac
 }
 HOOK_EVENT=PostToolUse
+CARGO_RUN=0
 
 # --- measurements (KB internally) -------------------------------------------
 target_kb() { du -sk "$TARGET" 2>/dev/null | awk '{ s = $1 + 0 } END { print s + 0 }'; }
@@ -290,10 +291,14 @@ low_free_warning() {
   local free t list
   free="$(free_kb)"
   [ "${1:-}" = force ] || [ "$free" -lt $((WARN_FREE_MB * 1024)) ] || return 1
-  if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then t="$(mb "$(target_kb)") MB"; else t="absent"; fi
+  # target/ is measured (du) only after cargo runs: every other command costs one df.
+  t=""
+  if [ "$CARGO_RUN" = 1 ]; then
+    if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then t=" target/: $(mb "$(target_kb)") MB"; else t=" target/: absent"; fi
+  fi
   list="$(culprits | awk 'NR > 1 { printf "; " } { printf "%s", $0 }')"
   WARN_SYS="target-guard: low disk space, $(mb "$free") MB free (warning below $WARN_FREE_MB MB)."
-  WARN_CTX="$WARN_SYS target/: $t (minimum free $MIN_FREE_MB MB, target budget $BUDGET_MB MB)."
+  WARN_CTX="$WARN_SYS$t (minimum free $MIN_FREE_MB MB, target budget $BUDGET_MB MB)."
   if [ -n "$list" ]; then
     WARN_CTX+=" Largest files directly in $(scan_dir) (likely culprits; xctrace leaves instruments*.ktrace there): $list."
   else
@@ -369,6 +374,7 @@ if [ "$MODE" = hook ]; then
   read_hook_input; cmd="$HOOK_CMD"
   # Cheap keyword check first: the tokenizer is slow on huge commands.
   case "$cmd" in *cargo*) runs_cargo "$cmd" || hook_done ;; *) hook_done ;; esac
+  CARGO_RUN=1
 fi
 
 if [ -L "$TARGET" ]; then warn "$TARGET is a symlink; refusing to touch it."; hook_done; fi
