@@ -38,12 +38,14 @@ use timefly_core::flight::chase::{
     fly_scale, globe_chase_distance_km, globe_chase_pose, globe_look_offset_range,
 };
 use timefly_core::flight::cloud::globe_exaggeration;
-use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, GlobeFlight, GlobeInput, globe_fly_step};
+use timefly_core::flight::globe::{
+    BOOST, GLOBE_MIN_ALTITUDE_KM, GlobeFlight, GlobeInput, SPEED_PER_ALTITUDE, globe_fly_step,
+};
 
 use crate::creature::FlyPose;
 use crate::diagnostics::DiagnosticsContext;
 use crate::fly_camera::{
-    ChaseGlide, FlyFlourish, KeyInput, LOOK_RADIANS_PER_PX, MAX_STEP_S, TURN_DEG_PER_S,
+    ChaseGlide, FlyFlourish, KeyInput, LOOK_RADIANS_PER_PX, MAX_STEP_S, TURN_DEG_PER_S, fly_speed,
     keys_to_input,
 };
 use crate::globe::{
@@ -213,6 +215,22 @@ pub fn descent_ease(altitude_km: f64) -> f64 {
         .clamp(0.0, 1.0)
 }
 
+/// A fly waiting in the cloud drifts at no more than this share of the M2 speed at its height
+/// (design §6: "eases to a gentle drift"; the waiting test's bound).
+pub const DIVE_DRIFT_SHARE: f64 = 0.05;
+
+/// The share of the keys' horizontal speed a fly waiting in the cloud keeps (fix round 1,
+/// minor 2): no more than [`DIVE_DRIFT_SHARE`] of the M2 speed at its height
+/// (`fly_speed`, capped at `MAX_SPEED_MPS`), as its descent drifts, so it stays over the dive
+/// point while the region generates.
+pub fn dive_horizontal_scale(altitude_km: f64, boost: bool) -> f64 {
+    let boost = if boost { BOOST } else { 1.0 };
+    // Before the step's angular cap, which only slows it further.
+    let full = SPEED_PER_ALTITUDE * altitude_km.max(0.0) * 1000.0 * boost;
+    let drift = DIVE_DRIFT_SHARE * f64::from(fly_speed((altitude_km * 1000.0) as f32));
+    if full > drift { drift / full } else { 1.0 }
+}
+
 /// Gathers the keys and the drag and steps [`GlobeFlightState`].
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn step_globe_flight(
@@ -225,6 +243,7 @@ fn step_globe_flight(
     mut drag: ResMut<GlobeDrag>,
     mut flight: ResMut<GlobeFlightState>,
     mut look: ResMut<GlobeLook>,
+    nav: Option<Res<Navigation>>,
 ) {
     if let Some(mouse) = &mouse {
         if mouse.just_pressed(MouseButton::Left) {
@@ -250,6 +269,15 @@ fn step_globe_flight(
         globe_input(held, look_delta, scroll_lines, time.delta_secs_f64());
     if input.climb < 0.0 {
         input.climb *= descent_ease(flight.0.altitude_km);
+    }
+    // Waiting in the cloud, the fly drifts over the dive point rather than flying off it.
+    if nav
+        .as_ref()
+        .is_some_and(|n| matches!(n.phase, NavPhase::Diving { .. }))
+    {
+        let scale = dive_horizontal_scale(flight.0.altitude_km, input.boost);
+        input.forward *= scale;
+        input.strafe *= scale;
     }
     // A neutral step would still re-normalise the heading and change its low bits, and the fly
     // would never count as idle (no hover bob): leave the state alone.
@@ -411,7 +439,6 @@ mod tests {
     use timefly_core::flight::chase::{
         CHASE_FLY_BELOW_CENTRE_DEG, globe_chase_elevation_deg, globe_look_pitch_deg,
     };
-    use timefly_core::flight::globe::SPEED_PER_ALTITUDE;
 
     use super::*;
 
@@ -1034,6 +1061,64 @@ mod tests {
             last = a;
         }
         assert!(step < 1.0, "still {step} km a frame");
+    }
+
+    /// Fix round 1, minor 2: held forward and boosted through a 3 s (native) generation, a fly
+    /// waiting in the cloud drifts no faster than 5 % of the M2 speed at its height, not the
+    /// 2,400 km it would cover on the globe.
+    #[test]
+    fn diving_holds_the_fly_over_the_dive_point() {
+        use crate::fly_camera::fly_speed;
+        use bevy::state::app::StatesPlugin;
+        for alt in [600.0, 900.0, DIVE_ALTITUDE_KM, 2_000.0] {
+            for boost in [false, true] {
+                let full = SPEED_PER_ALTITUDE
+                    * alt
+                    * 1000.0
+                    * if boost {
+                        timefly_core::flight::globe::BOOST
+                    } else {
+                        1.0
+                    };
+                let kept = full * dive_horizontal_scale(alt, boost);
+                let cap = 0.05 * f64::from(fly_speed((alt * 1000.0) as f32));
+                assert!(
+                    kept <= cap * (1.0 + 1e-9),
+                    "{alt} km, boost {boost}: {kept} m/s"
+                );
+                assert!(kept > 0.0);
+            }
+        }
+        let (mut app, _) = app(16.0 / 9.0);
+        app.add_plugins(StatesPlugin)
+            .init_state::<RegionState>()
+            .init_resource::<Navigation>();
+        app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Diving {
+            target: timefly_core::geo::RenderDir(DVec3::Z),
+            snapshot: timefly_core::deep_time::YearsBp(0.0),
+            since_s: 0.0,
+            started: true,
+        };
+        let start = at(1_100.0);
+        set_flight(&mut app, start);
+        app.update();
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.press(KeyCode::KeyW);
+        keys.press(KeyCode::ShiftLeft);
+        let mut last = flight(&app);
+        for frame in 0..180 {
+            app.update();
+            let f = flight(&app);
+            let metres = f.dir.angle_between(last.dir) * (EARTH_RADIUS_KM + f.altitude_km) * 1000.0;
+            let cap = 0.05 * f64::from(fly_speed((f.altitude_km * 1000.0) as f32));
+            assert!(
+                metres <= cap * STEP.as_secs_f64() * 1.001,
+                "frame {frame}: {metres} m in a frame"
+            );
+            last = f;
+        }
+        let km = start.dir.angle_between(last.dir) * (EARTH_RADIUS_KM + 1_100.0);
+        assert!(km < 2.0, "drifted {km} km");
     }
 
     #[test]

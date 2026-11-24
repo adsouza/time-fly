@@ -267,8 +267,8 @@ fn only_an_opaque_cloud_covers_the_view() {
 }
 
 /// The altitude bands' smoothstep tails never quite reach 0: a fly left at 2,499.9999999 km
-/// after climbing out would keep the cloud's pass running for nothing. A cloud too faint to
-/// see is clear.
+/// after climbing out would keep the cloud's pass running for nothing. They stay below the
+/// cloud's floor ([`crate::cloud::CLEAR_BELOW`], applied in its one sink), which draws nothing.
 #[test]
 fn a_cloud_too_faint_to_see_is_clear() {
     use timefly_core::flight::altitudes::REGION_CLOUD_BAND_M;
@@ -279,14 +279,16 @@ fn a_cloud_too_faint_to_see_is_clear() {
         globe_altitude_km: top,
         ..inputs()
     };
-    assert_eq!(NavPhase::Globe.cloud_density(&i), 0.0);
+    let tail = NavPhase::Globe.cloud_density(&i);
+    assert!(tail < crate::cloud::CLEAR_BELOW, "{tail}");
     let floor = (REGION_CLOUD_BASE_M - REGION_CLOUD_BAND_M) as f32 + 1.0;
     assert!(region_density(floor) > 0.0);
     let i = NavInputs {
         region_height_m: floor,
         ..inputs()
     };
-    assert_eq!(NavPhase::Flying.cloud_density(&i), 0.0);
+    let tail = NavPhase::Flying.cloud_density(&i);
+    assert!(tail < crate::cloud::CLEAR_BELOW, "{tail}");
     // Anything a display could show still draws.
     let i = NavInputs {
         globe_altitude_km: CLOUD_TOP_KM - 100.0,
@@ -379,6 +381,7 @@ fn inputs() -> NavInputs {
         globe_heading: DVec3::Y,
         region_height_m: 8_000.0,
         region_fly: None,
+        shown_density: 0.0,
     }
 }
 
@@ -414,6 +417,7 @@ fn frame(phase: NavPhase, i: &mut NavInputs) -> (NavPhase, Vec<NavAction>, f32, 
         }
     }
     let after = next.cloud_density(i);
+    i.shown_density = after;
     (next, actions, before, after)
 }
 
@@ -631,6 +635,7 @@ fn entering_places_the_fly_below_the_cloud_base_with_its_heading() {
             globe_heading: basis.east,
             globe_altitude_km: DIVE_ALTITUDE_KM - 50.0,
             time: YearsBp(21_000.0),
+            shown_density: 1.0,
             ..inputs()
         },
     );
@@ -739,6 +744,10 @@ fn climb_out(mut phase: NavPhase, i: &mut NavInputs) -> Vec<NavAction> {
     for k in 0..gather + 2 {
         let (next, actions, before, after) = frame(phase, i);
         i.climb_key = false;
+        assert!(
+            after >= before,
+            "frame {k}: the cloud thinned {before} -> {after}"
+        );
         if actions.iter().any(is_swap) {
             assert_eq!((before, after), (1.0, 1.0), "frame {k}");
             assert_eq!(
@@ -795,12 +804,9 @@ fn climbing_through_the_cloud_base_returns_to_the_globe() {
     i.region_height_m = CLIMB_OUT_M;
     let (phase, actions) = step_nav(NavPhase::Flying, &i);
     assert!(actions.is_empty());
-    assert_eq!(
-        phase,
-        NavPhase::Climbing {
-            elapsed_s: 0.0,
-            centre
-        }
+    assert!(
+        matches!(phase, NavPhase::Climbing { centre: Some(c), .. } if c == centre),
+        "{phase:?}"
     );
     let (dir, heading) = i.region_fly.unwrap();
     assert_eq!(
@@ -856,15 +862,146 @@ fn backspace_climbs_out() {
             placed: false,
         },
     ] {
-        let i = NavInputs {
+        let mut i = NavInputs {
             climb_key: true,
             ..region_fly(centre, 250_000.0)
         };
-        assert!(
-            matches!(step_nav(phase, &i).0, NavPhase::Climbing { .. }),
+        i.shown_density = phase.cloud_density(&i);
+        let (dir, heading) = i.region_fly.unwrap();
+        assert_eq!(
+            climb_out(phase, &mut i),
+            vec![
+                NavAction::Leave,
+                NavAction::PlaceOnGlobe {
+                    dir,
+                    heading,
+                    altitude_km: DIVE_ALTITUDE_KM,
+                },
+            ],
             "{phase:?}"
         );
     }
+}
+
+/// Fix round 1, important 1: climbing out of a snapshot change held at full cover (on
+/// `Backspace`, or the time moving on to a missing crust), or from a fly in the cloud base's
+/// band, starts the gather where the cloud already is: it never thins on the way to the swap.
+#[test]
+fn climbing_out_never_thins_the_cloud() {
+    let centre = RenderDir(DVec3::new(0.6, 0.0, 0.8));
+    let changing = |fade: Fade| NavPhase::ChangingSnapshot {
+        fade,
+        to: YearsBp(100e6),
+        requested: RenderDir(DVec3::X),
+        agl_m: 500.0,
+        generated: false,
+        placed: false,
+    };
+    let held = changing(Fade::new(SNAPSHOT_FADE_S).advance(2.0, true));
+    let closing = changing(Fade::new(SNAPSHOT_FADE_S).advance(0.3, true));
+    let missing = TimeChange {
+        to: YearsBp(250e6),
+        carried: None,
+        agl_m: 500.0,
+    };
+    for (what, phase, height, key, change) in [
+        ("held, Backspace", held, 8_000.0, true, None),
+        ("held, missing crust", held, 8_000.0, false, Some(missing)),
+        ("closing, Backspace", closing, 8_000.0, true, None),
+        (
+            "in the band, Backspace",
+            NavPhase::Flying,
+            280_000.0,
+            true,
+            None,
+        ),
+    ] {
+        let mut i = NavInputs {
+            climb_key: key,
+            time_change: change,
+            region_snapshot: Some(YearsBp(0.0)),
+            ..region_fly(centre, height)
+        };
+        i.shown_density = phase.cloud_density(&i);
+        let (next, _, before, after) = frame(phase, &mut i);
+        assert!(
+            matches!(next, NavPhase::Climbing { .. }),
+            "{what}: {next:?}"
+        );
+        assert!(after >= before, "{what}: {before} -> {after}");
+        (i.climb_key, i.time_change) = (false, None);
+        climb_out(next, &mut i);
+    }
+}
+
+/// Fix round 1, minor 1: the dive swaps only after a frame drawn opaque. A boosted descent that
+/// crosses the dive altitude in one frame (from 1,264 km, drawn at 0.993) waits a frame.
+#[test]
+fn a_boosted_crossing_waits_for_a_frame_drawn_opaque() {
+    let target = everest();
+    let mut i = ready(
+        target,
+        NavInputs {
+            globe_altitude_km: 1_264.0,
+            ..inputs()
+        },
+    );
+    let phase = diving(target);
+    i.shown_density = phase.cloud_density(&i);
+    assert!(
+        (0.99..1.0).contains(&i.shown_density),
+        "{}",
+        i.shown_density
+    );
+    i.globe_altitude_km = 1_190.0;
+    let (next, actions, _, _) = frame(phase, &mut i);
+    assert!(!actions.iter().any(is_swap), "{actions:?}");
+    assert!(matches!(next, NavPhase::Diving { .. }));
+    let (next, actions, before, after) = frame(next, &mut i);
+    assert!(
+        matches!(actions[..], [NavAction::PlaceInRegion { .. }]),
+        "{actions:?}"
+    );
+    assert_eq!((before, after), (1.0, 1.0));
+    assert!(matches!(next, NavPhase::Emerging { .. }));
+}
+
+/// Fix round 1, minor 5: a climb with no region and no fly (it cannot happen while flying)
+/// leaves the globe's fly where it is: no placement, nothing from a zero direction.
+#[test]
+fn a_climb_without_a_region_places_nothing() {
+    let phase = NavPhase::Climbing {
+        elapsed_s: CLOUD_GATHER_S as f32,
+        centre: None,
+    };
+    let i = NavInputs {
+        region_state: RegionState::InRegion,
+        ..inputs()
+    };
+    let (next, actions) = step_nav(phase, &i);
+    assert_eq!(actions, vec![NavAction::Leave]);
+    assert!(matches!(next, NavPhase::Emerging { .. }));
+    // With a centre but no fly: over the centre, heading north.
+    let centre = RenderDir(DVec3::new(0.6, 0.0, 0.8));
+    let (_, actions) = step_nav(
+        NavPhase::Climbing {
+            elapsed_s: CLOUD_GATHER_S as f32,
+            centre: Some(centre),
+        },
+        &i,
+    );
+    let north = RegionFrame { center: centre }.north_east().0;
+    assert_eq!(
+        actions,
+        vec![
+            NavAction::Leave,
+            NavAction::PlaceOnGlobe {
+                dir: centre,
+                heading: north,
+                altitude_km: DIVE_ALTITUDE_KM,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -1156,7 +1293,7 @@ fn slider_changes_wait_for_the_transition() {
         (
             NavPhase::Climbing {
                 elapsed_s: 0.1,
-                centre,
+                centre: Some(centre),
             },
             true,
         ),
@@ -1989,6 +2126,8 @@ struct Drawn {
     fly: FlyState,
     flight: GlobeFlight,
     look_offset_deg: f64,
+    /// The centre of the region the terrain scene draws.
+    scene_centre: Option<RenderDir>,
 }
 
 #[derive(Resource, Default)]
@@ -2002,6 +2141,7 @@ fn record_drawn(
     fly: Res<FlyState>,
     flight: Res<GlobeFlightState>,
     look: Res<GlobeLook>,
+    scene: Option<Res<crate::terrain::TerrainScene>>,
     cameras: Query<(
         &Camera,
         &Transform,
@@ -2028,6 +2168,7 @@ fn record_drawn(
         fly: *fly,
         flight: flight.0,
         look_offset_deg: look.offset_deg,
+        scene_centre: scene.map(|s| s.grid.spec.center),
     });
 }
 
@@ -2300,5 +2441,73 @@ fn no_ground_is_nearer_than_the_cloud_across_the_swaps() {
             "{h} m: ground {} m below, the cloud at {reach} m",
             pose.eye.y - ground
         );
+    }
+}
+
+/// Fix round 1, important 1: `Backspace` during a snapshot change, its region already
+/// generated but not placed (`after` 1), or finishing during the climb's gather (3, 5). The
+/// terrain never swaps to it, the cloud never thins until the swap to the globe, and the fly
+/// lands over its place in the region it was flying in.
+#[test]
+fn a_snapshot_change_left_mid_way_never_swaps_the_terrain() {
+    for after in [1u32, 3, 5] {
+        let mut app = worlds_app();
+        dive(&mut app);
+        let old = app.world().resource::<ActiveRegion>().frame;
+        {
+            let mut fly = app.world_mut().resource_mut::<FlyState>();
+            fly.pos_m = Vec3::new(20_000.0, 8_000.0, -35_000.0);
+            fly.yaw = 0.7;
+        }
+        for _ in 0..3 {
+            app.update();
+        }
+        app.world_mut().resource_mut::<FakeJob>().after = after;
+        set_time(&mut app, 100e6);
+        app.update();
+        assert!(
+            matches!(phase(&app), NavPhase::ChangingSnapshot { .. }),
+            "{:?}",
+            phase(&app)
+        );
+        app.update();
+        app.update();
+        let from = app.world().resource::<DrawnFrames>().0.len();
+        press(&mut app, LEAVE_KEY);
+        assert!(matches!(phase(&app), NavPhase::Climbing { .. }));
+        run_until(&mut app, 60, |a| phase(a) == NavPhase::Globe);
+        let frames = app.world().resource::<DrawnFrames>().0.clone();
+        let swap = first(&frames, from, |p| {
+            matches!(
+                p,
+                NavPhase::Emerging {
+                    world: World::Globe,
+                    ..
+                }
+            )
+        });
+        for (k, f) in frames.iter().enumerate().take(swap).skip(from - 1) {
+            assert_eq!(
+                f.scene_centre,
+                Some(old.center),
+                "after {after}, frame {k} ({:?}, density {}): the terrain swapped",
+                f.phase,
+                f.density
+            );
+        }
+        for w in frames[from - 1..=swap].windows(2) {
+            assert!(
+                w[1].density >= w[0].density,
+                "after {after}: the cloud thinned {} -> {} ({:?})",
+                w[0].density,
+                w[1].density,
+                w[1].phase
+            );
+        }
+        assert_eq!(frames[swap].density, 1.0);
+        let (dir, heading) = fly_on_globe(&old, 20_000.0, -35_000.0, 0.7);
+        let f = frames[swap].flight;
+        assert!((f.dir - dir.0).length() < 1e-9, "after {after}: {f:?}");
+        assert!(f.heading.dot(heading) > 1.0 - 1e-9, "after {after}: {f:?}");
     }
 }

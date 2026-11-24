@@ -65,6 +65,13 @@
 //! and once the fly has climbed out over the globe, `<prefix>-globe-after.png`. A fifth argument
 //! `divekey` climbs out with `Backspace` instead. Each step logs a `region tour dive` line.
 //!
+//! A fifth argument `lowclimb` checks the opaque cloud against near ground (M3 Task 7, fix
+//! round 1): after the start shot (give a low `AGL_M`, facing a ridge) it presses `Backspace`,
+//! and as the cloud gathers for the climb out holds its density at 0.995 for [`PIN_FRAMES`] and
+//! saves `<prefix>-climb-0995.png` (below opaque: the cloud sits just past the fly), then at 1.0
+//! and saves `<prefix>-climb-opaque.png` (what the frame before the swap draws: everything but
+//! the fly covered). Then it lets the climb finish onto the globe.
+//!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
 //! (as in the benches), the camera is held `AGL_M` above the centre, and after the settle it
@@ -157,6 +164,9 @@ enum Step {
     CloudClose,
     CloudFull,
     CloudClear,
+    /// `lowclimb`: climbing out, the shots held below opaque and opaque; then to the globe.
+    LowGather,
+    LowAfter,
     Done,
 }
 
@@ -170,6 +180,8 @@ enum Mode {
     Cruise,
     Cloud,
     Time,
+    /// `Backspace` from low, the cloud held just below opaque and opaque (`lowclimb`).
+    LowClimb,
     /// The dive and the climb (`dive`: climbing out through the cloud base; `divekey`: with
     /// `Backspace`).
     Dive {
@@ -393,6 +405,15 @@ fn tour(
                     tour.since = now;
                     tour.frames = 0;
                 }
+            } else if tour.mode == Mode::LowClimb && tour.frames >= WIRE_FRAMES {
+                if tour.frames == WIRE_FRAMES {
+                    log_flight("low climb start", &fly, region.as_deref(), &time);
+                    keys.press(LEAVE_KEY);
+                } else {
+                    keys.release(LEAVE_KEY);
+                    tour.step = Step::LowGather;
+                    tour.frames = 0;
+                }
             } else if tour.mode == Mode::High && tour.frames >= WIRE_FRAMES {
                 fly.pitch = MIN_PITCH_DEG.to_radians();
                 tour.step = Step::Down;
@@ -540,6 +561,32 @@ fn tour(
             }
             if *state.get() == RegionState::Globe {
                 error!(phase = ?nav.phase, "region tour: the snapshot change did not finish");
+                exit.write(AppExit::error());
+            }
+        }
+        Step::LowGather => {
+            if !matches!(nav.phase, NavPhase::Climbing { .. }) {
+                error!(phase = ?nav.phase, "region tour: the climb ended before its shots");
+                exit.write(AppExit::error());
+            } else if tour.frames == 1 {
+                tour.pin = Some(0.995);
+                shoot(&mut commands, &tour, "climb-0995");
+            } else if tour.frames == 1 + PIN_FRAMES {
+                tour.pin = Some(1.0);
+                shoot(&mut commands, &tour, "climb-opaque");
+            } else if tour.frames == 1 + 2 * PIN_FRAMES {
+                tour.pin = None;
+                log_flight("low climb shots", &fly, region.as_deref(), &time);
+                tour.step = Step::LowAfter;
+                tour.frames = 0;
+            }
+        }
+        Step::LowAfter => {
+            if nav.phase == NavPhase::Globe {
+                tour.step = Step::Done;
+                tour.frames = 0;
+            } else if tour.frames > 600 {
+                error!(phase = ?nav.phase, "region tour: the climb never reached the globe");
                 exit.write(AppExit::error());
             }
         }
@@ -853,7 +900,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|cruise|cloud|time|cloudtime|dive|divekey] [AGL_M] [LATER_S]"
+             [shaded|fly|cruise|cloud|time|cloudtime|dive|divekey|lowclimb] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -874,6 +921,7 @@ fn main() -> AppExit {
         Some("cruise") => Mode::Cruise,
         Some("cloud") => Mode::Cloud,
         Some("time" | "cloudtime") => Mode::Time,
+        Some("lowclimb") => Mode::LowClimb,
         Some("dive") => Mode::Dive { backspace: false },
         Some("divekey") => Mode::Dive { backspace: true },
         _ => Mode::Wire,

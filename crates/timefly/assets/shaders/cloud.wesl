@@ -4,7 +4,10 @@
 //
 // - Depth: the clip-space triangle sits at the clip depth of the cloud's view depth (just past
 //   the fly, `crate::cloud::fly_view_depth`). The pipeline depth-tests and never writes depth,
-//   so the fly (nearer) draws over the cloud and everything behind it is covered.
+//   so the fly (nearer) draws over the cloud and everything behind it is covered. Opaque (from
+//   OPAQUE_FROM), the cloud moves to the near plane and covers everything, ground nearer than the
+//   fly included, but for a hole around the fly (`crate::cloud::fly_hole`), where it sits just
+//   past the fly so the fly stays in front (`crate::cloud::cloud_covers` mirrors the rule).
 // - Field: octave k samples the noise at (dir × distance_k + motion) × (cells_k / distance_k):
 //   cells_k cells per radian of view, offset by the camera's accumulated motion and the wind (in
 //   cloud depths), which moves nearer layers across the view faster.
@@ -22,8 +25,12 @@ import bevy_pbr::render::mesh_view_bindings::view;
 import package::noise::gradient_noise3;
 
 struct CloudParams {
-    // x: density (0 clear, 1 opaque); y: the cloud's view depth (world units); z: tilt-shift.
+    // x: density (0 clear, 1 opaque); y: the cloud's view depth (world units); z: tilt-shift;
+    // w: the view's aspect (width over height).
     state: vec4<f32>,
+    // The fly's hole in the opaque cloud: xy its centre (NDC); z the radius (NDC height units, 0
+    // for none); w the view depth just past the fly.
+    fly: vec4<f32>,
     // xyz: the camera's accumulated motion and the wind, in cloud depths.
     motion: vec4<f32>,
     // xyz: world direction toward the active world's sun.
@@ -38,6 +45,8 @@ struct CloudParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> cloud: CloudParams;
 
 const OCTAVES: u32 = 4u;
+// `OPAQUE_FROM` in cloud.rs: from this density every pixel is opaque.
+const OPAQUE_FROM: f32 = 0.999;
 // The broad octaves that shape the wisps; the sun lights these.
 const SHAPE_OCTAVES: u32 = 2u;
 // Per octave: x: cells per radian of view; y: the layer's distance in cloud depths; z: weight
@@ -61,6 +70,17 @@ struct CloudVertex {
 struct CloudOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) ndc: vec2<f32>,
+}
+
+struct CloudFragment {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+
+// The clip depth of a point at `view_depth` along the view, whatever the projection.
+fn clip_depth(view_depth: f32) -> f32 {
+    let at = view.clip_from_view * vec4<f32>(0.0, 0.0, -view_depth, 1.0);
+    return at.z / at.w;
 }
 
 @vertex
@@ -98,7 +118,19 @@ fn shape(dir: vec3<f32>) -> f32 {
 }
 
 @fragment
-fn fragment(in: CloudOut) -> @location(0) vec4<f32> {
+fn fragment(in: CloudOut) -> CloudFragment {
+    var out: CloudFragment;
+    out.color = cloud_color(in);
+    out.depth = in.clip.z;
+    if cloud.state.x >= OPAQUE_FROM {
+        // Opaque: the near plane (reverse-Z 1) covers everything but the fly's hole.
+        let in_hole = cloud.fly.z > 0.0 && length((in.ndc - cloud.fly.xy) * vec2<f32>(cloud.state.w, 1.0)) <= cloud.fly.z;
+        out.depth = select(1.0, clip_depth(cloud.fly.w), in_hole);
+    }
+    return out;
+}
+
+fn cloud_color(in: CloudOut) -> vec4<f32> {
     let density = cloud.state.x;
     if density <= 0.0 {
         // Clear: drawn only to warm the pipeline.

@@ -56,17 +56,17 @@ use crate::cloud::{CloudDensity, add_cloud_density};
 use crate::data::GlobeData;
 use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyChase, FlyState};
 use crate::globe_flight::{GlobeChase, GlobeFlightState, GlobeFlightSystems, GlobeLook};
-use crate::terrain::{TerrainSceneSystems, TerrainSettings};
+use crate::terrain::{TerrainScene, TerrainSceneSystems, TerrainSettings};
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 use crate::ui::TEXT_COLOR;
 
 mod phase;
 
 pub use phase::{
-    CLEAR_BELOW, CLIMB_OUT_M, DIVE_DRIFT_S, Fade, NavAction, NavInputs, NavPhase, SNAPSHOT_FADE_S,
+    CLIMB_OUT_M, DIVE_DRIFT_S, Fade, NavAction, NavInputs, NavPhase, SNAPSHOT_FADE_S,
     START_TIMEOUT_S, SliderHold, TimeChange, World, dive_drift_mps, emerge_altitude_km,
-    emerge_density, emerge_height_m, fade_alpha, fly_on_globe, gather_density, hold_slider,
-    region_yaw, same_region, step_nav,
+    emerge_density, emerge_height_m, fade_alpha, fly_on_globe, gather_density, gather_elapsed_for,
+    hold_slider, region_yaw, same_region, step_nav,
 };
 
 /// "Descending..." shows only once a region has been generating this long (design §6.1).
@@ -424,6 +424,10 @@ struct NavWorld<'w> {
     globe: Option<Res<'w, GlobeData>>,
     region: Option<Res<'w, ActiveRegion>>,
     frames: Option<Res<'w, FrameCache>>,
+    /// The terrain on screen: during a snapshot change (or a climb out of one) it can still be
+    /// the old region after `ActiveRegion` became the new one, and the fly's local position is
+    /// in its frame.
+    scene: Option<Res<'w, TerrainScene>>,
 }
 
 /// Sets the globe time to `to`, with a [`TimeChanged`] of `cause`, if it differs.
@@ -462,6 +466,13 @@ fn navigate(
     let dt_s = real.delta_secs();
     let state = *world.region_state.get();
     let region = world.region.as_deref();
+    // The terrain drawn, which the fly's local position is in.
+    let shown_grid = world
+        .scene
+        .as_deref()
+        .map(|s| &s.grid)
+        .or(region.map(|r| &r.grid));
+    let shown_frame = shown_grid.map(|g| g.spec.frame());
 
     // The slider waits during a transition: a change since last frame is queued and put back.
     let (held, slider) = hold_slider(nav.phase.holds_time(), time.years, nav.slider);
@@ -499,9 +510,10 @@ fn navigate(
         globe_dir: RenderDir(flight.dir),
         globe_heading: flight.heading,
         region_height_m: flies.fly.pos_m.y,
-        region_fly: region.map(|r| {
+        shown_density: nav.density,
+        region_fly: shown_frame.map(|frame| {
             fly_on_globe(
-                &r.frame,
+                &frame,
                 f64::from(flies.fly.pos_m.x),
                 f64::from(flies.fly.pos_m.z),
                 flies.fly.yaw,
@@ -521,16 +533,16 @@ fn navigate(
     let (phase, actions) = step_nav(before, &inputs);
 
     // Apply.
+    let p = flies.fly.pos_m;
+    let ease = Ease {
+        region_shown: phase.region_shown(),
+        dt_s,
+        ground_m: shown_grid.map_or(0.0, |g| {
+            blended_height_m(g, f64::from(p.x), f64::from(p.z)).max(0.0)
+        }),
+    };
     for action in actions {
-        apply_action(
-            action,
-            phase.region_shown(),
-            dt_s,
-            region,
-            &mut time,
-            &mut flies,
-            &mut out,
-        );
+        apply_action(action, ease, region, &mut time, &mut flies, &mut out);
     }
     if std::mem::discriminant(&phase) != std::mem::discriminant(&before) {
         info!(from = ?before, to = ?phase, "navigation phase");
@@ -550,7 +562,13 @@ fn navigate(
     if out.terrain.visible != shown {
         out.terrain.visible = shown;
     }
-    let hold = matches!(phase, NavPhase::ChangingSnapshot { placed: false, .. });
+    // A snapshot change holds the new terrain back until the camera moves; a climb never shows
+    // it (a change left mid-way finishes behind the climb), so only one world swap happens,
+    // under the opaque cloud.
+    let hold = matches!(
+        phase,
+        NavPhase::ChangingSnapshot { placed: false, .. } | NavPhase::Climbing { .. }
+    );
     if out.terrain.hold_swap != hold {
         out.terrain.hold_swap = hold;
     }
@@ -582,13 +600,20 @@ fn navigate(
     }
 }
 
-/// Applies one action. `region_shown`: the world on screen after this frame's decision, which
-/// [`NavAction::EaseFly`] moves.
+/// What [`NavAction::EaseFly`] moves: the world on screen after this frame's decision, over the
+/// frame time, above the ground drawn under the region's fly.
+#[derive(Copy, Clone, Debug)]
+struct Ease {
+    region_shown: bool,
+    dt_s: f32,
+    ground_m: f32,
+}
+
+/// Applies one action.
 #[instrument(level = "debug", skip_all, fields(?action))]
 fn apply_action(
     action: NavAction,
-    region_shown: bool,
-    dt_s: f32,
+    ease: Ease,
     region: Option<&ActiveRegion>,
     time: &mut GlobeTime,
     flies: &mut Flies,
@@ -650,15 +675,12 @@ fn apply_action(
             }
         }
         NavAction::EaseFly { vertical_mps } => {
-            let dy = vertical_mps * dt_s;
-            if region_shown {
+            let dy = vertical_mps * ease.dt_s;
+            if ease.region_shown {
                 let p = flies.fly.pos_m;
-                let ground = region.map_or(0.0, |r| {
-                    blended_height_m(&r.grid, f64::from(p.x), f64::from(p.z)).max(0.0)
-                });
                 let y = (p.y + dy)
                     .min(CAMERA_CEILING_M)
-                    .max(ground + CAMERA_CLEARANCE_M);
+                    .max(ease.ground_m + CAMERA_CLEARANCE_M);
                 if y != p.y {
                     flies.fly.pos_m.y = y;
                 }

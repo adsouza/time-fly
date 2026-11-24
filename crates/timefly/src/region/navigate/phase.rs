@@ -53,11 +53,6 @@ pub const CLIMB_OUT_M: f32 = (REGION_CLOUD_BASE_M - 1_000.0) as f32;
 /// descending and slows to a drift.
 pub const DIVE_DRIFT_S: f64 = 1.5;
 
-/// A cloud fainter than this counts as clear ([`NavPhase::cloud_density`]): the cloud shader's
-/// wisps stay under one 8-bit step, and the altitude bands' smoothstep tails (a fly left at
-/// 2,499.9999999 km after climbing out) no longer keep its full-screen pass running.
-pub const CLEAR_BELOW: f32 = 1.0 / 1024.0;
-
 /// Progress within this of the end counts as reaching it (frame times add up in `f32`).
 const FADE_EPSILON: f32 = 1e-4;
 
@@ -138,6 +133,26 @@ pub fn gather_density(elapsed_s: f32) -> f32 {
     ease01(elapsed_s / CLOUD_GATHER_S as f32)
 }
 
+/// How far into the gather ([`gather_density`]) the cloud is already `density`: a climb starts
+/// there, so the cloud never thins on the way to the swap (fix round 1: from a snapshot change
+/// held at full cover it swaps on the next frame).
+pub fn gather_elapsed_for(density: f32) -> f32 {
+    let gather = CLOUD_GATHER_S as f32;
+    if density >= 1.0 {
+        return gather;
+    }
+    if density <= 0.0 || density.is_nan() {
+        return 0.0;
+    }
+    // The inverse of smoothstep, then up to the first time whose density is not below it.
+    let t = 0.5 - ((1.0 - 2.0 * density).asin() / 3.0).sin();
+    let mut elapsed = (t * gather).clamp(0.0, gather);
+    while gather_density(elapsed) < density && elapsed < gather {
+        elapsed = elapsed.next_up();
+    }
+    elapsed
+}
+
 /// The cloud's own density while emerging, `elapsed_s` in: exactly 1 at the swap, 0 at
 /// [`EMERGE_S`].
 pub fn emerge_density(elapsed_s: f32) -> f32 {
@@ -203,9 +218,12 @@ pub enum NavPhase {
         generated: bool,
         placed: bool,
     },
-    /// Climbing out of the region centred on `centre`: the cloud gathers for `elapsed_s` of
-    /// [`CLOUD_GATHER_S`], then the views swap to the globe.
-    Climbing { elapsed_s: f32, centre: RenderDir },
+    /// Climbing out of the region centred on `centre` (none without a region): the cloud
+    /// gathers for `elapsed_s` of [`CLOUD_GATHER_S`], then the views swap to the globe.
+    Climbing {
+        elapsed_s: f32,
+        centre: Option<RenderDir>,
+    },
 }
 
 impl NavPhase {
@@ -221,7 +239,7 @@ impl NavPhase {
     }
 
     /// The cloud's density ([`crate::cloud::CloudDensity`]): the largest of the altitude band
-    /// of the world on screen and the phase's own fade, or 0 below [`CLEAR_BELOW`].
+    /// of the world on screen and the phase's own fade.
     pub fn cloud_density(&self, i: &NavInputs) -> f32 {
         let band = if self.region_shown() {
             region_density(i.region_height_m)
@@ -234,8 +252,7 @@ impl NavPhase {
             NavPhase::ChangingSnapshot { fade, .. } => fade.alpha(),
             NavPhase::Globe | NavPhase::Diving { .. } | NavPhase::Flying => 0.0,
         };
-        let density = band.max(own);
-        if density < CLEAR_BELOW { 0.0 } else { density }
+        band.max(own)
     }
 
     /// Whether the cloud fully covers the view (a dive waiting in the cloud, a snapshot change
@@ -302,6 +319,8 @@ pub struct NavInputs {
     /// globe and its heading there ([`fly_on_globe`]).
     pub region_height_m: f32,
     pub region_fly: Option<(RenderDir, DVec3)>,
+    /// The cloud density navigation raised last frame: what the frame before this one drew.
+    pub shown_density: f32,
 }
 
 /// What [`step_nav`] asks the shell to do.
@@ -405,10 +424,10 @@ fn emerge_speed_mps(world: World, elapsed_s: f32, i: &NavInputs) -> f32 {
 /// The next phase and the actions to apply, from this frame's inputs.
 pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
     let mut actions = Vec::new();
+    // The gather starts where the cloud already is: it never thins on the way out.
     let climb = |i: &NavInputs| NavPhase::Climbing {
-        elapsed_s: 0.0,
-        // Without a region (it cannot happen while flying) the globe stays where it is.
-        centre: i.region_centre.unwrap_or(RenderDir(DVec3::ZERO)),
+        elapsed_s: gather_elapsed_for(i.shown_density),
+        centre: i.region_centre,
     };
     // Over the globe, out of the cloud: where a region that vanished leaves the fly.
     let out_over_globe = NavPhase::Emerging {
@@ -462,7 +481,9 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 // Climbed back out of the cloud before the swap: the dive is off.
                 actions.push(NavAction::CancelRequest);
                 NavPhase::Globe
-            } else if ready && globe_density(i.globe_altitude_km) == 1.0 {
+            } else if ready && i.shown_density == 1.0 && globe_density(i.globe_altitude_km) == 1.0 {
+                // After a frame drawn opaque (a boosted descent can cross the dive altitude in
+                // one frame), on a frame that is.
                 actions.push(NavAction::PlaceInRegion {
                     yaw: region_yaw(i.region_centre.unwrap_or(target), i.globe_heading),
                     height_m: REGION_CLOUD_BASE_M as f32,
@@ -610,12 +631,10 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 out_over_globe
             } else if opaque {
                 actions.push(NavAction::Leave);
-                let fallback = || {
-                    let (north, _) = RegionFrame { center: centre }.north_east();
-                    (centre, north)
-                };
-                let (dir, heading) = i.region_fly.unwrap_or_else(fallback);
-                if dir.0.length_squared() > 0.0 {
+                // Over the fly's place; without one, over the region's centre heading north;
+                // without a region either, the globe's fly stays where it is.
+                let centred = centre.map(|c| (c, RegionFrame { center: c }.north_east().0));
+                if let Some((dir, heading)) = i.region_fly.or(centred) {
                     actions.push(NavAction::PlaceOnGlobe {
                         dir,
                         heading,
