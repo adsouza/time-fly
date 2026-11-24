@@ -51,13 +51,34 @@ fi
 # command_segments <command>: one line per simple command, its words tab-separated with
 # quotes removed, starting at the program actually run. Splits on && || ; | & ( ) ` $(
 # and newlines outside quotes; drops comments; skips leading VAR=value assignments,
-# `env [opts] [VAR=value...]`, `time [-p]`, `nice [-n N]`, `command [-p]`, `direnv exec <dir>`
-# and the keywords ! { if then else elif do while until. `command -v/-V` (a lookup) yields
-# no line. A rough tokenizer: unusual syntax may hide a command, never invent one.
+# `env [opts] [VAR=value...]`, `time [-p]`, `nice [-n N]`, `command [-p]`, `direnv exec <dir>`,
+# `nohup`, `exec [opts]`, `sudo [opts]`, `timeout [opts] DURATION` and the keywords
+# ! { if then else elif do while until. `command -v/-V` (a lookup) yields no line.
+# Newlines and tabs inside words are encoded as \036 and \035 so each segment stays one line.
+# Nested commands, i.e. the script of `sh|bash|zsh|dash|ksh -c SCRIPT` and the body of a
+# `$(...)` or backtick substitution inside double quotes, come out as extra lines: \034 then
+# the (encoded) nested command; all_segments tokenizes those in turn.
+# A rough tokenizer: unusual syntax may hide a command, never invent one.
 command_segments() {
   TF_CMD="$1" awk '
-    function endword() { if (inword) { w[++n] = word }; word = ""; inword = 0 }
-    function endseg(   k, out, j) {
+    function enc(t) { gsub(/\n/, "\036", t); gsub(/\t/, "\035", t); return t }
+    function endword() { if (inword) { w[++n] = enc(word) }; word = ""; inword = 0 }
+    # substitution body starting at st inside double quotes; returns the index of its end
+    function capsub(st, tick,   j, ch, depth) {
+      if (tick) {
+        j = index(substr(s, st), "`"); j = j ? st + j - 1 : L + 1
+      } else {
+        depth = 1
+        for (j = st; j <= L; j++) {
+          ch = substr(s, j, 1)
+          if (ch == "(") depth++
+          else if (ch == ")" && --depth == 0) break
+        }
+      }
+      subs[++ns] = enc(substr(s, st, j - st))
+      return j
+    }
+    function endseg(   k, out, j, prog, hasc) {
       endword()
       k = 1
       while (k <= n) {
@@ -83,6 +104,23 @@ command_segments() {
           continue
         }
         if (w[k] == "direnv" && w[k + 1] == "exec") { k += 3; continue }
+        if (w[k] == "nohup") { k++; continue }
+        if (w[k] == "exec") { k++; while (w[k] ~ /^-/) { if (w[k] == "-a") k++; k++ }; continue }
+        if (w[k] == "sudo") {
+          k++
+          while (w[k] ~ /^-/) {
+            if (w[k] == "--") { k++; break }
+            if (w[k] ~ /^-[ugChprtUDTR]$/) k++
+            k++
+          }
+          continue
+        }
+        if (w[k] == "timeout" || w[k] == "gtimeout") {
+          k++
+          while (w[k] ~ /^-/) { if (w[k] == "-s" || w[k] == "-k") k++; k++ }
+          k++   # the duration
+          continue
+        }
         if (w[k] ~ /^(!|[{]|if|then|else|elif|do|while|until)$/) { k++; continue }
         break
       }
@@ -90,17 +128,28 @@ command_segments() {
         out = w[k]
         for (j = k + 1; j <= n; j++) out = out "\t" w[j]
         print out
+        prog = w[k]; sub(/.*\//, "", prog)
+        if (prog ~ /^(sh|bash|zsh|dash|ksh)$/) {
+          hasc = 0
+          for (j = k + 1; j <= n && w[j] ~ /^[-+]/; j++) {
+            if (w[j] ~ /^-[A-Za-z]*c[A-Za-z]*$/) hasc = 1
+            if (w[j] ~ /^[-+]o$/) j++
+          }
+          if (hasc && j <= n) subs[++ns] = w[j]
+        }
       }
       n = 0
     }
     BEGIN {
-      s = ENVIRON["TF_CMD"]; L = length(s); q = ""; n = 0; word = ""; inword = 0
+      s = ENVIRON["TF_CMD"]; L = length(s); q = ""; n = 0; ns = 0; word = ""; inword = 0
       for (i = 1; i <= L; i++) {
         c = substr(s, i, 1); nx = substr(s, i + 1, 1)
         if (q == "\047") { if (c == "\047") q = ""; else word = word c; continue }
         if (q == "\"") {
           if (c == "\"") q = ""
           else if (c == "\\" && index("\"\\$`", nx)) { word = word nx; i++ }
+          else if (c == "$" && nx == "(") { e = capsub(i + 2, 0); word = word substr(s, i, e - i + 1); i = e }
+          else if (c == "`") { e = capsub(i + 1, 1); word = word substr(s, i, e - i + 1); i = e }
           else word = word c
           continue
         }
@@ -122,18 +171,33 @@ command_segments() {
         word = word c; inword = 1
       }
       endseg()
+      for (j = 1; j <= ns; j++) print "\034" subs[j]
     }'
+}
+# all_segments <command> [depth]: command_segments plus, recursively (depth <= 4), the
+# segments of every nested command it reports.
+all_segments() {
+  local depth="${2:-0}" line mark
+  mark="$(printf '\034')"
+  command_segments "$1" | while IFS= read -r line; do
+    case "$line" in
+      "$mark"*)
+        [ "$depth" -lt 4 ] || continue
+        all_segments "$(printf '%s' "${line#"$mark"}" | tr '\036\035' '\n\t')" $((depth + 1)) ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done
 }
 # runs_cargo <command>: true when some simple command runs cargo itself.
 runs_cargo() {
-  command_segments "$1" | awk -F '\t' '$1 == "cargo" || $1 ~ /\/cargo$/ { f = 1 } END { exit !f }'
+  all_segments "$1" | awk -F '\t' '$1 == "cargo" || $1 ~ /\/cargo$/ { f = 1 } END { exit !f }'
 }
 
 # xctrace_records <command>: one line per simple command that runs `xctrace record`
 # (directly, by path, or through xcrun): "limit" if it passes --time-limit (before any
 # `--`, after which the arguments belong to the launched program), else "nolimit".
 xctrace_records() {
-  command_segments "$1" | awk -F '\t' '
+  all_segments "$1" | awk -F '\t' '
     {
       k = 1
       if ($1 == "xcrun" || $1 ~ /\/xcrun$/) {

@@ -501,6 +501,41 @@ assert r.returncode==0 and not r.stdout, r
 assert dt < 1.0, dt' "$GUARD" "$m" "$ROOT" "$BIG"
 done
 
+echo "14. xctrace record behind prefixes, nested shells and command substitutions"
+newroot 14
+xcase deny  20000 "nohup xctrace record --template X --all-processes &"
+xcase deny  20000 "timeout 60 xctrace record --template X --all-processes"
+xcase deny  20000 "timeout -s INT 60 xctrace record --template X"
+xcase deny  20000 "timeout --signal=INT -k 5 60 xcrun xctrace record --template X"
+xcase deny  20000 "exec xctrace record --template X"
+xcase deny  20000 "sudo xctrace record --template X --all-processes"
+xcase deny  20000 "sudo -u root -E xctrace record --template X"
+xcase deny  20000 "bash -c 'xctrace record --template X --all-processes'"
+xcase deny  20000 "sh -c \"cd /tmp && xcrun xctrace record --template X\""
+xcase deny  20000 "zsh -lc 'xctrace record --template X'"
+xcase deny  20000 "/bin/bash -c 'nohup xctrace record --template X &'"
+xcase deny  20000 "bash -c 'cd /tmp${NL}xctrace record --template X'"
+xcase deny  20000 'out="$(xctrace record --template X --all-processes)"'
+xcase deny  20000 'echo "trace: $(xcrun xctrace record --template X)"'
+xcase deny  20000 'out="`xctrace record --template X`"'
+xcase deny  20000 "bash -c 'out=\"\$(xctrace record --template X)\"'"
+xcase allow 20000 "nohup xctrace record --time-limit 30s --template X &"
+xcase allow 20000 "timeout 60 xctrace record --time-limit 30s --template X"
+xcase allow 20000 "bash -c 'xctrace record --time-limit 30s --template X'"
+xcase allow 20000 'out="$(xctrace record --time-limit 30s --template X)"'
+xcase allow 20000 "bash -c 'grep xctrace record.log'"
+xcase allow 20000 "rg 'xctrace record' docs"
+xcase allow 20000 "git log --grep 'xctrace record'"
+xcase allow 20000 'echo "$(xctrace list devices)"'
+xcase allow 20000 "xcrun simctl list devices"
+xcase allow 20000 "echo 'out=\$(xctrace record --template X)'"
+cargo_case yes 'timeout 600 cargo test'
+cargo_case yes 'nohup cargo build &'
+cargo_case yes "bash -c 'cargo build'"
+cargo_case yes 'meta="$(cargo metadata --format-version 1)"'
+cargo_case no  "bash -c 'echo cargo'"
+cargo_case no  "echo 'x=\$(cargo build)'"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
