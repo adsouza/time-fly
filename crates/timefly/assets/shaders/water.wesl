@@ -98,10 +98,17 @@ fn floor_gradient(params: TerrainParams, xz: vec2<f32>) -> vec2<f32> {
 // triangles that straddle the shore interpolate it.
 const SWASH_LIFT_LAND_M: f32 = 25.0;
 
+// `WATER_HORIZON_MARGIN` in water.rs: the mesh reaches this fraction past the horizon.
+const WATER_HORIZON_MARGIN: f32 = 0.05;
+
 @vertex
 fn vertex(in: Vertex) -> WaterVertexOutput {
     let params = terrain.params;
-    let rel = in.position.xz;
+    // `water_radius_m`: from high up the horizon is farther than the mesh's radius
+    // (`look.mesh.w`), and the mesh stretches past it, so its rim never shows.
+    let h = max(params.camera.y, 0.0);
+    let reach = max(look.mesh.w, sqrt(h * (2.0 * params.lattice.z + h)) * (1.0 + WATER_HORIZON_MARGIN));
+    let rel = in.position.xz * (reach / look.mesh.w);
     let xz = params.camera.xz + rel;
     let drop = dot(rel, rel) / (2.0 * params.lattice.z);
     // Low down: the swell's height, and the swash's amplitude for the depth lift below. Higher

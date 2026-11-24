@@ -4,14 +4,17 @@
 //! - **State.** [`GlobeFlightState`] holds the core's [`GlobeFlight`] (a direction, a tangent
 //!   heading and an altitude, f64 in the render frame), so the fly crosses the poles with no
 //!   special case. [`GlobeLook`] holds the view drag's offset.
-//! - **Input** ([`GlobeFlightSystems::Step`]), only on the globe: the region's keys
-//!   ([`keys_to_input`]), the drag and the scroll wheel (up descends, down climbs, M1's zoom
-//!   habit), mapped by [`globe_input`] and stepped by `globe_fly_step`.
+//! - **Input** ([`GlobeFlightSystems::Step`]), on the globe and while a dive waits in the cloud
+//!   (the player can climb back out to cancel it): the region's keys ([`keys_to_input`]), the
+//!   drag and the scroll wheel (up descends, down climbs, M1's zoom habit), mapped by
+//!   [`globe_input`] and stepped by `globe_fly_step`. Below the dive altitude a descent eases
+//!   into the floor inside the cloud ([`descent_ease`]).
 //!   A drag turns the fly and tilts the view (dragging down looks further down, as in a
 //!   region); the tilt is an offset added to both the chase look and the eye's elevation, and
 //!   the stored offset is clamped to [`globe_look_offset_range`], so a drag back never has a
 //!   dead zone.
-//! - **Chase** ([`GlobeFlightSystems::Apply`], before the bridge cameras copy the globe camera,
+//! - **Chase** ([`GlobeFlightSystems::Apply`], after the camera switch
+//!   (`crate::terrain::RegionViewSystems`) and before the bridge cameras copy the globe camera,
 //!   [`GlobeCameraSync`]): `globe_chase_pose` in kilometres, the look pitch rising with altitude
 //!   (`globe_look_pitch_deg`: 50° at the dive, so the ground fills the lower two-thirds of the
 //!   frame, to 85° at the top, with the eye straight over the fly and the globe centred) and
@@ -30,12 +33,12 @@
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::*;
-use timefly_core::flight::altitudes::GLOBE_MAX_CAMERA_DISTANCE_KM;
+use timefly_core::flight::altitudes::{DIVE_ALTITUDE_KM, GLOBE_MAX_CAMERA_DISTANCE_KM};
 use timefly_core::flight::chase::{
     fly_scale, globe_chase_distance_km, globe_chase_pose, globe_look_offset_range,
 };
 use timefly_core::flight::cloud::globe_exaggeration;
-use timefly_core::flight::globe::{GlobeFlight, GlobeInput, globe_fly_step};
+use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, GlobeFlight, GlobeInput, globe_fly_step};
 
 use crate::creature::FlyPose;
 use crate::diagnostics::DiagnosticsContext;
@@ -48,6 +51,7 @@ use crate::globe::{
 };
 use crate::region::RegionState;
 use crate::region::navigate::{NavPhase, Navigation};
+use crate::terrain::RegionViewSystems;
 use crate::ui::PointerOverUi;
 use crate::ui::altitude::{Altitude, FlyAltitude};
 
@@ -57,8 +61,6 @@ pub const SCROLL_CLIMB_S_PER_LINE: f64 = 0.125;
 /// Trackpad pixels per scroll line.
 pub const PIXELS_PER_LINE: f32 = 24.0;
 
-/// The time constant (s) of [`ease_flight_toward`]: about 95 % of the way in three of them.
-pub const EASE_TIME_S: f64 = 0.6;
 /// The globe camera's far plane (km), for culling only (the depth is reversed-Z and infinite):
 /// past the far side of the globe from the farthest eye.
 pub const GLOBE_FAR_KM: f32 = (GLOBE_MAX_CAMERA_DISTANCE_KM + 2.0 * EARTH_RADIUS_KM) as f32;
@@ -98,11 +100,19 @@ struct GlobeDrag(bool);
 
 /// The chase camera's glide and the fly's visual state between frames.
 #[derive(Resource, Clone, Debug, Default)]
-struct GlobeChase {
+pub(crate) struct GlobeChase {
     glide: ChaseGlide,
     /// The flight last frame: the up to carry the glide by, the turn rate and idleness.
     last: Option<GlobeFlight>,
     flourish: FlyFlourish,
+}
+
+impl GlobeChase {
+    /// Forgets the glide, the last flight and the flourish: the next frame starts at the wanted
+    /// pose (a placement over the globe: the climb's swap).
+    pub(crate) fn reset(&mut self) {
+        *self = GlobeChase::default();
+    }
 }
 
 pub struct GlobeFlightPlugin;
@@ -123,6 +133,8 @@ impl Plugin for GlobeFlightPlugin {
                     .before(GlobeCameraSync)
                     .before(GlobeExaggerationSync),
             )
+            // The cameras switch first, so a swap frame's pose is the active world's.
+            .configure_sets(Update, GlobeFlightSystems::Apply.after(RegionViewSystems))
             .add_systems(
                 Update,
                 step_globe_flight
@@ -138,11 +150,16 @@ impl Plugin for GlobeFlightPlugin {
     }
 }
 
-/// The flight takes input only on the globe: while a region is requested, generates, is shown
-/// or is being left, region navigation owns the state.
+/// The flight takes input on the globe, and while a dive waits in the cloud (the player can
+/// climb back out to cancel it). While a region is requested otherwise, generates, is shown, or
+/// while the fly emerges, region navigation owns the state.
 fn on_the_globe(state: Option<Res<State<RegionState>>>, nav: Option<Res<Navigation>>) -> bool {
-    state.is_none_or(|s| *s.get() == RegionState::Globe)
-        && nav.is_none_or(|n| n.phase == NavPhase::Globe)
+    let diving = nav
+        .as_ref()
+        .is_some_and(|n| matches!(n.phase, NavPhase::Diving { .. }));
+    diving
+        || (state.is_none_or(|s| *s.get() == RegionState::Globe)
+            && nav.is_none_or(|n| n.phase == NavPhase::Globe))
 }
 
 /// One frame's globe input from the held keys, the drag (logical pixels, y down) and the scroll
@@ -187,37 +204,13 @@ pub fn globe_input(
     (input, (f64::from(look_delta.y) * px).to_degrees())
 }
 
-/// The flight `dt_s` further along an exponential ease (time constant [`EASE_TIME_S`]) toward
-/// the point over `target` (a direction) at `altitude_km`: along the great circle, carrying the
-/// heading.
-pub fn ease_flight_toward(
-    state: GlobeFlight,
-    target: DVec3,
-    altitude_km: f64,
-    dt_s: f64,
-) -> GlobeFlight {
-    let k = 1.0 - (-dt_s.max(0.0) / EASE_TIME_S).exp();
-    if k <= 0.0 {
-        return state;
-    }
-    let dir = state.dir.normalize();
-    let target = target.normalize();
-    let angle = dir.angle_between(target);
-    let axis = dir
-        .cross(target)
-        .try_normalize()
-        .unwrap_or_else(|| dir.cross(state.heading).normalize());
-    let turn = DQuat::from_axis_angle(axis, angle * k);
-    let (dir, heading) = if angle > 1e-12 {
-        ((turn * dir).normalize(), turn * state.heading)
-    } else {
-        (dir, state.heading)
-    };
-    GlobeFlight {
-        dir,
-        heading: (heading - dir * dir.dot(heading)).normalize(),
-        altitude_km: state.altitude_km + (altitude_km - state.altitude_km) * k,
-    }
+/// How much of a descent the fly keeps at `altitude_km` (design §7.1, Task 7): all of it down
+/// to [`DIVE_ALTITUDE_KM`], then less and less toward the floor inside the cloud
+/// ([`GLOBE_MIN_ALTITUDE_KM`], half the dive altitude), none at it, so the floor is eased rather
+/// than hit.
+pub fn descent_ease(altitude_km: f64) -> f64 {
+    ((altitude_km - GLOBE_MIN_ALTITUDE_KM) / (DIVE_ALTITUDE_KM - GLOBE_MIN_ALTITUDE_KM))
+        .clamp(0.0, 1.0)
 }
 
 /// Gathers the keys and the drag and steps [`GlobeFlightState`].
@@ -253,7 +246,11 @@ fn step_globe_flight(
         },
         _ => 0.0,
     };
-    let (input, look_change) = globe_input(held, look_delta, scroll_lines, time.delta_secs_f64());
+    let (mut input, look_change) =
+        globe_input(held, look_delta, scroll_lines, time.delta_secs_f64());
+    if input.climb < 0.0 {
+        input.climb *= descent_ease(flight.0.altitude_km);
+    }
     // A neutral step would still re-normalise the heading and change its low bits, and the fly
     // would never count as idle (no hover bob): leave the state alone.
     let neutral =
@@ -1003,6 +1000,84 @@ mod tests {
     }
 
     #[test]
+    fn descending_eases_into_the_floor_inside_the_cloud() {
+        assert_eq!(descent_ease(GLOBE_MAX_ALTITUDE_KM), 1.0);
+        assert_eq!(descent_ease(DIVE_ALTITUDE_KM), 1.0);
+        assert_eq!(descent_ease(GLOBE_MIN_ALTITUDE_KM), 0.0);
+        let mid = descent_ease((DIVE_ALTITUDE_KM + GLOBE_MIN_ALTITUDE_KM) / 2.0);
+        assert!((mid - 0.5).abs() < 1e-12, "{mid}");
+        // Held down inside the cloud, the fly slows into the floor rather than hitting it.
+        use bevy::state::app::StatesPlugin;
+        let (mut app, _) = app(16.0 / 9.0);
+        app.add_plugins(StatesPlugin)
+            .init_state::<RegionState>()
+            .init_resource::<Navigation>();
+        app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Diving {
+            target: timefly_core::geo::RenderDir(DVec3::Z),
+            snapshot: timefly_core::deep_time::YearsBp(0.0),
+            since_s: 0.0,
+            started: true,
+        };
+        set_flight(&mut app, at(DIVE_ALTITUDE_KM - 1.0));
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        app.update();
+        let mut last = flight(&app).altitude_km;
+        let mut step = f64::INFINITY;
+        for frame in 0..600 {
+            app.update();
+            let a = flight(&app).altitude_km;
+            assert!(a <= last && a > GLOBE_MIN_ALTITUDE_KM, "frame {frame}: {a}");
+            assert!(last - a <= step + 1e-9, "frame {frame}: sped up");
+            step = last - a;
+            last = a;
+        }
+        assert!(step < 1.0, "still {step} km a frame");
+    }
+
+    #[test]
+    fn the_flight_takes_input_while_diving_but_not_while_emerging() {
+        use crate::region::navigate::World;
+        use bevy::state::app::StatesPlugin;
+        let (mut app, _) = app(16.0 / 9.0);
+        app.add_plugins(StatesPlugin)
+            .init_state::<RegionState>()
+            .init_resource::<Navigation>();
+        set_flight(&mut app, at(1_100.0));
+        app.update();
+        app.world_mut()
+            .resource_mut::<NextState<RegionState>>()
+            .set(RegionState::Generating);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+        let diving = NavPhase::Diving {
+            target: timefly_core::geo::RenderDir(DVec3::Z),
+            snapshot: timefly_core::deep_time::YearsBp(0.0),
+            since_s: 0.0,
+            started: true,
+        };
+        for (phase, moves) in [
+            (diving, true),
+            (
+                NavPhase::Emerging {
+                    world: World::Globe,
+                    elapsed_s: 0.5,
+                },
+                false,
+            ),
+            (NavPhase::Flying, false),
+        ] {
+            app.world_mut().resource_mut::<Navigation>().phase = phase;
+            app.update();
+            let before = flight(&app);
+            run(&mut app, 5);
+            assert_eq!(flight(&app) != before, moves, "{phase:?}");
+        }
+    }
+
+    #[test]
     fn portrait_resize_fits_the_globe_and_landscape_restores_the_field_of_view() {
         let (mut app, entity) = app(1.0);
         let diameter = 2.0 * (EARTH_RADIUS_KM / (2.74 * EARTH_RADIUS_KM)).asin();
@@ -1021,31 +1096,5 @@ mod tests {
             assert!((horizontal.min(p.fov) - PerspectiveProjection::default().fov).abs() < 1e-6);
             assert_eq!(p.far, GLOBE_FAR_KM);
         }
-    }
-
-    #[test]
-    fn the_descent_eases_along_the_great_circle_to_the_dive_altitude() {
-        let from = at(GLOBE_MAX_ALTITUDE_KM);
-        let target = GlobeFlight::start(-10.0, 30.0).dir;
-        let one = ease_flight_toward(from, target, DIVE_ALTITUDE_KM, 0.1);
-        assert!(one.dir.angle_between(target) < from.dir.angle_between(target));
-        assert!(one.altitude_km < from.altitude_km && one.altitude_km > DIVE_ALTITUDE_KM);
-        // On the great circle, with the heading still a unit tangent.
-        let normal = from.dir.cross(target).normalize();
-        assert!(one.dir.dot(normal).abs() < 1e-9);
-        assert!((one.heading.length() - 1.0).abs() < 1e-9 && one.heading.dot(one.dir).abs() < 1e-9);
-        let mut s = from;
-        for _ in 0..100 {
-            s = ease_flight_toward(s, target, DIVE_ALTITUDE_KM, 0.1);
-        }
-        assert!(s.dir.angle_between(target) < 1e-6);
-        assert!((s.altitude_km - DIVE_ALTITUDE_KM).abs() < 1e-3);
-        assert_eq!(
-            ease_flight_toward(from, target, DIVE_ALTITUDE_KM, 0.0),
-            from
-        );
-        // Already there: the heading is kept.
-        let there = ease_flight_toward(s, s.dir, DIVE_ALTITUDE_KM, 0.1);
-        assert!(there.heading.dot(s.heading) > 1.0 - 1e-12);
     }
 }

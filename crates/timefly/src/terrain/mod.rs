@@ -62,6 +62,13 @@ const EARTH_RADIUS_M: f32 = (EARTH_RADIUS_KM * 1000.0) as f32;
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerrainSceneSystems;
 
+/// The system that switches between the globe and region cameras (`TerrainSettings::visible`).
+/// Whatever writes the fly's pose for the active camera (`crate::fly_camera::FlySystems::Apply`,
+/// `crate::globe_flight::GlobeFlightSystems::Apply`) runs after it, so on a swap frame the pose
+/// is the newly active world's.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionViewSystems;
+
 /// Terrain options set at launch.
 #[derive(Resource, Copy, Clone, Debug, PartialEq, Eq)]
 pub struct TerrainOptions {
@@ -279,7 +286,7 @@ pub(crate) fn add_terrain_systems(app: &mut App) {
             (
                 sync_terrain_scene.in_set(TerrainSceneSystems),
                 toggle_wireframe,
-                sync_region_view,
+                sync_region_view.in_set(RegionViewSystems),
             )
                 .chain(),
         )

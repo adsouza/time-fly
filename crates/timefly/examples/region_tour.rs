@@ -53,6 +53,18 @@
 //! others, on another Space) gets no main pass at all, only the shadow and compute passes, so
 //! GPU costs read from a trace (Metal System Trace) are only real offscreen.
 //!
+//! A fifth argument `dive` checks the dive and the climb through the cloud (M3 Task 7). The game
+//! starts on the globe (no launch region), the globe camera renders into the offscreen image
+//! too, and the tour puts the fly over `LAT,LON` at `AGE_YEARS`, [`ABOVE_CLOUD_KM`] up, just
+//! above the cloud: `<prefix>-globe-above.png`. Then it holds `Ctrl` (descend) through the cloud
+//! top and the dive altitude, and saves `<prefix>-dive-cloud.png` in the white-out over the
+//! globe and `<prefix>-dive-swap.png` from the swap frame, on the region's side. Once the fly
+//! has emerged below the cloud base and the region has settled: `<prefix>-region-below.png`.
+//! Then it holds `Space` (climb) up through the cloud base, saving `<prefix>-climb-cloud.png`
+//! (the region in the white-out) and `<prefix>-climb-swap.png` (the globe's side of the swap),
+//! and once the fly has climbed out over the globe, `<prefix>-globe-after.png`. A fifth argument
+//! `divekey` climbs out with `Backspace` instead. Each step logs a `region tour dive` line.
+//!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
 //! (as in the benches), the camera is held `AGL_M` above the centre, and after the settle it
@@ -74,7 +86,10 @@ use timefly::diagnostics;
 use timefly::fly_camera::{
     CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems, MIN_PITCH_DEG,
 };
+use timefly::globe::{GlobeCamera, GlobeRenderStatus};
+use timefly::globe_flight::{GlobeFlightState, GlobeLook};
 use timefly::region::launch::launch_request;
+use timefly::region::navigate::{LEAVE_KEY, World};
 use timefly::region::navigate::{NavPhase, Navigation, NavigationSystems, same_region};
 use timefly::region::{
     ActiveRegion, CAMERA_START_ALTITUDE_M, RegionEntered, RegionRequested, RegionState,
@@ -82,6 +97,9 @@ use timefly::region::{
 use timefly::terrain::view::RegionCamera;
 use timefly::terrain::{TerrainScene, WIREFRAME_KEY};
 use timefly::time::{GlobeTime, OLDER_KEY, YOUNGER_KEY};
+use timefly_core::deep_time::YearsBp;
+use timefly_core::flight::altitudes::CLOUD_TOP_KM;
+use timefly_core::flight::globe::GlobeFlight;
 
 /// Seconds after the region appears before the first shot, so its pipelines compile and the
 /// shadow cascades settle.
@@ -107,6 +125,10 @@ const FLIGHT_SHOT_SECS: f32 = 2.0;
 const PIN_FRAMES: u32 = 8;
 /// The density `cloudtime` holds the cloud at.
 const TIMED_CLOUD_DENSITY: f32 = 0.5;
+/// The `dive` mode's first shot: the fly this far above the cloud top (km).
+const ABOVE_CLOUD_KM: f64 = 300.0;
+/// Frames after a swap before its shot is requested (each shot resolves a few frames later).
+const SWAP_SHOT_FRAMES: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -148,6 +170,11 @@ enum Mode {
     Cruise,
     Cloud,
     Time,
+    /// The dive and the climb (`dive`: climbing out through the cloud base; `divekey`: with
+    /// `Backspace`).
+    Dive {
+        backspace: bool,
+    },
 }
 
 #[derive(Resource)]
@@ -191,19 +218,25 @@ fn shoot(commands: &mut Commands, tour: &Tour, name: &str) {
         .observe(save_to_disk(path));
 }
 
-/// Points the region camera at an offscreen image the size of the window when it appears
-/// (except in `time` mode, which draws to the window as the game does).
+/// A region or globe camera spawned this frame.
+type NewWorldCamera = Or<(Added<RegionCamera>, Added<GlobeCamera>)>;
+
+/// Points the region camera (and in `dive` mode the globe camera, which carries the UI) at an
+/// offscreen image the size of the window when it appears (except in `time` mode, which draws
+/// to the window as the game does).
 fn render_offscreen(
     mut tour: ResMut<Tour>,
     mut images: ResMut<Assets<Image>>,
-    cameras: Query<Entity, Added<RegionCamera>>,
+    cameras: Query<(Entity, Has<GlobeCamera>), NewWorldCamera>,
     mut commands: Commands,
 ) {
     if tour.mode == Mode::Time && !tour.offscreen {
         return;
     }
     let (w, h) = tour.size;
-    for camera in &cameras {
+    let diving = matches!(tour.mode, Mode::Dive { .. });
+    for camera in cameras.iter().filter(|(_, globe)| diving || !globe) {
+        let camera = camera.0;
         let target = tour
             .target
             .get_or_insert_with(|| {
@@ -286,7 +319,7 @@ fn tour(
         tour.left_generating = true;
     }
     let timed_flight = tour.mode == Mode::Time;
-    let density = nav.phase.cloud_density();
+    let density = nav.density;
     let on_course = *state.get() == RegionState::InRegion
         && nav.phase == NavPhase::Flying
         && region.as_ref().is_some_and(|r| {
@@ -576,6 +609,224 @@ fn tour(
     }
 }
 
+/// The `dive` mode's steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiveStep {
+    WaitGlobe,
+    Above,
+    Descend,
+    DiveCloud,
+    DiveSwap,
+    Below,
+    Climb,
+    ClimbCloud,
+    ClimbSwap,
+    After,
+    Done,
+}
+
+/// The `dive` mode's state.
+#[derive(Resource)]
+struct DiveTour {
+    region: timefly::args::RegionArg,
+    backspace: bool,
+    step: DiveStep,
+    since: f32,
+    frames: u32,
+    shot: bool,
+}
+
+/// Logs where both flies are and the cloud, for the report.
+fn log_dive(label: &str, nav: &Navigation, fly: &FlyState, flight: &GlobeFlight, time: &GlobeTime) {
+    let (lat, lon) = timefly_core::geo::geo_to_latlon(timefly_core::geo::render_to_geo(
+        timefly_core::geo::RenderDir(flight.dir),
+    ));
+    info!(
+        label,
+        phase = ?nav.phase,
+        density = nav.density,
+        globe_lat = lat,
+        globe_lon = lon,
+        globe_altitude_km = flight.altitude_km,
+        region_x_m = fly.pos_m.x,
+        region_y_m = fly.pos_m.y,
+        region_z_m = fly.pos_m.z,
+        region_yaw = fly.yaw,
+        years = time.years.0,
+        "region tour dive"
+    );
+}
+
+/// The `dive` mode: the globe above the cloud, the dive, the region below it, the climb, and
+/// the globe again, with shots on each side of each cloud.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
+fn dive_tour(
+    mut dive: ResMut<DiveTour>,
+    tour: Res<Tour>,
+    real: Res<Time<Real>>,
+    status: Option<Res<GlobeRenderStatus>>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    nav: Res<Navigation>,
+    worlds: (
+        Res<FlyState>,
+        ResMut<GlobeFlightState>,
+        ResMut<GlobeLook>,
+        ResMut<GlobeTime>,
+    ),
+    mut commands: Commands,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let (fly, mut flight, mut look, mut time) = worlds;
+    let now = real.elapsed_secs();
+    dive.frames += 1;
+    if now > GIVE_UP_SECS * 2.0 && dive.step != DiveStep::Done {
+        error!(step = ?dive.step, phase = ?nav.phase, "region tour: the dive tour timed out");
+        exit.write(AppExit::error());
+        return;
+    }
+    let next = |dive: &mut DiveTour, step: DiveStep| {
+        dive.step = step;
+        dive.since = now;
+        dive.frames = 0;
+        dive.shot = false;
+    };
+    match dive.step {
+        DiveStep::WaitGlobe => {
+            if matches!(status.as_deref(), Some(GlobeRenderStatus::Failed(_))) {
+                error!("region tour: the globe failed");
+                exit.write(AppExit::error());
+            } else if matches!(
+                status.as_deref(),
+                Some(GlobeRenderStatus::Interactive { .. })
+            ) {
+                next(&mut dive, DiveStep::Above);
+            }
+        }
+        DiveStep::Above => {
+            // Held over the place, just above the cloud, until the shot is taken.
+            let r = dive.region;
+            time.years = YearsBp(r.years);
+            flight.0 = GlobeFlight {
+                altitude_km: CLOUD_TOP_KM + ABOVE_CLOUD_KM,
+                ..GlobeFlight::start(r.lat_deg, r.lon_deg)
+            };
+            look.offset_deg = 0.0;
+            if !dive.shot && now - dive.since >= SETTLE_SECS {
+                log_dive("globe above the cloud", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "globe-above");
+                dive.shot = true;
+                dive.frames = 0;
+            } else if dive.shot && dive.frames >= WIRE_FRAMES {
+                next(&mut dive, DiveStep::Descend);
+            }
+        }
+        DiveStep::Descend => {
+            keys.press(KeyCode::ControlLeft);
+            if matches!(nav.phase, NavPhase::Diving { .. }) {
+                keys.release(KeyCode::ControlLeft);
+                log_dive("dive committed", &nav, &fly, &flight.0, &time);
+                next(&mut dive, DiveStep::DiveCloud);
+            }
+        }
+        DiveStep::DiveCloud => {
+            if !dive.shot && nav.density == 1.0 && matches!(nav.phase, NavPhase::Diving { .. }) {
+                log_dive("in the cloud over the globe", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "dive-cloud");
+                dive.shot = true;
+            }
+            if matches!(
+                nav.phase,
+                NavPhase::Emerging {
+                    world: World::Region,
+                    ..
+                }
+            ) {
+                next(&mut dive, DiveStep::DiveSwap);
+            } else if matches!(nav.phase, NavPhase::Globe | NavPhase::Emerging { .. }) {
+                error!(phase = ?nav.phase, "region tour: the dive did not reach the region");
+                exit.write(AppExit::error());
+            }
+        }
+        DiveStep::DiveSwap => {
+            if !dive.shot && dive.frames >= SWAP_SHOT_FRAMES {
+                log_dive("the dive's swap", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "dive-swap");
+                dive.shot = true;
+            }
+            if nav.phase == NavPhase::Flying {
+                next(&mut dive, DiveStep::Below);
+            }
+        }
+        DiveStep::Below => {
+            if !dive.shot && now - dive.since >= SETTLE_SECS {
+                log_dive("region below the cloud", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "region-below");
+                dive.shot = true;
+                dive.frames = 0;
+            } else if dive.shot && dive.frames >= WIRE_FRAMES {
+                next(&mut dive, DiveStep::Climb);
+            }
+        }
+        DiveStep::Climb => {
+            if dive.backspace {
+                if dive.frames == 1 {
+                    keys.press(LEAVE_KEY);
+                } else {
+                    keys.release(LEAVE_KEY);
+                }
+            } else {
+                keys.press(KeyCode::Space);
+            }
+            if matches!(nav.phase, NavPhase::Climbing { .. }) {
+                keys.release(KeyCode::Space);
+                log_dive("climb started", &nav, &fly, &flight.0, &time);
+                next(&mut dive, DiveStep::ClimbCloud);
+            }
+        }
+        DiveStep::ClimbCloud => {
+            if !dive.shot && nav.density == 1.0 && matches!(nav.phase, NavPhase::Climbing { .. }) {
+                log_dive("in the cloud over the region", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "climb-cloud");
+                dive.shot = true;
+            }
+            if matches!(
+                nav.phase,
+                NavPhase::Emerging {
+                    world: World::Globe,
+                    ..
+                }
+            ) {
+                next(&mut dive, DiveStep::ClimbSwap);
+            }
+        }
+        DiveStep::ClimbSwap => {
+            if !dive.shot && dive.frames >= SWAP_SHOT_FRAMES {
+                log_dive("the climb's swap", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "climb-swap");
+                dive.shot = true;
+            }
+            if nav.phase == NavPhase::Globe {
+                next(&mut dive, DiveStep::After);
+            }
+        }
+        DiveStep::After => {
+            if !dive.shot && now - dive.since >= AFTER_CHANGE_SECS {
+                log_dive("globe after the climb", &nav, &fly, &flight.0, &time);
+                shoot(&mut commands, &tour, "globe-after");
+                dive.shot = true;
+                dive.frames = 0;
+            } else if dive.shot && dive.frames >= WIRE_FRAMES {
+                next(&mut dive, DiveStep::Done);
+            }
+        }
+        DiveStep::Done => {
+            if dive.frames >= DONE_FRAMES {
+                exit.write(AppExit::Success);
+            }
+        }
+    }
+}
+
 /// Holds the cloud's density at the tour's pin, after navigation has raised it this frame.
 fn pin_cloud(tour: Res<Tour>, mut density: ResMut<CloudDensity>) {
     if let Some(pin) = tour.pin
@@ -602,7 +853,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|cruise|cloud|time|cloudtime] [AGL_M] [LATER_S]"
+             [shaded|fly|cruise|cloud|time|cloudtime|dive|divekey] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -623,8 +874,11 @@ fn main() -> AppExit {
         Some("cruise") => Mode::Cruise,
         Some("cloud") => Mode::Cloud,
         Some("time" | "cloudtime") => Mode::Time,
+        Some("dive") => Mode::Dive { backspace: false },
+        Some("divekey") => Mode::Dive { backspace: true },
         _ => Mode::Wire,
     };
+    let diving = matches!(mode, Mode::Dive { .. });
     let agl_m = match args.get(5) {
         None => CAMERA_START_ALTITUDE_M,
         Some(s) => match s.parse::<f32>() {
@@ -651,7 +905,8 @@ fn main() -> AppExit {
     }
     let session = diagnostics::start(LaunchArgs {
         window: Some(size),
-        region: Some(region),
+        // The dive starts on the globe.
+        region: (!diving).then_some(region),
         no_dunes,
         ..default()
     });
@@ -661,6 +916,16 @@ fn main() -> AppExit {
             Update,
             tour.after(FlySystems::Step).before(FlySystems::Apply),
         );
+    } else if let Mode::Dive { backspace } = mode {
+        app.insert_resource(DiveTour {
+            region,
+            backspace,
+            step: DiveStep::WaitGlobe,
+            since: 0.0,
+            frames: 0,
+            shot: false,
+        })
+        .add_systems(PreUpdate, dive_tour.after(bevy::input::InputSystems));
     } else {
         app.add_systems(PreUpdate, tour.after(bevy::input::InputSystems));
     }

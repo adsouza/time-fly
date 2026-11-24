@@ -57,7 +57,7 @@ use crate::creature::{FlyPose, HOVER_EASE_S, bank_step, hover_offset};
 use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
 use crate::region::{ActiveRegion, CAMERA_START_ALTITUDE_M};
 use crate::terrain::view::REGION_FOV_DEG;
-use crate::terrain::{TerrainScene, TerrainSceneSystems};
+use crate::terrain::{RegionViewSystems, TerrainScene, TerrainSceneSystems};
 use crate::ui::PointerOverUi;
 use crate::ui::altitude::{Altitude, FlyAltitude};
 
@@ -324,7 +324,7 @@ impl Plugin for FlyCameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FlyState>()
             .init_resource::<LookDrag>()
-            .init_resource::<Chase>()
+            .init_resource::<FlyChase>()
             .init_resource::<FlyPose>()
             .init_resource::<FlyAltitude>()
             .configure_sets(
@@ -334,6 +334,8 @@ impl Plugin for FlyCameraPlugin {
                     .after(NavigationSystems),
             )
             .configure_sets(Update, FlySystems::Apply.after(TerrainSceneSystems))
+            // The cameras switch first, so a swap frame's pose is the active world's.
+            .configure_sets(Update, FlySystems::Apply.after(RegionViewSystems))
             .add_systems(Update, step_fly.in_set(FlySystems::Step))
             .add_systems(Update, apply_fly.in_set(FlySystems::Apply));
     }
@@ -510,11 +512,19 @@ impl FlyFlourish {
 
 /// The chase camera's smoothed pose and the fly's visual state between frames.
 #[derive(Resource, Clone, Debug, Default)]
-struct Chase {
+pub(crate) struct FlyChase {
     glide: ChaseGlide,
     /// The fly's state last frame, for the yaw rate and whether it is idle.
     last: Option<FlyState>,
     flourish: FlyFlourish,
+}
+
+impl FlyChase {
+    /// Forgets the glide, the last state and the flourish: the next frame starts at the wanted
+    /// pose (a placement into the region: the dive's swap, the launch region).
+    pub(crate) fn reset(&mut self) {
+        *self = FlyChase::default();
+    }
 }
 
 /// Places the region camera behind and above [`FlyState`] (smoothed, and always clear of the
@@ -523,7 +533,7 @@ fn apply_fly(
     fly: Res<FlyState>,
     scene: Option<Res<TerrainScene>>,
     time: Res<Time>,
-    mut chase: ResMut<Chase>,
+    mut chase: ResMut<FlyChase>,
     mut pose: ResMut<FlyPose>,
     mut altitude: ResMut<FlyAltitude>,
     mut cameras: Query<(&mut Transform, &Camera)>,
