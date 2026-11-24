@@ -819,9 +819,15 @@ saturated at 99 % after the first pass, so frame times are the measure:
 | 400 m | on | 16.75, 18.11, 17.69, 16.61 | 1,657–1,807 |
 | 400 m | off | 16.48, 16.64, 16.66, 11.80 | 1,801–2,543 |
 
-- At 8 km the dunes cost **about 2–4 ms a frame** in every pass: 13 % more frames with them off.
-- At 400 m most frames stay on the 60 Hz display either way. The fourth pass ran unpaced
-  (11.8 ms with the dunes off), so it is not compared.
+- At 8 km the dunes cost **about 2–4 ms a frame** in every pass. Over the four passes there are
+  6,466 frames with them off against 5,571 with them on: **about 16 % more frames** (11–20 % per
+  pass).
+- At 400 m the median stays on the 60 Hz interval either way. The three paced passes still show
+  0.27–1.47 ms more mean frame time with the dunes on. The fourth pass ran unpaced (11.8 ms with
+  the dunes off), so it is not compared.
+- Pass 1 is kept in the table although the GPU reached 99 % utilisation only from pass 2 (pass 1
+  read 68 % on / 45 % off at 400 m). Utilisation can't separate on from off once it saturates,
+  so the paced 400 m cost is shown by the small mean-frame-time difference, not by utilisation.
 - The art pass's earlier estimate (≤ 0.25 ms, ruling R8) was taken at 1920 × 951 with the display
   pacing every frame and the GPU far from busy. At this size the GPU is saturated, which is
   where the dune cost shows.
@@ -829,7 +835,7 @@ saturated at 99 % after the first pass, so frame times are the measure:
 **Chrome WebGPU, Pangaea interior alone, dunes off** (session `8165d9b0`, the owner's Incognito
 window, `?region-bench&region=-22,-18,250000000&no-dunes`; its build label reads `ba99e39`, a
 stale label from the shared target dir, but the `.wasm` was checked for the art-pass and
-`--no-dunes` strings before serving):
+`--no-dunes` strings before serving). An excerpt of the log (other lines left out):
 
 ```text
 dunes: off
@@ -841,9 +847,11 @@ result: PASS
 ```
 
 - **Not comparable with the dunes-on run.** That run (`5434520`, above) rendered at
-  3200 × 1800, 6.25 times these pixels. At 1280 × 720 every frame keeps to the 60 Hz display, so
-  the dunes' cost can't show here. The art-pass branch had no canvas fitting then; main's
-  `fit_canvas_to_parent` (PR #11) makes the canvas follow the window.
+  3200 × 1800, 6.25 times these pixels. At 1280 × 720 the median sits on the 60 Hz interval
+  (16.60 ms, p95 18.60 ms, worst 21.83 ms), so the dunes' cost can't show here.
+- Why the two runs got different render sizes is not known. Neither build fits the canvas to the
+  window. Main's `fit_canvas_to_parent` (PR #11, merged later) ties the render size to the
+  window, so a pair on a build with it compares like for like.
 - **Still to do:** a same-window pair, Pangaea alone with and without `&no-dunes`, on a build that
   fits the canvas to the window.
 
