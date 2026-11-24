@@ -1,5 +1,7 @@
 //! The free-fly region camera (M2 design §6.6): `W` `A` `S` `D` move, a drag looks, `Space` /
-//! `E` climb, `Ctrl` / `Q` descend and `Shift` boosts.
+//! `E` climb and `Ctrl` / `Q` descend. The arrow keys also fly: `↑` / `↓` forward and back,
+//! `←` / `→` turn, and with `Shift` held `←` / `→` fly sideways instead. `Shift` with forward
+//! (`↑` or `W`) boosts; `Shift` alone, or with any other direction, does not.
 //!
 //! The step is a pure function ([`fly_step`]), like M1's orbit camera. Its rules:
 //!
@@ -51,6 +53,8 @@ pub const MAX_SPEED_MPS: f32 = 10_000.0;
 pub const BOOST: f32 = 4.0;
 /// Radians of turn per dragged pixel.
 pub const LOOK_RADIANS_PER_PX: f32 = 0.003;
+/// How fast `←` / `→` turn the camera.
+pub const TURN_DEG_PER_S: f32 = 60.0;
 /// The pitch stops short of straight up or down, so the view's "up" stays defined.
 pub const MAX_PITCH_DEG: f32 = 89.0;
 /// A frame longer than this moves the camera only this far: a hitch never flings it.
@@ -113,6 +117,8 @@ pub struct FlyInput {
     pub move_local: Vec3,
     /// Pointer movement while dragging, in logical pixels (y down).
     pub look_delta: Vec2,
+    /// Turning in [−1, 1], `+1` to the right (`→`), at [`TURN_DEG_PER_S`].
+    pub turn: f32,
     pub boost: bool,
     pub dt_s: f32,
 }
@@ -142,7 +148,8 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
         0.0
     };
     let max_pitch = MAX_PITCH_DEG.to_radians();
-    let yaw = state.yaw - input.look_delta.x * LOOK_RADIANS_PER_PX;
+    let turn = input.turn.clamp(-1.0, 1.0) * TURN_DEG_PER_S.to_radians() * dt;
+    let yaw = state.yaw - input.look_delta.x * LOOK_RADIANS_PER_PX - turn;
     let pitch =
         (state.pitch - input.look_delta.y * LOOK_RADIANS_PER_PX).clamp(-max_pitch, max_pitch);
     let surface = |x: f32, z: f32| ground_m(x, z).max(0.0);
@@ -217,20 +224,48 @@ impl Plugin for FlyCameraPlugin {
     }
 }
 
-/// Movement from the held keys: `W` `A` `S` `D`, `Space` / `E` up, `Ctrl` / `Q` down.
-pub fn keys_to_move(keys: &ButtonInput<KeyCode>) -> Vec3 {
-    let axis = |plus: &[KeyCode], minus: &[KeyCode]| {
-        f32::from(u8::from(keys.any_pressed(plus.iter().copied())))
-            - f32::from(u8::from(keys.any_pressed(minus.iter().copied())))
-    };
-    Vec3::new(
-        axis(&[KeyCode::KeyD], &[KeyCode::KeyA]),
+/// What the held keys ask for this frame.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct KeyInput {
+    /// See [`FlyInput::move_local`].
+    pub move_local: Vec3,
+    /// See [`FlyInput::turn`].
+    pub turn: f32,
+    pub boost: bool,
+}
+
+/// The held keys as flight input:
+/// - `W` / `↑` forward, `S` / `↓` back, `A` / `D` sideways;
+/// - `Space` / `E` up, `Ctrl` / `Q` down;
+/// - `←` / `→` turn, or fly sideways while `Shift` is held;
+/// - `Shift` with forward boosts. It boosts nothing else, since with the arrows it means
+///   "sideways".
+pub fn keys_to_input(keys: &ButtonInput<KeyCode>) -> KeyInput {
+    let held = |codes: &[KeyCode]| keys.any_pressed(codes.iter().copied());
+    let axis = |plus: bool, minus: bool| f32::from(u8::from(plus)) - f32::from(u8::from(minus));
+    let shift = held(&[KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let left = held(&[KeyCode::ArrowLeft]);
+    let right = held(&[KeyCode::ArrowRight]);
+    let (strafe_left, strafe_right) = if shift { (left, right) } else { (false, false) };
+    let move_local = Vec3::new(
         axis(
-            &[KeyCode::Space, KeyCode::KeyE],
-            &[KeyCode::ControlLeft, KeyCode::ControlRight, KeyCode::KeyQ],
+            held(&[KeyCode::KeyD]) || strafe_right,
+            held(&[KeyCode::KeyA]) || strafe_left,
         ),
-        axis(&[KeyCode::KeyS], &[KeyCode::KeyW]),
-    )
+        axis(
+            held(&[KeyCode::Space, KeyCode::KeyE]),
+            held(&[KeyCode::ControlLeft, KeyCode::ControlRight, KeyCode::KeyQ]),
+        ),
+        axis(
+            held(&[KeyCode::KeyS, KeyCode::ArrowDown]),
+            held(&[KeyCode::KeyW, KeyCode::ArrowUp]),
+        ),
+    );
+    KeyInput {
+        move_local,
+        turn: if shift { 0.0 } else { axis(right, left) },
+        boost: shift && move_local.z < 0.0,
+    }
 }
 
 /// Gathers the keys and the look drag, steps [`FlyState`] over the region's ground.
@@ -258,15 +293,15 @@ fn step_fly(
             drag.0 = false;
         }
     }
+    let held = keys.as_deref().map(keys_to_input).unwrap_or_default();
     let input = FlyInput {
-        move_local: keys.as_deref().map_or(Vec3::ZERO, keys_to_move),
+        move_local: held.move_local,
         look_delta: match (&motion, drag.0) {
             (Some(m), true) => m.delta,
             _ => Vec2::ZERO,
         },
-        boost: keys
-            .as_ref()
-            .is_some_and(|k| k.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])),
+        turn: held.turn,
+        boost: held.boost,
         dt_s: time.delta_secs(),
     };
     let grid = &region.grid;
@@ -307,9 +342,18 @@ mod tests {
         FlyInput {
             move_local,
             look_delta: Vec2::ZERO,
+            turn: 0.0,
             boost,
             dt_s,
         }
+    }
+
+    fn held(codes: &[KeyCode]) -> KeyInput {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        for &code in codes {
+            keys.press(code);
+        }
+        keys_to_input(&keys)
     }
 
     fn floor(ground: &impl Fn(f32, f32) -> f32, p: Vec3) -> f32 {
@@ -361,6 +405,7 @@ mod tests {
                 let step = FlyInput {
                     move_local: Vec3::new(mx, my, mz),
                     look_delta: Vec2::new(lx, ly),
+                    turn: 0.0,
                     // Most steps boost: the brief's worst case.
                     boost: boost || dt_s > 0.1,
                     dt_s,
@@ -545,17 +590,102 @@ mod tests {
     #[test]
     fn keys_map_to_movement() {
         let mut keys = ButtonInput::<KeyCode>::default();
-        assert_eq!(keys_to_move(&keys), Vec3::ZERO);
+        assert_eq!(keys_to_input(&keys), KeyInput::default());
         keys.press(KeyCode::KeyW);
         keys.press(KeyCode::KeyD);
         keys.press(KeyCode::KeyQ);
-        assert_eq!(keys_to_move(&keys), Vec3::new(1.0, -1.0, -1.0));
+        assert_eq!(keys_to_input(&keys).move_local, Vec3::new(1.0, -1.0, -1.0));
         keys.press(KeyCode::KeyA);
         keys.press(KeyCode::Space);
         keys.release(KeyCode::KeyW);
         keys.press(KeyCode::KeyS);
         // Opposite keys cancel.
-        assert_eq!(keys_to_move(&keys), Vec3::new(0.0, 0.0, 1.0));
+        assert_eq!(keys_to_input(&keys).move_local, Vec3::new(0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn arrows_move_forward_and_back_and_turn() {
+        let forward = held(&[KeyCode::ArrowUp]);
+        assert_eq!(forward.move_local, Vec3::new(0.0, 0.0, -1.0));
+        assert_eq!((forward.turn, forward.boost), (0.0, false));
+        assert_eq!(
+            held(&[KeyCode::ArrowDown]).move_local,
+            Vec3::new(0.0, 0.0, 1.0)
+        );
+        let left = held(&[KeyCode::ArrowLeft]);
+        assert_eq!((left.move_local, left.turn), (Vec3::ZERO, -1.0));
+        let right = held(&[KeyCode::ArrowRight]);
+        assert_eq!((right.move_local, right.turn), (Vec3::ZERO, 1.0));
+        // Arrows and letters add up and clamp like any two keys for one direction.
+        assert_eq!(
+            held(&[KeyCode::ArrowUp, KeyCode::KeyW]).move_local,
+            Vec3::new(0.0, 0.0, -1.0)
+        );
+    }
+
+    #[test]
+    fn shift_turns_left_and_right_arrows_into_strafing() {
+        for shift in [KeyCode::ShiftLeft, KeyCode::ShiftRight] {
+            let left = held(&[shift, KeyCode::ArrowLeft]);
+            assert_eq!(
+                (left.move_local, left.turn),
+                (Vec3::new(-1.0, 0.0, 0.0), 0.0)
+            );
+            let right = held(&[shift, KeyCode::ArrowRight]);
+            assert_eq!(
+                (right.move_local, right.turn),
+                (Vec3::new(1.0, 0.0, 0.0), 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn boost_needs_shift_with_forward() {
+        assert!(held(&[KeyCode::ShiftLeft, KeyCode::ArrowUp]).boost);
+        assert!(held(&[KeyCode::ShiftRight, KeyCode::KeyW]).boost);
+        for keys in [
+            &[KeyCode::ShiftLeft][..],
+            &[KeyCode::ArrowUp],
+            &[KeyCode::ShiftLeft, KeyCode::ArrowDown],
+            &[KeyCode::ShiftLeft, KeyCode::ArrowRight],
+            &[KeyCode::ShiftLeft, KeyCode::KeyA],
+            &[KeyCode::ShiftLeft, KeyCode::Space],
+            // Forward and back cancel, so there is nothing to boost.
+            &[KeyCode::ShiftLeft, KeyCode::ArrowUp, KeyCode::KeyS],
+        ] {
+            assert!(!held(keys).boost, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn turning_turns_like_a_drag() {
+        let s = FlyState::default();
+        let turned = |turn: f32| {
+            fly_step(
+                s,
+                FlyInput {
+                    turn,
+                    dt_s: 0.5,
+                    ..input(Vec3::ZERO, false, 0.5)
+                },
+                flat(0.0),
+            )
+        };
+        let right = turned(1.0);
+        let expected = TURN_DEG_PER_S.to_radians() * 0.5;
+        assert!((s.yaw - right.yaw - expected).abs() < 1e-6, "{right:?}");
+        assert!((turned(-1.0).yaw - s.yaw - expected).abs() < 1e-6);
+        // A drag to the right turns the same way as the right arrow.
+        let dragged = fly_step(
+            s,
+            FlyInput {
+                look_delta: Vec2::new(100.0, 0.0),
+                ..input(Vec3::ZERO, false, 0.5)
+            },
+            flat(0.0),
+        );
+        assert!(dragged.yaw < s.yaw && right.yaw < s.yaw);
+        assert_eq!(right.pos_m, s.pos_m, "turning alone does not move");
     }
 
     #[test]
