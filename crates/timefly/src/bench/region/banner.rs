@@ -36,6 +36,8 @@ pub enum BannerKey {
     Pan(usize),
     /// Memory cycle `u32` (0-based) of `cycles`.
     Cycle(u32, u32),
+    /// Leaving the last region of a run with no memory cycles, on the way to the summary.
+    Summary,
     /// The bench has finished: whether it passed.
     Finished(bool),
 }
@@ -87,6 +89,7 @@ pub fn banner_lines(key: BannerKey, regions: &[BenchRegion]) -> (String, Option<
             format!("Memory cycles · {CYCLE_REGION} · {} of {cycles}", cycle + 1),
             None,
         ),
+        BannerKey::Summary => ("Writing the summary".to_string(), None),
         BannerKey::Finished(pass) => (
             format!(
                 "Region bench finished: {}",
@@ -103,6 +106,7 @@ pub(super) fn banner_key(bench: &RegionBench) -> BannerKey {
     let next = |n: Next| match n {
         Next::Region(r) => BannerKey::Next(r),
         Next::Cycle(c) => BannerKey::Cycle(c, bench.config.cycles),
+        Next::Summary if bench.config.cycles == 0 => BannerKey::Summary,
         Next::Summary => {
             BannerKey::Cycle(bench.config.cycles.saturating_sub(1), bench.config.cycles)
         }
@@ -223,6 +227,36 @@ mod tests {
     use super::*;
     use crate::bench::region::BENCH_REGIONS;
     use crate::bench::region::{RegionBenchConfig, RegionBenchPlugin};
+
+    #[test]
+    fn a_single_region_run_never_shows_memory_cycles() {
+        use crate::args::RegionArg;
+        use crate::bench::region::Next;
+        let arg = RegionArg {
+            lat_deg: -22.0,
+            lon_deg: -18.0,
+            years: 250.0e6,
+        };
+        let mut bench = RegionBench::new(RegionBenchConfig::single(30, true, arg));
+        bench.stage = Stage::Leaving {
+            next: Next::Summary,
+            cycle: None,
+            since: 0.0,
+        };
+        assert_eq!(banner_key(&bench), BannerKey::Summary);
+        assert_eq!(
+            banner_lines(BannerKey::Summary, bench.regions()).0,
+            "Writing the summary"
+        );
+        // The full bench still shows its last cycle while it leaves for the summary.
+        let mut full = RegionBench::new(RegionBenchConfig::new(30, true));
+        full.stage = Stage::Leaving {
+            next: Next::Summary,
+            cycle: Some(9),
+            since: 0.0,
+        };
+        assert_eq!(banner_key(&full), BannerKey::Cycle(9, 10));
+    }
 
     #[test]
     fn stops_count_the_pan() {
