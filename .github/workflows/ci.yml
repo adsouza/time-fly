@@ -1,0 +1,71 @@
+# Pull-request gate: formatting, clippy, the CPU tests and the wasm32 build check, on every PR
+# against main and every push to main. No secrets; no baked data (the tests use committed
+# fixtures; the GPU and real-bake tests stay #[ignore]).
+#
+# Caching: a PR run can restore only caches saved by its own PR or by main, never those that
+# linux-package's dispatch runs save on feature branches. So pushes to main save the Rust cache
+# and PR runs only restore it (the repo's cache quota is already full; per-PR copies would evict
+# useful entries).
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # Bevy's native build links these (as in linux-package.yml's test job).
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustc --version
+
+      # First, so a formatting slip fails in seconds rather than after the build.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The `ci-test` profile (Cargo.toml): dependencies unoptimized, so Bevy compiles fast.
+      - name: Tests
+        run: cargo test --locked --profile ci-test --workspace
+
+      - name: wasm32 build check
+        run: cargo check --locked -p timefly --target wasm32-unknown-unknown
+
+      - name: No trace spans on wasm (ruling R29)
+        run: tools/dev/test-check-wasm-spans.sh

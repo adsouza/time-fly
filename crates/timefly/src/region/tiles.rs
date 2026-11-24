@@ -2,7 +2,7 @@
 //! decoded tiles.
 //!
 //! Every tile and the overview load through the asset server with the same relative path on
-//! every platform (`data/tiles/rRRcCC.tfgrid`): bundled files on desktop, fetched from the
+//! every platform (under the manifest’s generation directory for version 2): bundled files on desktop, fetched from the
 //! Pages site on the web. The loader checks each file's size and SHA-256 against the manifest
 //! ([`FileEntry::settings`]).
 
@@ -24,7 +24,7 @@ use super::frames::CpuGridSettings;
 pub const TILE_MANIFEST_PATH: &str = "data/tiles/manifest.json";
 /// The global overview grid (ruling R7), relative to the asset root.
 pub const OVERVIEW_PATH: &str = "data/tiles/overview.tfgrid";
-pub const TILE_MANIFEST_VERSION: u32 = 1;
+pub const TILE_MANIFEST_VERSION: u32 = 2;
 /// The cache's normal limit. A region that reads more than `TILE_CACHE_TILES −
 /// TILE_CACHE_SLACK` tiles (near a pole, with moving plates) raises it to its own needs plus the
 /// slack while it is current: see [`TileCache::capacity_for`].
@@ -56,12 +56,14 @@ impl FileEntry {
 /// The parsed `data/tiles/manifest.json`.
 #[derive(Asset, TypePath, Clone, Debug, PartialEq)]
 pub struct TileManifest {
+    generation: Option<String>,
     pub overview: Option<FileEntry>,
     pub tiles: HashMap<(u8, u8), FileEntry>,
 }
 
 #[derive(Deserialize)]
 struct ManifestFile {
+    generation: Option<String>,
     version: u32,
     tile_deg: f64,
     samples: u32,
@@ -84,6 +86,7 @@ pub enum TileManifestError {
     Io(String),
     Json(String),
     Version(u32),
+    InvalidGeneration,
     Layout { tile_deg: f64, samples: u32 },
     BadTile { row: u8, col: u8 },
 }
@@ -93,9 +96,10 @@ impl fmt::Display for TileManifestError {
         match self {
             TileManifestError::Io(e) => write!(f, "could not read: {e}"),
             TileManifestError::Json(e) => write!(f, "invalid tile manifest: {e}"),
+            TileManifestError::InvalidGeneration => write!(f, "invalid tile generation digest"),
             TileManifestError::Version(v) => write!(
                 f,
-                "tile manifest version {v} is not supported (expected {TILE_MANIFEST_VERSION})"
+                "tile manifest version {v} is not supported (supported versions: 1 and {TILE_MANIFEST_VERSION})"
             ),
             TileManifestError::Layout { tile_deg, samples } => write!(
                 f,
@@ -112,13 +116,30 @@ impl fmt::Display for TileManifestError {
 impl std::error::Error for TileManifestError {}
 
 impl TileManifest {
+    /// Resolve a standard tile asset path in the generation selected by this manifest.
+    pub fn payload_path(&self, standard: &str) -> String {
+        match &self.generation {
+            Some(id) => format!(
+                "data/tiles/{id}/{}",
+                standard.rsplit('/').next().unwrap_or(standard)
+            ),
+            None => standard.to_owned(),
+        }
+    }
+
     /// Parses and checks a manifest.
     #[instrument(level = "debug", skip_all, fields(len = bytes.len()), err)]
     pub fn parse(bytes: &[u8]) -> Result<TileManifest, TileManifestError> {
         let file: ManifestFile =
             serde_json::from_slice(bytes).map_err(|e| TileManifestError::Json(e.to_string()))?;
-        if file.version != TILE_MANIFEST_VERSION {
+        if !matches!(file.version, 1 | TILE_MANIFEST_VERSION) {
             return Err(TileManifestError::Version(file.version));
+        }
+        match (file.version, file.generation.as_deref()) {
+            (1, None) => {}
+            (TILE_MANIFEST_VERSION, Some(id))
+                if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return Err(TileManifestError::InvalidGeneration),
         }
         if file.tile_deg != TILE_DEG || file.samples != TILE_SAMPLES {
             return Err(TileManifestError::Layout {
@@ -137,6 +158,7 @@ impl TileManifest {
             tiles.insert((t.row, t.col), t.entry);
         }
         Ok(TileManifest {
+            generation: file.generation,
             overview: file.overview,
             tiles,
         })
@@ -409,10 +431,10 @@ mod tests {
         assert_eq!(m.tiles[&(17, 35)].settings().sha256.as_deref(), Some("cd"));
         assert_eq!(tile_path(3, 7), "data/tiles/r03c07.tfgrid");
 
-        let v2 = br#"{"version":2,"tile_deg":5,"samples":301,"tiles":[]}"#;
+        let unsupported = br#"{"version":3,"tile_deg":5,"samples":301,"tiles":[]}"#;
         assert_eq!(
-            TileManifest::parse(v2).unwrap_err(),
-            TileManifestError::Version(2)
+            TileManifest::parse(unsupported).unwrap_err(),
+            TileManifestError::Version(3)
         );
         let layout = br#"{"version":1,"tile_deg":1,"samples":61,"tiles":[]}"#;
         assert!(matches!(

@@ -129,6 +129,65 @@ fn a_corrupt_or_missing_tile_fails_the_tile_check() {
 }
 
 #[test]
+fn checker_validates_the_published_generations_overview_layout() {
+    let root = temp_dir("generation-shape");
+    let generation = "a".repeat(64);
+    let payloads = root.join(&generation);
+    copy_dir(&tiny_tiles(), &payloads);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(payloads.join("manifest.json")).unwrap()).unwrap();
+    manifest["version"] = 2.into();
+    manifest["generation"] = generation.into();
+    let path = root.join("manifest.json");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    check_tiles(&root, Duration::from_secs(20)).unwrap();
+
+    let tile = &manifest["tiles"][0];
+    let name = format!(
+        "r{:02}c{:02}.tfgrid",
+        tile["row"].as_u64().unwrap(),
+        tile["col"].as_u64().unwrap()
+    );
+    fs::copy(payloads.join(name), payloads.join("overview.tfgrid")).unwrap();
+    manifest["overview"] = tile.clone();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let error = check_tiles(&root, Duration::from_secs(20)).unwrap_err();
+    assert!(
+        error.contains("overview.tfgrid") && error.contains("301"),
+        "{error}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn checker_rejects_a_single_channel_tile_with_valid_dimensions_and_hash() {
+    let root = temp_dir("tile-channels");
+    copy_dir(&tiny_tiles(), &root);
+    let path = root.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let tile = &mut manifest["tiles"][0];
+    let name = format!(
+        "r{:02}c{:02}.tfgrid",
+        tile["row"].as_u64().unwrap(),
+        tile["col"].as_u64().unwrap()
+    );
+    let mut bytes = fs::read(root.join(&name)).unwrap();
+    // One f32 consumes the same payload bytes as the fixture's two f16 channels.
+    bytes[9] = 2;
+    bytes[10] = 1;
+    tile["sha256"] = timefly_core::sha256::sha256_hex(&bytes).into();
+    fs::write(root.join(&name), bytes).unwrap();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let error = check_tiles(&root, Duration::from_secs(20)).unwrap_err();
+    assert!(
+        error.contains(&name) && error.contains("2-channel"),
+        "{error}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn a_missing_bake_fails_with_the_reason() {
     let empty = temp_dir("missing");
     let error = check_globe_data(&empty, Duration::from_secs(20)).expect_err("Failed");

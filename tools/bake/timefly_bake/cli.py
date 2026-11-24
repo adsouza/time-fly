@@ -23,6 +23,7 @@ then the PaleoDEMs from the present-day bridge frame to 540 Ma.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -426,7 +427,7 @@ def _bake_staged(raw, out, cube_size, ages_path, paleodem_step_myr, footprint_di
     return manifest
 
 
-TILES_MANIFEST_VERSION = 1
+TILES_MANIFEST_VERSION = 2
 ETOPO_RAW = "etopo/ETOPO_2022_v1_60s_N90W180_surface.nc"
 KOPPEN_RAW = "koppen/koppen_geiger_tif.zip"
 OVERVIEW_NAME = "overview.tfgrid"
@@ -434,10 +435,30 @@ OVERVIEW_NAME = "overview.tfgrid"
 
 @traced
 def write_tiles(elev, koppen_codes, out, sources: dict, per_deg: int = tiles.PER_DEG) -> dict:
-    """Write every tile as ``r{row:02}c{col:02}.tfgrid``, the 5 arc-minute ``overview.tfgrid``
-    and ``manifest.json`` into ``out`` and return the manifest. ``sources`` maps ``"etopo"`` and ``"koppen"`` to the raw files' SHA-256."""
+    """Publish a complete tile generation, with manifest replacement as the commit point."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".tile-bake-", dir=out) as tmp:
+        stage = Path(tmp)
+        payloads = stage / "payloads"
+        payloads.mkdir()
+        manifest = _write_tile_payloads(elev, koppen_codes, payloads, sources, per_deg)
+        generation = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        manifest["generation"] = generation
+        destination = out / generation
+        # Concurrent identical bakes can publish the same immutable directory.
+        try:
+            payloads.rename(destination)
+        except OSError as error:
+            if error.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not destination.is_dir():
+                raise
+        staged = stage / MANIFEST_NAME
+        staged.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
+        staged.replace(out / MANIFEST_NAME)
+        return manifest
+
+
+def _write_tile_payloads(elev, koppen_codes, out, sources, per_deg):
     entries = []
     for row, col, tile in tiles.split_tiles(elev, koppen_codes, per_deg):
         path = out / f"r{row:02}c{col:02}.tfgrid"
@@ -457,9 +478,6 @@ def write_tiles(elev, koppen_codes, out, sources: dict, per_deg: int = tiles.PER
         "tiles": entries,
         "overview": {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()},
     }
-    staged = out / ".manifest.json.tmp"
-    staged.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
-    staged.replace(out / MANIFEST_NAME)
     return manifest
 
 

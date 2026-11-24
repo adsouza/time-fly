@@ -7,6 +7,7 @@ on:
     paths:
       - '.github/workflows/pages.yml'
       - 'packaging/web/**'
+      - 'packaging/stage_tiles.py'
   workflow_dispatch:
 
 permissions:
@@ -43,7 +44,10 @@ jobs:
           key: raw-data-${{ hashFiles('data/sources.json') }}
 
       - run: rustup toolchain install
+      # Saved from main only: PR runs restore main's cache instead of storing their own copy.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
@@ -88,11 +92,11 @@ jobs:
         run: |
           cp packaging/web/index.html _site/
           cp packaging/linux/io.github.adsouza.TimeFly.svg _site/favicon.svg
-          cp -R crates/timefly/assets _site/
+          rsync -a --exclude=/data/tiles/ crates/timefly/assets/ _site/assets/
+          python3 packaging/stage_tiles.py crates/timefly/assets/data/tiles _site/assets/data/tiles
           rm -f _site/assets/data/globe/bake.log _site/assets/data/tiles/bake.log
           test -f _site/assets/data/globe/manifest.json
           test -f _site/assets/data/tiles/manifest.json
-          test -f _site/assets/data/tiles/overview.tfgrid
 
       # GitHub Pages: at most 1 GB per site and 100 MB per file.
       - name: Check the site against the Pages limits

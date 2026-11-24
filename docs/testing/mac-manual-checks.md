@@ -160,8 +160,12 @@ Run the game normally (`cargo run -p timefly`, or the release build). Wait for t
 - [ ] A slow double-click (more than about a third of a second between the clicks) or one
       where the pointer moves between the clicks does not enter a region.
 - [ ] `W` `A` `S` `D` move (forward follows the view), dragging looks around, `Space` / `E`
-      climb, `Ctrl` / `Q` descend, `Shift` boosts. Higher up the camera moves faster.
-- [ ] Fly low and fast with `Shift` over mountains and over the sea: the camera never goes
+      climb, `Ctrl` / `Q` descend. Higher up the camera moves faster.
+- [ ] The arrow keys fly too: `↑` / `↓` forward and back, `←` / `→` turn left and right, and
+      with `Shift` held `←` / `→` fly sideways instead of turning.
+- [ ] `Shift` + `↑` (or `Shift` + `W`) boosts forward. `Shift` alone, or with `↓`, sideways or
+      vertical moves, does not boost.
+- [ ] Fly low and fast with `Shift` + `↑` over mountains and over the sea: the camera never goes
       into the ground or under the sea surface, and never jumps through a ridge.
 - [ ] Climbing slows near 60 km and stops there.
 - [ ] Scrolling and dragging do not turn the (hidden) globe while in the region: after leaving,
@@ -171,7 +175,7 @@ Run the game normally (`cargo run -p timefly`, or the release build). Wait for t
 
 ### 12. Leaving at the edge
 
-- [ ] Fly straight out (east, say) with `Shift` held. Past the region's edge (150 km out) the
+- [ ] Fly straight out (east, say) with `Shift` + `↑` held. Past the region's edge (150 km out) the
       camera is pushed back: it slows and settles a little way out instead of flying on.
 - [ ] Press `Backspace` out there: the globe comes back centred on the region (not on where
       the camera drifted).

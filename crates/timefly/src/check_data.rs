@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use bevy::asset::{AssetMetaCheck, LoadState, UntypedAssetId};
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
-use timefly_core::worldgen::tiles::TILE_SAMPLES;
+use timefly_core::worldgen::tiles::TileSet;
 
 use crate::args::DataCheck;
 use crate::data::{
@@ -204,7 +204,7 @@ fn wait_for(
 
 /// Loads the tile manifest in `dir` (a baked `tiles` folder), then the overview and the
 /// [`CHECKED_TILES`] largest tiles, through the game's loaders, which check each file's size and
-/// SHA-256 against the manifest. Tiles must be [`TILE_SAMPLES`] square.
+/// SHA-256 against the manifest. The runtime validates the tile and overview layouts.
 pub fn check_tiles(dir: &Path, timeout: Duration) -> Result<TileSummary, String> {
     let mut app = App::new();
     app.add_plugins((
@@ -253,35 +253,36 @@ pub fn check_tiles(dir: &Path, timeout: Duration) -> Result<TileSummary, String>
             .with_settings(move |s: &mut CpuGridSettings| *s = settings.clone())
             .load::<CpuGrid>(name.to_string())
     };
-    let mut loads = vec![(
-        file_name(OVERVIEW_PATH).to_string(),
-        load(file_name(OVERVIEW_PATH), overview.settings()),
-    )];
+    let relative = |standard: &str| {
+        let path = manifest.payload_path(standard);
+        path.strip_prefix("data/tiles/")
+            .expect("tile asset root")
+            .to_owned()
+    };
+    let overview_name = relative(OVERVIEW_PATH);
+    let overview_handle = load(&overview_name, overview.settings());
+    let mut loads = Vec::new();
     for &(&(row, col), entry) in &tiles {
-        let path = tile_path(row, col);
-        let name = file_name(&path).to_string();
+        let name = relative(&tile_path(row, col));
         let handle = load(&name, entry.settings());
-        loads.push((name, handle));
+        loads.push((row, col, name, handle));
     }
-    for (name, handle) in &loads {
+    let mut read = |name: &str, handle: Handle<CpuGrid>| {
         wait_for(&mut app, handle.id().untyped(), name, deadline)?;
-    }
-    let grids = app.world().resource::<Assets<CpuGrid>>();
-    let grid = |(name, handle): &(String, Handle<CpuGrid>)| {
-        grids
-            .get(handle)
-            .map(|g| (g.0.width, g.0.height))
+        app.world_mut()
+            .resource_mut::<Assets<CpuGrid>>()
+            .remove(&handle)
+            .map(|grid| grid.0)
             .ok_or_else(|| format!("{name}: vanished after loading"))
     };
-    let overview_size = grid(&loads[0])?;
-    for load in &loads[1..] {
-        let size = grid(load)?;
-        if size != (TILE_SAMPLES, TILE_SAMPLES) {
-            return Err(format!(
-                "{}: {}x{} samples, expected {TILE_SAMPLES}x{TILE_SAMPLES}",
-                load.0, size.0, size.1
-            ));
-        }
+    let mut set = TileSet::new();
+    let overview = read(&overview_name, overview_handle)?;
+    let overview_size = (overview.width, overview.height);
+    set.set_overview(overview)
+        .map_err(|e| format!("{overview_name}: {e}"))?;
+    for (row, col, name, handle) in loads {
+        set.insert(row, col, read(&name, handle)?)
+            .map_err(|e| format!("{name}: {e}"))?;
     }
     Ok(TileSummary {
         listed: manifest.tiles.len(),

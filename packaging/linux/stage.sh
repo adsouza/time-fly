@@ -82,38 +82,7 @@ PYTHON
 
 # Region tiles, by the same allowlist rule: the tile manifest, the overview and every tile it
 # lists (`region/tiles.rs`), each checked against the manifest's size. bake.log is left out.
-n_tiles=$(python3 - "$tiles" "$lib/assets/data/tiles" <<'PYTHON'
-import json
-from pathlib import Path
-import shutil
-import sys
-
-source, dest = map(Path, sys.argv[1:])
-manifest = (source / "manifest.json").read_bytes()
-data = json.loads(manifest)
-
-
-def copy(name, size):
-    if (source / name).stat().st_size != size:
-        sys.exit(f"{name}: size differs from the tile manifest")
-    shutil.copyfile(source / name, dest / name)
-    (dest / name).chmod(0o644)
-
-
-if not data.get("tiles"):
-    sys.exit("tile manifest lists no tiles")
-if not data.get("overview"):
-    sys.exit("tile manifest lists no overview")
-copy("overview.tfgrid", data["overview"]["bytes"])
-for tile in data["tiles"]:
-    row, col = int(tile["row"]), int(tile["col"])
-    if not (0 <= row < 36 and 0 <= col < 72):
-        sys.exit(f"tile outside the tile map: {row}, {col}")
-    copy(f"r{row:02}c{col:02}.tfgrid", tile["bytes"])
-(dest / "manifest.json").write_bytes(manifest)
-print(len(data["tiles"]))
-PYTHON
-)
+n_tiles=$(python3 "$root/packaging/stage_tiles.py" "$tiles" "$lib/assets/data/tiles")
 
 cat >"$out/bin/time-fly" <<'WRAPPER'
 #!/bin/sh
