@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|fly|time] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|fly|cruise|time] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
 //! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
@@ -30,6 +30,11 @@
 //! [`DIVE_SECS`], then `W` alone for [`CRUISE_SECS`], and saves `<prefix>-low.png`; then it
 //! presses `[` (the next older snapshot), waits for the region to regenerate around the
 //! camera's crust position and the fade to finish, and saves `<prefix>-older.png`.
+//!
+//! A fifth argument `cruise` checks the chase camera in sustained flight (M3 Task 3): after the
+//! start shot it holds `W` for [`FLIGHT_SHOT_SECS`] and saves `<prefix>-cruise.png` while still
+//! flying, then holds `Shift`+`W` (boost) as long and saves `<prefix>-boost.png`. Each shot logs
+//! a `region tour chase view` line with how far the fly sits below the view's centre.
 //!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
@@ -74,6 +79,8 @@ const CRUISE_SECS: f32 = 1.5;
 const AFTER_CHANGE_SECS: f32 = 4.0;
 /// Seconds of frame deltas the `time` mode records after the settle.
 const TIME_SECS: f32 = 30.0;
+/// Seconds of steady flight (`cruise`) before each in-flight shot.
+const FLIGHT_SHOT_SECS: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -91,6 +98,9 @@ enum Step {
     Older,
     /// Recording frame deltas (`time`).
     Timing,
+    /// Sustained flight (`cruise`): plain, then boosted.
+    Plain,
+    Boosted,
     Done,
 }
 
@@ -100,6 +110,7 @@ enum Mode {
     Wire,
     Shaded,
     Fly,
+    Cruise,
     Time,
 }
 
@@ -120,6 +131,8 @@ struct Tour {
     step: Step,
     /// The snapshot change has started (`Older`).
     changing: bool,
+    /// The current flight segment's shot is requested (`cruise`).
+    shot_taken: bool,
     since: f32,
     frames: u32,
     left_generating: bool,
@@ -190,6 +203,24 @@ fn log_flight(label: &str, fly: &FlyState, region: Option<&ActiveRegion>, time: 
     );
 }
 
+/// Logs where the fly sits in the chase camera's view: degrees below the view's centre
+/// (negative is above) and sideways.
+fn log_chase_view(label: &str, camera: &Transform, fly: &FlyState) {
+    let to = (fly.pos_m - camera.translation).normalize();
+    let forward = camera.forward().as_vec3();
+    let below_deg = (-to.dot(camera.up().as_vec3()))
+        .atan2(to.dot(forward))
+        .to_degrees();
+    let side_deg = to.dot(camera.right().as_vec3()).asin().to_degrees();
+    info!(
+        label,
+        below_deg,
+        side_deg,
+        distance_m = (fly.pos_m - camera.translation).length(),
+        "region tour chase view"
+    );
+}
+
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn tour(
     mut tour: ResMut<Tour>,
@@ -204,6 +235,7 @@ fn tour(
         Option<Res<ActiveRegion>>,
         Res<GlobeTime>,
     ),
+    cameras: Query<&Transform, With<RegionCamera>>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -277,7 +309,11 @@ fn tour(
             }
         }
         Step::Shaded => {
-            if tour.mode == Mode::Fly && tour.frames >= WIRE_FRAMES {
+            if tour.mode == Mode::Cruise && tour.frames >= WIRE_FRAMES {
+                tour.step = Step::Plain;
+                tour.since = now;
+                tour.shot_taken = false;
+            } else if tour.mode == Mode::Fly && tour.frames >= WIRE_FRAMES {
                 log_flight("start", &fly, region.as_deref(), &time);
                 tour.step = Step::Dive;
                 tour.since = now;
@@ -331,6 +367,35 @@ fn tour(
                 log_flight("low", &fly, region.as_deref(), &time);
                 shoot(&mut commands, &tour, "low");
                 tour.step = Step::Low;
+                tour.frames = 0;
+            }
+        }
+        Step::Plain | Step::Boosted => {
+            let boosted = tour.step == Step::Boosted;
+            keys.press(KeyCode::KeyW);
+            if boosted {
+                keys.press(KeyCode::ShiftLeft);
+            }
+            let name = if boosted { "boost" } else { "cruise" };
+            if !tour.shot_taken && now - tour.since >= FLIGHT_SHOT_SECS {
+                log_flight(name, &fly, region.as_deref(), &time);
+                if let Ok(camera) = cameras.single() {
+                    log_chase_view(name, camera, &fly);
+                }
+                shoot(&mut commands, &tour, name);
+                tour.shot_taken = true;
+                tour.frames = 0;
+            } else if tour.shot_taken && tour.frames >= WIRE_FRAMES {
+                // Still flying while the shot resolves; then the next segment.
+                if boosted {
+                    keys.release(KeyCode::KeyW);
+                    keys.release(KeyCode::ShiftLeft);
+                    tour.step = Step::Done;
+                } else {
+                    tour.step = Step::Boosted;
+                    tour.since = now;
+                    tour.shot_taken = false;
+                }
                 tour.frames = 0;
             }
         }
@@ -415,7 +480,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|time] [AGL_M] [LATER_S]"
+             [shaded|fly|cruise|time] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -431,6 +496,7 @@ fn main() -> AppExit {
     let mode = match args.get(4).map(String::as_str) {
         Some("shaded") => Mode::Shaded,
         Some("fly") => Mode::Fly,
+        Some("cruise") => Mode::Cruise,
         Some("time") => Mode::Time,
         _ => Mode::Wire,
     };
@@ -485,6 +551,7 @@ fn main() -> AppExit {
         shot_at: 0.0,
         step: Step::WaitRegion,
         changing: false,
+        shot_taken: false,
         since: 0.0,
         frames: 0,
         left_generating: false,
@@ -542,6 +609,7 @@ mod tests {
                 shot_at: 0.0,
                 step: Step::Timing,
                 changing: false,
+                shot_taken: false,
                 since: 0.0,
                 frames: 0,
                 left_generating: false,

@@ -30,9 +30,11 @@
 //! the player is flying, and [`FlySystems::Apply`] places the camera every frame:
 //! [`region_chase_pose`] puts the eye behind the fly's heading and above it (Task 1's
 //! `chase_pose`, looking [`chase_look_pitch_deg`] below the horizontal, so the view pitch tilts
-//! the view), lifted clear of the ground; the eye and its target glide there with
-//! [`critically_damped`] smoothing ([`CHASE_SMOOTHING_S`]) and are lifted again, so the camera
-//! never enters a hill. The same set writes the dragonfly's `FlyPose` (scaled by `fly_scale` to
+//! the view), lifted clear of the ground. The smoothing works in the fly's frame: the eye's and
+//! the target's offsets from the fly glide with [`critically_damped`] smoothing
+//! ([`CHASE_SMOOTHING_S`]) and are added to the fly's current position, so the camera follows
+//! the fly's motion rigidly and only turns and view changes glide. The result is lifted again,
+//! so the camera never enters a hill. The same set writes the dragonfly's `FlyPose` (scaled by `fly_scale` to
 //! hold its size on screen, banked and bobbing) and the overlay's `FlyAltitude`. A scripted
 //! driver (Task 10's bench) writes [`FlyState`] between the two sets.
 
@@ -112,8 +114,8 @@ const fn pitch_for_look_deg(look_deg: f64) -> f32 {
     (-(START_PITCH_DEG as f64) + CHASE_START_LOOK_DEG - look_deg) as f32
 }
 
-/// A chase camera more than this many chase distances from where it should be jumps there (a
-/// region entered, a scripted pose) instead of gliding.
+/// When the wanted eye offset from the fly jumps by more than this many chase distances (a
+/// region entered, a scripted height), the camera takes it at once instead of gliding.
 pub const CHASE_SNAP_DISTANCES: f64 = 4.0;
 
 /// How far below the horizontal the chase camera looks (degrees) for the view `pitch`
@@ -425,8 +427,8 @@ fn step_fly(
 /// The chase camera's smoothed pose and the fly's visual state between frames.
 #[derive(Resource, Clone, Debug, Default)]
 struct Chase {
-    /// The smoothed eye and target and their velocities; `None` until a region shows (and
-    /// after it goes), so the next one starts in place.
+    /// The smoothed eye and target **offsets from the fly** and their velocities; `None` until
+    /// a region shows (and after it goes), so the next one starts in place.
     smooth: Option<[DVec3; 4]>,
     /// The fly's state last frame, for the yaw rate and whether it is idle.
     last: Option<FlyState>,
@@ -462,23 +464,29 @@ fn apply_fly(
     let want = region_chase_pose(&fly, ground);
     let dt = time.delta_secs_f64();
 
-    // Smooth the eye and the target, then lift the result again: the glide never dips into
-    // the ground.
+    // Smooth in the fly's frame: the eye's and the target's offsets from the fly glide, and are
+    // added to where the fly is now. Translation is followed rigidly (a world-space follower
+    // lags 2τ·v behind steady flight, which at 0.8–3.2 × AGL per second is as long as the
+    // chase distance itself and runs the fly off the top of the frame); only turns, view-pitch
+    // changes and height changes glide. The result is lifted again, so the glide never dips
+    // into the ground.
     let fly_m = fly.pos_m.as_dvec3();
     let chase_distance =
         CHASE_MIN_DISTANCE_M.max(CHASE_DISTANCE_PER_AGL * (fly_m.y - ground(fly_m.x, fly_m.z)));
-    let [eye, eye_v, target, target_v] = match chase.smooth {
+    let (want_eye, want_target) = (want.eye - fly_m, want.target - fly_m);
+    let [eye_off, eye_v, target_off, target_v] = match chase.smooth {
         Some([eye, eye_v, target, target_v])
-            if (eye - want.eye).length() <= CHASE_SNAP_DISTANCES * chase_distance =>
+            if (eye - want_eye).length() <= CHASE_SNAP_DISTANCES * chase_distance =>
         {
-            let (eye, eye_v) = critically_damped(eye, eye_v, want.eye, dt, CHASE_SMOOTHING_S);
+            let (eye, eye_v) = critically_damped(eye, eye_v, want_eye, dt, CHASE_SMOOTHING_S);
             let (target, target_v) =
-                critically_damped(target, target_v, want.target, dt, CHASE_SMOOTHING_S);
+                critically_damped(target, target_v, want_target, dt, CHASE_SMOOTHING_S);
             [eye, eye_v, target, target_v]
         }
-        _ => [want.eye, DVec3::ZERO, want.target, DVec3::ZERO],
+        _ => [want_eye, DVec3::ZERO, want_target, DVec3::ZERO],
     };
-    chase.smooth = Some([eye, eye_v, target, target_v]);
+    chase.smooth = Some([eye_off, eye_v, target_off, target_v]);
+    let (eye, target) = (fly_m + eye_off, fly_m + target_off);
     let shown = lift_above_ground(
         ChasePose {
             eye,
@@ -517,7 +525,9 @@ fn apply_fly(
         scale,
         bank_rad: chase.bank_rad,
     };
-    if *pose != next {
+    // Only the world on screen writes the pose: a region held while the globe draws (a
+    // preload, a swap) leaves it to the globe.
+    if camera_settings.is_active && *pose != next {
         *pose = next;
     }
 
@@ -1217,39 +1227,101 @@ mod tests {
             );
         }
 
+        /// The bearing (radians, as `yaw`) of the camera from the fly: `rot_y(yaw) · +z` is behind.
+        fn bearing(cam: &Transform, fly: Vec3) -> f32 {
+            let o = cam.translation - fly;
+            o.x.atan2(o.z)
+        }
+
         #[test]
-        fn the_chase_camera_follows_smoothly() {
+        fn the_chase_camera_follows_moves_rigidly_and_turns_smoothly() {
             let grid = grid(|_, _| 0.0);
             let fly = FlyState {
                 pos_m: Vec3::new(0.0, 2_000.0, 0.0),
                 yaw: 0.0,
-                pitch: 0.0,
+                pitch: -START_PITCH_DEG.to_radians(),
             };
             let mut app = app(&grid, fly);
             for _ in 0..10 {
                 app.update();
             }
-            let before = camera(&mut app).translation;
-            // The fly moves 100 m north in one frame: the camera follows over a few frames,
-            // never past where it is heading.
+            let offset = camera(&mut app).translation - fly.pos_m;
+            // A move is followed in the same frame: the camera keeps its place behind the fly.
             app.world_mut().resource_mut::<FlyState>().pos_m.z -= 100.0;
             app.update();
-            let first = camera(&mut app).translation;
-            let moved = before.z - first.z;
-            assert!(moved > 0.0 && moved < 50.0, "{moved}");
-            let mut last = first.z;
+            let moved = *app.world().resource::<FlyState>();
+            let now = camera(&mut app).translation - moved.pos_m;
+            assert!((now - offset).length() < 1e-2, "{now} vs {offset}");
+            // A turn glides: the camera swings round behind the fly over a few frames, never
+            // past the new heading.
+            app.world_mut().resource_mut::<FlyState>().yaw = 0.5;
+            app.update();
+            let first = bearing(&camera(&mut app), moved.pos_m);
+            assert!(first > 0.0 && first < 0.25, "{first}");
+            let mut last = first;
             for _ in 0..150 {
                 app.update();
-                let z = camera(&mut app).translation.z;
-                assert!(z <= last + 1e-3 && z >= before.z - 100.0 - 1e-2, "{z}");
-                last = z;
+                let b = bearing(&camera(&mut app), moved.pos_m);
+                assert!(b >= last - 1e-5 && b <= 0.5 + 1e-4, "{b} after {last}");
+                last = b;
             }
-            assert!((before.z - 100.0 - last).abs() < 0.1, "{last}");
-            // A jump of many chase distances (entering a region, a script) snaps.
+            assert!((last - 0.5).abs() < 1e-3, "{last}");
+            // A jump of many chase distances (entering a region, a script) is followed at once.
             app.world_mut().resource_mut::<FlyState>().pos_m.x += 50_000.0;
             app.update();
-            let snapped = camera(&mut app).translation;
-            assert!((snapped.x - 50_000.0).abs() < 1.0, "{snapped}");
+            let fly = *app.world().resource::<FlyState>();
+            let cam = camera(&mut app);
+            let (below, side) = seen(&cam, fly.pos_m);
+            assert!(
+                (below - 5.0).abs() < 0.05 && side.abs() < 1e-3,
+                "{below} {side}"
+            );
+        }
+
+        #[test]
+        fn the_fly_stays_in_frame_in_sustained_flight() {
+            // Steady level flight north for 2 s, plain and boosted, at the steepest, start and
+            // shallowest view pitches: the fly never leaves the frame, and at the start pitch it
+            // holds its place a little below the centre.
+            let grid = grid(|_, _| 0.0);
+            let agl = 2_000.0;
+            let dt = STEP.as_secs_f32();
+            for pitch_deg in [MIN_PITCH_DEG, -START_PITCH_DEG, MAX_PITCH_DEG] {
+                for boost in [false, true] {
+                    let mut state = FlyState {
+                        pos_m: Vec3::new(0.0, agl, 60_000.0),
+                        yaw: 0.0,
+                        pitch: pitch_deg.to_radians(),
+                    };
+                    let mut app = app(&grid, state);
+                    for _ in 0..5 {
+                        app.update();
+                    }
+                    let speed = fly_speed(agl) * if boost { BOOST } else { 1.0 };
+                    let at_rest =
+                        CHASE_ELEVATION_DEG as f32 - chase_look_pitch_deg(state.pitch) as f32;
+                    for frame in 0..120 {
+                        state.pos_m.z -= speed * dt;
+                        app.world_mut().insert_resource(state);
+                        app.update();
+                        let (below, side) = seen(&camera(&mut app), state.pos_m);
+                        let what = format!("pitch {pitch_deg}, boost {boost}, frame {frame}");
+                        assert!(
+                            below.abs() <= REGION_FOV_DEG / 2.0 - 4.0,
+                            "{what}: {below}° from the centre"
+                        );
+                        assert!(side.abs() < 1e-3, "{what}: {side}");
+                        // The view holds the fly where it sits at rest.
+                        assert!(
+                            (below - at_rest).abs() < 0.1,
+                            "{what}: {below} vs {at_rest}"
+                        );
+                        if pitch_deg == -START_PITCH_DEG {
+                            assert!(below > 4.0, "{what}: {below}");
+                        }
+                    }
+                }
+            }
         }
 
         #[test]
@@ -1312,6 +1384,32 @@ mod tests {
             }
             let shown = Some(Altitude::Metres(fly.pos_m.y));
             assert_eq!(app.world().resource::<FlyAltitude>().0, shown);
+            // A region held off screen (the globe drawing, a preload, a swap) writes neither
+            // the fly's pose nor its altitude: the active world owns them.
+            app.world_mut()
+                .resource_mut::<crate::terrain::TerrainSettings>()
+                .visible = false;
+            app.update();
+            let other = FlyPose {
+                translation: Vec3::new(1.0, 2.0, 3.0),
+                ..default()
+            };
+            app.insert_resource(other);
+            app.world_mut().resource_mut::<FlyState>().pos_m.z -= 500.0;
+            for _ in 0..3 {
+                app.update();
+            }
+            assert_eq!(*app.world().resource::<FlyPose>(), other);
+            assert_eq!(app.world().resource::<FlyAltitude>().0, None);
+            // Back on screen, the region writes them again.
+            app.world_mut()
+                .resource_mut::<crate::terrain::TerrainSettings>()
+                .visible = true;
+            for _ in 0..3 {
+                app.update();
+            }
+            assert_ne!(*app.world().resource::<FlyPose>(), other);
+            assert!(app.world().resource::<FlyAltitude>().0.is_some());
             app.world_mut().remove_resource::<ActiveRegion>();
             for _ in 0..3 {
                 app.update();
