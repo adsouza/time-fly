@@ -1,6 +1,7 @@
 // The sea's waves (art pass §5.4): the swell's directional components and the swash at the
-// shore. Plain WGSL with no imports, registered as `package::waves`, so water.wesl imports it and
-// terrain.wesl can import the swash with no WaterLook uniform (ruling R1).
+// shore. Plain WGSL with no imports, registered as `package::waves`, so water.wesl imports it.
+// The swash constants live here rather than in WaterLook (ruling R1) so that terrain.wesl could
+// import them too; Task 8 (wet sand), which would have, was dropped.
 //
 // Mirrored by water.rs: SWASH_REACH_M, SWASH_MAX_AMPLITUDE_M and SWASH_PROBE_M (a Rust test
 // reads them from this file), `swash_amplitude_m`, `swash_reach_factor`, `swell_spacing_weight`,

@@ -1,7 +1,11 @@
 //! Shared constants for the art pass: shader animation clocks must loop seamlessly.
 
-/// The period (seconds) at which Bevy wraps `Time<Real>`, and so `globals.time` in shaders.
-/// Every looping shader animation's period must divide it exactly, or it jumps at the wrap.
+/// The period (seconds) at which Bevy wraps the plain `Time` clock, and so `globals.time` in
+/// shaders: bevy_render 0.20.1 (`globals.rs`, `prepare_globals_buffer`) writes the extracted
+/// `Res<Time>`'s `elapsed_secs_wrapped()`. In the main world that clock is `Time<Virtual>`'s copy
+/// outside the fixed-step schedules, so its wrap period is the virtual clock's (Bevy's default,
+/// one hour, like every clock's). Every looping shader animation's period must divide it exactly,
+/// or it jumps at the wrap.
 pub const TIME_WRAP_S: f32 = 3600.0;
 
 /// Panics unless `period_s` divides [`TIME_WRAP_S`] exactly, so an animation with that period
@@ -58,10 +62,15 @@ mod tests {
 
     #[test]
     fn time_wrap_matches_bevy() {
-        assert_eq!(
-            Time::<Real>::default().wrap_period(),
-            Duration::from_secs_f32(TIME_WRAP_S)
-        );
+        // The clock bevy_render extracts for `globals.time` is the main world's plain `Time`
+        // resource, which TimePlugin sets from `Time<Virtual>` every frame: check it as an app
+        // that has run a frame holds it, and the virtual clock it copies.
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.update();
+        let wrap = Duration::from_secs_f32(TIME_WRAP_S);
+        assert_eq!(app.world().resource::<Time>().wrap_period(), wrap);
+        assert_eq!(app.world().resource::<Time<Virtual>>().wrap_period(), wrap);
     }
 
     #[test]

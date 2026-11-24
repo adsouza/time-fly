@@ -12,7 +12,7 @@
 //! | 101, 102 | inner and apron heights, `R32Float`, read with `textureLoad` |
 //! | 103, 104 | inner and apron surface codes, `Rgba8Unorm` (`Field::surface`), `textureLoad` |
 //! | 105 | the palette, `Rgba8UnormSrgb` ([`palette_texels`]: ground, canopy, rock per era and biome) |
-//! | 106 | uniform [`TerrainLook`]: the painterly light (shadow hue, ramp, brush, snowline latitude, snow shading) and the region frame and wind (planet position, dunes) |
+//! | 106 | uniform [`TerrainLook`]: the painterly light (shadow hue, ramp, brush, snowline latitude, snow shading), the region frame and wind (planet position, dunes) and the region sun's direction (the dune tilt bound) |
 //!
 //! None of the textures has a sampler: `R32Float` is not filterable in baseline WebGPU, and the
 //! codes and palette are looked up texel by texel.
@@ -48,6 +48,8 @@ use timefly_core::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
 use timefly_core::worldgen::generate::{Field, RegionGrid};
 use timefly_core::worldgen::wind::wind_axis;
 
+use super::view::REGION_SUN_DIRECTION;
+
 /// `terrain.wesl`: the main-pass vertex and fragment shaders.
 pub const TERRAIN_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e11");
 /// `terrain_prepass.wesl`: the prepass and shadow vertex shader.
@@ -64,7 +66,7 @@ pub const SNOWLINE_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d6
 /// `planet.wesl`: the planet-fixed position (`planet_position_m`), imported as `package::planet`.
 pub const PLANET_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e16");
 /// `waves.wesl`: the sea's swell and swash (`crate::water`), imported as `package::waves` by
-/// `water.wesl` (and the swash by `terrain.wesl`).
+/// `water.wesl`.
 pub const WAVES_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e17");
 
 /// How strongly shadowed light takes the sky's cool, era-tinted hue (0 = not at all).
@@ -94,8 +96,10 @@ pub const DUNE_SMALL_SPACING_M: f32 = 200.0;
 /// Seconds for the main crests to creep one spacing downwind: 1 km an hour, about 17 m a minute.
 /// Divides [`crate::art::TIME_WRAP_S`], so the creep loops seamlessly at the clock's wrap.
 pub const DUNE_PERIOD_S: f32 = 3600.0;
-/// Seconds for the small crests to creep one small spacing (200 m in 10 min: twice as fast as
-/// the main crests, as small dunes are in nature). Divides [`crate::art::TIME_WRAP_S`].
+/// Seconds for the small crests to creep one small spacing: 200 m in 10 min, about 20 m a minute
+/// against the main crests' 17, so 1.2 times as fast, as small dunes are in nature. Their pattern
+/// cycles six times as often (one spacing per 600 s against 3,600 s). Divides
+/// [`crate::art::TIME_WRAP_S`].
 pub const DUNE_SMALL_PERIOD_S: f32 = 600.0;
 /// The sand-sea mask's noise scale (m): sand seas are tens of km across, the rest of the desert
 /// is stony plain.
@@ -112,6 +116,33 @@ pub const BAND_MIN_SLOPE: f32 = 0.06;
 /// The slope at which that ramp reaches full weight. Mirrored as `BAND_FULL_SLOPE` in
 /// `terrain.wesl`.
 pub const BAND_FULL_SLOPE: f32 = 0.2;
+/// The true slopes (rise over run) over which the sand sea fades out: the desert there is stony
+/// plain, so the dunes' tilt never rides on a hillside's. Mirrored as `DUNE_SLOPE` in
+/// `terrain.wesl`.
+pub const DUNE_SLOPE: [f32; 2] = [0.03, 0.07];
+/// How far the dunes may turn a face away from the sun: this share of the way from facing straight
+/// up to the terminator, counting the terrain's own shading tilt ([`bound_dune_tilt`]). At 0.25 a
+/// slip face keeps about three quarters of level ground's sunlight. Mirrored as `DUNE_AWAY_LIMIT`
+/// in `terrain.wesl`.
+pub const DUNE_AWAY_LIMIT: f32 = 0.25;
+
+/// The Rust mirror of `bound_dune_tilt` (`terrain.wesl`): the dunes' shading tilt `dune`
+/// (region-local xz, minus the rise over run), bounded so that with the terrain's shading tilt
+/// `base` it never turns a face more than [`DUNE_AWAY_LIMIT`] of the way to the terminator of the
+/// sun at `to_sun` (unit, toward the light). Unnormalised, N·L is `to_sun.y + dot(tilt,
+/// to_sun.xz)`. Only the dune tilt's component along `to_sun.xz` changes, and only where it turns
+/// the face away: the bounded N·L is at least `min(base N·L, (1 - DUNE_AWAY_LIMIT) · to_sun.y)`.
+pub fn bound_dune_tilt(base: Vec2, dune: Vec2, to_sun: Vec3) -> Vec2 {
+    let across = Vec2::new(to_sun.x, to_sun.z);
+    let len2 = across.dot(across);
+    if to_sun.y <= 0.0 || len2 < 1e-6 {
+        return dune;
+    }
+    let lowest = -DUNE_AWAY_LIMIT * to_sun.y;
+    let along = dune.dot(across);
+    let allowed = along.max(0.0_f32.min(lowest - base.dot(across)));
+    dune + across * ((allowed - along) / len2)
+}
 
 /// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
@@ -135,8 +166,10 @@ pub struct TerrainLook {
     /// `xyz`: the unit tangent toward east at the centre (region-local `+x`); `w`: 0.
     pub frame_east: Vec4,
     /// `xyz`: the prevailing wind's 3D axis `W` at the centre (`wind_axis`), tangent to the
-    /// sphere there, so a dune's crest phase is `dot(p, W)` for the planet position `p`; `w`:
-    /// unused.
+    /// sphere there. A dune's crest phase is the along-wind distance from the region centre,
+    /// `dot(p, W)` for the planet position `p`, which the shader takes from local metres. It
+    /// depends on the centre, so crests shift between visits from different centres (a known
+    /// limitation; the plan appendix). `w`: unused.
     pub wind: Vec4,
     /// `x`: [`DUNE_SPACING_M`]; `y`: [`DUNE_SMALL_SPACING_M`]; `z`: [`DUNE_PERIOD_S`]; `w`:
     /// [`DUNE_SMALL_PERIOD_S`].
@@ -144,6 +177,10 @@ pub struct TerrainLook {
     /// `x`: [`SAND_SEA_SCALE_M`]; `y`: [`BAND_SCALE_M`]; `z`: [`BAND_WARP_M`]; `w`:
     /// [`BAND_MIN_SLOPE`].
     pub patterns: Vec4,
+    /// `xyz`: the unit direction toward the region's sun ([`REGION_SUN_DIRECTION`], the
+    /// direction the sun entity's transform gives its light), for `bound_dune_tilt`; `w`: 0.
+    /// Passed here rather than read from Bevy's light list, whose order is not guaranteed.
+    pub sun: Vec4,
 }
 
 impl Default for TerrainLook {
@@ -192,6 +229,7 @@ pub fn terrain_look(
             DUNE_SMALL_PERIOD_S,
         ),
         patterns: Vec4::new(SAND_SEA_SCALE_M, BAND_SCALE_M, BAND_WARP_M, BAND_MIN_SLOPE),
+        sun: REGION_SUN_DIRECTION.normalize().extend(0.0),
     }
 }
 
@@ -594,9 +632,95 @@ mod tests {
                 "frame_east",
                 "wind",
                 "dunes",
-                "patterns"
+                "patterns",
+                "sun"
             ]
         );
+    }
+
+    #[test]
+    fn look_carries_the_region_sun() {
+        let look = TerrainLook::default();
+        assert_eq!(look.sun, REGION_SUN_DIRECTION.normalize().extend(0.0));
+        // The sun entity's light shines from where its transform puts it: toward the origin from
+        // REGION_SUN_DIRECTION, so its direction to the light is that direction.
+        let t = Transform::from_translation(REGION_SUN_DIRECTION.normalize())
+            .looking_at(Vec3::ZERO, Vec3::Y);
+        assert!((-t.forward().as_vec3() - look.sun.truncate()).length() < 1e-6);
+    }
+
+    #[test]
+    fn dune_tilt_bound_mirrors_the_wesl() {
+        // The shader bounds the dunes' tilt with the look's sun, not with Bevy's light list
+        // (whose order a second directional light on the terrain layer could change).
+        assert!(TERRAIN_WESL.contains(
+            "let shading = base_shading + bound_dune_tilt(base_shading, painted.dune_gradient);"
+        ));
+        assert!(TERRAIN_WESL.contains("let to_sun = look.sun.xyz;"));
+        assert!(!TERRAIN_WESL.contains("directional_lights"));
+        assert_eq!(
+            crate::art::wesl_const_f32(TERRAIN_WESL, "DUNE_AWAY_LIMIT"),
+            DUNE_AWAY_LIMIT
+        );
+        assert_eq!(DUNE_AWAY_LIMIT, 0.25);
+        // The sand sea fades out on slopes, by the same constants.
+        assert!(TERRAIN_WESL.contains(&format!(
+            "const DUNE_SLOPE: vec2<f32> = vec2<f32>({:?}, {:?});",
+            DUNE_SLOPE[0], DUNE_SLOPE[1]
+        )));
+        assert!(
+            TERRAIN_WESL
+                .contains("desert.sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope))")
+        );
+        // A zero dune tilt stays exactly zero, whatever the terrain does.
+        let sun = REGION_SUN_DIRECTION.normalize();
+        for base in [Vec2::ZERO, Vec2::new(3.0, -2.0), Vec2::new(-5.0, 4.0)] {
+            assert_eq!(bound_dune_tilt(base, Vec2::ZERO, sun), Vec2::ZERO);
+        }
+    }
+
+    /// N·L before normalisation for a shading tilt (`normal = (tilt.x, 1, tilt.y)`).
+    fn unnormalised_n_dot_l(tilt: Vec2, to_sun: Vec3) -> f32 {
+        to_sun.y + tilt.dot(Vec2::new(to_sun.x, to_sun.z))
+    }
+
+    proptest::proptest! {
+        /// For any terrain tilt, dune tilt and a sun at the region sun's elevation (any bearing),
+        /// the bounded tilt never turns a face further than `DUNE_AWAY_LIMIT` toward the
+        /// terminator unless the terrain alone already does, leaves the component toward the sun
+        /// and the component across the sun's bearing unchanged, and a zero dune tilt stays zero.
+        #[test]
+        fn bound_dune_tilt_keeps_faces_lit(
+            bx in -4.0_f32..4.0,
+            bz in -4.0_f32..4.0,
+            dx in -1.5_f32..1.5,
+            dz in -1.5_f32..1.5,
+            bearing in 0.0_f32..core::f32::consts::TAU,
+        ) {
+            let elevation = REGION_SUN_DIRECTION.normalize().y;
+            let flat = (1.0 - elevation * elevation).sqrt();
+            let sun = Vec3::new(flat * bearing.cos(), elevation, flat * bearing.sin());
+            let (base, dune) = (Vec2::new(bx, bz), Vec2::new(dx, dz));
+            let bounded = bound_dune_tilt(base, dune, sun);
+            let across = Vec2::new(sun.x, sun.z);
+            let tol = 1e-4 * (1.0 + base.length() + dune.length());
+
+            let lit = unnormalised_n_dot_l(base + bounded, sun);
+            let floor = unnormalised_n_dot_l(base, sun).min((1.0 - DUNE_AWAY_LIMIT) * sun.y);
+            proptest::prop_assert!(lit >= floor - tol, "N.L {lit} under {floor}");
+            // Only the component along the sun's bearing ever changes.
+            let side = across.perp();
+            proptest::prop_assert!((bounded.dot(side) - dune.dot(side)).abs() <= tol);
+            // A dune tilt toward the sun (the windward face) is kept as it is.
+            if dune.dot(across) >= 0.0 {
+                proptest::prop_assert_eq!(bounded, dune);
+            }
+            // The bound never adds tilt toward the sun beyond what the dunes had, and never
+            // pushes past the dunes' own tilt away from it.
+            proptest::prop_assert!(bounded.dot(across) >= dune.dot(across) - tol);
+            proptest::prop_assert!(bounded.dot(across) <= dune.dot(across).max(0.0) + tol);
+            proptest::prop_assert_eq!(bound_dune_tilt(base, Vec2::ZERO, sun), Vec2::ZERO);
+        }
     }
 
     const CDLOD_WESL: &str = include_str!("../../assets/shaders/terrain_cdlod.wesl");

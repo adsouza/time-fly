@@ -11,20 +11,22 @@
 //   colour space; canopy over ground in brushy patches; rock on slopes; snow from the ice byte
 //   and the snowline; green-grey microbial mats on Barren-era shores; in deserts, sand seas of
 //   creeping transverse dunes (their slope tilts the shading normal) and stony plain with gravel
-//   patches and mottling elsewhere, keyed to the planet-fixed position; a few percent of value
-//   and hue jitter. The brush is noise.wesl at 400 m, 60 m and 9 m world scales, each faded out
-//   as it shrinks below a couple of pixels.
+//   patches and mottling elsewhere; a few percent of value and hue jitter. The sand-sea mask, the
+//   dune warp, the stony plain and the band warp are keyed to the planet-fixed position; the
+//   dunes' crest phase is the along-wind distance from the region centre, so it depends on the
+//   centre (a known limitation until M3 adds a global phase offset). The brush is noise.wesl
+//   at 400 m, 60 m and 9 m world scales, each faded out as it shrinks below a couple of pixels.
 // - light: Bevy PBR, then a soft three-band ramp on the diffuse illumination and a hue shift of
 //   shadowed light toward the sky's cool, era-tinted zenith (TerrainLook, binding 106).
 
 import package::terrain_cdlod::{
-    TerrainBuffer, TerrainParams, cdlod_vertex, grid_index_of, terrain_normal,
+    TerrainBuffer, TerrainParams, blended_height, cdlod_vertex, grid_index_of, terrain_normal,
 };
 import package::noise::{gradient_noise3, hash3};
 import package::planet::planet_position_m;
 import package::snowline::{snowline_m, snowline_raise_from_byte};
 import bevy_pbr::render::mesh_functions::get_tag;
-import bevy_pbr::render::mesh_view_bindings::{globals, lights};
+import bevy_pbr::render::mesh_view_bindings::globals;
 import bevy_pbr::render::view_transformations::position_world_to_clip;
 import bevy_pbr::render::pbr_fragment::pbr_input_from_standard_material;
 import bevy_pbr::render::pbr_functions::{apply_pbr_lighting, main_pass_post_lighting_processing};
@@ -44,7 +46,8 @@ struct TerrainLook {
     frame_north: vec4<f32>,
     // xyz: unit tangent toward east at the centre (local +x).
     frame_east: vec4<f32>,
-    // xyz: the prevailing wind's 3D axis W (tangent at the centre); dune phase is dot(p, W).
+    // xyz: the prevailing wind's 3D axis W (tangent at the centre). The dune phase is the
+    // along-wind distance from the centre, dot(p, W), taken from local metres (desert_at).
     wind: vec4<f32>,
     // x: main dune spacing (m); y: small dune spacing (m); z: main period (s); w: small period (s).
     dunes: vec4<f32>,
@@ -52,6 +55,9 @@ struct TerrainLook {
     // amplitude (m); w: the slope (rise over run) from which dry bare
     // ground shows bands (BAND_FULL_SLOPE below is where they reach full weight).
     patterns: vec4<f32>,
+    // xyz: the unit direction toward the region's sun (REGION_SUN_DIRECTION), for
+    // bound_dune_tilt; w: 0.
+    sun: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<storage, read> terrain: TerrainBuffer;
@@ -193,9 +199,10 @@ fn octave_weight(footprint_m: f32, scale_m: f32) -> f32 {
 }
 
 // Gradient noise at a planet-fixed position p (m, from planet_position_m), so the pattern stays
-// put whichever region centre the place is entered from. |p| is about 6.4e6 m, so p / scale_m
-// fits an i32 cell for any scale; at scales of 30 m or more the f32 fraction resolves a cell to
-// 1/64 or better, which is plenty for value noise.
+// put whichever region centre the place is entered from (the sand-sea mask, the dune warp, the
+// stony plain and the band warp; not the dunes' crest phase, see desert_at). |p| is about
+// 6.4e6 m, so p / scale_m fits an i32 cell for any scale; at scales of 30 m or more the f32
+// fraction resolves a cell to 1/64 or better, which is plenty for value noise.
 fn planet_noise(p: vec3<f32>, scale_m: f32, seed: u32) -> f32 {
     let q = p / scale_m;
     let c = floor(q);
@@ -253,13 +260,15 @@ const DUNE_SMALL_ANGLE: f32 = 0.35;
 // Forward-difference step (m) for the warp's gradient (the warp's finest scale is 600 m).
 const DUNE_WARP_STEP_M: f32 = 40.0;
 // Sand seas lie on flat ground: the erg fades out between these true slopes (rise over run) and
-// the desert there is stony plain, so the dunes' tilt never rides on a hillside's.
+// the desert there is stony plain, so the dunes' tilt never rides on a hillside's. Mirrored as
+// DUNE_SLOPE in material.rs.
 const DUNE_SLOPE: vec2<f32> = vec2<f32>(0.03, 0.07);
 // How far the dunes may turn a face away from the sun: this share of the way from facing straight
 // up to the terminator, counting the terrain's own (exaggerated) tilt (bound_dune_tilt). At 0.25
 // a slip face turned from the sun keeps about three quarters of level ground's sunlight, above
 // the ramp's shade step, so it reads as soft shade and never as a black line (0.4-0.5 still
-// dropped into the step at the Grand Canyon plateau edge).
+// dropped into the step at the Grand Canyon plateau edge). Mirrored as DUNE_AWAY_LIMIT in
+// material.rs, whose bound_dune_tilt mirror is property-tested.
 const DUNE_AWAY_LIMIT: f32 = 0.25;
 const PI: f32 = 3.14159265;
 
@@ -306,8 +315,8 @@ struct Desert {
     mottle: f32,
 }
 
-// p is the planet position of region-local xz; footprint the pixel's size (m).
-fn desert_at(p: vec3<f32>, footprint: f32) -> Desert {
+// xz is the region-local position, p its planet position; footprint the pixel's size (m).
+fn desert_at(xz: vec2<f32>, p: vec3<f32>, footprint: f32) -> Desert {
     var d: Desert;
     let mask = planet_noise(p, look.patterns.x, 213u)
         + SAND_SEA_DETAIL * planet_noise(p, look.patterns.x / 3.0, 225u);
@@ -324,6 +333,14 @@ fn desert_at(p: vec3<f32>, footprint: f32) -> Desert {
     let north = look.frame_north.xyz;
     let wind = look.wind.xyz;
     let t = globals.time;
+    // The crest phase's along-wind distance, dot(p, W) for a tangent axis W at the centre. With
+    // p = R (cos(a) centre + sin(a) / |xz| (east x - north z)) and a = |xz| / R, that is
+    // dot(xz, W's local xz) times sin(a) / a, taken from local metres so f32 never has to resolve
+    // metres against |p| of 6.4e6 m. It is the distance from the region centre, so the phase
+    // depends on the centre: crests shift between visits from different centres (a known
+    // limitation; M3 adds a per-region f64 phase offset from a global along-wind field).
+    let a = length(xz) / look.frame_center.w;
+    let sinc = select(sin(a) / a, 1.0 - a * a / 6.0, a < 1e-3);
 
     // Each octave's sharp profile fades out as its slip face (a fifth of a spacing, the sharpest
     // feature) shrinks below a couple of pixels. The main crests then carry on as a sinusoid,
@@ -340,7 +357,7 @@ fn desert_at(p: vec3<f32>, footprint: f32) -> Desert {
         let warp_grad = vec2<f32>(dune_warp(pe) - w0, dune_warp(ps) - w0) / DUNE_WARP_STEP_M;
         let wind_xz = vec2<f32>(dot(wind, east), -dot(wind, north));
         // Crest phase along the wind; only the phase moves, by one spacing per period.
-        let u = dot(p, wind) / look.dunes.x + w0 - t / look.dunes.z;
+        let u = dot(xz, wind_xz) * sinc / look.dunes.x + w0 - t / look.dunes.z;
         let big = mix(dune_profile_soft(u), dune_profile(u), sharp_w) * main_w;
         let big_grad = wind_xz / look.dunes.x + warp_grad;
         // The normal tilts away from the rise: minus height times dh/du times du/dxz.
@@ -357,7 +374,7 @@ fn desert_at(p: vec3<f32>, footprint: f32) -> Desert {
             let s0 = dune_small_warp(p);
             let small_warp_grad = vec2<f32>(dune_small_warp(pe) - s0, dune_small_warp(ps) - s0)
                 / DUNE_WARP_STEP_M;
-            let u2 = dot(p, wind2) / look.dunes.y + w0 * ratio + s0 - t / look.dunes.w;
+            let u2 = dot(xz, wind2_xz) * sinc / look.dunes.y + w0 * ratio + s0 - t / look.dunes.w;
             let small = dune_profile(u2);
             let small_grad = wind2_xz / look.dunes.y + warp_grad * ratio + small_warp_grad;
             d.gradient -= DUNE_SMALL_HEIGHT_M * small_w * small.y * small_grad;
@@ -368,7 +385,7 @@ fn desert_at(p: vec3<f32>, footprint: f32) -> Desert {
     // The stony plain: darker gravel patches (desert pavement) at 2.5 km and 700 m, and a
     // mottling at 150 m and 35 m.
     if d.sea < 1.0 {
-        let g = planet_noise(p, 2500.0, 239u)
+        let g = planet_noise(p, 2500.0, 239u) * octave_weight(footprint, 2500.0)
             + 0.35 * planet_noise(p, 700.0, 241u) * octave_weight(footprint, 700.0);
         d.gravel = smoothstep(-0.25, 0.45, g);
         d.mottle = planet_noise(p, 150.0, 251u) * octave_weight(footprint, 150.0)
@@ -387,8 +404,9 @@ struct Paint {
     dune_gradient: vec2<f32>,
 }
 
-// The painted albedo (linear) at xz for the true height, the flat-terrain slope (rise over run)
-// and the pixel footprint (m).
+// The painted albedo (linear) at xz for the height of the drawn surface (the morphing mesh, as
+// the beach, mat, snow and desert thresholds have used since M2; the strata read the true
+// surface), the flat-terrain slope (rise over run) and the pixel footprint (m).
 fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprint: f32) -> Paint {
     // The class boundaries come from 1.85 km climate data and read as stair-steps; warping the
     // lookup with two noise scales turns them into ragged, brushy edges (the heights are not
@@ -425,17 +443,37 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     let mats = shore * barren * near_sea * smoothstep(-0.25, 0.25, n400 + 0.5 * n60);
     c = mix(c, MICROBIAL_MAT, mats * 0.55);
 
+    // Rock above a slope of 0.6 (31 degrees), with a ragged edge (applied after the deserts).
+    let rock = smoothstep(0.5, 0.7, slope + 0.12 * n60 + 0.06 * n9);
+
+    // Rock strata (spec §5.5), applied before the snow so snow edges keep their full cover: on
+    // cliffs, and on slopes of dry or bare ground (exposure >= 0.8) with a weight that grows from
+    // look.patterns.w to BAND_FULL_SLOPE, scaled by how exposed the rock is. Not under canopy
+    // (a true zero), on beaches, on microbial mats (an era signature) or on dune sand (below).
+    // The weight also fades with the strata's visibility, so ground too far away to show bands
+    // keeps its own colour instead of turning rock-coloured.
+    let moderate = smoothstep(0.7, 0.8, surf.exposure)
+        * smoothstep(look.patterns.w, BAND_FULL_SLOPE, slope);
+    let vertical_m = slope * footprint;
+    let visible = octave_weight(vertical_m, 1.7 * look.patterns.y);
+    let band_ground = surf.exposure * max(rock, moderate) * (1.0 - min(canopy / 0.9, 1.0))
+        * (1.0 - beach) * (1.0 - mats) * visible;
+
     // Deserts (spec §5.3): sand seas with creeping dunes, and stony plain elsewhere. The sand
     // weight blends like every other surface value, so desert edges stay soft. No dunes under
     // the sea (the water plane covers height < 0) or on beaches; rock and snow are masked below.
     var dune_sea = 0.0;
     var dune_gradient = vec2<f32>(0.0);
     let desert_ground = surf.sand * (1.0 - canopy) * (1.0 - beach) * smoothstep(0.0, 2.0, height);
-    if desert_ground > 0.0 {
-        let pp = planet_position_m(
+    // The planet position, once, for the desert and the strata (pixels needing neither skip it).
+    var pp = vec3<f32>(0.0);
+    if desert_ground > 0.0 || band_ground > 0.0 {
+        pp = planet_position_m(
             xz, look.frame_center.xyz, look.frame_north.xyz, look.frame_east.xyz, look.frame_center.w
         );
-        let desert = desert_at(pp, footprint);
+    }
+    if desert_ground > 0.0 {
+        let desert = desert_at(xz, pp, footprint);
         let sea = desert.sea * (1.0 - smoothstep(DUNE_SLOPE.x, DUNE_SLOPE.y, slope));
         dune_sea = desert_ground * sea;
         dune_gradient = desert.gradient;
@@ -449,27 +487,16 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
         c = c * mix(1.0, erg, dune_sea);
     }
 
-    // Rock above a slope of 0.6 (31 degrees), with a ragged edge.
-    let rock = smoothstep(0.5, 0.7, slope + 0.12 * n60 + 0.06 * n9);
+    // The rock on steep slopes (its weight is above).
     c = mix(c, surf.rock, rock);
 
-    // Rock strata (spec §5.5), before the snow so snow edges keep their full cover: on cliffs,
-    // and on slopes of dry or bare ground (exposure >= 0.8) with a weight that grows from
-    // look.patterns.w to BAND_FULL_SLOPE, scaled by how exposed the rock is. Not under canopy
-    // (a true zero) or dune sand. The weight also fades with the strata's visibility, so ground
-    // too far away to show bands keeps its own colour instead of turning rock-coloured.
-    // Pixels with no weight evaluate no noise.
-    let moderate = smoothstep(0.7, 0.8, surf.exposure)
-        * smoothstep(look.patterns.w, BAND_FULL_SLOPE, slope);
-    let vertical_m = slope * footprint;
-    let visible = octave_weight(vertical_m, 1.7 * look.patterns.y);
-    let band_weight = surf.exposure * max(rock, moderate)
-        * (1.0 - min(canopy / 0.9, 1.0)) * (1.0 - dune_sea) * visible;
+    // The strata. Pixels with no weight evaluate no noise and load no extra heights. The bands
+    // are keyed to the true bilinear surface, not the morphing mesh height (`height`), so 14-60 m
+    // strata don't slide across the LOD morph ring.
+    let band_weight = band_ground * (1.0 - dune_sea);
     if band_weight > 0.0 {
-        let bp = planet_position_m(
-            xz, look.frame_center.xyz, look.frame_north.xyz, look.frame_east.xyz, look.frame_center.w
-        );
-        c = mix(c, surf.rock * band_tint(bp, height, vertical_m), band_weight);
+        let true_height = blended_height(inner_height, apron_height, params, xz);
+        c = mix(c, surf.rock * band_tint(pp, true_height, vertical_m), band_weight);
     }
 
     // Snow: the ice byte, sharpened per pixel by the snowline at the pixel's latitude (north is
@@ -532,12 +559,11 @@ fn paint_light(lit: vec3<f32>, albedo: vec3<f32>, snow: f32) -> vec3<f32> {
 // sun.y + dot(tilt, sun.xz), so the terminator is dot(tilt, sun.xz) = -sun.y. Only the dune
 // tilt's component along sun.xz is limited, and only where it turns the face away; faces turned
 // toward the sun, and faces the terrain alone already turns further, keep their tilt (the dunes
-// then add nothing away from the sun). The sun is the region's one directional light.
+// then add nothing away from the sun). The sun is the region sun's direction from the look
+// (Bevy's per-view light list is sorted by shadow flags and entity, so a second directional light
+// on the terrain layer could take index 0). Mirrored by bound_dune_tilt in material.rs.
 fn bound_dune_tilt(base: vec2<f32>, dune: vec2<f32>) -> vec2<f32> {
-    if lights.n_directional_lights == 0u {
-        return dune;
-    }
-    let to_sun = lights.directional_lights[0].direction_to_light;
+    let to_sun = look.sun.xyz;
     let across = to_sun.xz;
     let len2 = dot(across, across);
     if to_sun.y <= 0.0 || len2 < 1e-6 {

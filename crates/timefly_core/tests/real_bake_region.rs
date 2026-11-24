@@ -906,9 +906,10 @@ fn desert_band_share() {
     }
 }
 
-/// A coarse map of the Grand Canyon's inner field (1.5 km cells, 40 km square, north up) for
-/// choosing the showcase camera: elevation in hundreds of metres (digit, capped at 9 above
-/// 3,000 m... printed as `h/400` clipped) and `#` where the mean band weight of the cell > 0.5.
+/// A coarse map of the Grand Canyon's inner field (40 km square, north up, cells of 5 × 5 texels,
+/// about 1.5 km) for choosing the showcase camera. Each cell prints its mean elevation in 400 m
+/// steps as a digit (0 below 400 m, 9 from 3,600 m up), or `#` where its mean band weight exceeds
+/// 0.5.
 #[test]
 #[ignore = "reads the real bake; run in release"]
 fn grand_canyon_map() {
