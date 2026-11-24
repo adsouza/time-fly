@@ -31,6 +31,7 @@ use timefly_core::globe::{DeepSampling, source_id_ranks};
 use timefly_core::surface::{FrameSelection, Timeline};
 use tracing::instrument;
 
+use crate::clock::{LoadClock, add_load_clock};
 use crate::data::{GlobeData, GlobeLoadError, GlobeLoadState};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use crate::diagnostics::{DiagnosticsContext, FirstInteractiveFrame};
@@ -207,7 +208,8 @@ impl RenderProbe {
     }
 }
 
-/// Seconds without pipeline progress before GPU preparation counts as failed.
+/// Seconds without pipeline progress before GPU preparation counts as failed, on the
+/// [`LoadClock`]: a hidden tab or paused page during startup is not a stuck renderer.
 pub const GPU_PREPARE_TIMEOUT_SECS: f64 = 30.0;
 
 /// Pipeline preparation progress: the fewest pending pipelines seen and when that last improved.
@@ -314,6 +316,13 @@ struct GlobeScene {
     applied_age_myr: Option<f64>,
     applied_debug: bool,
     view: Option<GlobeView>,
+}
+
+/// GPU preparation since the globe spawned: inserted with the [`GlobeScene`] and read by
+/// [`track_render_status`] until the globe is interactive or has failed.
+#[derive(Resource, Copy, Clone, Debug, PartialEq)]
+struct GlobePrepare {
+    /// The render-probe frame count at the spawn.
     spawned_at: u64,
     progress: PrepareProgress,
 }
@@ -352,6 +361,7 @@ impl Plugin for GlobePlugin {
                 .chain()
                 .run_if(resource_exists::<GlobeScene>),
         );
+        add_load_clock(app);
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .insert_resource(probe)
@@ -425,7 +435,7 @@ fn spawn_globe(
     mut atmospheres_m: ResMut<Assets<AtmosphereMaterial>>,
     mut status: ResMut<GlobeRenderStatus>,
     probe: Res<RenderProbe>,
-    real_time: Res<Time<Real>>,
+    clock: Res<LoadClock>,
     camera: Query<&Camera, With<GlobeCamera>>,
 ) {
     let crust = &data.crust;
@@ -581,10 +591,12 @@ fn spawn_globe(
         applied_age_myr: None,
         applied_debug: false,
         view: None,
+    });
+    commands.insert_resource(GlobePrepare {
         spawned_at: probe.report().frames,
         progress: PrepareProgress {
             fewest_pending: None,
-            last_progress_secs: real_time.elapsed_secs_f64(),
+            last_progress_secs: clock.elapsed_s,
         },
     });
     *status = GlobeRenderStatus::PreparingGpu;
@@ -786,19 +798,19 @@ fn sync_bridge_cameras(
 }
 
 fn track_render_status(
-    mut scene: ResMut<GlobeScene>,
+    mut prepare: ResMut<GlobePrepare>,
     probe: Res<RenderProbe>,
-    real_time: Res<Time<Real>>,
+    clock: Res<LoadClock>,
     frames: Option<Res<FrameCount>>,
     mut status: ResMut<GlobeRenderStatus>,
     first_frame: Option<ResMut<Messages<FirstInteractiveFrame>>>,
 ) {
     let frame = frames.map_or(0, |f| f.0);
     let report = probe.report();
-    let now = real_time.elapsed_secs_f64();
-    scene.progress = track_progress(scene.progress, report.pending, now);
-    let stalled = now - scene.progress.last_progress_secs;
-    let next = next_render_status(&status, &report, scene.spawned_at, frame, stalled);
+    let now = clock.elapsed_s;
+    prepare.progress = track_progress(prepare.progress, report.pending, now);
+    let stalled = now - prepare.progress.last_progress_secs;
+    let next = next_render_status(&status, &report, prepare.spawned_at, frame, stalled);
     if next == *status {
         return;
     }
@@ -864,7 +876,61 @@ fn probe_pipelines(cache: Res<PipelineCache>, probe: Res<RenderProbe>) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use bevy::time::TimeUpdateStrategy;
+
     use super::*;
+
+    /// GPU preparation with three pipelines that never finish, tracked from the first update.
+    fn preparing_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                16,
+            )))
+            .insert_resource(GlobeRenderStatus::PreparingGpu)
+            .insert_resource(RenderProbe(Arc::new(Mutex::new(RenderProbeReport {
+                pending: 3,
+                ..default()
+            }))))
+            .insert_resource(GlobePrepare {
+                spawned_at: 0,
+                progress: PrepareProgress::default(),
+            })
+            .add_systems(Update, track_render_status);
+        add_load_clock(&mut app);
+        app.update();
+        app
+    }
+
+    /// One frame stalled past the timeout (a hidden tab, a host pausing
+    /// `requestAnimationFrame`) is not a stuck renderer; running time without progress is.
+    #[test]
+    fn a_frame_stall_does_not_fail_gpu_preparation() {
+        let mut app = preparing_app();
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(40)));
+        app.update();
+        assert_eq!(
+            *app.world().resource::<GlobeRenderStatus>(),
+            GlobeRenderStatus::PreparingGpu,
+            "a 40 s stall"
+        );
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            250,
+        )));
+        for _ in 0..(GPU_PREPARE_TIMEOUT_SECS / 0.25) as usize + 4 {
+            app.update();
+        }
+        assert!(
+            matches!(
+                app.world().resource::<GlobeRenderStatus>(),
+                GlobeRenderStatus::Failed(_)
+            ),
+            "{} s of running frames without progress",
+            GPU_PREPARE_TIMEOUT_SECS
+        );
+    }
 
     /// The globe camera carries `ClusterConfig::None` from its own spawn (ruling R28).
     #[test]

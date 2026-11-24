@@ -356,6 +356,7 @@ fn the_fallback_notice_shows_for_three_seconds_after_a_fallback_region() {
 fn inputs() -> NavInputs {
     NavInputs {
         now_s: 10.0,
+        load_s: 10.0,
         dt_s: 0.1,
         region_state: RegionState::Globe,
         time: YearsBp(30_000.0),
@@ -409,10 +410,16 @@ fn a_double_click_snaps_then_requests() {
     let (still, _) = step_nav(descending, &inputs());
     assert_eq!(still, descending);
     let late = NavInputs {
-        now_s: 10.0 + START_TIMEOUT_S + 0.1,
+        load_s: 10.0 + START_TIMEOUT_S + 0.1,
         ..inputs()
     };
     assert_eq!(step_nav(descending, &late).0, NavPhase::Globe);
+    // Only the load clock counts: wall-clock time alone (a stalled page) does not give up.
+    let stalled = NavInputs {
+        now_s: 10.0 + 60.0,
+        ..inputs()
+    };
+    assert_eq!(step_nav(descending, &stalled).0, descending);
     let generating = NavInputs {
         region_state: RegionState::Generating,
         ..inputs()
@@ -813,6 +820,32 @@ fn press(app: &mut App, key: KeyCode) {
 
 fn set_time(app: &mut App, years: f64) {
     app.world_mut().resource_mut::<GlobeTime>().years = YearsBp(years);
+}
+
+/// One frame stalled past [`START_TIMEOUT_S`] (a hidden tab, a host pausing
+/// `requestAnimationFrame`) does not cancel a descent; running time without a start does.
+#[test]
+fn a_frame_stall_does_not_cancel_a_descent() {
+    let mut app = nav_app(false);
+    let descending = NavPhase::Descending {
+        target: RenderDir(ON_PLATE),
+        since_s: 0.0,
+        started: false,
+    };
+    app.world_mut().resource_mut::<Navigation>().phase = descending;
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs(40)));
+    app.update();
+    assert_eq!(phase(&app), descending, "a 40 s stall");
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(STEP));
+    let frames = (START_TIMEOUT_S / STEP.as_secs_f64()) as usize + 4;
+    for _ in 0..frames {
+        app.update();
+    }
+    assert_eq!(
+        phase(&app),
+        NavPhase::Globe,
+        "{START_TIMEOUT_S} s without a start"
+    );
 }
 
 #[test]

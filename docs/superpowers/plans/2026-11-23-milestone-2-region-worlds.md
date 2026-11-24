@@ -741,6 +741,10 @@ docs/testing/region-m2/              screenshots, performance.md
   failed for the session, and a frame fails the request back to the globe. On a connection
   slower than about 4 Mbit/s the overview can time out though it would have arrived; the aprons
   then use the globe frames for the session.
+  Since 2026-11-23 the same clock (`crate::clock::LoadClock`) also times the globe's GPU
+  preparation (30 s without pipeline progress) and a descent's start (2 s); before, both read
+  wall-clock time, so one stalled frame at startup or mid-descent could fail the globe or
+  cancel the descent.
 - **The fallback notice (Review Focus 2, final fix wave).** A region with a missing or corrupt
   tile shows "terrain detail unavailable here" near the top of the view for 3 s after it
   appears; the job logs a `warn` per tile. A region without the overview (aprons on the globe

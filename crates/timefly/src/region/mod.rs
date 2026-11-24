@@ -43,9 +43,10 @@ use timefly_core::worldgen::frame::RegionFrame;
 use timefly_core::worldgen::generate::{RegionGrid, RegionSpec};
 use timefly_core::worldgen::{APRON_RES, REGION_RES};
 
+pub use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, LoadClock, advance_load_clock};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use frames::{CpuGrid, CpuGridLoader, FrameCache};
-pub use job::{LOAD_CLOCK_MAX_DELTA_S, LOAD_TIMEOUT_S, LoadClock, advance_load_clock};
+pub use job::LOAD_TIMEOUT_S;
 use job::{
     TileIndex, advance_frames, advance_tiles, leave_region, poll_generation, poll_overview,
     poll_tile_manifest, start_region_request,
@@ -216,7 +217,6 @@ impl Plugin for RegionPlugin {
             .init_resource::<TileIndex>()
             .init_resource::<RegionSettings>()
             .init_resource::<LargeGenBudget>()
-            .init_resource::<LoadClock>()
             .add_logged_state::<RegionState>()
             .add_domain_event::<RegionRequested>()
             .add_domain_event::<RegionGenerated>()
@@ -226,7 +226,6 @@ impl Plugin for RegionPlugin {
             .add_systems(
                 Update,
                 (
-                    job::tick_load_clock,
                     leave_region,
                     start_region_request,
                     poll_tile_manifest,
@@ -238,6 +237,7 @@ impl Plugin for RegionPlugin {
                     .chain()
                     .in_set(RegionSystems),
             );
+        crate::clock::add_load_clock(app);
         launch::add_launch_systems(app);
     }
 }

@@ -31,6 +31,9 @@ use super::{
     ActiveRegion, GenMode, LargeGenBudget, REGION_SEED, RegionEntered, RegionGenerated, RegionLeft,
     RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState, gen_budget,
 };
+use crate::clock::LoadClock;
+#[cfg(test)]
+use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, advance_load_clock};
 use crate::data::{GlobeData, describe_load_error};
 
 /// A load that has not finished after this long is abandoned, so a stalled fetch (not a 404,
@@ -39,27 +42,6 @@ use crate::data::{GlobeData, describe_load_error};
 /// [`LoadClock`]: 20 s of running frames, so a paused or throttled page (a hidden tab, a laptop
 /// asleep, a host that stops `requestAnimationFrame`) does not time out its loads.
 pub const LOAD_TIMEOUT_S: f64 = 20.0;
-/// The most one frame adds to the [`LoadClock`] (Bevy's `Time<Virtual>` convention).
-pub const LOAD_CLOCK_MAX_DELTA_S: f64 = 0.25;
-
-/// The [`LoadClock`] after a frame whose real delta was `real_delta_s`: at most
-/// [`LOAD_CLOCK_MAX_DELTA_S`] more, never less.
-pub fn advance_load_clock(elapsed_s: f64, real_delta_s: f64) -> f64 {
-    elapsed_s + real_delta_s.clamp(0.0, LOAD_CLOCK_MAX_DELTA_S)
-}
-
-/// The clock loads time out on: the sum of each frame's real delta clamped to
-/// [`LOAD_CLOCK_MAX_DELTA_S`]. A long stall counts as one short frame; the game never pauses or
-/// scales it.
-#[derive(Resource, Copy, Clone, Debug, Default, PartialEq)]
-pub struct LoadClock {
-    pub elapsed_s: f64,
-}
-
-/// Advances the [`LoadClock`]; first in the region systems.
-pub(super) fn tick_load_clock(real: Res<Time<Real>>, mut clock: ResMut<LoadClock>) {
-    clock.elapsed_s = advance_load_clock(clock.elapsed_s, real.delta_secs_f64());
-}
 /// The slowest transfer a large file is allowed before it times out (bytes per second, about
 /// 4 Mbit/s): the 12.4 MB overview gets about 25 s, the tiles (about 100 kB) the plain
 /// [`LOAD_TIMEOUT_S`].
