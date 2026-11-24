@@ -5,15 +5,17 @@
 //!   heading and an altitude, f64 in the render frame), so the fly crosses the poles with no
 //!   special case. [`GlobeLook`] holds the view drag's offset.
 //! - **Input** ([`GlobeFlightSystems::Step`]), only on the globe: the region's keys
-//!   ([`keys_to_input`]) and drag, mapped by [`globe_input`] and stepped by `globe_fly_step`.
+//!   ([`keys_to_input`]), the drag and the scroll wheel (up descends, down climbs, M1's zoom
+//!   habit), mapped by [`globe_input`] and stepped by `globe_fly_step`.
 //!   A drag turns the fly and tilts the view (dragging down looks further down, as in a
 //!   region); the tilt is an offset added to both the chase look and the eye's elevation, and
 //!   the stored offset is clamped to [`globe_look_offset_range`], so a drag back never has a
 //!   dead zone.
 //! - **Chase** ([`GlobeFlightSystems::Apply`], before the bridge cameras copy the globe camera,
 //!   [`GlobeCameraSync`]): `globe_chase_pose` in kilometres, the look pitch rising with altitude
-//!   (`globe_look_pitch_deg`) and the eye 5° above it, so the fly sits 5° below the view's centre
-//!   at every altitude. The glide is the region's ([`ChaseGlide`]); the held offsets are carried
+//!   (`globe_look_pitch_deg`: 50° at the dive, so the ground fills the lower two-thirds of the
+//!   frame, to 85° at the top, with the eye straight over the fly and the globe centred) and
+//!   the eye 5° above it, so the fly sits 5° below the view's centre at every altitude. The glide is the region's ([`ChaseGlide`]); the held offsets are carried
 //!   by the turn of the local up as the fly travels, so travel is followed rigidly and only
 //!   turns and view changes glide. The eye never leaves `GLOBE_MAX_CAMERA_DISTANCE_KM`.
 //! - **The fly** ([`FlyPose`], scaled by `fly_scale` at the globe camera's field of view) and
@@ -25,7 +27,7 @@
 //!   farthest eye.
 //! - The diagnostics context's camera distance and direction are written every frame.
 
-use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::*;
 use timefly_core::flight::altitudes::GLOBE_MAX_CAMERA_DISTANCE_KM;
@@ -48,6 +50,12 @@ use crate::region::RegionState;
 use crate::region::navigate::{NavPhase, Navigation};
 use crate::ui::PointerOverUi;
 use crate::ui::altitude::{Altitude, FlyAltitude};
+
+/// Seconds of full climb (or descent) one scroll line asks for: at the keys' 0.8 × altitude a
+/// second, a line moves the fly 10 % of its altitude, as a line of M1's zoom moved the camera.
+pub const SCROLL_CLIMB_S_PER_LINE: f64 = 0.125;
+/// Trackpad pixels per scroll line.
+pub const PIXELS_PER_LINE: f32 = 24.0;
 
 /// The time constant (s) of [`ease_flight_toward`]: about 95 % of the way in three of them.
 pub const EASE_TIME_S: f64 = 0.6;
@@ -137,11 +145,18 @@ fn on_the_globe(state: Option<Res<State<RegionState>>>, nav: Option<Res<Navigati
         && nav.is_none_or(|n| n.phase == NavPhase::Globe)
 }
 
-/// One frame's globe input from the held keys and the drag (logical pixels, y down), and the
-/// change to the view's drag offset (degrees). The keys mean what they mean in a region:
-/// forward, strafe, climb, turn (`→` turns right) and boost; a drag right turns right, a drag
-/// down looks further down. A frame longer than `MAX_STEP_S` moves only that far.
-pub fn globe_input(held: KeyInput, look_delta: Vec2, dt_s: f64) -> (GlobeInput, f64) {
+/// One frame's globe input from the held keys, the drag (logical pixels, y down) and the scroll
+/// wheel (lines, positive away from the user), and the change to the view's drag offset
+/// (degrees). The keys mean what they mean in a region: forward, strafe, climb, turn (`→` turns
+/// right) and boost; a drag right turns right, a drag down looks further down; scrolling up
+/// descends and down climbs, [`SCROLL_CLIMB_S_PER_LINE`] of full climb per line (M1's zoom
+/// habit). A frame longer than `MAX_STEP_S` moves only that far.
+pub fn globe_input(
+    held: KeyInput,
+    look_delta: Vec2,
+    scroll_lines: f64,
+    dt_s: f64,
+) -> (GlobeInput, f64) {
     let dt = if dt_s.is_finite() {
         dt_s.clamp(0.0, f64::from(MAX_STEP_S))
     } else {
@@ -153,12 +168,19 @@ pub fn globe_input(held: KeyInput, look_delta: Vec2, dt_s: f64) -> (GlobeInput, 
         .as_dvec3();
     let px = f64::from(LOOK_RADIANS_PER_PX);
     let keys_turn = f64::from(held.turn.clamp(-1.0, 1.0)) * f64::from(TURN_DEG_PER_S).to_radians();
+    // A scroll line is SCROLL_CLIMB_S_PER_LINE of full climb (scrolling up descends), whatever
+    // the frame time; the step multiplies the climb by the speed and this frame's time.
+    let scroll_climb = if dt > 0.0 && scroll_lines.is_finite() {
+        -scroll_lines * SCROLL_CLIMB_S_PER_LINE / dt
+    } else {
+        0.0
+    };
     let input = GlobeInput {
         forward: -m.z,
         strafe: m.x,
         // Positive turns left, as `yaw` does in a region.
         turn_rad: -keys_turn * dt - f64::from(look_delta.x) * px,
-        climb: m.y,
+        climb: m.y + scroll_climb,
         boost: held.boost,
         dt_s: dt,
     };
@@ -205,6 +227,7 @@ fn step_globe_flight(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     motion: Option<Res<AccumulatedMouseMotion>>,
+    scroll: Option<Res<AccumulatedMouseScroll>>,
     over_ui: Option<Res<PointerOverUi>>,
     mut drag: ResMut<GlobeDrag>,
     mut flight: ResMut<GlobeFlightState>,
@@ -212,7 +235,7 @@ fn step_globe_flight(
 ) {
     if let Some(mouse) = &mouse {
         if mouse.just_pressed(MouseButton::Left) {
-            drag.0 = !over_ui.is_some_and(|o| o.0);
+            drag.0 = !over_ui.as_ref().is_some_and(|o| o.0);
         } else if !mouse.pressed(MouseButton::Left) {
             drag.0 = false;
         }
@@ -222,7 +245,15 @@ fn step_globe_flight(
         (Some(m), true) => m.delta,
         _ => Vec2::ZERO,
     };
-    let (input, look_change) = globe_input(held, look_delta, time.delta_secs_f64());
+    let over_ui = over_ui.is_some_and(|o| o.0);
+    let scroll_lines = match &scroll {
+        Some(s) if !over_ui => match s.unit {
+            MouseScrollUnit::Line => f64::from(s.delta.y),
+            MouseScrollUnit::Pixel => f64::from(s.delta.y / PIXELS_PER_LINE),
+        },
+        _ => 0.0,
+    };
+    let (input, look_change) = globe_input(held, look_delta, scroll_lines, time.delta_secs_f64());
     // A neutral step would still re-normalise the heading and change its low bits, and the fly
     // would never count as idle (no hover bob): leave the state alone.
     let neutral =
@@ -466,14 +497,15 @@ mod tests {
             run(&mut app, 180);
             let t = camera(&app, cam);
             let eye = t.translation.as_dvec3();
-            // Outside the fly's altitude, behind it along the heading.
+            // Outside the fly's altitude, behind it along the heading (straight over it at the
+            // top; f32 camera translations, so within a kilometre).
             assert!(
                 eye.length() > EARTH_RADIUS_KM + alt,
                 "{alt}: {} km",
                 eye.length()
             );
             assert!(
-                (eye - f.position_km()).dot(f.heading) < 0.0,
+                (eye - f.position_km()).dot(f.heading) < 1.0,
                 "{alt}: not behind"
             );
             // No roll about the view axis: the camera's right is level in the fly's frame.
@@ -600,6 +632,109 @@ mod tests {
         }
     }
 
+    /// The world-space ray through normalized device coordinates `(x, y)` of the camera.
+    fn ray(t: &Transform, p: &PerspectiveProjection, x: f32, y: f32) -> DVec3 {
+        let view = p
+            .get_clip_from_view()
+            .inverse()
+            .project_point3(Vec3::new(x, y, 1.0));
+        (t.rotation * view.normalize()).as_dvec3()
+    }
+
+    /// Whether a ray from `eye` meets the globe (radius `EARTH_RADIUS_KM`) ahead of it.
+    fn meets_globe(eye: DVec3, dir: DVec3) -> bool {
+        let b = eye.dot(dir);
+        let c = eye.length_squared() - EARTH_RADIUS_KM * EARTH_RADIUS_KM;
+        let disc = b * b - c;
+        disc >= 0.0 && -b - disc.sqrt() > 0.0
+    }
+
+    fn perspective(app: &App, cam: Entity) -> PerspectiveProjection {
+        match app.world().get::<Projection>(cam).unwrap() {
+            Projection::Perspective(p) => p.clone(),
+            _ => panic!("perspective"),
+        }
+    }
+
+    #[test]
+    fn the_ground_fills_the_lower_two_thirds_at_the_dive() {
+        // Framing target (fix round 1): at the dive altitude and at 1,250 km the ray through
+        // the frame's vertical centre line, a third of the way down from its top, meets the
+        // globe, landscape and portrait; so does every ray below it on that line.
+        for aspect in [16.0 / 9.0, 600.0 / 1000.0] {
+            let (mut app, cam) = app(aspect);
+            for alt in [DIVE_ALTITUDE_KM, 1_250.0] {
+                set_flight(&mut app, at(alt));
+                run(&mut app, 180);
+                let t = camera(&app, cam);
+                let p = perspective(&app, cam);
+                let eye = t.translation.as_dvec3();
+                for k in 0..=16 {
+                    let y = 1.0 / 3.0 - (4.0 / 3.0) * k as f32 / 16.0;
+                    assert!(
+                        meets_globe(eye, ray(&t, &p, 0.0, y)),
+                        "aspect {aspect}, {alt} km: the ray at y = {y} misses the globe"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn at_the_top_the_globe_is_centred_under_the_fly() {
+        // Framing target (fix round 1): at the top altitude the globe's centre projects within
+        // about a tenth of the view's height of the view's centre, and the fly is over the
+        // disc. With the fly 5° below the centre the best possible is the eye straight over the
+        // fly: tan 5° / tan 22.5° / 2 = 10.6 % of the height in landscape (6.4 % in portrait).
+        for aspect in [16.0 / 9.0, 600.0 / 1000.0] {
+            let (mut app, cam) = app(aspect);
+            set_flight(&mut app, at(GLOBE_MAX_ALTITUDE_KM));
+            run(&mut app, 180);
+            let t = camera(&app, cam);
+            let p = perspective(&app, cam);
+            let clip_from_world = p.get_clip_from_view() * t.to_matrix().inverse();
+            let c = clip_from_world.project_point3(Vec3::ZERO);
+            let share = f64::from(c.y.abs()) / 2.0;
+            assert!(share <= 0.107, "aspect {aspect}: {share} of the height");
+            assert!(c.x.abs() < 1e-3, "aspect {aspect}: {c}");
+            let eye = t.translation.as_dvec3();
+            let fly = flight(&app).position_km();
+            assert!(
+                meets_globe(eye, (fly - eye).normalize()),
+                "the fly is off the disc"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scroll_wheel_climbs_and_descends_on_the_globe() {
+        let (mut app, _) = app(16.0 / 9.0);
+        app.init_resource::<AccumulatedMouseScroll>();
+        set_flight(&mut app, at(3_000.0));
+        app.update();
+        let scroll = |app: &mut App, unit: MouseScrollUnit, y: f32| {
+            let mut s = app.world_mut().resource_mut::<AccumulatedMouseScroll>();
+            s.unit = unit;
+            s.delta = Vec2::new(0.0, y);
+            app.update();
+            app.world_mut()
+                .resource_mut::<AccumulatedMouseScroll>()
+                .delta = Vec2::ZERO;
+            app.update();
+            flight(app).altitude_km
+        };
+        // Scrolling up (away) descends, as M1's zoom closed in: each line is
+        // SCROLL_CLIMB_S_PER_LINE of full climb at the keys' speed (0.8 × altitude a second).
+        let per_line = SPEED_PER_ALTITUDE * SCROLL_CLIMB_S_PER_LINE;
+        let a = scroll(&mut app, MouseScrollUnit::Line, 2.0);
+        assert!((a - 3_000.0 * (1.0 - 2.0 * per_line)).abs() < 1e-6, "{a}");
+        let b = scroll(&mut app, MouseScrollUnit::Pixel, -2.0 * PIXELS_PER_LINE);
+        assert!((b - a * (1.0 + 2.0 * per_line)).abs() < 1e-3, "{b}");
+        // Not over the UI.
+        app.insert_resource(PointerOverUi(true));
+        assert_eq!(scroll(&mut app, MouseScrollUnit::Line, 3.0), b);
+    }
+
     #[test]
     fn the_fly_stays_in_view_in_portrait() {
         // A 600 × 1000 window: the fly's centre projects inside the view and it spans
@@ -672,7 +807,12 @@ mod tests {
             turn,
             boost,
         };
-        let (i, look) = globe_input(held(Vec3::new(1.0, 1.0, -1.0), 1.0, true), Vec2::ZERO, 0.1);
+        let (i, look) = globe_input(
+            held(Vec3::new(1.0, 1.0, -1.0), 1.0, true),
+            Vec2::ZERO,
+            0.0,
+            0.1,
+        );
         assert_eq!(
             (i.forward, i.strafe, i.climb, i.boost),
             (1.0, 1.0, 1.0, true)
@@ -685,15 +825,24 @@ mod tests {
         );
         assert_eq!((i.dt_s, look), (0.1, 0.0));
         // A drag right turns right; a drag down looks further down.
-        let (i, look) = globe_input(KeyInput::default(), Vec2::new(10.0, 20.0), 0.1);
+        let (i, look) = globe_input(KeyInput::default(), Vec2::new(10.0, 20.0), 0.0, 0.1);
         let px = f64::from(LOOK_RADIANS_PER_PX);
         assert!((i.turn_rad + 10.0 * px).abs() < 1e-9);
         assert!((look - (20.0 * px).to_degrees()).abs() < 1e-9);
         // A hitch moves no further than MAX_STEP_S.
-        let (i, _) = globe_input(KeyInput::default(), Vec2::ZERO, 3.0);
+        let (i, _) = globe_input(KeyInput::default(), Vec2::ZERO, 0.0, 3.0);
         assert_eq!(i.dt_s, f64::from(MAX_STEP_S));
-        let (i, _) = globe_input(KeyInput::default(), Vec2::ZERO, f64::NAN);
+        let (i, _) = globe_input(KeyInput::default(), Vec2::ZERO, 0.0, f64::NAN);
         assert_eq!(i.dt_s, 0.0);
+        // A scroll line up is SCROLL_CLIMB_S_PER_LINE of full descent, whatever the frame time;
+        // with no frame time it does nothing.
+        let (i, _) = globe_input(KeyInput::default(), Vec2::ZERO, 1.0, 0.02);
+        assert!(
+            (i.climb * i.dt_s + SCROLL_CLIMB_S_PER_LINE).abs() < 1e-12,
+            "{i:?}"
+        );
+        let (i, _) = globe_input(KeyInput::default(), Vec2::ZERO, 1.0, 0.0);
+        assert_eq!(i.climb, 0.0);
     }
 
     #[test]
@@ -742,7 +891,10 @@ mod tests {
         assert!((below - CHASE_FLY_BELOW_CENTRE_DEG).abs() < 0.05, "{below}");
         // Climbing re-clamps the stored offset to the new altitude's range.
         let elevation = globe_chase_elevation_deg(3_000.0) + offset;
-        assert!(elevation <= 85.0 + 1e-9, "{elevation}");
+        assert!(
+            elevation <= timefly_core::flight::chase::GLOBE_CHASE_MAX_ELEVATION_DEG + 1e-9,
+            "{elevation}"
+        );
     }
 
     #[test]

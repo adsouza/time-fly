@@ -64,6 +64,7 @@ use crate::region::{
 use crate::terrain::TerrainOptions;
 use crate::time::GlobeTime;
 pub use path::{BenchPath, Coast, SCRIPT_SECS, Segment};
+use timefly_core::flight::altitudes::GLOBE_MAX_ALTITUDE_KM;
 use timefly_core::flight::globe::GlobeFlight;
 
 /// A bench region: a name and the launch argument that enters it. With `pan_from_previous`,
@@ -78,6 +79,9 @@ pub struct BenchRegion {
 
 /// Seconds the globe pan between two bench regions takes (eased at both ends).
 pub const PAN_SECS: f64 = 8.0;
+/// The fly's altitude during the globe pan: the top of globe flight, whose view (the whole disc
+/// under the fly) is the nearest to M1's orbit pan (Task 4 fix round 1).
+pub const PAN_ALTITUDE_KM: f64 = GLOBE_MAX_ALTITUDE_KM;
 
 /// The globe's fly `t_s` seconds into a pan from `from` to `to` (lat, lon in degrees) at
 /// `altitude_km`: along the great circle, eased in and out over [`PAN_SECS`], heading along it.
@@ -365,7 +369,6 @@ enum Stage {
         region: usize,
         since: f64,
         from: (f64, f64),
-        altitude_km: f64,
     },
     /// [`RegionLeft`] was written; waiting for the globe. `cycle` is the cycle that left.
     Leaving {
@@ -772,12 +775,6 @@ fn drive_region_bench(
             match next {
                 Next::Region(region) if bench.config.regions[region].pan_from_previous => {
                     let prev = bench.config.regions[region - 1].arg;
-                    let altitude_km = controls
-                        .flight
-                        .as_ref()
-                        .map_or(crate::region::navigate::NEAR_GLOBE_ALTITUDE_KM, |f| {
-                            f.0.altitude_km
-                        });
                     info!(
                         from = bench.config.regions[region - 1].name,
                         to = bench.config.regions[region].name,
@@ -787,7 +784,6 @@ fn drive_region_bench(
                         region,
                         since: now,
                         from: (prev.lat_deg, prev.lon_deg),
-                        altitude_km,
                     };
                 }
                 Next::Region(region) => start_region(bench, region, now, &mut controls),
@@ -808,7 +804,6 @@ fn drive_region_bench(
             region,
             since,
             from,
-            altitude_km,
         } => {
             bench.runs[region].pan_ms.push(frame_ms);
             let to = (
@@ -817,7 +812,7 @@ fn drive_region_bench(
             );
             let t = now - since;
             if let Some(flight) = controls.flight.as_mut() {
-                let next = pan_globe(from, to, altitude_km, t);
+                let next = pan_globe(from, to, PAN_ALTITUDE_KM, t);
                 if flight.0 != next {
                     flight.0 = next;
                 }
@@ -1590,6 +1585,8 @@ mod tests {
 
     #[test]
     fn the_pan_follows_the_great_circle_eased() {
+        // The bench pans at the top of globe flight, the view nearest M1's orbit pan.
+        assert_eq!(PAN_ALTITUDE_KM, GLOBE_MAX_ALTITUDE_KM);
         let from = (62.0, -175.0);
         let to = (48.5, -113.5);
         let dir = |f: GlobeFlight| f.dir;
