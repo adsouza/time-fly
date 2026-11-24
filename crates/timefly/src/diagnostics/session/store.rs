@@ -110,7 +110,7 @@ pub fn write_crash_report(dir: &Path, report: &str) -> io::Result<PathBuf> {
     )))
 }
 
-fn log_root_env() -> LogRootEnv {
+pub(crate) fn log_root_env() -> LogRootEnv {
     let dirs = directories::BaseDirs::new();
     LogRootEnv {
         override_dir: std::env::var_os("TIMEFLY_LOG_DIR")

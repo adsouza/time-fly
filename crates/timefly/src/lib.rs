@@ -21,6 +21,8 @@ pub mod terrain;
 pub mod time;
 pub mod ui;
 pub mod water;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod window_memory;
 
 use args::LaunchArgs;
 use bench::ScrubBenchPlugin;
@@ -73,10 +75,24 @@ pub fn app(session: &Session) -> App {
     let mut app = App::new();
     // Before `DefaultPlugins`: `LogPlugin` takes its layers from the diagnostics resources.
     app.add_plugins(DiagnosticsPlugin::new(session));
+    // A plain launch reopens the window where the player left it (`window_memory`).
+    #[cfg(not(target_arch = "wasm32"))]
+    let remembered = window_memory::remembers_window(&args)
+        .then(window_memory::window_file)
+        .flatten();
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(unused_mut, reason = "native-only window memory")
+    )]
+    let mut window = primary_window(&args);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(geometry) = remembered.as_deref().and_then(window_memory::load_geometry) {
+        window_memory::apply_geometry(&mut window, &geometry);
+    }
     let plugins = DefaultPlugins
         .set(diagnostics::log_plugin())
         .set(WindowPlugin {
-            primary_window: Some(primary_window(&args)),
+            primary_window: Some(window),
             ..default()
         })
         .set(AssetPlugin {
@@ -103,6 +119,10 @@ pub fn app(session: &Session) -> App {
         FlyCameraPlugin,
         GameUiPlugins,
     ));
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = remembered {
+        app.add_plugins(window_memory::WindowMemoryPlugin { path });
+    }
     let default_fps = if cfg!(target_arch = "wasm32") {
         bench::WEB_TARGET_FPS
     } else {
