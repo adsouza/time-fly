@@ -634,6 +634,15 @@ chmod u+w "$ROOT/target"
 check "read-only target/: stops once free space is back (two dirs emptied, three kept)" test "$(has)" = "scratch-a doc debug "
 check "read-only target/: failures are not called 'space not returned'" bash -c '! grep -qi "not being returned" <<<"$1"' _ "$out"
 
+echo "21. << inside arithmetic is a shift, not a heredoc"
+newroot 21
+xcase deny  20000 "echo \$((1 << 2))${NL}xctrace record --template X"
+xcase deny  20000 "(( n <<= 1 ))${NL}xctrace record --template X"
+xcase deny  20000 "x=\"\$(echo \$((1<<2))${NL}xctrace record --template X)\""
+xcase deny  20000 "echo \"\$(( (1 + 2) << 3 ))\"${NL}xctrace record --template X"
+xcase allow 20000 "echo \$((1 << 2))${NL}cat <<EOF${NL}xctrace record --template X${NL}EOF"
+xcase allow 20000 "x=\"\$(echo \$((1<<2)); cat <<EOF${NL}xctrace record --template X${NL}EOF${NL})\""
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
