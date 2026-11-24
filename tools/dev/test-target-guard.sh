@@ -650,7 +650,7 @@ out="$(lr 95)"
 rm -f "$FAKEBIN/find"
 check "race: nothing deleted" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
 check "race: lock moved back in place" test -d "$ROOT/target/.guard-lock"
-check "race: no renamed copy left" test -z "$(ls -A "$ROOT/target" | grep 'guard-lock\.stale')"
+check "race: no renamed copy left" test -z "$(find "$ROOT/target" -maxdepth 1 -name '.guard-lock.stale.*')"
 check "race: says the lock is held" grep -qi 'lock' <<<"$out"
 
 echo
