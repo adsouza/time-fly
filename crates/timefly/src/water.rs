@@ -12,7 +12,8 @@
 //! - **Fragment:** the sea-floor depth is `−blended_height` at the fragment's surface point.
 //!   Fragments over land (depth ≤ 0) are discarded, so the shoreline is the height field's own
 //!   zero contour, per pixel. Then the depth tint ([`water_tint`]), foam where `0 < depth < 4 m`
-//!   broken up by `noise.wesl`, Bevy PBR lighting, and a Schlick Fresnel blend (f0 = 0.02) toward
+//!   (within [`FOAM_WIDTH_M`] of the edge on gentle coasts, [`foam_band_depth_m`]) broken up by
+//!   `noise.wesl`, Bevy PBR lighting, and a Schlick Fresnel blend (f0 = 0.02) toward
 //!   the sky's colour along the reflected ray.
 //!
 //! Waves (art pass §5.4, `waves.wesl`):
@@ -54,8 +55,18 @@ pub const WATER_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3
 pub const WATER_DEPTH_PULL: f32 = 6.0e-4;
 /// The constant part of the pull (m).
 pub const WATER_PULL_M: f32 = 1.0;
-/// Foam lives where the sea floor is less than this deep (m).
+/// Foam lives where the sea floor is less than this deep (m), on coasts steep enough
+/// ([`foam_band_depth_m`]); on gentler ones the band is kept within [`FOAM_WIDTH_M`].
 pub const FOAM_DEPTH_M: f32 = 4.0;
+/// The widest the shore's foam band gets on the ground (m): on a gentle shelf the
+/// [`FOAM_DEPTH_M`] band would be kilometres wide, a white field that hides the swash's line.
+pub const FOAM_WIDTH_M: f32 = 60.0;
+/// The thinnest water (m) the foam band ever ends at, so a flat floor still has one.
+pub const FOAM_MIN_DEPTH_M: f32 = 0.02;
+/// The swash's foam line is the water thinner than this fraction of the swash amplitude.
+pub const SWASH_LINE_FRACTION: f32 = 0.35;
+/// ... and never thinner than this (m), where the amplitude is tiny.
+pub const SWASH_LINE_MIN_M: f32 = 0.03;
 /// Schlick's reflectance at normal incidence for water.
 pub const WATER_F0: f32 = 0.02;
 /// The water mesh's outer radius (m): past the apron's corner from its centre.
@@ -159,6 +170,32 @@ pub fn swash_reach_factor(depth_m: f32, probe_depth_m: f32, amplitude_m: f32) ->
     t * t * (3.0 - 2.0 * t)
 }
 
+/// The water thickness (m) at which the shore's foam band ends on a floor of slope `floor_slope`:
+/// [`FOAM_DEPTH_M`] on coasts steep enough for that to be within [`FOAM_WIDTH_M`] of the edge
+/// (today's look), less on gentler ones so the band stays about [`FOAM_WIDTH_M`] wide on the
+/// ground, and never below [`FOAM_MIN_DEPTH_M`]. The band starts fading at 7.5 % of it (0.3 m
+/// of 4 m). Mirrored in `water.wesl`'s fragment stage.
+pub fn foam_band_depth_m(floor_slope: f32) -> f32 {
+    (FOAM_WIDTH_M * floor_slope).clamp(FOAM_MIN_DEPTH_M, FOAM_DEPTH_M)
+}
+
+/// The swash foam line's width on the ground (m) on a floor of slope `floor_slope`: the water
+/// thinner than [`SWASH_LINE_FRACTION`] of the amplitude (at least [`SWASH_LINE_MIN_M`]),
+/// spread over the slope. About 9 m on a gentle beach; well under a metre on a steep one, where
+/// [`octave_weight`] fades it out before it can alias. Mirrored in `water.wesl`.
+pub fn swash_line_width_m(floor_slope: f32) -> f32 {
+    (SWASH_LINE_FRACTION * swash_amplitude_m(floor_slope)).max(SWASH_LINE_MIN_M)
+        / floor_slope.max(1e-4)
+}
+
+/// How much of a pattern `scale_m` across survives a pixel footprint of `footprint_m`: all of it
+/// below a quarter of the scale, none from 0.6 of it, so nothing narrower than a couple of
+/// pixels is drawn at strength. Mirrors `octave_weight` in `water.wesl`.
+pub fn octave_weight(footprint_m: f32, scale_m: f32) -> f32 {
+    let t = ((footprint_m / scale_m - 0.25) / (0.6 - 0.25)).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
 /// The water's own colour over a sea floor `depth_m` below the surface, before lighting: the
 /// shallow colour at 0 m, darkening monotonically toward the deep colour. Mirrored by
 /// `water_tint` in `water.wesl` (from the same constants, through [`WaterLook`]).
@@ -185,7 +222,7 @@ pub struct WaterLook {
     /// `x`: [`SWELL_AMPLITUDE_M`]; `y`, `z`: [`SWELL_FADE_AGL_M`]; `w`: [`SWELL_MIN_VERTICES`].
     pub swell: Vec4,
     /// `x`: [`SWASH_PERIOD_S`]; `y`: [`SWASH_PHASE_SCALE_M`]; `z`: [`SWASH_DEPTH_M`]; `w`:
-    /// reserved. The reach and the cap are `waves.wesl` constants (ruling R1).
+    /// [`FOAM_WIDTH_M`]. The reach and the cap are `waves.wesl` constants (ruling R1).
     pub swash: Vec4,
     /// `xy`: the region-local wind direction (`wind_axis`), the way it blows; `zw`: unused.
     pub wind: Vec4,
@@ -219,7 +256,12 @@ pub fn water_look(grid: &RegionGrid) -> WaterLook {
             SWELL_FADE_AGL_M[1],
             SWELL_MIN_VERTICES,
         ),
-        swash: Vec4::new(SWASH_PERIOD_S, SWASH_PHASE_SCALE_M, SWASH_DEPTH_M, 0.0),
+        swash: Vec4::new(
+            SWASH_PERIOD_S,
+            SWASH_PHASE_SCALE_M,
+            SWASH_DEPTH_M,
+            FOAM_WIDTH_M,
+        ),
         wind: wind.extend(0.0).extend(0.0),
         mesh: Vec4::new(WATER_RING_M, WATER_RING_GROWTH, WATER_SEGMENTS as f32, 0.0),
         bands: Vec4::new(
@@ -572,6 +614,74 @@ mod tests {
     }
 
     #[test]
+    fn foam_band_stays_narrow_on_flat_coasts() {
+        // Steep coasts keep the M2 band: FOAM_DEPTH_M thick.
+        for slope in [FOAM_DEPTH_M / FOAM_WIDTH_M, 0.1, 0.5, 2.0] {
+            assert_eq!(foam_band_depth_m(slope), FOAM_DEPTH_M, "slope {slope}");
+        }
+        // Gentler ones: about FOAM_WIDTH_M wide on the ground, not kilometres.
+        for slope in [0.0005f32, 0.001, 0.003, 0.01, 0.03, 0.06] {
+            let width = foam_band_depth_m(slope) / slope;
+            assert!(
+                (width - FOAM_WIDTH_M).abs() < 1e-3 * FOAM_WIDTH_M,
+                "slope {slope}: {width} m"
+            );
+        }
+        // A flat floor still has a band (no zero-width smoothstep in the shader).
+        assert_eq!(foam_band_depth_m(0.0), FOAM_MIN_DEPTH_M);
+        // Monotonic in the slope, so there is no seam where it changes.
+        let mut last = 0.0;
+        for i in 0..=2000 {
+            let d = foam_band_depth_m(i as f32 * 1e-4);
+            assert!(d >= last);
+            last = d;
+        }
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "FOAM_MIN_DEPTH_M"),
+            FOAM_MIN_DEPTH_M
+        );
+        // The shader carries the same widths, and the band ends at its depth.
+        assert!(
+            WATER_WESL
+                .contains("clamp(look.swash.w * floor_slope_m, FOAM_MIN_DEPTH_M, look.deep.w)")
+        );
+    }
+
+    #[test]
+    fn swash_line_fades_before_it_aliases() {
+        // About a third of the reach wide on a gentle beach...
+        let gentle = swash_line_width_m(0.01);
+        assert!(
+            (gentle - SWASH_LINE_FRACTION * SWASH_REACH_M).abs() < 1e-3,
+            "{gentle}"
+        );
+        // ...under 2 m on a steep coast, once the amplitude is capped.
+        assert!(swash_line_width_m(0.1) < 2.0);
+        assert!(swash_line_width_m(0.5) < 0.4);
+        // A flat floor never divides by zero.
+        assert!(swash_line_width_m(0.0).is_finite());
+        // Full strength while the footprint is under a quarter of the width; gone well before
+        // the pixel is as wide as the line, on any slope.
+        for slope in [0.0005f32, 0.005, 0.02, 0.1, 0.5, 1.0] {
+            let width = swash_line_width_m(slope);
+            assert_eq!(octave_weight(0.2 * width, width), 1.0, "slope {slope}");
+            assert_eq!(octave_weight(0.6 * width, width), 0.0, "slope {slope}");
+            assert_eq!(octave_weight(3.0 * width, width), 0.0, "slope {slope}");
+        }
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "SWASH_LINE_FRACTION"),
+            SWASH_LINE_FRACTION
+        );
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "SWASH_LINE_MIN_M"),
+            SWASH_LINE_MIN_M
+        );
+        // The shader fades the line by this weight.
+        assert!(WATER_WESL.contains("octave_weight(footprint, line_width)"));
+        assert!(WATER_WESL.contains("fn octave_weight(footprint_m: f32, scale_m: f32) -> f32 {\n    return 1.0 - smoothstep(0.25, 0.6, footprint_m / scale_m);"));
+    }
+
+    #[test]
     fn waves_wesl_mirrors_the_swash_constants() {
         // Ruling R1: terrain.wesl imports `swash_amplitude_m` with no WaterLook, so the reach
         // and the cap live in waves.wesl and must match these.
@@ -673,7 +783,7 @@ mod tests {
         assert!((look.wind.truncate().truncate() - wind).length() < 1e-6);
         assert_eq!(look.waves, water_waves(wind));
         assert_eq!(look.swell, Vec4::new(0.5, 500.0, 1000.0, 4.0));
-        assert_eq!(look.swash, Vec4::new(8.0, 800.0, 3.0, 0.0));
+        assert_eq!(look.swash, Vec4::new(8.0, 800.0, 3.0, 60.0));
         assert_eq!(look.mesh, Vec4::new(25.0, 0.04, 256.0, 0.0));
         assert_eq!(look.bands, Vec4::new(0.02, 6000.0, 2.0, 10.0));
         // Task 4's calm-from-altitude ramp.

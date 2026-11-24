@@ -47,10 +47,10 @@ shots=(
   "panama-3ma-low           9,-79.5,3000000 400"
   "rockies-21ka-low         48.5,-113.5,21000 1500"
   # Centred on a shoreline (the low scenes above have no coast in frame), 400 m up, looking north
-  # along it. Panama 3 Ma and Beringia 21 ka are points on a north-south coast that the
-  # generated field crosses zero at (Beringia's is about 82 km west of the 62,-175 bench centre,
-  # on a near-flat shore: floor slope 0.0007).
-  "red-sea-coast-0ka-low    19.9,37.2,0 400 4"
+  # along it: points on a north-south coast where the generated field crosses zero. The Red Sea's
+  # is 1.7 km north-east of 19.9,37.2 (floor slope 0.007); Beringia's is about 82 km west of the
+  # 62,-175 bench centre, on a near-flat shore (floor slope 0.0007).
+  "red-sea-coast-0ka-low    19.9105,37.2116,0 400 4"
   "panama-coast-3ma-low     9.0,-79.312,3000000 400 4"
   "beringia-coast-21ka-low  61.815,-176.516,21000 400 4"
 )

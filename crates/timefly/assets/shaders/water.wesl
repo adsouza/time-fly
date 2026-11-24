@@ -154,7 +154,14 @@ fn brush(xz: vec2<f32>, scale_m: f32, z: f32, seed: u32) -> f32 {
     return gradient_noise3(vec3<i32>(i32(c.x), i32(c.y), i32(zc)), vec3<f32>(q - c, z - zc), seed);
 }
 
-// Fades a noise octave out as it shrinks below a couple of pixels.
+// The thinnest water (m) the shore's foam band ends at (FOAM_MIN_DEPTH_M in water.rs).
+const FOAM_MIN_DEPTH_M: f32 = 0.02;
+// The swash's foam line: water thinner than this fraction of the amplitude, and never thinner
+// than SWASH_LINE_MIN_M (SWASH_LINE_FRACTION, SWASH_LINE_MIN_M in water.rs).
+const SWASH_LINE_FRACTION: f32 = 0.35;
+const SWASH_LINE_MIN_M: f32 = 0.03;
+
+// `octave_weight` in water.rs: fades a pattern out as it shrinks below a couple of pixels.
 fn octave_weight(footprint_m: f32, scale_m: f32) -> f32 {
     return 1.0 - smoothstep(0.25, 0.6, footprint_m / scale_m);
 }
@@ -179,19 +186,23 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     // with a phase that drifts along the coast. It applies only where the shore lies within
     // SWASH_PROBE_M along the slope (`swash_reach_factor`), and eases in from SWASH_DEPTH_M to
     // half that, so the water's thickness has no seam there.
+    // The floor's slope is read wherever the swash or the foam band can reach.
+    var floor_slope_m = 0.0;
     var amplitude = 0.0;
     var level = 0.0;
-    if depth < look.swash.z {
+    if depth < max(look.swash.z, look.deep.w) {
         let gradient = floor_gradient(params, xz);
-        let slope = length(gradient);
-        amplitude = swash_amplitude_m(slope);
-        // Toward the shore: downhill from land, uphill from the sea.
-        let toward = gradient / max(slope, 1e-9) * select(-1.0, 1.0, depth > 0.0);
-        let probe = -blended_height(inner_height, apron_height, params, xz + toward * SWASH_PROBE_M);
-        let phase = 2.0 * TAU * brush(xz, look.swash.y, 0.0, 101u);
-        let ease = 1.0 - smoothstep(0.5 * look.swash.z, look.swash.z, depth);
-        level = swash_level_m(slope, t, look.swash.x, phase) * ease
-            * swash_reach_factor(depth, probe, amplitude);
+        floor_slope_m = length(gradient);
+        amplitude = swash_amplitude_m(floor_slope_m);
+        if depth < look.swash.z {
+            // Toward the shore: downhill from land, uphill from the sea.
+            let toward = gradient / max(floor_slope_m, 1e-9) * select(-1.0, 1.0, depth > 0.0);
+            let probe = -blended_height(inner_height, apron_height, params, xz + toward * SWASH_PROBE_M);
+            let phase = 2.0 * TAU * brush(xz, look.swash.y, 0.0, 101u);
+            let ease = 1.0 - smoothstep(0.5 * look.swash.z, look.swash.z, depth);
+            level = swash_level_m(floor_slope_m, t, look.swash.x, phase) * ease
+                * swash_reach_factor(depth, probe, amplitude);
+        }
     }
     // The water's thickness over the floor; land wherever the floor is above the water level.
     let water = depth + level;
@@ -225,14 +236,19 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     let tilt = rel / params.lattice.z + ripple - wave_slope;
     let normal = normalize(vec3<f32>(tilt.x, 1.0, tilt.y));
 
-    // Foam: a band where the water is less than FOAM_DEPTH_M thick, broken up by noise, faded
-    // to nothing where its texture can't be resolved; and a line riding the swash's moving edge,
-    // where the water is thinnest (about a third of the reach wide on a gentle beach).
-    let band = 1.0 - smoothstep(0.3, look.deep.w, water);
+    // Foam: a band where the water is less than FOAM_DEPTH_M thick, kept within FOAM_WIDTH_M of
+    // the edge on gentle coasts (`foam_band_depth_m`), broken up by noise, faded to nothing
+    // where its texture can't be resolved; and a line riding the swash's moving edge, where the
+    // water is thinnest (`swash_line_width_m`: about a third of the reach wide on a gentle
+    // beach), faded before it narrows below a couple of pixels on steep ones.
+    let band_depth = clamp(look.swash.w * floor_slope_m, FOAM_MIN_DEPTH_M, look.deep.w);
+    let band = 1.0 - smoothstep(0.075 * band_depth, band_depth, water);
     let w25 = octave_weight(footprint, 25.0);
     let w6 = octave_weight(footprint, 6.0);
     let n = brush(xz, 25.0, t * 0.15, 89u) * w25 + 0.6 * brush(xz, 6.0, t * 0.3, 97u) * w6;
-    let line = 1.0 - smoothstep(0.0, max(0.35 * amplitude, 0.03), water);
+    let line_thickness = max(SWASH_LINE_FRACTION * amplitude, SWASH_LINE_MIN_M);
+    let line_width = line_thickness / max(floor_slope_m, 1e-4);
+    let line = (1.0 - smoothstep(0.0, line_thickness, water)) * octave_weight(footprint, line_width);
     let foam = max(
         smoothstep(0.45, 0.6, band * (0.8 + n)),
         smoothstep(0.5, 0.75, line * (0.9 + n)),
