@@ -36,33 +36,48 @@ If both limits hold it does nothing. Otherwise it prunes, re-measuring after eac
    one at a time in the order `release`, `<triple>/` dirs, `scratch-*`, any others, `debug`
    last, stopping as soon as free space is back above the minimum. Only if every dir has to go
    does `target/` end up empty (the same as `cargo clean`; the guard no longer runs it).
+   It also stops if a deletion raised free space by less than half the dir's size: the space is
+   not being returned, usually because of APFS local snapshots or a process holding the files
+   open, and deleting more builds would not help. The report says so; check with
+   `tmutil listlocalsnapshots /` and `lsof +L1`.
 
-Steps 3 and 4 are skipped while a `cargo` or `rustc` process is running. If free space is short
+Steps 3 and 4 are skipped while a `cargo` or `rustc` process is running. Steps 1-4 run under a
+lock, the directory `target/.guard-lock`, so overlapping hook runs don't prune at once. A run
+that finds the lock held skips pruning (the hook still warns about low free space). A lock older
+than 10 minutes is a leftover from a killed run and is taken over. If the lock can't be created
+and none exists (a full disk), the guard prunes without it. If free space is short
 of the minimum by more than all of `target/` holds, deleting builds would not fix it: the guard
 deletes nothing for free space (steps 1-3 still run for the budget) and instead lists the likely
 culprits outside `target/` (below).
 
 ### Hooks
 
-`.claude/settings.json` registers two hooks on `Bash`:
+`.claude/settings.json` registers three hooks on `Bash`:
 
-- `PostToolUse`: `target-guard.sh --hook`, after every command. It never blocks.
-  - **Free space:** one `df` call; if free space is at least `TIMEFLY_WARN_FREE_MB` it exits
-    silently. Below it, it tells Claude the free space, the size of `target/`, and the largest
+- `PostToolUse` and `PostToolUseFailure`: `target-guard.sh --hook`, after every command. A
+  command that exits non-zero fires `PostToolUseFailure` instead of `PostToolUse`, so both are
+  needed; the hook answers under whichever event called it. It never blocks.
+  - **Free space:** one `df` call and nothing else; if free space is at least
+    `TIMEFLY_WARN_FREE_MB` it exits silently. Below it, it tells Claude the free space (plus the
+    size of `target/`, but only after cargo commands, to avoid a `du`), and the largest
     regular files (500 MB or more, at most 5) directly in `$TMPDIR`, where xctrace leaves its raw
     `instruments*.ktrace`. It deletes none of them: the owner must approve deleting anything
     outside `target/`.
   - **Pruning** (the steps above) runs only when the command actually runs cargo: as a command
     at the start or after `&&`, `||`, `;`, `|`, `(`, `$(` or a newline, optionally behind
-    `VAR=value` assignments, `env`, `time`, `nice`, `command` or `direnv exec <dir>`, or as a path
-    ending in `/cargo`. Mentions such as `pgrep -fl 'cargo|rustc'`, `grep cargo`,
+    `VAR=value` assignments, `env`, `time`, `nice`, `command`, `nohup`, `exec`, `sudo`,
+    `timeout <duration>` or `direnv exec <dir>`, or as a path ending in `/cargo`. Commands nested
+    in `bash`/`sh`/`zsh -c '…'` and in double-quoted `"$(…)"` count too. Mentions such as `pgrep -fl 'cargo|rustc'`, `grep cargo`,
     `ls ~/.cargo/bin` or `echo "run cargo test"` do not count. It reports to Claude Code only when
     it pruned, limits are still exceeded, or free space is low.
 - `PreToolUse`: `target-guard.sh --pre-hook`, before every command. It denies `xctrace record`
-  (also by path or through `xcrun`) without `--time-limit`, and any `xctrace record` while free
-  space is under `TIMEFLY_XCTRACE_MIN_FREE_MB`; the reason says why and how to proceed. It allows
-  everything else, and allows everything if the input can't be parsed or neither `jq` nor
-  `python3` is available.
+  (also by path, through `xcrun`, behind the same prefixes as above, including `nohup … &` and
+  `timeout 60 …`, whose kill is what leaves the .ktrace behind, and nested in `bash -c '…'` or
+  `"$(…)"`) without `--time-limit`, and any `xctrace record` while free space is under
+  `TIMEFLY_XCTRACE_MIN_FREE_MB`; the reason says why and how to proceed. Mentions (`grep`, `rg`,
+  `echo`, `git log --grep`), `xctrace list` and `xcrun simctl` are allowed. It allows everything
+  else, and allows everything if the input can't be parsed or neither `jq` nor `python3` is
+  available. Known false deny: text in a heredoc body that looks like an `xctrace record` command.
 
 ```sh
 tools/dev/target-guard.sh --status   # sizes and limits, deletes nothing
