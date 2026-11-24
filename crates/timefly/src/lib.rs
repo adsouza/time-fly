@@ -54,6 +54,10 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
         // Wayland app ID / X11 WM_CLASS: matches the Linux desktop file and Flatpak app ID, so
         // the shell shows the packaged icon for the window.
         name: Some(APP_ID.to_string()),
+        // Web: the canvas follows its parent's size, so the game fills the page on any host
+        // page (the dev server's bare one included) instead of sitting at the engine's default
+        // size in the top-left corner. No effect natively.
+        fit_canvas_to_parent: true,
         ..default()
     };
     #[cfg(not(target_arch = "wasm32"))]
@@ -153,4 +157,17 @@ pub fn app(session: &Session) -> App {
         }
     }
     app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_canvas_fills_its_page() {
+        // On the web the canvas follows its parent's size, so any page (the dev server's bare
+        // one or `packaging/web/index.html`) shows the game across the whole window, not at the
+        // engine's default size in the top-left corner. Natively the setting does nothing.
+        assert!(primary_window(&LaunchArgs::default()).fit_canvas_to_parent);
+    }
 }
