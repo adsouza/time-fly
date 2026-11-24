@@ -801,6 +801,52 @@ window with no other tabs, keep it in front for about 10 minutes, and copy the l
 `copy(...)` one-liner under "Chrome WebGPU, real Chrome (gated)" above. Don't use the Claude
 desktop app's browser pane for the gated numbers (R23).
 
+#### `--no-dunes`, art pass, 2026-11-24
+
+`--no-dunes` (web `?no-dunes`) skips all the dune work in the terrain shader
+(`docs/superpowers/plans/2026-11-24-no-dunes.md`). Renders, dunes on and off, are in
+`docs/testing/art-pass/no-dunes/`.
+
+**Native, Sahara erg (23° N, 10° E, 0 ka), M4.** `region_tour`'s `time` mode, 30 s per run,
+2560 × 1440 requested, dev profile (the GPU work is the same as release; a release build would
+have pushed `target/` past target-guard's budget). Four passes, interleaved on/off. GPU utilisation
+saturated at 99 % after the first pass, so frame times are the measure:
+
+| Height | Dunes | Mean frame time, passes 1–4 (ms) | Frames in 30 s |
+|---|---|---|---|
+| 8 km | on | 20.68, 22.19, 21.72, 21.65 | 1,352–1,452 |
+| 8 km | off | 18.03, 18.59, 18.18, 19.52 | 1,538–1,664 |
+| 400 m | on | 16.75, 18.11, 17.69, 16.61 | 1,657–1,807 |
+| 400 m | off | 16.48, 16.64, 16.66, 11.80 | 1,801–2,543 |
+
+- At 8 km the dunes cost **about 2–4 ms a frame** in every pass: 13 % more frames with them off.
+- At 400 m most frames stay on the 60 Hz display either way. The fourth pass ran unpaced
+  (11.8 ms with the dunes off), so it is not compared.
+- The art pass's earlier estimate (≤ 0.25 ms, ruling R8) was taken at 1920 × 951 with the display
+  pacing every frame and the GPU far from busy. At this size the GPU is saturated, which is
+  where the dune cost shows.
+
+**Chrome WebGPU, Pangaea interior alone, dunes off** (session `8165d9b0`, the owner's Incognito
+window, `?region-bench&region=-22,-18,250000000&no-dunes`; its build label reads `ba99e39`, a
+stale label from the shared target dir, but the `.wasm` was checked for the art-pass and
+`--no-dunes` strings before serving):
+
+```text
+dunes: off
+render resolution: 1280x720
+first-region worst frame (R11 gate <= 250 ms, ...): 226.66 ms -> PASS
+flight (60 s path): frames 3600, median 16.60 ms, p95 18.60 ms, worst 21.83 ms, stalls 0 -> PASS
+regions: single (-22, -18 at 250000000 years)
+result: PASS
+```
+
+- **Not comparable with the dunes-on run.** That run (`5434520`, above) rendered at
+  3200 × 1800, 6.25 times these pixels. At 1280 × 720 every frame keeps to the 60 Hz display, so
+  the dunes' cost can't show here. The art-pass branch had no canvas fitting then; main's
+  `fit_canvas_to_parent` (PR #11) makes the canvas follow the window.
+- **Still to do:** a same-window pair, Pangaea alone with and without `&no-dunes`, on a build that
+  fits the canvas to the window.
+
 ## Sizes: packages and Pages (Task 10)
 
 | Item | Bytes |
