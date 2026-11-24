@@ -5,24 +5,27 @@
 #   target-guard.sh --hook     Claude Code PostToolUse hook (JSON on stdin); never blocks.
 #                              Prunes only after cargo runs; warns after any command when
 #                              free space is low.
+#   target-guard.sh --pre-hook Claude Code PreToolUse hook (JSON on stdin): denies
+#                              `xctrace record` without --time-limit or on low free space
 #   target-guard.sh --status   print sizes and limits, delete nothing
 #
 # Env: TIMEFLY_TARGET_BUDGET_MB (default 15360), TIMEFLY_MIN_FREE_MB (default 5120),
-#      TIMEFLY_WARN_FREE_MB (default 10240).
+#      TIMEFLY_WARN_FREE_MB (default 10240), TIMEFLY_XCTRACE_MIN_FREE_MB (default 10240).
 # Test-only: TIMEFLY_FAKE_FREE_MB, TIMEFLY_GUARD_ROOT, TIMEFLY_RUSTUP_BIN.
 
 MODE=manual
 case "${1:-}" in
   --hook) MODE=hook ;;
+  --pre-hook) MODE=prehook ;;
   --status) MODE=status ;;
   "") ;;
-  *) echo "usage: $0 [--hook|--status]" >&2; exit 0 ;;
+  *) echo "usage: $0 [--hook|--pre-hook|--status]" >&2; exit 0 ;;
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${TIMEFLY_GUARD_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 TARGET="$ROOT/target"
-warn() { [ "$MODE" = hook ] || echo "target-guard: $*" >&2; }
+warn() { case "$MODE" in hook|prehook) ;; *) echo "target-guard: $*" >&2 ;; esac; }
 # Numeric env values only; fall back to the default otherwise (never fail).
 num_or() { # num_or <name> <value> <default>
   case "$2" in
@@ -33,6 +36,7 @@ num_or() { # num_or <name> <value> <default>
 BUDGET_MB="$(num_or TIMEFLY_TARGET_BUDGET_MB "${TIMEFLY_TARGET_BUDGET_MB:-}" 15360)"
 MIN_FREE_MB="$(num_or TIMEFLY_MIN_FREE_MB "${TIMEFLY_MIN_FREE_MB:-}" 5120)"
 WARN_FREE_MB="$(num_or TIMEFLY_WARN_FREE_MB "${TIMEFLY_WARN_FREE_MB:-}" 10240)"
+XCTRACE_MIN_FREE_MB="$(num_or TIMEFLY_XCTRACE_MIN_FREE_MB "${TIMEFLY_XCTRACE_MIN_FREE_MB:-}" 10240)"
 STALE_MIN=1440   # 24 h
 CULPRIT_MIN_BYTES=524288000   # 500 MB: files this big directly in $TMPDIR are listed
 
@@ -124,6 +128,32 @@ runs_cargo() {
   command_segments "$1" | awk -F '\t' '$1 == "cargo" || $1 ~ /\/cargo$/ { f = 1 } END { exit !f }'
 }
 
+# xctrace_records <command>: one line per simple command that runs `xctrace record`
+# (directly, by path, or through xcrun): "limit" if it passes --time-limit (before any
+# `--`, after which the arguments belong to the launched program), else "nolimit".
+xctrace_records() {
+  command_segments "$1" | awk -F '\t' '
+    {
+      k = 1
+      if ($1 == "xcrun" || $1 ~ /\/xcrun$/) {
+        k = 2
+        while (k <= NF && $k ~ /^-/) {
+          if ($k ~ /^--?(f|find|show-sdk-path|show-sdk-version|show-sdk-platform-path)$/) next
+          if ($k ~ /^--?(sdk|toolchain)$/) k++
+          k++
+        }
+      }
+      if ($k != "xctrace" && $k !~ /\/xctrace$/) next
+      if ($(k + 1) != "record") next
+      lim = "nolimit"
+      for (j = k + 2; j <= NF; j++) {
+        if ($j == "--") break
+        if ($j == "--time-limit" || $j ~ /^--time-limit=/) lim = "limit"
+      }
+      print lim
+    }'
+}
+
 # --- hook input --------------------------------------------------------------
 # hook_command: the Bash command from the hook JSON on stdin; empty if unparsable.
 hook_command() {
@@ -199,6 +229,45 @@ hook_done() {
   if [ "$MODE" = hook ] && low_free_warning; then emit_post "$WARN_SYS" "$WARN_CTX"; fi
   exit 0
 }
+
+# emit_pre_deny <systemMessage> <reason>: PreToolUse "deny" hook output.
+emit_pre_deny() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg s "$1" --arg r "$2" \
+      '{systemMessage:$s, hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:$r}}'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys
+print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":sys.argv[2]}}))' "$1" "$2"
+  else
+    echo "$2" >&2; exit 2
+  fi
+}
+
+# --- PreToolUse: block runaway xctrace recordings; allow everything else ---------
+if [ "$MODE" = prehook ]; then
+  cmd="$(hook_command)"
+  [ -n "$cmd" ] || exit 0
+  recs="$(xctrace_records "$cmd")"
+  [ -n "$recs" ] || exit 0
+  free="$(free_kb)"
+  case "$free" in ""|*[!0-9]*) free="" ;; esac
+  why=""
+  case "$recs" in *nolimit*) why="it has no --time-limit" ;; esac
+  if [ -n "$free" ] && [ "$free" -lt $((XCTRACE_MIN_FREE_MB * 1024)) ]; then
+    low="only $(mb "$free") MB free, under TIMEFLY_XCTRACE_MIN_FREE_MB ($XCTRACE_MIN_FREE_MB MB)"
+    why="${why:+$why and }$low"
+  fi
+  [ -n "$why" ] || exit 0
+  reason="target-guard blocked this xctrace record: $why."
+  reason+=" xctrace streams its raw trace to \$TMPDIR/instruments*.ktrace (here $(scan_dir)), not to --output, and a stopped or aborted recording leaves it there."
+  reason+=" On 2026-11-24 two aborted recordings left 3.4 + 4.3 GB of .ktrace there, the disk filled (ENOSPC) and Bash could no longer start."
+  reason+=" To proceed:"
+  case "$recs" in *nolimit*) reason+=" add --time-limit (e.g. --time-limit 30s) to every xctrace record;" ;; esac
+  [ -n "${low:-}" ] && reason+=" free space first (check df -h; look for instruments*.ktrace and other large files in $(scan_dir) and delete them only with the owner's approval);"
+  reason+=" for GPU cost prefer sampling ioreg instead (ioreg -c IOAccelerator, PerformanceStatistics \"Device Utilization %\" every 0.25 s; see docs/dev/build-disk.md)."
+  emit_pre_deny "target-guard: blocked xctrace record ($why)." "$reason"
+  exit 0
+fi
 
 # --- hook pre-filter: prune only after cargo runs; warn after any command --------
 if [ "$MODE" = hook ]; then

@@ -334,6 +334,79 @@ best=min((lambda t0: (subprocess.run([sys.argv[1],"--hook"],input=b"{\"tool_inpu
 assert best < 0.5, best' "$GUARD" "$ROOT"
 unset TIMEFLY_TARGET_BUDGET_MB TIMEFLY_MIN_FREE_MB
 
+echo "10. --pre-hook denies runaway xctrace recordings, allows everything else"
+newroot 10
+# decision <hook output>: deny / allow / other, checking the PreToolUse shape.
+decision() { python3 -c '
+import json,sys
+raw=sys.stdin.read()
+if not raw.strip(): print("allow"); sys.exit()
+h=json.loads(raw)["hookSpecificOutput"]
+assert h["hookEventName"]=="PreToolUse" and h["permissionDecisionReason"]
+print(h["permissionDecision"])' <<<"$1" 2>/dev/null || echo other; }
+reason_of() { python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["permissionDecisionReason"])' <<<"$1" 2>/dev/null; }
+pre() { hook_json "$2" | TIMEFLY_FAKE_FREE_MB="$1" TMPDIR="$CUL" guard --pre-hook 2>/dev/null; }
+# xcase <deny|allow> <free MB> <command>
+xcase() {
+  local out rc label
+  out="$(pre "$2" "$3")"; rc=$?
+  label="$(printf '%s' "$3" | tr '\n' '~')"
+  if [ "$1" = deny ]; then
+    check "deny  ($2 MB free): $label" bash -c 'test "$1" -eq 0 && test "$2" = deny' _ "$rc" "$(decision "$out")"
+  else
+    check "allow ($2 MB free): $label" bash -c 'test "$1" -eq 0 && test -z "$2"' _ "$rc" "$out"
+  fi
+}
+xcase deny  20000 "xctrace record --template 'Time Profiler' --launch -- ./game"
+xcase deny  20000 "xcrun xctrace record --template 'Metal System Trace' --attach 123 --output /tmp/x.trace"
+xcase deny  20000 "/usr/bin/xcrun xctrace record --template X --all-processes"
+xcase deny  20000 "xcrun -sdk macosx xctrace record --template X --all-processes"
+xcase deny  20000 "/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace record --template X"
+xcase deny  20000 "cd /tmp && xctrace record --template X --launch -- ls"
+xcase deny  20000 "TMPDIR=/tmp/x nice xctrace record --template X"
+xcase deny  20000 "xctrace record --template X; sleep 1 --time-limit 5s"
+xcase deny  20000 "xctrace record --template X --launch -- ./game --time-limit 5s"
+xcase deny  5000  "xctrace record --time-limit 30s --template X --launch -- ./game"
+xcase allow 20000 "xctrace record --time-limit 30s --template X --launch -- ./game"
+xcase allow 20000 "xcrun xctrace record --template X --time-limit=30s --all-processes"
+xcase allow 20000 "xctrace list devices"
+xcase allow 20000 "xcrun xctrace export --input a.trace --toc"
+xcase allow 20000 "xctrace help record"
+xcase allow 20000 'echo "xctrace record"'
+xcase allow 20000 "grep -n 'xctrace record' notes.md"
+xcase allow 20000 "man xctrace"
+xcase allow 20000 "cargo build"
+xcase allow 5000  "ls -la"
+out=$(hook_json "xctrace record --time-limit 30s --template X" | TIMEFLY_XCTRACE_MIN_FREE_MB=1000 TIMEFLY_FAKE_FREE_MB=5000 guard --pre-hook 2>&1)
+check "TIMEFLY_XCTRACE_MIN_FREE_MB lowers the free-space floor" test -z "$out"
+out=$(hook_json "xctrace record --template X" | TIMEFLY_XCTRACE_MIN_FREE_MB=1000 TIMEFLY_FAKE_FREE_MB=5000 guard --pre-hook 2>&1)
+check "no --time-limit is denied whatever the floor" test "$(decision "$out")" = deny
+r="$(reason_of "$(pre 20000 "xctrace record --template X --all-processes")")"
+check "reason: says --time-limit is missing" grep -q -- '--time-limit' <<<"$r"
+check "reason: says where the raw trace goes" grep -q 'instruments\*\.ktrace' <<<"$r"
+check "reason: names TMPDIR" grep -q "$CUL" <<<"$r"
+check "reason: cites the incident" grep -q '2026-11-24' <<<"$r"
+check "reason: suggests ioreg sampling" grep -q 'ioreg' <<<"$r"
+r="$(reason_of "$(pre 5000 "xctrace record --time-limit 30s --template X")")"
+check "low-free reason: gives free space and floor" bash -c 'grep -q "5000 MB free" <<<"$1" && grep -q "10240 MB" <<<"$1"' _ "$r"
+check "low-free reason: says to free space first" grep -qi 'free space first' <<<"$r"
+check "low-free reason: does not claim --time-limit is missing" bash -c '! grep -qi "no --time-limit" <<<"$1"' _ "$r"
+for bad in 'not json' '' '{"tool_input":{}}' '{"tool_input":{"command":null}}'; do
+  out=$(printf '%s' "$bad" | TIMEFLY_FAKE_FREE_MB=1 guard --pre-hook 2>&1); rc=$?
+  check "fail open on input '$bad'" bash -c 'test "$1" -eq 0 && test -z "$2"' _ "$rc" "$out"
+done
+NOPY="$TMP/nopy"; mkdir -p "$NOPY"
+for t in bash cat dirname awk df du find sort head uname stat tr; do ln -s "$(command -v "$t")" "$NOPY/$t"; done
+out=$(hook_json "xctrace record --template X" | PATH="$NOPY" TIMEFLY_FAKE_FREE_MB=1 TIMEFLY_GUARD_ROOT="$ROOT" "$GUARD" --pre-hook 2>&1); rc=$?
+check "fail open without jq or python3" bash -c 'test "$1" -eq 0 && test -z "$2"' _ "$rc" "$out"
+check ".claude/settings.json wires --pre-hook as a PreToolUse Bash hook" python3 -c '
+import json,sys
+h=json.load(open(sys.argv[1]))["hooks"]
+pre=[x for e in h["PreToolUse"] if e["matcher"]=="Bash" for x in e["hooks"]]
+assert any(x["type"]=="command" and x["command"].endswith("tools/dev/target-guard.sh --pre-hook") for x in pre)
+post=[x for e in h["PostToolUse"] if e["matcher"]=="Bash" for x in e["hooks"]]
+assert any(x["command"].endswith("tools/dev/target-guard.sh --hook") for x in post)' "$SCRIPT_DIR/../../.claude/settings.json"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
