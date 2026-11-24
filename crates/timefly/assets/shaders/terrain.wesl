@@ -20,7 +20,7 @@
 import package::terrain_cdlod::{
     TerrainBuffer, TerrainParams, cdlod_vertex, grid_index_of, terrain_normal,
 };
-import package::noise::gradient_noise3;
+import package::noise::{gradient_noise3, hash3};
 import package::planet::planet_position_m;
 import package::snowline::{snowline_m, snowline_raise_from_byte};
 import bevy_pbr::render::mesh_functions::get_tag;
@@ -48,7 +48,8 @@ struct TerrainLook {
     wind: vec4<f32>,
     // x: main dune spacing (m); y: small dune spacing (m); z: main period (s); w: small period (s).
     dunes: vec4<f32>,
-    // x: the sand-sea mask's noise scale (m); yzw: reserved (rock bands).
+    // x: the sand-sea mask's noise scale (m); y: mean rock band thickness (m); z: the band warp's
+    // amplitude (m); w: the slope from which dry bare ground shows bands (rise over run).
     patterns: vec4<f32>,
 }
 
@@ -198,6 +199,35 @@ fn planet_noise(p: vec3<f32>, scale_m: f32, seed: u32) -> f32 {
     let q = p / scale_m;
     let c = floor(q);
     return gradient_noise3(vec3<i32>(c), q - c, seed);
+}
+
+// Rock strata (spec §5.5). Each layer cuts the warped height into cells of its own thickness and
+// gives every cell a random (value, hue) in -1..1; three layers at 0.4, 1 and 1.7 times
+// look.patterns.y (14, 35 and 60 m) overlap into bands of mixed thickness (10-60 m), so the
+// stack does not read as stripes. A layer fades out as the vertical extent of a pixel
+// (`vertical_m`) approaches its thickness, so the bands never alias.
+fn band_layer(h: f32, thickness_m: f32, seed: u32, vertical_m: f32) -> vec2<f32> {
+    let cell = i32(floor(h / thickness_m));
+    let a = f32(hash3(vec3<i32>(cell, 0, 0), seed) >> 8u) / 8388608.0 - 1.0;
+    let b = f32(hash3(vec3<i32>(cell, 1, 0), seed + 1u) >> 8u) / 8388608.0 - 1.0;
+    return vec2<f32>(a, b) * octave_weight(vertical_m, thickness_m);
+}
+
+// The strata's colour factor at the planet position p and true height: value +-20 % and a
+// warm-cool hue of a few percent, per band. The height is warped by km-scale planet noise of
+// amplitude look.patterns.z, so the layers dip and fold, the same way on every visit.
+fn band_tint(p: vec3<f32>, height: f32, vertical_m: f32) -> vec3<f32> {
+    let warp = look.patterns.z
+        * (0.7 * planet_noise(p, 4000.0, 301u) + 0.3 * planet_noise(p, 1300.0, 303u));
+    let h = height + warp;
+    let t = look.patterns.y;
+    let l0 = band_layer(h, 0.4 * t, 311u, vertical_m);
+    let l1 = band_layer(h, t, 317u, vertical_m);
+    let l2 = band_layer(h, 1.7 * t, 331u, vertical_m);
+    let v = clamp(0.35 * l0.x + 0.45 * l1.x + 0.55 * l2.x, -1.0, 1.0);
+    let w = clamp(0.35 * l0.y + 0.45 * l1.y + 0.55 * l2.y, -1.0, 1.0);
+    return (1.0 + 0.2 * v)
+        * mix(vec3<f32>(1.03, 1.0, 0.96), vec3<f32>(0.97, 1.0, 1.04), 0.5 + 0.5 * w);
 }
 
 // The sand seas (spec §5.3). The mask is planet-position noise at look.patterns.x (40 km) and a
@@ -417,6 +447,21 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     let snow_amount = max(ice * (1.0 - 0.6 * cliff), above * step(0.0, height) * (1.0 - cliff));
     let snow = smoothstep(0.35, 0.65, snow_amount + 0.12 * n60 + 0.06 * n9);
     c = mix(c, SNOW, snow);
+
+    // Rock strata (spec §5.5): on cliffs, and on moderate slopes (from look.patterns.w, 15
+    // degrees) of dry or bare ground, weighted by how exposed the rock is. Not under snow,
+    // canopy or dune sand. Pixels with no weight evaluate no noise.
+    let moderate = smoothstep(0.7, 0.8, surf.exposure)
+        * smoothstep(look.patterns.w - 0.05, look.patterns.w + 0.05, slope);
+    let band_weight = surf.exposure * max(rock, moderate) * (1.0 - canopy) * (1.0 - snow)
+        * (1.0 - dune_sea);
+    if band_weight > 0.0 {
+        let bp = planet_position_m(
+            xz, look.frame_center.xyz, look.frame_north.xyz, look.frame_east.xyz, look.frame_center.w
+        );
+        let tint = band_tint(bp, height, slope * footprint);
+        c = mix(c, surf.rock * tint, band_weight);
+    }
 
     // Brush: value jitter, and a warm-cool hue jitter, a few percent each.
     let k = look.light.z;

@@ -100,6 +100,13 @@ pub const DUNE_SMALL_PERIOD_S: f32 = 600.0;
 /// The sand-sea mask's noise scale (m): sand seas are tens of km across, the rest of the desert
 /// is stony plain.
 pub const SAND_SEA_SCALE_M: f32 = 40_000.0;
+/// The rock strata's mean band thickness (m); the shader mixes bands of 10-60 m around it.
+pub const BAND_SCALE_M: f32 = 35.0;
+/// The amplitude (m) of the km-scale noise that warps the strata, so layers dip and fold.
+pub const BAND_WARP_M: f32 = 40.0;
+/// The slope (rise over run, 15 degrees) from which dry, bare ground shows strata on moderate
+/// slopes (the shader ramps over this +-0.05).
+pub const BAND_MIN_SLOPE: f32 = 0.27;
 
 /// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
@@ -129,7 +136,8 @@ pub struct TerrainLook {
     /// `x`: [`DUNE_SPACING_M`]; `y`: [`DUNE_SMALL_SPACING_M`]; `z`: [`DUNE_PERIOD_S`]; `w`:
     /// [`DUNE_SMALL_PERIOD_S`].
     pub dunes: Vec4,
-    /// `x`: [`SAND_SEA_SCALE_M`]; `yzw`: reserved for the rock bands (zero for now).
+    /// `x`: [`SAND_SEA_SCALE_M`]; `y`: [`BAND_SCALE_M`]; `z`: [`BAND_WARP_M`]; `w`:
+    /// [`BAND_MIN_SLOPE`].
     pub patterns: Vec4,
 }
 
@@ -178,7 +186,7 @@ pub fn terrain_look(
             DUNE_PERIOD_S,
             DUNE_SMALL_PERIOD_S,
         ),
-        patterns: Vec4::new(SAND_SEA_SCALE_M, 0.0, 0.0, 0.0),
+        patterns: Vec4::new(SAND_SEA_SCALE_M, BAND_SCALE_M, BAND_WARP_M, BAND_MIN_SLOPE),
     }
 }
 
@@ -538,6 +546,17 @@ mod tests {
         );
         assert_eq!(look.relief.z, 0.30);
         assert_eq!(look.relief.w, 0.78);
+    }
+
+    #[test]
+    fn band_constants() {
+        assert_eq!(BAND_SCALE_M, 35.0);
+        assert_eq!(BAND_WARP_M, 40.0);
+        assert_eq!(BAND_MIN_SLOPE, 0.27);
+        let look = TerrainLook::default();
+        assert_eq!(look.patterns.y, 35.0);
+        assert_eq!(look.patterns.z, 40.0);
+        assert_eq!(look.patterns.w, 0.27);
     }
 
     #[test]

@@ -765,3 +765,82 @@ fn dry_snowline_on_the_real_bake() {
         assert!(change.abs() <= 0.10, "{change}");
     }
 }
+
+/// The Grand Canyon (36.1 N, -112.1 E at 0 ka): how much relief the ETOPO-sourced inner field
+/// carries near the centre, for the rock-banding art pass (slope thresholds 0.27 = 15 degrees,
+/// where moderate-slope strata begin, and 0.6 = 31 degrees, the cliff rock test). Prints the
+/// height range within 15 km and the share of land texels above each slope; asserts only that the
+/// field generated.
+#[test]
+#[ignore = "reads the real bake; run in release"]
+fn grand_canyon_relief() {
+    let globe = data().join("globe");
+    let b = bake(&globe);
+    let age = 0.0;
+    let mut grids: Vec<Option<Grid>> = vec![None; b.files.len()];
+    for i in frames_needed(&b.timeline, age) {
+        grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
+    }
+    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
+    let centre = geo_to_render(latlon_to_geo(36.1, -112.1));
+    let frame = RegionFrame { center: centre };
+    let mut tiles = TileSet::new();
+    tiles.set_overview(overview).unwrap();
+    let probe = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+        grids[i].as_ref().unwrap()
+    })
+    .unwrap();
+    for (r, c) in probe.tiles_needed(&frame) {
+        let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
+        tiles
+            .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
+            .unwrap();
+    }
+    let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+        grids[i].as_ref().unwrap()
+    })
+    .unwrap();
+    let spec = RegionSpec {
+        seed: 0x7F1E_0002,
+        ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
+    };
+    let grid = RegionGenerator::new(spec, &field).finish();
+    let f = &grid.inner;
+    let n = f.res as usize;
+    let h = |r: usize, c: usize| f.elevation_m[r * n + c];
+    let step = f.spacing_m() as f32;
+    for radius in [15_000.0_f64, 150_000.0] {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let (mut land, mut over_015, mut over_06) = (0usize, 0usize, 0usize);
+        for r in 1..n - 1 {
+            for c in 1..n - 1 {
+                let (x, z) = f.local_of(r as u32, c as u32);
+                if x.hypot(z) > radius {
+                    continue;
+                }
+                lo = lo.min(h(r, c));
+                hi = hi.max(h(r, c));
+                if h(r, c) <= 0.0 {
+                    continue;
+                }
+                let gx = (h(r, c + 1) - h(r, c - 1)) / (2.0 * step);
+                let gz = (h(r + 1, c) - h(r - 1, c)) / (2.0 * step);
+                let slope = gx.hypot(gz);
+                land += 1;
+                over_015 += usize::from(slope > 0.27);
+                over_06 += usize::from(slope > 0.6);
+            }
+        }
+        let pct = |k: usize| 100.0 * k as f64 / land.max(1) as f64;
+        println!(
+            "grand canyon within {:.0} km (inner texel {:.0} m): height {lo:.0} .. {hi:.0} m \
+             (range {:.0} m); land texels {land}; slope > 0.27: {:.2} %; slope > 0.6: {:.2} %",
+            radius / 1000.0,
+            step,
+            hi - lo,
+            pct(over_015),
+            pct(over_06)
+        );
+    }
+    assert!(!f.elevation_m.is_empty());
+}
