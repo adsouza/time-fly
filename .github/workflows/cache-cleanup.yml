@@ -1,0 +1,37 @@
+# Deletes a pull request's Actions caches when it closes (merged or not), so they stop counting
+# against the repository's 10 GB cache quota. Once the PR is closed, nothing can restore them:
+# caches saved on refs/pull/N/merge are visible only to that PR, and the head branch is deleted
+# on merge (delete_branch_on_merge).
+#
+# pull_request_target, so PRs from forks also get a token that can delete caches. Safe here
+# because nothing from the PR is checked out or run; the head branch name is passed through an
+# environment variable, never interpolated into the script.
+name: cache-cleanup
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  delete-caches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+      HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+    steps:
+      - name: Delete the pull request's caches
+        run: gh cache delete --all --ref "$PR_REF" --succeed-on-no-caches
+
+      # Only when the head branch lives in this repository: a fork's branch name can match one
+      # of ours (a fork PR from its `main` must not delete main's caches).
+      - name: Delete the head branch's caches
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.head.ref != github.event.repository.default_branch
+        run: gh cache delete --all --ref "refs/heads/$HEAD_BRANCH" --succeed-on-no-caches

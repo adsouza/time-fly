@@ -3,7 +3,8 @@
 #
 # Jobs: `test` (ci-test profile gates) runs in parallel with `build` (optimized binary: `dist`
 # on tags, `release` otherwise; data; .deb);
-# `flatpak` needs both. Caches: Rust targets per job (rust-cache, saved on failure too), uv
+# `flatpak` needs both. Caches: Rust targets per job (rust-cache, saved on failure too, never
+# on tags: a tag's cache is visible only to that tag's runs), uv
 # downloads, the raw data (keyed on data/sources.json), the baked globe and the baked region
 # tiles (each keyed on its inputs; when both hit, nothing is fetched or baked).
 name: linux-package
@@ -47,6 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       # setup-uv publishes no major-version tag, so it is pinned to a release.
       - uses: astral-sh/setup-uv@v10.3.3
@@ -115,6 +117,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
       - name: Version
         id: meta
