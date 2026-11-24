@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use bevy::window::{PresentMode, WindowResolution};
 
 pub mod args;
+pub mod art;
 pub mod bench;
 pub mod build_features;
 pub mod camera;

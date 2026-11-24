@@ -7,11 +7,14 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|fly]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|fly] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
 //! skips the wireframe shot. Exits with an error if the region never appears. Set a fresh
 //! `TIMEFLY_LOG_DIR` per run.
+//!
+//! A sixth argument `AGL_M` places the camera that many metres above `max(ground, 0)` at the
+//! region's centre instead of [`CAMERA_START_ALTITUDE_M`], for the low-altitude shots.
 //!
 //! `tools/dev/region-shots.sh` runs it over the Task 8 set (the bench regions and one region
 //! per vegetation era).
@@ -32,7 +35,7 @@ use timefly::args::{LaunchArgs, parse_region, parse_window_size};
 use timefly::diagnostics;
 use timefly::fly_camera::FlyState;
 use timefly::region::navigate::{NavPhase, Navigation};
-use timefly::region::{ActiveRegion, RegionEntered, RegionState};
+use timefly::region::{ActiveRegion, CAMERA_START_ALTITUDE_M, RegionEntered, RegionState};
 use timefly::terrain::view::RegionCamera;
 use timefly::terrain::{TerrainScene, WIREFRAME_KEY};
 use timefly::time::{GlobeTime, OLDER_KEY};
@@ -84,6 +87,8 @@ struct Tour {
     size: (u32, u32),
     target: Option<Handle<Image>>,
     mode: Mode,
+    /// Camera height above `max(ground, 0)` at the centre.
+    agl_m: f32,
     step: Step,
     /// The snapshot change has started (`Older`).
     changing: bool,
@@ -161,14 +166,14 @@ fn tour(
     mut keys: ResMut<ButtonInput<KeyCode>>,
     flight: (
         Res<Navigation>,
-        Res<FlyState>,
+        ResMut<FlyState>,
         Option<Res<ActiveRegion>>,
         Res<GlobeTime>,
     ),
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let (nav, fly, region, time) = flight;
+    let (nav, mut fly, region, time) = flight;
     let now = real.elapsed_secs();
     tour.frames += 1;
     if *state.get() == RegionState::Generating {
@@ -188,6 +193,12 @@ fn tour(
             }
         }
         Step::Settle => {
+            // Hold the requested height above the centre until the shot (the region's start
+            // pose may be applied a frame or two after `RegionEntered`).
+            if let Some(r) = region.as_deref() {
+                let ground = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
+                fly.pos_m = Vec3::new(0.0, ground as f32 + tour.agl_m, 0.0);
+            }
             if now - tour.since >= SETTLE_SECS {
                 shoot(&mut commands, &tour, "shaded");
                 tour.step = Step::Shaded;
@@ -282,7 +293,9 @@ fn tour(
 fn main() -> AppExit {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(out) = args.first().map(PathBuf::from) else {
-        eprintln!("usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly]");
+        eprintln!(
+            "usage: region_tour <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] [shaded|fly] [AGL_M]"
+        );
         return AppExit::error();
     };
     let size = args
@@ -298,6 +311,16 @@ fn main() -> AppExit {
         Some("shaded") => Mode::Shaded,
         Some("fly") => Mode::Fly,
         _ => Mode::Wire,
+    };
+    let agl_m = match args.get(5) {
+        None => CAMERA_START_ALTITUDE_M,
+        Some(s) => match s.parse::<f32>() {
+            Ok(v) if v.is_finite() && v > 0.0 => v,
+            _ => {
+                eprintln!("bad AGL_M {s:?}: want a positive number of metres");
+                return AppExit::error();
+            }
+        },
     };
     if let Err(e) = std::fs::create_dir_all(&out) {
         eprintln!("cannot create {}: {e}", out.display());
@@ -315,6 +338,7 @@ fn main() -> AppExit {
         size,
         target: None,
         mode,
+        agl_m,
         step: Step::WaitRegion,
         changing: false,
         since: 0.0,
