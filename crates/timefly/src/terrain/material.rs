@@ -75,13 +75,14 @@ pub const BRUSH_STRENGTH: f32 = 0.08;
 /// only; the geometry and the slope rules (rock, snow) use the true slope.
 pub const RELIEF_EXAGGERATION: f32 = 1.8;
 
-/// The ramp's shade level for snow (others keep 0.16): lifted so a snowfield in shadow is about
-/// half as bright as in sun (measured 0.50 on the Rockies shot). The half-light (0.58) and full
-/// light (1.0) bands do not move, so sunlit snow is unchanged and relief stays readable.
-pub const SNOW_SHADE_FLOOR: f32 = 0.22;
-/// How much of the cool shadow hue shaded snow takes (1 = as strongly as everything else, so the
-/// shade is clearly pale blue; the lifted floor is what keeps it from reading navy).
-pub const SNOW_HUE_FACTOR: f32 = 1.0;
+/// The ramp's shade level for snow (others keep 0.16): lifted so snow in shadow is paler than
+/// before (darkest 5 % over brightest 20 % of a snowfield: 0.57, against 0.45 with the plain
+/// floor). The half-light (0.58) and full-light (1.0) bands do not move, so sunlit snow is
+/// unchanged and relief stays readable.
+pub const SNOW_SHADE_FLOOR: f32 = 0.30;
+/// How much of the cool shadow hue shaded snow takes (1 = as strongly as everything else): most of
+/// it, so the shade stays clearly blue, though paler than other shade.
+pub const SNOW_HUE_FACTOR: f32 = 0.78;
 
 /// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
@@ -499,8 +500,8 @@ mod tests {
                 center: RenderDir(DVec3::Z),
             },
         );
-        assert_eq!(look.relief.z, 0.22);
-        assert_eq!(look.relief.w, 1.0);
+        assert_eq!(look.relief.z, 0.30);
+        assert_eq!(look.relief.w, 0.78);
     }
 
     const CDLOD_WESL: &str = include_str!("../../assets/shaders/terrain_cdlod.wesl");
