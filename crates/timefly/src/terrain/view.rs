@@ -15,9 +15,10 @@
 use bevy::camera::Exposure;
 use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::CascadeShadowConfigBuilder;
 use bevy::light::cluster::ClusterConfig;
+use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::prelude::*;
+use timefly_core::flight::altitudes::REGION_CLOUD_BASE_M;
 use timefly_core::terrain::blended_height_m;
 use timefly_core::worldgen::generate::RegionGrid;
 
@@ -33,14 +34,129 @@ pub const DEBUG_PITCH_DEG: f32 = 20.0;
 pub const REGION_FOV_DEG: f32 = 60.0;
 /// Near plane (m). Depth is reversed-Z with an infinite far plane, so 1 m costs little.
 pub const REGION_NEAR_M: f32 = 1.0;
-/// Far plane (m), used for culling only: beyond the apron's corner seen from its centre.
+/// Far plane (m) up to [`M2_CEILING_M`], used for culling only: beyond the apron's corner seen
+/// from its centre. Higher up, [`view_ranges`] pushes it out.
 pub const REGION_FAR_M: f32 = 2_000_000.0;
-/// Shadow cascades cover the nearest 60 km (the camera's ceiling).
+/// Shadow cascades cover the nearest 60 km (M2's ceiling) up to [`M2_CEILING_M`]; higher up,
+/// [`view_ranges`] stretches them.
 pub const SHADOW_DISTANCE_M: f32 = 60_000.0;
 /// The first cascade's far bound.
 pub const FIRST_CASCADE_M: f32 = 2_500.0;
 /// Shadow cascades.
 pub const SHADOW_CASCADES: usize = 4;
+/// M2's ceiling: at or below this fly height [`view_ranges`] gives M2's render ranges exactly.
+pub const M2_CEILING_M: f32 = 60_000.0;
+/// M2's fog end (m): from the camera, where the clearest M2 fog (`fog_visibility_m`'s 460 km)
+/// reaches [`FOG_COMPLETE`]. M2's fog is exponential-squared from the eye, so its start is 0.
+pub const FOG_END_M: f32 = 665_000.0;
+/// The fog fraction that counts as fully fogged: the terrain's own colour keeps under half an
+/// 8-bit step.
+pub const FOG_COMPLETE: f32 = 0.998;
+/// The fog's start at the cloud base (`REGION_CLOUD_BASE_M`) *(call)*: just past the ground under
+/// the fly (378 km from the chase camera), so the region below reads clearly from up there.
+pub const FOG_START_AT_BASE_M: f32 = 380_000.0;
+/// The fog's end at the cloud base *(call)*: inside the nearest the apron's edge comes into view
+/// (about 1,160 km; `the_apron_edge_is_never_visible`).
+pub const FOG_END_AT_BASE_M: f32 = 1_100_000.0;
+/// The far plane grows by this many metres per metre the fly climbs above [`M2_CEILING_M`]
+/// *(call)*, so it holds the apron's far corner from every chase camera.
+pub const FAR_PER_M: f32 = 1.0;
+/// Above [`M2_CEILING_M`] the shadow cascades stretch out to the fog's end over this much
+/// climb *(call)*, so their edge sinks into full fog instead of cutting across the view.
+pub const SHADOW_STRETCH_M: f32 = 60_000.0;
+
+/// The region view's distances for one fly height ([`view_ranges`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ViewRanges {
+    /// The camera's far plane (m), for culling.
+    pub far_m: f32,
+    /// The shadow cascades' maximum distance (m).
+    pub shadow_m: f32,
+    /// The distance (m) at which the fog starts: nearer ground is unfogged.
+    pub fog_start_m: f32,
+    /// The distance (m) at which every era's fog is complete ([`FOG_COMPLETE`]).
+    pub fog_end_m: f32,
+}
+
+impl ViewRanges {
+    /// The factor on the distance past [`ViewRanges::fog_start_m`] that the fog reads, so the
+    /// era's M2 fog completes at [`ViewRanges::fog_end_m`]: 1 at M2's heights.
+    pub fn fog_scale(&self) -> f32 {
+        FOG_END_M / (self.fog_end_m - self.fog_start_m).max(1.0)
+    }
+
+    /// The first shadow cascade's far bound: [`FIRST_CASCADE_M`], scaled with the shadow
+    /// distance so the cascades keep M2's proportions.
+    pub fn first_cascade_m(&self) -> f32 {
+        FIRST_CASCADE_M * (self.shadow_m / SHADOW_DISTANCE_M)
+    }
+}
+
+/// The region view's ranges for a fly `height_m` above sea level. Pure; M2's values exactly
+/// at or below [`M2_CEILING_M`]. Higher up:
+///
+/// - **Fog.** Its start and end move linearly with the height, from M2's (0 and [`FOG_END_M`])
+///   at [`M2_CEILING_M`] to [`FOG_START_AT_BASE_M`] and [`FOG_END_AT_BASE_M`] at the cloud base:
+///   the near ground clears (seen from high up, it lies under thin air), and the fog still
+///   completes before the apron's edge comes into view.
+/// - **Shadows** stretch from [`SHADOW_DISTANCE_M`] to the fog's end over [`SHADOW_STRETCH_M`].
+/// - **Far plane:** [`REGION_FAR_M`] plus [`FAR_PER_M`] of the climb.
+pub fn view_ranges(height_m: f32) -> ViewRanges {
+    let above = (height_m - M2_CEILING_M).max(0.0);
+    let base = REGION_CLOUD_BASE_M as f32 - M2_CEILING_M;
+    let up = above / base;
+    let fog_start_m = FOG_START_AT_BASE_M * up;
+    let fog_end_m = FOG_END_M + (FOG_END_AT_BASE_M - FOG_END_M) * up;
+    let t = (above / SHADOW_STRETCH_M).clamp(0.0, 1.0);
+    let stretch = t * t * (3.0 - 2.0 * t);
+    ViewRanges {
+        far_m: REGION_FAR_M + above * FAR_PER_M,
+        shadow_m: SHADOW_DISTANCE_M + (fog_end_m - SHADOW_DISTANCE_M) * stretch,
+        fog_start_m,
+        fog_end_m,
+    }
+}
+
+/// The ranges for the fly's current height (M2's without a fly).
+pub fn fly_view_ranges(fly: Option<&crate::fly_camera::FlyState>) -> ViewRanges {
+    view_ranges(fly.map_or(0.0, |f| f.pos_m.y))
+}
+
+/// The sun's cascades for `ranges`: [`SHADOW_CASCADES`] from
+/// [`ViewRanges::first_cascade_m`] out to [`ViewRanges::shadow_m`].
+pub fn region_cascades(ranges: &ViewRanges) -> CascadeShadowConfig {
+    CascadeShadowConfigBuilder {
+        num_cascades: SHADOW_CASCADES,
+        first_cascade_far_bound: ranges.first_cascade_m(),
+        maximum_distance: ranges.shadow_m,
+        ..default()
+    }
+    .build()
+}
+
+/// Sets the region camera's far plane and the region sun's cascades from the fly's height
+/// ([`view_ranges`]), touching each only when it changes. The fog's start and scale ride in
+/// the terrain's buffer (`update_patches`).
+pub(super) fn apply_view_ranges(
+    fly: Option<Res<crate::fly_camera::FlyState>>,
+    mut cameras: Query<&mut Projection, With<RegionCamera>>,
+    mut suns: Query<&mut CascadeShadowConfig, With<TerrainSun>>,
+) {
+    let ranges = fly_view_ranges(fly.as_deref());
+    for mut projection in &mut cameras {
+        let stale = matches!(&*projection, Projection::Perspective(p) if p.far != ranges.far_m);
+        if stale && let Projection::Perspective(p) = &mut *projection {
+            p.far = ranges.far_m;
+        }
+    }
+    let cascades = region_cascades(&ranges);
+    for mut config in &mut suns {
+        if config.bounds != cascades.bounds {
+            *config = cascades.clone();
+        }
+    }
+}
+
 /// Direction toward the region's sun: west-south-west, about 26° up, so relief reads across a
 /// north-facing view *(call)*.
 pub const REGION_SUN_DIRECTION: Vec3 = Vec3::new(-0.72, 0.42, 0.52);
@@ -142,13 +258,7 @@ pub(super) fn region_sun() -> DirectionalLight {
 pub(super) fn region_sun_parts() -> impl Bundle {
     (
         region_sun(),
-        CascadeShadowConfigBuilder {
-            num_cascades: SHADOW_CASCADES,
-            first_cascade_far_bound: FIRST_CASCADE_M,
-            maximum_distance: SHADOW_DISTANCE_M,
-            ..default()
-        }
-        .build(),
+        region_cascades(&view_ranges(0.0)),
         Transform::from_translation(REGION_SUN_DIRECTION.normalize())
             .looking_at(Vec3::ZERO, Vec3::Y),
     )

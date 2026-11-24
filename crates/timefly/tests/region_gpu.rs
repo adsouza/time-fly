@@ -182,15 +182,17 @@ const CDLOD: &str = include_str!("../assets/shaders/terrain_cdlod.wesl");
 const XZ_TOLERANCE_M: f32 = 1e-3;
 /// The height: the Rust reference takes a few f64 steps that f32 can only follow to rounding.
 const HEIGHT_TOLERANCE_M: f32 = 0.5;
-/// Vertices checked, over [`MORPH_CAMERAS`] cameras.
-const MORPH_VERTICES: usize = 512;
+/// Vertices checked, over [`MORPH_CAMERAS`] cameras (a multiple of their count).
+const MORPH_VERTICES: usize = 520;
 
-/// Cameras: low over the centre, over the blend edge, high and far out, and at the ceiling.
-const MORPH_CAMERAS: [[f32; 3]; 4] = [
+/// Cameras: low over the centre, over the blend edge, high and far out, at M2's 60 km ceiling,
+/// and the chase camera over a fly at the cloud base (M3: about 350 km up).
+const MORPH_CAMERAS: [[f32; 3]; 5] = [
     [1_234.5, 150.0, -2_345.25],
     [-131_000.0, 2_000.0, 140_500.0],
     [149_000.0, 8_000.0, -98_765.0],
     [-60_000.0, 60_000.0, 20_000.0],
+    [90_000.0, 351_300.0, 140_900.0],
 ];
 
 const MORPH_ENTRY: &str = r#"

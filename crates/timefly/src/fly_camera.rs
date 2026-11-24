@@ -16,8 +16,9 @@
 //!   (sea level is `y = 0`). A step is split into horizontal substeps of at most
 //!   [`MAX_SUBSTEP_M`] and the floor is applied after each, so a long boosted step follows the
 //!   terrain instead of tunnelling through a ridge.
-//! - **A soft ceiling** at [`CAMERA_CEILING_M`]: climbing slows over the last
-//!   [`CEILING_EASE_M`] and stops at the ceiling.
+//! - **A soft ceiling** at [`CAMERA_CEILING_M`], the region's cloud base: climbing slows over
+//!   the last [`CEILING_EASE_M`] (to no less than [`CEILING_MIN_EASE`] of its speed) and stops
+//!   at the ceiling.
 //! - **A soft edge:** past the inner field (`REGION_SIZE_M / 2` from the centre on either axis)
 //!   the camera gains an inward velocity proportional to how far out it is, a stand-in for the
 //!   parent spec's exit rule.
@@ -46,7 +47,8 @@ use timefly_core::worldgen::REGION_SIZE_M;
 use timefly_core::worldgen::generate::RegionGrid;
 
 use timefly_core::flight::altitudes::{
-    CHASE_DISTANCE_PER_AGL, CHASE_ELEVATION_DEG, CHASE_MIN_DISTANCE_M,
+    CHASE_DISTANCE_PER_AGL, CHASE_ELEVATION_DEG, CHASE_MIN_DISTANCE_M, REGION_CLOUD_BAND_M,
+    REGION_CLOUD_BASE_M,
 };
 pub use timefly_core::flight::chase::CHASE_START_LOOK_DEG;
 use timefly_core::flight::chase::{ChasePose, chase_pose, fly_scale, lift_above_ground};
@@ -61,10 +63,14 @@ use crate::ui::altitude::{Altitude, FlyAltitude};
 
 /// The least height above `max(terrain, 0)` the camera ends any step at (design §6.6).
 pub const CAMERA_CLEARANCE_M: f32 = 150.0;
-/// The camera's ceiling above sea level (design §6.6).
-pub const CAMERA_CEILING_M: f32 = 60_000.0;
-/// Climbing slows over this last stretch below the ceiling.
-pub const CEILING_EASE_M: f32 = 6_000.0;
+/// The fly's ceiling above sea level: the region's cloud base (M3 design §7.3; M2's was 60 km).
+pub const CAMERA_CEILING_M: f32 = REGION_CLOUD_BASE_M as f32;
+/// Climbing slows over this last stretch below the ceiling: the cloud base's band.
+pub const CEILING_EASE_M: f32 = REGION_CLOUD_BAND_M as f32;
+/// The slowest the climb gets under the ceiling, as a fraction of the climb speed *(call)*: the
+/// ease never stalls short of the base, so the climb out (`REGION_CLOUD_BASE_M − 1 km`, ruling
+/// P3) is always reached, and the fly stops at the base itself.
+pub const CEILING_MIN_EASE: f32 = 0.1;
 /// The starting pitch: looking north and down this much (M2 design §6.1).
 pub const START_PITCH_DEG: f32 = 20.0;
 /// Speed per metre of height above ground, per second *(call)*: at the 8 km start the camera
@@ -106,9 +112,9 @@ pub const CHASE_LOOK_MIN_DEG: f64 =
 pub const CHASE_LOOK_MAX_DEG: f64 =
     CHASE_ELEVATION_DEG + (REGION_FOV_DEG as f64 / 2.0 - CHASE_LOOK_MARGIN_DEG);
 
-/// The view pitch (degrees) whose chase look is `look_deg`: the inverse of
-/// [`chase_look_pitch_deg`].
-const fn pitch_for_look_deg(look_deg: f64) -> f32 {
+/// The view pitch (degrees) whose chase look is `look_deg` (degrees below the horizontal): the
+/// inverse of [`chase_look_pitch_deg`].
+pub const fn pitch_for_look_deg(look_deg: f64) -> f32 {
     (-(START_PITCH_DEG as f64) + CHASE_START_LOOK_DEG - look_deg) as f32
 }
 
@@ -275,7 +281,7 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
     let boost = if input.boost { BOOST } else { 1.0 };
     let mut velocity = wish * fly_speed(p.y - surface(p.x, p.z)) * boost;
     if velocity.y > 0.0 {
-        velocity.y *= ((CAMERA_CEILING_M - p.y) / CEILING_EASE_M).clamp(0.0, 1.0);
+        velocity.y *= ((CAMERA_CEILING_M - p.y) / CEILING_EASE_M).clamp(CEILING_MIN_EASE, 1.0);
     }
     velocity.x += edge_nudge(p.x);
     velocity.z += edge_nudge(p.z);
@@ -947,6 +953,32 @@ mod tests {
                 .y,
             CAMERA_CEILING_M
         );
+    }
+
+    /// Ruling P3: the climb out triggers at `REGION_CLOUD_BASE_M − 1 km`, so the eased ceiling
+    /// must reach that height (and hold at the base), not creep toward it forever.
+    #[test]
+    fn the_eased_ceiling_reaches_the_climb_trigger() {
+        use timefly_core::flight::altitudes::{REGION_CLOUD_BAND_M, REGION_CLOUD_BASE_M};
+        assert_eq!(CAMERA_CEILING_M, REGION_CLOUD_BASE_M as f32);
+        assert_eq!(CEILING_EASE_M, REGION_CLOUD_BAND_M as f32);
+        let trigger = (REGION_CLOUD_BASE_M - 1_000.0) as f32;
+        let mut s = FlyState {
+            pos_m: Vec3::new(0.0, CAMERA_CEILING_M - CEILING_EASE_M, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        // Holding climb, unboosted, at 60 fps: the trigger within 30 s.
+        let mut reached = None;
+        for frame in 0..60 * 30 {
+            s = fly_step(s, input(Vec3::Y, false, 1.0 / 60.0), flat(0.0));
+            assert!(s.pos_m.y <= CAMERA_CEILING_M, "{}", s.pos_m);
+            if s.pos_m.y >= trigger && reached.is_none() {
+                reached = Some(frame);
+            }
+        }
+        assert!(reached.is_some(), "stuck at {} m", s.pos_m.y);
+        assert_eq!(s.pos_m.y, CAMERA_CEILING_M, "held at the base");
     }
 
     #[test]

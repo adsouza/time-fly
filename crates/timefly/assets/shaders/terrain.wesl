@@ -20,7 +20,8 @@
 //   shadowed light toward the sky's cool, era-tinted zenith (TerrainLook, binding 106).
 
 import package::terrain_cdlod::{
-    TerrainBuffer, TerrainParams, blended_height, cdlod_vertex, grid_index_of, terrain_normal,
+    TerrainBuffer, TerrainParams, blended_height, cdlod_vertex, fog_position, grid_index_of,
+    terrain_normal,
 };
 import package::noise::{gradient_noise3, hash3};
 import package::planet::planet_position_m;
@@ -639,7 +640,7 @@ fn fragment(in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> F
 
     var pbr_input = pbr_input_from_standard_material(mesh, is_front);
     var albedo = painted.albedo;
-    let wireframe = params.debug.x > 0.5;
+    let wireframe = params.shading.x > 0.5;
     if wireframe {
         albedo = mix(albedo, lod_tint(in.lod), 0.55);
     }
@@ -648,6 +649,7 @@ fn fragment(in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> F
     var out: FragmentOutput;
     let lit = apply_pbr_lighting(pbr_input);
     out.color = vec4<f32>(paint_light(lit.rgb, pbr_input.material.base_color.rgb, painted.snow), lit.a);
+    pbr_input.world_position = vec4<f32>(fog_position(params, pbr_input.world_position.xyz), 1.0);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     if wireframe {
         let line = 1.0 - smoothstep(0.5, 1.5, edge_pixels(in.grid));

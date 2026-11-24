@@ -125,16 +125,17 @@ fn region_bench_reports_all_regions() {
             "coast: ",
             "memory (",
             "target: 60 fps",
-            "flight (60 s path): frames ",
+            "flight (75 s path): frames ",
             "  low pass: frames ",
             "  apron sweep: frames ",
+            "  high pass: frames ",
             "result: ",
         ] {
             assert!(report.contains(line), "missing {line:?} in\n{report}");
         }
         assert!(!report.contains("result: FAIL ("), "{report}");
         // 6 s of path at 60 updates a second.
-        assert!(report.contains("flight (60 s path): frames 36"), "{report}");
+        assert!(report.contains("flight (75 s path): frames 36"), "{report}");
     }
     assert!(
         reports[0].contains("first-region worst frame (R11"),

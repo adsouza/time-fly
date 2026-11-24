@@ -48,6 +48,8 @@ use timefly_core::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
 use timefly_core::worldgen::generate::{Field, RegionGrid};
 use timefly_core::worldgen::wind::wind_axis;
 
+use super::view::ViewRanges;
+
 use super::view::REGION_SUN_DIRECTION;
 
 /// `terrain.wesl`: the main-pass vertex and fragment shaders.
@@ -272,8 +274,10 @@ pub struct TerrainParams {
     pub apron: [f32; 4],
     /// Reserved for M4's voxel-window clip (the draft's clipping is removed for now): zero.
     pub voxel_window: [f32; 4],
-    /// `[wireframe (0 or 1), reserved ×3]`.
-    pub debug: [f32; 4],
+    /// `[wireframe (0 or 1), fog start m, fog scale, reserved]`: the fog reads a fragment's
+    /// distance `d` as `max(d − start, 1 m) × scale` ([`super::view::ViewRanges`]); `[0, 1]`, the
+    /// identity, at M2's heights.
+    pub shading: [f32; 4],
 }
 
 impl TerrainParams {
@@ -301,7 +305,7 @@ impl TerrainParams {
             inner: field(&grid.inner, e0),
             apron: field(&grid.apron, e1),
             voxel_window: [0.0; 4],
-            debug: [0.0; 4],
+            shading: [0.0, 0.0, 1.0, 0.0],
         }
     }
 
@@ -315,8 +319,18 @@ impl TerrainParams {
 
     /// The same header with the wireframe view on or off.
     pub fn with_wireframe(self, on: bool) -> TerrainParams {
+        let [_, start, scale, reserved] = self.shading;
         TerrainParams {
-            debug: [if on { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            shading: [if on { 1.0 } else { 0.0 }, start, scale, reserved],
+            ..self
+        }
+    }
+
+    /// The same header with the fog's start and scale from `ranges`.
+    pub fn with_fog(self, ranges: &ViewRanges) -> TerrainParams {
+        let [wireframe, _, _, reserved] = self.shading;
+        TerrainParams {
+            shading: [wireframe, ranges.fog_start_m, ranges.fog_scale(), reserved],
             ..self
         }
     }
@@ -871,7 +885,7 @@ mod tests {
             (offset_of!(TerrainParams, inner), "inner"),
             (offset_of!(TerrainParams, apron), "apron"),
             (offset_of!(TerrainParams, voxel_window), "voxel_window"),
-            (offset_of!(TerrainParams, debug), "debug"),
+            (offset_of!(TerrainParams, shading), "shading"),
         ];
         // The shader declares the same fields, in the same order, as 16-byte vectors.
         let wesl = wesl_fields("TerrainParams");
@@ -951,13 +965,30 @@ mod tests {
         assert_eq!(p.inner, [300_000.0, 292.96875, 1025.0, 131_250.0]);
         assert_eq!(p.apron, [2_400_000.0, 4_687.5, 513.0, 150_000.0]);
         assert_eq!(p.voxel_window, [0.0; 4]);
-        assert_eq!(p.debug, [0.0; 4]);
+        assert_eq!(p.shading, [0.0, 0.0, 1.0, 0.0]);
         let moved = p
             .with_camera(Vec3::new(1.0, 2.0, -3.0))
             .with_wireframe(true);
         assert_eq!(moved.camera, [1.0, 2.0, -3.0, 0.0]);
-        assert_eq!(moved.debug, [1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(moved.with_wireframe(false).debug, [0.0; 4]);
+        assert_eq!(moved.shading, [1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(moved.with_wireframe(false).shading, [0.0, 0.0, 1.0, 0.0]);
+        // The fog's start and scale ride alongside the wireframe switch.
+        let high = super::super::view::view_ranges(300_000.0);
+        let fogged = moved.with_fog(&high);
+        assert_eq!(
+            fogged.shading,
+            [1.0, high.fog_start_m, high.fog_scale(), 0.0]
+        );
+        assert_eq!(
+            fogged.with_wireframe(false).shading[1..3],
+            fogged.shading[1..3]
+        );
+        assert_eq!(
+            moved
+                .with_fog(&super::super::view::view_ranges(0.0))
+                .shading,
+            moved.shading
+        );
         assert_eq!(moved.inner, p.inner);
     }
 

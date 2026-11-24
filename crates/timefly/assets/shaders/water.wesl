@@ -19,7 +19,9 @@
 //   shallows toward the camera by the swash's height too, so water laid over the beach still
 //   wins depth ties with the terrain there.
 
-import package::terrain_cdlod::{TerrainBuffer, TerrainParams, blended_height, texel_step};
+import package::terrain_cdlod::{
+    TerrainBuffer, TerrainParams, blended_height, fog_position, texel_step,
+};
 import package::noise::gradient_noise3;
 import package::waves::{
     TAU, SWASH_MAX_AMPLITUDE_M, SWASH_PROBE_M, swash_amplitude_m, swash_level_m, swash_reach_factor,
@@ -287,6 +289,7 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     color = vec4<f32>(mix(color.rgb, sky, fresnel * (1.0 - foam)), 1.0);
 
     var out: FragmentOutput;
+    pbr_input.world_position = vec4<f32>(fog_position(params, pbr_input.world_position.xyz), 1.0);
     out.color = main_pass_post_lighting_processing(pbr_input, color);
     return out;
 }

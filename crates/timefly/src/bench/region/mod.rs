@@ -403,7 +403,7 @@ struct RegionRun {
     generated: Option<RegionGenerated>,
     path: Option<BenchPath>,
     flight_ms: Vec<f32>,
-    segment_ms: [Vec<f32>; 4],
+    segment_ms: [Vec<f32>; 5],
     /// The globe pan that led here, if any.
     pan_ms: Vec<f32>,
     memory_before: Option<u64>,

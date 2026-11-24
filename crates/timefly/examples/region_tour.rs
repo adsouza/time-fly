@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|fly|cruise|cloud|time|cloudtime] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|high|fly|cruise|cloud|time|cloudtime] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
 //! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
@@ -30,6 +30,10 @@
 //! [`DIVE_SECS`], then `W` alone for [`CRUISE_SECS`], and saves `<prefix>-low.png`; then it
 //! presses `[` (the next older snapshot), waits for the region to regenerate around the
 //! camera's crust position and the fade to finish, and saves `<prefix>-older.png`.
+//!
+//! A fifth argument `high` checks a region from high up (M3 Task 6; give a large `AGL_M`): after
+//! the start shot (looking north at the start pitch) it sets the steepest view pitch
+//! ([`MIN_PITCH_DEG`], the chase camera looking 45° down) and saves `<prefix>-down.png`.
 //!
 //! A fifth argument `cruise` checks the chase camera in sustained flight (M3 Task 3): after the
 //! start shot it holds `W` for [`FLIGHT_SHOT_SECS`] and saves `<prefix>-cruise.png` while still
@@ -67,7 +71,9 @@ use timefly::args::{LaunchArgs, parse_region, parse_window_size};
 use timefly::bench::frame_time_stats;
 use timefly::cloud::CloudDensity;
 use timefly::diagnostics;
-use timefly::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems};
+use timefly::fly_camera::{
+    CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems, MIN_PITCH_DEG,
+};
 use timefly::region::launch::launch_request;
 use timefly::region::navigate::{NavPhase, Navigation, NavigationSystems, same_region};
 use timefly::region::{
@@ -109,6 +115,8 @@ enum Step {
     /// The shaded shot is requested; a screenshot resolves frames later, so wait before F2.
     Shaded,
     Wire,
+    /// The steepest look is set (`high`); its shot follows once the chase camera has glided.
+    Down,
     /// The scripted flight (`fly`): diving, then cruising.
     Dive,
     Cruise,
@@ -135,6 +143,7 @@ enum Step {
 enum Mode {
     Wire,
     Shaded,
+    High,
     Fly,
     Cruise,
     Cloud,
@@ -351,6 +360,10 @@ fn tour(
                     tour.since = now;
                     tour.frames = 0;
                 }
+            } else if tour.mode == Mode::High && tour.frames >= WIRE_FRAMES {
+                fly.pitch = MIN_PITCH_DEG.to_radians();
+                tour.step = Step::Down;
+                tour.frames = 0;
             } else if tour.mode == Mode::Cruise && tour.frames >= WIRE_FRAMES {
                 tour.step = Step::Plain;
                 tour.since = now;
@@ -381,6 +394,14 @@ fn tour(
                 // The real toggle: press F2 for one frame.
                 keys.press(WIREFRAME_KEY);
                 tour.step = Step::Wire;
+                tour.frames = 0;
+            }
+        }
+        Step::Down => {
+            if tour.frames == 2 * WIRE_FRAMES {
+                shoot(&mut commands, &tour, "down");
+            } else if tour.frames > 3 * WIRE_FRAMES {
+                tour.step = Step::Done;
                 tour.frames = 0;
             }
         }
@@ -597,6 +618,7 @@ fn main() -> AppExit {
     let timed_cloud = args.get(4).is_some_and(|m| m == "cloudtime");
     let mode = match args.get(4).map(String::as_str) {
         Some("shaded") => Mode::Shaded,
+        Some("high") => Mode::High,
         Some("fly") => Mode::Fly,
         Some("cruise") => Mode::Cruise,
         Some("cloud") => Mode::Cloud,
@@ -763,8 +785,8 @@ mod tests {
     fn requested_height_must_be_renderable_at_the_region_centre() {
         for (agl, ground, expected_y) in [
             (50.0, 0.0, None),
-            (59_001.0, 1000.0, None),
-            (59_000.0, 1000.0, Some(CAMERA_CEILING_M)),
+            (299_001.0, 1000.0, None),
+            (299_000.0, 1000.0, Some(CAMERA_CEILING_M)),
             (CAMERA_CLEARANCE_M, -500.0, Some(CAMERA_CLEARANCE_M)),
         ] {
             let mut app = timing_app(agl, ground);
