@@ -475,6 +475,7 @@ BEFORE="$(describe_state)"
 REMOVED=()
 SKIPPED=()
 NOTES=()
+FAILED=()
 MIN_FREE_KB=$((MIN_FREE_MB * 1024))
 free_ok() { [ "$(free_kb)" -ge "$MIN_FREE_KB" ]; }
 under_budget() { [ "$(target_kb)" -le $((BUDGET_MB * 1024)) ]; }
@@ -499,8 +500,10 @@ remove() {
   (
     cd -P -- "$parent" || exit 1
     [ "$(pwd -P)" = "$PHYSICAL_TARGET${parent#"$TARGET"}" ] || exit 1
-    [ ! -L "./$leaf" ] && rm -rf -- "./$leaf"
-  ) && REMOVED+=("${1#"$ROOT"/}")
+    [ ! -L "./$leaf" ] && rm -rf -- "./$leaf" 2>/dev/null
+  ) && { REMOVED+=("${1#"$ROOT"/}"); return 0; }
+  FAILED+=("${1#"$ROOT"/}")
+  return 1
 }
 fresh() { [ -n "$(find "$1" -mmin -"$STALE_MIN" -print -quit 2>/dev/null)" ]; }
 newest_mtime() {   # newest mtime (epoch) of a dir and its subdirs down to depth 2
@@ -587,7 +590,8 @@ if ! free_ok; then
       # (APFS local snapshots, open files): deleting more builds would not help.
       size_kb="$(du -sk "$d" 2>/dev/null | awk '{ s = $1 + 0 } END { print s + 0 }')"
       free_before="$(free_kb)"
-      remove "$d" && LR_COUNT=$((LR_COUNT + 1))
+      remove "$d" || continue   # reported via FAILED; try the next dir
+      LR_COUNT=$((LR_COUNT + 1))
       free_ok && break
       if [ $(($(free_kb) - free_before)) -lt $((size_kb / 2)) ]; then
         LR_STUCK="${d#"$ROOT"/}"
@@ -613,12 +617,13 @@ join() { local IFS=,; echo "$*"; }
 SUMMARY="target-guard: "
 if [ "${#REMOVED[@]}" -gt 0 ]; then SUMMARY+="removed $(join "${REMOVED[@]}"). "; fi
 if [ "${#SKIPPED[@]}" -gt 0 ]; then SUMMARY+="Skipped: $(join "${SKIPPED[@]}"). "; fi
+if [ "${#FAILED[@]}" -gt 0 ]; then SUMMARY+="Could not delete $(join "${FAILED[@]}"). "; fi
 for n in "${NOTES[@]}"; do SUMMARY+="Note: $n. "; done
 SUMMARY+="Now: ${AFTER}."
 [ "$STILL_OVER" = 1 ] && SUMMARY+=" Still over limits."
 
 if [ "$MODE" = hook ]; then
-  [ "${#REMOVED[@]}" -eq 0 ] && [ "$STILL_OVER" = 0 ] && hook_done
+  [ "${#REMOVED[@]}" -eq 0 ] && [ "${#FAILED[@]}" -eq 0 ] && [ "$STILL_OVER" = 0 ] && hook_done
   CONTEXT="$SUMMARY"
   if [ "$STILL_OVER" = 1 ]; then
     CONTEXT+=" To free space: close other cargo/rustc processes and re-run tools/dev/target-guard.sh, or delete target/scratch-* dirs. See docs/dev/build-disk.md."
@@ -637,6 +642,7 @@ else
   echo "removed: nothing"
 fi
 for s in "${SKIPPED[@]}"; do echo "skipped: $s"; done
+for f in "${FAILED[@]}"; do echo "could not delete $f"; done
 for n in "${NOTES[@]}"; do echo "note: $n"; done
 [ "$HOPELESS" = 1 ] && culprit_lines
 echo "after:  $AFTER"

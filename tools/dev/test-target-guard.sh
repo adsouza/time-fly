@@ -599,6 +599,15 @@ cargo_case no  "git commit -m \"\$(cat <<${Q}EOF${Q}${NL}Run \`cargo build\` fir
 cargo_case no  "git commit -F - <<${Q}EOF${Q}${NL}cargo build fixed${NL}EOF"
 cargo_case yes "cat <<EOF${NL}notes${NL}EOF${NL}cargo build"
 
+echo "18. a failed removal is reported as such, and the last resort moves on"
+profiles 18a
+chmod 555 "$ROOT/target/release"   # rm -rf can't empty it (fixture only)
+out="$(lr 95)"
+chmod -R u+w "$ROOT/target"
+check "failed removal: release kept, next dirs removed until enough" test "$(left)" = "release doc debug "
+check "failed removal: reported" grep -qi 'could not delete target/release' <<<"$out"
+check "failed removal: not misreported as space not returned" bash -c '! grep -qi "not being returned" <<<"$1"' _ "$out"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
