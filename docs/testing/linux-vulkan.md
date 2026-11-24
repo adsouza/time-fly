@@ -182,8 +182,8 @@ Launch normally. To go straight into a region, add `--region=LAT,LON,AGE_YEARS`,
       takes over a second, "Descending..." shows; then the view fades into the region. Expect
       ridges, forest and alpine ground, snow on the summits and haze toward the horizon (compare
       `docs/testing/region-m2/bench-alps-0ka-shaded.png`).
-- [ ] **Fly.** `W` `A` `S` `D` move, a drag looks, `Space` / `E` climb, `Ctrl` / `Q` descend,
-      `Shift` boosts. Skim a ridge low, then climb high and look toward the horizon. There
+- [ ] **Fly.** `W` `A` `S` `D` or the arrows move (`←` / `→` turn; with `Shift`, fly sideways),
+      a drag looks, `Space` / `E` climb, `Ctrl` / `Q` descend, `Shift` + `↑` (or `W`) boosts. Skim a ridge low, then climb high and look toward the horizon. There
       should be no cracks or holes between terrain patches, no flicker along patch edges, no
       popping water at the coast, and the camera never goes into the ground.
 - [ ] **Snapshot change.** Inside the region, press `[` (one snapshot older). The view fades
