@@ -32,7 +32,6 @@ use bevy::render::render_resource::BufferUsages;
 use bevy::render::storage::ShaderBuffer;
 use timefly_core::globe::EARTH_RADIUS_KM;
 use timefly_core::terrain::{LodSettings, PATCH_QUADS, Patch, select_patches};
-use timefly_core::worldgen::frame::RegionFrame;
 use timefly_core::worldgen::generate::RegionGrid;
 use tracing::instrument;
 
@@ -64,7 +63,8 @@ const EARTH_RADIUS_M: f32 = (EARTH_RADIUS_KM * 1000.0) as f32;
 pub struct TerrainSceneSystems;
 
 /// The painterly look for a region: the sky's zenith as the shadow hue, the region sun's
-/// illumination, and the centre's latitude for the snowline.
+/// illumination, the centre's latitude for the snowline, the snow-shading constants, and the
+/// region's frame (planet position) and prevailing wind for the dunes.
 pub fn look_for(grid: &RegionGrid) -> TerrainLook {
     let (era, biome) = crate::sky::region_look(grid);
     let (zenith, _, _) = crate::sky::sky_tint(era, biome);
@@ -74,9 +74,7 @@ pub fn look_for(grid: &RegionGrid) -> TerrainLook {
         view::full_sun_illumination(),
         crate::sky::centre_lat_deg(grid),
         grid.spec.sea_level_anomaly_m as f32,
-        &RegionFrame {
-            center: grid.spec.center,
-        },
+        &grid.spec.frame(),
     )
 }
 

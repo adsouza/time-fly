@@ -57,6 +57,13 @@ pub const WATER_RING_GROWTH: f32 = 0.04;
 pub const WATER_SHALLOW: Color = Color::srgb(0.27, 0.66, 0.64);
 /// Water colour over the deep sea floor (sRGB): a dark navy.
 pub const WATER_DEEP: Color = Color::srgb(0.035, 0.14, 0.26);
+/// Water colour right at the shore as seen from altitude (sRGB): the shallow turquoise, calmed
+/// to a sea teal so the shoreline does not glow as a bright rim from the air.
+pub const WATER_SHALLOW_FAR: Color = Color::srgb(0.07, 0.27, 0.36);
+/// Camera height above the sea (m) up to which the shallow tint is the clear-water one.
+pub const WATER_CALM_FROM_M: f32 = 300.0;
+/// Camera height above the sea (m) from which the shallow tint is fully the calmed one.
+pub const WATER_CALM_TO_M: f32 = 3000.0;
 /// The depth (m) over which the shallow colour gives way to the deep one, as `1 − e^(−d/scale)`.
 pub const WATER_DEPTH_SCALE_M: f32 = 28.0;
 
@@ -79,8 +86,10 @@ pub struct WaterLook {
     pub sky_zenith: Vec4,
     /// The sky's horizon (linear); `w`: [`WATER_DEPTH_PULL`].
     pub sky_horizon: Vec4,
-    /// `x`: [`WATER_PULL_M`]; `yzw`: reserved.
+    /// `x`: [`WATER_PULL_M`]; `y`: [`WATER_CALM_FROM_M`]; `z`: [`WATER_CALM_TO_M`]; `w`: reserved.
     pub pull: Vec4,
+    /// [`WATER_SHALLOW_FAR`], linear: the shallow colour from altitude (`w` reserved).
+    pub shallow_far: Vec4,
 }
 
 /// The look for a region: the constants above and the region's sky.
@@ -93,7 +102,8 @@ pub fn water_look(grid: &RegionGrid) -> WaterLook {
         deep: v(WATER_DEEP).extend(FOAM_DEPTH_M),
         sky_zenith: v(zenith).extend(WATER_F0),
         sky_horizon: v(horizon).extend(WATER_DEPTH_PULL),
-        pull: Vec4::new(WATER_PULL_M, 0.0, 0.0, 0.0),
+        pull: Vec4::new(WATER_PULL_M, WATER_CALM_FROM_M, WATER_CALM_TO_M, 0.0),
+        shallow_far: v(WATER_SHALLOW_FAR).extend(0.0),
     }
 }
 

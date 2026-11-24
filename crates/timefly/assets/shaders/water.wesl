@@ -25,8 +25,11 @@ struct WaterLook {
     sky_zenith: vec4<f32>,
     // rgb: sky horizon; w: depth pull (fraction of the view distance).
     sky_horizon: vec4<f32>,
-    // x: constant depth pull (m).
+    // x: constant depth pull (m); y, z: camera heights (m) where the shallow tint starts and
+    // finishes calming.
     pull: vec4<f32>,
+    // rgb: the shallow colour seen from altitude.
+    shallow_far: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<storage, read> terrain: TerrainBuffer;
@@ -64,10 +67,12 @@ fn vertex(in: Vertex) -> WaterVertexOutput {
     return out;
 }
 
-// `water_tint` in water.rs: shallow to deep by 1 − e^(−depth / scale).
+// `water_tint` in water.rs: shallow to deep by 1 − e^(−depth / scale). From altitude the shallow
+// colour calms toward `shallow_far` (no turquoise rim); up close it is the clear-water one.
 fn water_tint(depth_m: f32) -> vec3<f32> {
     let t = 1.0 - exp(-max(depth_m, 0.0) / look.shallow.w);
-    return mix(look.shallow.rgb, look.deep.rgb, t);
+    let calm = smoothstep(look.pull.y, look.pull.z, view.world_position.y);
+    return mix(mix(look.shallow.rgb, look.shallow_far.rgb, calm), look.deep.rgb, t);
 }
 
 // Gradient noise at a world-space scale: integer cell plus fraction, as noise.wesl expects.
@@ -109,13 +114,13 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     ) * 0.04;
     let normal = normalize(vec3<f32>(rel.x / params.lattice.z + ripple.x, 1.0, rel.y / params.lattice.z + ripple.y));
 
-    // Foam: a band where the floor is less than FOAM_DEPTH_M deep, broken up by noise, thinned
-    // to a softer average where its texture would alias.
+    // Foam: a band where the floor is less than FOAM_DEPTH_M deep, broken up by noise, faded
+    // to nothing where its texture can't be resolved.
     let band = 1.0 - smoothstep(0.3, look.deep.w, depth);
     let w25 = octave_weight(footprint, 25.0);
     let w6 = octave_weight(footprint, 6.0);
     let n = brush(xz, 25.0, t * 0.15, 89u) * w25 + 0.6 * brush(xz, 6.0, t * 0.3, 97u) * w6;
-    let foam = smoothstep(0.45, 0.6, band * (0.8 + n)) * mix(0.4, 1.0, w25);
+    let foam = smoothstep(0.45, 0.6, band * (0.8 + n)) * w25;
 
     var mesh: VertexOutput;
     mesh.position = in.position;

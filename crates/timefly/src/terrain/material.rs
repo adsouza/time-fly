@@ -12,7 +12,7 @@
 //! | 101, 102 | inner and apron heights, `R32Float`, read with `textureLoad` |
 //! | 103, 104 | inner and apron surface codes, `Rgba8Unorm` (`Field::surface`), `textureLoad` |
 //! | 105 | the palette, `Rgba8UnormSrgb` ([`palette_texels`]: ground, canopy, rock per era and biome) |
-//! | 106 | uniform [`TerrainLook`]: the painterly light (shadow hue, ramp, brush, snowline latitude) |
+//! | 106 | uniform [`TerrainLook`]: the painterly light (shadow hue, ramp, brush, snowline latitude, snow shading) and the region frame and wind (planet position, dunes) |
 //!
 //! None of the textures has a sampler: `R32Float` is not filterable in baseline WebGPU, and the
 //! codes and palette are looked up texel by texel.
@@ -21,7 +21,8 @@
 //! texels in colour space, breaks them up with `noise.wesl` at 400 m, 60 m and 9 m, adds rock on
 //! slopes, snow from the ice byte and the snowline, and Barren-era microbial mats at the shore,
 //! then lights through Bevy PBR and repaints the light: a soft three-band ramp and a cool,
-//! era-tinted hue shift in shadow.
+//! era-tinted hue shift in shadow (snow keeps more light and less of the hue, so shaded snow
+//! stays pale blue).
 //!
 //! The extension is not bindless, so the combined material is not either (Bevy only goes
 //! bindless when the base and the extension both are). That one layout works on Metal, Vulkan
@@ -74,6 +75,13 @@ pub const BRUSH_STRENGTH: f32 = 0.08;
 /// only; the geometry and the slope rules (rock, snow) use the true slope.
 pub const RELIEF_EXAGGERATION: f32 = 1.8;
 
+/// How bright shaded snow stays against sunlit snow: the ramp's floor for snow (rock, forest and
+/// sand keep the 0.16 floor), so a snowfield in shadow is about half as bright as in sun.
+pub const SNOW_SHADE_FLOOR: f32 = 0.45;
+/// How much of the cool shadow hue shaded snow takes (1 = as strongly as everything else):
+/// half, so snow in shadow is pale blue rather than navy.
+pub const SNOW_HUE_FACTOR: f32 = 0.5;
+
 /// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
 pub struct TerrainLook {
@@ -85,7 +93,8 @@ pub struct TerrainLook {
     /// region centre's latitude in the era frame (degrees), for the snowline.
     pub light: Vec4,
     /// `x`: [`RELIEF_EXAGGERATION`]; `y`: the era's sea-level anomaly (m), which lowers the
-    /// snowline in glacial eras (ruling R18, `snowline.wesl`); `zw`: reserved.
+    /// snowline in glacial eras (ruling R18, `snowline.wesl`); `z`: [`SNOW_SHADE_FLOOR`];
+    /// `w`: [`SNOW_HUE_FACTOR`].
     pub relief: Vec4,
     /// `xyz`: the region centre's unit direction in the era frame; `w`: `EARTH_RADIUS_M`.
     /// With `frame_north` and `frame_east`, the input of `planet_position_m`.
@@ -129,7 +138,12 @@ pub fn terrain_look(
     TerrainLook {
         shadow: (zenith / luminance).extend(SHADOW_HUE_STRENGTH),
         light: Vec4::new(full_sun, RAMP_AMOUNT, BRUSH_STRENGTH, centre_lat_deg),
-        relief: Vec4::new(RELIEF_EXAGGERATION, sea_level_anomaly_m, 0.0, 0.0),
+        relief: Vec4::new(
+            RELIEF_EXAGGERATION,
+            sea_level_anomaly_m,
+            SNOW_SHADE_FLOOR,
+            SNOW_HUE_FACTOR,
+        ),
         frame_center: basis.center.as_vec3().extend(EARTH_RADIUS_M as f32),
         frame_north: basis.north.as_vec3().extend(0.0),
         frame_east: basis.east.as_vec3().extend(0.0),
@@ -472,6 +486,21 @@ mod tests {
     use core::mem::{align_of, offset_of, size_of};
     use timefly_core::terrain::select_patches;
     use timefly_core::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
+
+    #[test]
+    fn look_carries_snow_shade() {
+        let look = terrain_look(
+            Vec3::ONE,
+            1.0,
+            0.0,
+            0.0,
+            &RegionFrame {
+                center: RenderDir(DVec3::Z),
+            },
+        );
+        assert_eq!(look.relief.z, 0.45);
+        assert_eq!(look.relief.w, 0.5);
+    }
 
     const CDLOD_WESL: &str = include_str!("../../assets/shaders/terrain_cdlod.wesl");
 

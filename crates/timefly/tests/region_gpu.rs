@@ -876,8 +876,9 @@ fn wesl_planet_position_matches_rust() {
                     e.z as f32,
                     0.0,
                 ]);
-                // Truth from the same f32-rounded inputs, so only the shader's arithmetic is
-                // measured.
+                // Truth from the same f32-rounded x and z. The GPU also gets the f32 centre,
+                // north and east, whose rounding (about 0.4 m at Earth's radius) is part of the
+                // error measured against the 0.906 m bound.
                 let xf = f64::from(x as f32);
                 let zf = f64::from(z as f32);
                 truth.push(basis.local_to_dir(xf, zf).0 * EARTH_RADIUS_M);

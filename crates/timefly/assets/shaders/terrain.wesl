@@ -32,7 +32,8 @@ struct TerrainLook {
     shadow: vec4<f32>,
     // x: full-sun illumination; y: ramp amount; z: brush strength; w: centre latitude (deg).
     light: vec4<f32>,
-    // x: relief exaggeration for shading; y: the era's sea-level anomaly (m), for the snowline.
+    // x: relief exaggeration for shading; y: the era's sea-level anomaly (m), for the snowline;
+    // z: the ramp floor for snow; w: the hue factor for shaded snow.
     relief: vec4<f32>,
     // xyz: the region centre's unit direction (era frame); w: Earth's radius (m).
     frame_center: vec4<f32>,
@@ -182,9 +183,18 @@ fn octave_weight(footprint_m: f32, scale_m: f32) -> f32 {
     return 1.0 - smoothstep(0.25, 0.6, footprint_m / scale_m);
 }
 
+// What `paint` returns: the albedo (linear), the snow cover (0..1, which lights differently),
+// and the sand cover and dune gradient (zero until the dunes land).
+struct Paint {
+    albedo: vec3<f32>,
+    snow: f32,
+    sand: f32,
+    dune_gradient: vec2<f32>,
+}
+
 // The painted albedo (linear) at xz for the true height, the flat-terrain slope (rise over run)
 // and the pixel footprint (m).
-fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprint: f32) -> vec3<f32> {
+fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprint: f32) -> Paint {
     // The class boundaries come from 1.85 km climate data and read as stair-steps; warping the
     // lookup with two noise scales turns them into ragged, brushy edges (the heights are not
     // warped, so the land and sea stay where the data put them).
@@ -239,24 +249,30 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     let value = 1.0 + k * (n400 + 0.7 * n60 + 0.45 * n9);
     let hue = 0.5 + 0.5 * (0.6 * n2k + 0.4 * n60);
     c = c * value * mix(vec3<f32>(1.035, 1.0, 0.955), vec3<f32>(0.965, 1.0, 1.045), hue);
-    return max(c, vec3<f32>(0.0));
+    var p: Paint;
+    p.albedo = max(c, vec3<f32>(0.0));
+    p.snow = snow;
+    p.sand = 0.0;
+    p.dune_gradient = vec2<f32>(0.0);
+    return p;
 }
 
 // The ramp: illumination l (1 = a surface facing the sun; level ground in the region's sun is
 // about 0.55 with the ambient) pulled toward three soft bands: shade, half-light and full light.
 // Level ground sits inside the middle band, so slopes turned to or from the sun step out of it.
-fn ramp(l: f32) -> f32 {
-    let banded = 0.16 + 0.42 * smoothstep(0.22, 0.38, l) + 0.42 * smoothstep(0.70, 0.86, l);
+fn ramp(l: f32, floor_level: f32) -> f32 {
+    let banded = floor_level + 0.42 * smoothstep(0.22, 0.38, l) + 0.42 * smoothstep(0.70, 0.86, l);
     let bands = banded + max(l - 1.0, 0.0);
     return mix(l, bands, look.light.y);
 }
 
 // Repaints PBR light: the ramp on the illumination, then a hue shift of shadowed light.
-fn paint_light(lit: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
+// Snow (0..1) lifts the ramp's floor to look.relief.z and takes only look.relief.w of the hue.
+fn paint_light(lit: vec3<f32>, albedo: vec3<f32>, snow: f32) -> vec3<f32> {
     let l = dot(lit, LUMA) / max(dot(albedo, LUMA), 1e-4) / max(look.light.x, 1e-6);
-    var c = lit * (ramp(l) / max(l, 1e-4));
+    var c = lit * (ramp(l, mix(0.16, look.relief.z, snow)) / max(l, 1e-4));
     let shade = 1.0 - smoothstep(0.12, 0.6, l);
-    c = c * mix(vec3<f32>(1.0), look.shadow.rgb, shade * look.shadow.a);
+    c = c * mix(vec3<f32>(1.0), look.shadow.rgb, shade * look.shadow.a * mix(1.0, look.relief.w, snow));
     return c;
 }
 
@@ -283,12 +299,17 @@ fn fragment(in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> F
     // patch's LOD. The vertex stage computes none.
     let normal = terrain_normal(inner_height, apron_height, params, xz);
 
-    // The terrain's own gradient (the normal's, less the curvature's d/R), its slope, and the
-    // shading normal: the gradient exaggerated, the curvature tilt kept.
+    // The terrain's own gradient (the normal's, less the curvature's d/R) and its slope.
     let d = xz - params.camera.xz;
     let curve = d / params.lattice.z;
     let gradient = normal.xz / max(normal.y, 1e-3) - curve;
     let slope = length(gradient);
+
+    // The paint first (it also says how much snow lies here), then the shading normal: the
+    // gradient exaggerated, the curvature tilt kept. The drop moves the surface below the blended
+    // height; colour by the terrain's own height.
+    let height = in.world_position.y + dot(d, d) / (2.0 * params.lattice.z);
+    let painted = paint(params, xz, height, slope, length(fwidth(xz)));
     let shading = gradient * look.relief.x + curve;
     var mesh: VertexOutput;
     mesh.position = in.position;
@@ -308,9 +329,7 @@ fn fragment(in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> F
     mesh.visibility_range_dither = 0;
 
     var pbr_input = pbr_input_from_standard_material(mesh, is_front);
-    // The drop moves the surface below the blended height; colour by the terrain's own height.
-    let height = in.world_position.y + dot(d, d) / (2.0 * params.lattice.z);
-    var albedo = paint(params, xz, height, slope, length(fwidth(xz)));
+    var albedo = painted.albedo;
     let wireframe = params.debug.x > 0.5;
     if wireframe {
         albedo = mix(albedo, lod_tint(in.lod), 0.55);
@@ -319,7 +338,7 @@ fn fragment(in: TerrainVertexOutput, @builtin(front_facing) is_front: bool) -> F
 
     var out: FragmentOutput;
     let lit = apply_pbr_lighting(pbr_input);
-    out.color = vec4<f32>(paint_light(lit.rgb, pbr_input.material.base_color.rgb), lit.a);
+    out.color = vec4<f32>(paint_light(lit.rgb, pbr_input.material.base_color.rgb, painted.snow), lit.a);
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
     if wireframe {
         let line = 1.0 - smoothstep(0.5, 1.5, edge_pixels(in.grid));
