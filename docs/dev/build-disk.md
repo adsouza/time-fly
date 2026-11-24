@@ -15,13 +15,16 @@ cargo never removes stale artifacts. On a laptop with a few GB free this fills t
 
 ## The guard
 
-`tools/dev/target-guard.sh` keeps `<repo>/target` under a budget. It only ever operates
-on that directory (refuses if it is a symlink or missing).
+`tools/dev/target-guard.sh` keeps `<repo>/target` under a budget and watches free disk space.
+It only ever deletes inside that directory (refuses if it is a symlink or missing, never follows
+symlinks inside it). It never deletes anything outside `target/`.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TIMEFLY_TARGET_BUDGET_MB` | 15360 | max size of `target/` |
 | `TIMEFLY_MIN_FREE_MB` | 5120 | min free space on the disk |
+| `TIMEFLY_WARN_FREE_MB` | 10240 | warn Claude after any Bash command when free space is below this |
+| `TIMEFLY_XCTRACE_MIN_FREE_MB` | 10240 | block `xctrace record` when free space is below this |
 
 If both limits hold it does nothing. Otherwise it prunes, re-measuring after each step:
 
@@ -29,19 +32,57 @@ If both limits hold it does nothing. Otherwise it prunes, re-measuring after eac
 2. `cargo sweep --time 2`, if `cargo-sweep` is installed;
 3. whole build dirs (`release`, `wasm32-unknown-unknown`, `scratch-*`, ...) not modified in
    24 h, oldest first, never the most recently modified one;
-4. `cargo clean`, only if free space is still below the minimum.
+4. last resort, only if free space is still below the minimum: whole build dirs, fresh or not,
+   one at a time in the order `release`, `<triple>/` dirs, `scratch-*`, any others, `debug`
+   last, stopping as soon as free space is back above the minimum. Only if every dir has to go
+   does `target/` end up empty (the same as `cargo clean`; the guard no longer runs it).
 
-Steps 3 and 4 are skipped while a `cargo` or `rustc` process is running.
+Steps 3 and 4 are skipped while a `cargo` or `rustc` process is running. If free space is short
+of the minimum by more than all of `target/` holds, deleting builds would not fix it: the guard
+deletes nothing for free space (steps 1-3 still run for the budget) and instead lists the likely
+culprits outside `target/` (below).
 
-It runs automatically: `.claude/settings.json` registers a `PostToolUse` hook on `Bash`
-that calls `target-guard.sh --hook` (acts only on commands containing `cargo`, reports to
-Claude Code only when it pruned or limits are still exceeded, never blocks).
+### Hooks
+
+`.claude/settings.json` registers two hooks on `Bash`:
+
+- `PostToolUse`: `target-guard.sh --hook`, after every command. It never blocks.
+  - **Free space:** one `df` call; if free space is at least `TIMEFLY_WARN_FREE_MB` it exits
+    silently. Below it, it tells Claude the free space, the size of `target/`, and the largest
+    regular files (500 MB or more, at most 5) directly in `$TMPDIR`, where xctrace leaves its raw
+    `instruments*.ktrace`. It deletes none of them: the owner must approve deleting anything
+    outside `target/`.
+  - **Pruning** (the steps above) runs only when the command actually runs cargo: as a command
+    at the start or after `&&`, `||`, `;`, `|`, `(`, `$(` or a newline, optionally behind
+    `VAR=value` assignments, `env`, `time`, `nice`, `command` or `direnv exec <dir>`, or as a path
+    ending in `/cargo`. Mentions such as `pgrep -fl 'cargo|rustc'`, `grep cargo`,
+    `ls ~/.cargo/bin` or `echo "run cargo test"` do not count. It reports to Claude Code only when
+    it pruned, limits are still exceeded, or free space is low.
+- `PreToolUse`: `target-guard.sh --pre-hook`, before every command. It denies `xctrace record`
+  (also by path or through `xcrun`) without `--time-limit`, and any `xctrace record` while free
+  space is under `TIMEFLY_XCTRACE_MIN_FREE_MB`; the reason says why and how to proceed. It allows
+  everything else, and allows everything if the input can't be parsed or neither `jq` nor
+  `python3` is available.
 
 ```sh
 tools/dev/target-guard.sh --status   # sizes and limits, deletes nothing
 tools/dev/target-guard.sh            # prune now, with a report
 tools/dev/test-target-guard.sh       # self-test of the guard
 ```
+
+### Incidents behind the current rules (2026-11-24)
+
+- **xctrace filled the Mac.** `xctrace record` streams its raw trace to
+  `$TMPDIR/instruments<random>.ktrace`, not to `--output`. Two aborted recordings left 3.4 + 4.3 GB
+  there and the disk hit ENOSPC. The guard only ran after cargo commands and only looked inside
+  `target/`. Hence the free-space warning after every command and the xctrace block. For GPU
+  cost, prefer sampling `ioreg -c IOAccelerator` ("Device Utilization %", see
+  `docs/testing/region-m2/performance.md`); if you do record, pass `--time-limit` and check
+  `df -h` first.
+- **A mention of cargo wiped every build.** With 3.8 GiB free, `pgrep -fl 'cargo|rustc'` matched
+  the old `*cargo*` filter and the last resort ran a full `cargo clean` (10.6 GB: debug 5.8,
+  release 4.8), when deleting `target/release` alone would have restored the 5 GB minimum. Hence
+  the cargo-invocation check and the proportional last resort.
 
 ## Rule for development
 
