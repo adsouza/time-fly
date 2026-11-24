@@ -63,16 +63,28 @@ mod tests {
 
     #[test]
     fn exaggeration_eases_from_twenty_to_the_cloud_value() {
-        assert_eq!(globe_exaggeration(GLOBE_MAX_ALTITUDE_KM), ELEVATION_EXAGGERATION);
-        assert_eq!(globe_exaggeration(GLOBE_EXAGGERATION_FULL_KM), ELEVATION_EXAGGERATION);
-        assert_eq!(globe_exaggeration(CLOUD_TOP_KM), GLOBE_EXAGGERATION_AT_CLOUD);
+        assert_eq!(
+            globe_exaggeration(GLOBE_MAX_ALTITUDE_KM),
+            ELEVATION_EXAGGERATION
+        );
+        assert_eq!(
+            globe_exaggeration(GLOBE_EXAGGERATION_FULL_KM),
+            ELEVATION_EXAGGERATION
+        );
+        assert_eq!(
+            globe_exaggeration(CLOUD_TOP_KM),
+            GLOBE_EXAGGERATION_AT_CLOUD
+        );
         assert_eq!(globe_exaggeration(100.0), GLOBE_EXAGGERATION_AT_CLOUD);
         let (lo, hi) = (CLOUD_TOP_KM.ln(), GLOBE_EXAGGERATION_FULL_KM.ln());
         let mut prev = GLOBE_EXAGGERATION_AT_CLOUD;
         for i in 1..=100 {
             let alt = (lo + (hi - lo) * i as f64 / 101.0).exp();
             let e = globe_exaggeration(alt);
-            assert!(e > prev, "not strictly increasing at {alt} km: {e} <= {prev}");
+            assert!(
+                e > prev,
+                "not strictly increasing at {alt} km: {e} <= {prev}"
+            );
             assert!(e < ELEVATION_EXAGGERATION);
             prev = e;
         }

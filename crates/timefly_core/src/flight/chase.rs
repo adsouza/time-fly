@@ -51,7 +51,11 @@ pub fn lift_above_ground(
     ground_at: impl Fn(DVec3) -> f64,
     clearance: f64,
 ) -> ChasePose {
-    let ChasePose { mut eye, target, up } = pose;
+    let ChasePose {
+        mut eye,
+        target,
+        up,
+    } = pose;
     let dist = (eye - target).length();
     for _ in 0..8 {
         let need = ground_at(eye) + clearance;
@@ -134,7 +138,14 @@ mod tests {
     fn the_fly_keeps_its_screen_size_across_heights() {
         let vfov = 45f64.to_radians();
         for agl in [150.0, 8_000.0, 60_000.0, 300_000.0] {
-            let p = chase_pose(DVec3::new(0.0, agl, 0.0), FWD, UP, agl, 20.0, CHASE_MIN_DISTANCE_M);
+            let p = chase_pose(
+                DVec3::new(0.0, agl, 0.0),
+                FWD,
+                UP,
+                agl,
+                20.0,
+                CHASE_MIN_DISTANCE_M,
+            );
             let d = (p.eye - DVec3::new(0.0, agl, 0.0)).length();
             let body = fly_scale(d, vfov);
             let fraction = body / (2.0 * d * (vfov / 2.0).tan());
