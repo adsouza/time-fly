@@ -205,6 +205,59 @@ TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=1000 gua
 check "cargo-sweep on PATH: 'cargo sweep --time 2' invoked" grep -q '^sweep --time 2' "$CALLS"
 rm -f "$FAKEBIN/cargo-sweep"
 
+# hook_json <command>: the PostToolUse/PreToolUse payload for a Bash command.
+hook_json() { python3 -c 'import json,sys; print(json.dumps({"tool_name":"Bash","tool_input":{"command":sys.argv[1]}}))' "$1"; }
+
+echo "8. --hook prunes only after real cargo invocations, not mentions"
+# cargo_case <yes|no> <command>: over budget with a stale session; pruned only for cargo runs.
+cargo_case() {
+  newroot cmd
+  mkfile "$ROOT/target/debug/incremental/stale/x" 1
+  age "$ROOT/target/debug/incremental/stale" $OLD
+  hook_json "$2" | TIMEFLY_TARGET_BUDGET_MB=0 TIMEFLY_MIN_FREE_MB=0 TIMEFLY_WARN_FREE_MB=0 TIMEFLY_FAKE_FREE_MB=1000 \
+    guard --hook >/dev/null 2>&1
+  local label; label="$(printf '%s' "$2" | tr '\n' '~')"
+  if [ "$1" = yes ]; then
+    check "cargo run:   $label" test ! -e "$ROOT/target/debug/incremental/stale"
+  else
+    check "not cargo:   $label" test -d "$ROOT/target/debug/incremental/stale"
+  fi
+}
+NL='
+'
+cargo_case yes 'cargo build'
+cargo_case yes '  cargo test -p timefly'
+cargo_case yes 'cd crates && cargo test'
+cargo_case yes 'false || cargo build'
+cargo_case yes 'echo hi; cargo build'
+cargo_case yes 'echo x | cargo run'
+cargo_case yes '(cargo build)'
+cargo_case yes "echo a${NL}cargo build"
+cargo_case yes 'v=$(cargo metadata --format-version 1)'
+cargo_case yes 'FOO=1 PATH="/a b:$PATH" cargo build'
+cargo_case yes 'env CARGO_TARGET_DIR=target/scratch-x cargo build'
+cargo_case yes 'env -u CARGO_TARGET_DIR cargo clean'
+cargo_case yes 'time cargo build'
+cargo_case yes 'nice cargo build'
+cargo_case yes 'nice -n 10 cargo build'
+cargo_case yes 'command cargo build'
+cargo_case yes 'direnv exec . cargo build'
+cargo_case yes '/opt/homebrew/opt/rustup/bin/cargo build'
+cargo_case yes './bin/cargo build'
+cargo_case yes 'PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo build -p timefly 2>&1 | tail -5'
+cargo_case no  "pgrep -fl 'cargo|rustc'"
+cargo_case no  'grep cargo x'
+cargo_case no  'ls ~/.cargo/bin'
+cargo_case no  'cat Cargo.toml'
+cargo_case no  'echo "run cargo test"'
+cargo_case no  'echo cargo'
+cargo_case no  'command -v cargo'
+cargo_case no  'which cargo'
+cargo_case no  '# cargo build'
+cargo_case no  'cargo-sweep --help'
+cargo_case no  'git commit -m "fix cargo build"'
+cargo_case no  "bash -c 'echo nothing' # cargo"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

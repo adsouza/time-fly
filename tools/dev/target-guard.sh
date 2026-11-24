@@ -37,18 +37,105 @@ if [ -n "$RUSTUP_BIN" ] && [ -d "$RUSTUP_BIN" ]; then
   PATH="$RUSTUP_BIN:$PATH"
 fi
 
+# --- shell command parsing ---------------------------------------------------
+# command_segments <command>: one line per simple command, its words tab-separated with
+# quotes removed, starting at the program actually run. Splits on && || ; | & ( ) ` $(
+# and newlines outside quotes; drops comments; skips leading VAR=value assignments,
+# `env [opts] [VAR=value...]`, `time [-p]`, `nice [-n N]`, `command [-p]`, `direnv exec <dir>`
+# and the keywords ! { if then else elif do while until. `command -v/-V` (a lookup) yields
+# no line. A rough tokenizer: unusual syntax may hide a command, never invent one.
+command_segments() {
+  TF_CMD="$1" awk '
+    function endword() { if (inword) { w[++n] = word }; word = ""; inword = 0 }
+    function endseg(   k, out, j) {
+      endword()
+      k = 1
+      while (k <= n) {
+        if (w[k] ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { k++; continue }
+        if (w[k] == "env") {
+          k++
+          while (k <= n && w[k] ~ /^-/) {
+            if (w[k] == "-u" || w[k] == "-P" || w[k] == "-C" || w[k] == "-S") k++
+            k++
+          }
+          continue
+        }
+        if (w[k] == "time") { k++; if (w[k] == "-p") k++; continue }
+        if (w[k] == "nice") {
+          k++
+          if (w[k] == "-n") k += 2; else if (w[k] ~ /^-/) k++
+          continue
+        }
+        if (w[k] == "command") {
+          k++
+          if (w[k] == "-v" || w[k] == "-V") { k = n + 1; break }
+          if (w[k] == "-p") k++
+          continue
+        }
+        if (w[k] == "direnv" && w[k + 1] == "exec") { k += 3; continue }
+        if (w[k] ~ /^(!|[{]|if|then|else|elif|do|while|until)$/) { k++; continue }
+        break
+      }
+      if (k <= n) {
+        out = w[k]
+        for (j = k + 1; j <= n; j++) out = out "\t" w[j]
+        print out
+      }
+      n = 0
+    }
+    BEGIN {
+      s = ENVIRON["TF_CMD"]; L = length(s); q = ""; n = 0; word = ""; inword = 0
+      for (i = 1; i <= L; i++) {
+        c = substr(s, i, 1); nx = substr(s, i + 1, 1)
+        if (q == "\047") { if (c == "\047") q = ""; else word = word c; continue }
+        if (q == "\"") {
+          if (c == "\"") q = ""
+          else if (c == "\\" && index("\"\\$`", nx)) { word = word nx; i++ }
+          else word = word c
+          continue
+        }
+        if (c == "\\") {
+          if (nx == "\n") { i++; continue }
+          word = word nx; inword = 1; i++; continue
+        }
+        if (c == "\047" || c == "\"") { q = c; inword = 1; continue }
+        if (c == "#" && !inword) { while (i <= L && substr(s, i, 1) != "\n") i++; endseg(); continue }
+        if (c == " " || c == "\t") { endword(); continue }
+        if (c == "\n" || c == ";" || c == "(" || c == ")" || c == "`") { endseg(); continue }
+        if (c == "$" && nx == "(") { i++; endseg(); continue }
+        if (c == "&") {
+          if (substr(word, length(word), 1) ~ /[<>]/ || nx == ">") { word = word c; inword = 1; continue }
+          if (nx == "&") i++
+          endseg(); continue
+        }
+        if (c == "|") { if (nx == "|" || nx == "&") i++; endseg(); continue }
+        word = word c; inword = 1
+      }
+      endseg()
+    }'
+}
+# runs_cargo <command>: true when some simple command runs cargo itself.
+runs_cargo() {
+  command_segments "$1" | awk -F '\t' '$1 == "cargo" || $1 ~ /\/cargo$/ { f = 1 } END { exit !f }'
+}
+
+# --- hook input --------------------------------------------------------------
+# hook_command: the Bash command from the hook JSON on stdin; empty if unparsable.
+hook_command() {
+  local input; input="$(cat)"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$input" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("tool_input",{}).get("command",""))
+except Exception: pass' 2>/dev/null
+  fi
+}
+
 # --- hook pre-filter: only react to cargo commands --------------------------
 if [ "$MODE" = hook ]; then
-  input="$(cat)"
-  cmd=""
-  if command -v jq >/dev/null 2>&1; then
-    cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
-  elif command -v python3 >/dev/null 2>&1; then
-    cmd="$(printf '%s' "$input" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("tool_input",{}).get("command",""))
-except Exception: pass' 2>/dev/null)"
-  fi
-  case "$cmd" in *cargo*) ;; *) exit 0 ;; esac
+  cmd="$(hook_command)"
+  runs_cargo "$cmd" || exit 0
 fi
 
 if [ -L "$TARGET" ]; then warn "$TARGET is a symlink; refusing to touch it."; exit 0; fi
