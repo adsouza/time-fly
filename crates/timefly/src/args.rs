@@ -1,7 +1,8 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--region-bench`, `--target-fps N`, `--window WxH` and `--region LAT,LON,AGE_YEARS`. A value
+//! `--region-bench`, `--no-dunes`, `--target-fps N`, `--window WxH` and
+//! `--region LAT,LON,AGE_YEARS`. A value
 //! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
 //! with `--` is the next flag, never a value.
 //! `--check-data` takes its optional value only as `--check-data=DIR`.
@@ -21,6 +22,9 @@ pub struct LaunchArgs {
     /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`.
     /// With `--region` it benches only that region: one flight, no globe pan or memory cycles.
     pub region_bench: bool,
+    /// `--no-dunes` (web: `?no-dunes`): skip the terrain's dune shading, for slower machines.
+    /// A bare flag: `--no-dunes=VALUE` is not it and goes to `unknown`.
+    pub no_dunes: bool,
     /// `--target-fps N`: the frame rate the benchmarks check their frames against.
     pub target_fps: Option<u32>,
     /// `--window WxH`: the window's size in physical pixels (native only).
@@ -47,6 +51,7 @@ const CHECK_DATA_FLAG: &str = "--check-data";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const REGION_BENCH_FLAG: &str = "--region-bench";
+const NO_DUNES_FLAG: &str = "--no-dunes";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
 const REGION_FLAG: &str = "--region";
@@ -109,6 +114,10 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
         }
         if arg == REGION_BENCH_FLAG {
             parsed.region_bench = true;
+            continue;
+        }
+        if arg == NO_DUNES_FLAG {
+            parsed.no_dunes = true;
             continue;
         }
         if arg == CHECK_DATA_FLAG {
@@ -206,6 +215,24 @@ pub fn percent_decode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn no_dunes_is_a_bare_flag() {
+        assert!(parse_launch_args(args(&["--no-dunes"])).no_dunes);
+        assert!(!parse_launch_args(args(&[])).no_dunes);
+        let valued = parse_launch_args(args(&["--no-dunes=1"]));
+        assert!(!valued.no_dunes);
+        assert_eq!(valued.unknown, args(&["--no-dunes=1"]));
+    }
+
+    #[test]
+    fn no_dunes_on_the_web_in_any_order() {
+        for q in ["?region-bench&no-dunes", "?no-dunes&region-bench"] {
+            let parsed = parse_query_args(q);
+            assert!(parsed.no_dunes && parsed.region_bench, "{q}");
+        }
+        assert!(!parse_query_args("?no-dunes=true").no_dunes);
+    }
 
     #[test]
     fn region_bench_with_a_region_in_either_order() {

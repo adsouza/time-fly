@@ -45,7 +45,7 @@ use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 
 use super::material::{TerrainMaterial, TerrainParams, palette_image, patch_instances};
 use super::view::{REGION_SKY, region_camera_parts, region_sun, region_sun_parts};
-use super::{grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
+use super::{TerrainOptions, grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
 use crate::globe::{GlobeRenderStatus, RenderProbe};
 use crate::sky::{SkyMaterial, distance_fog, region_look, sky_params};
 use crate::water::{WaterMaterial, water_look, water_material};
@@ -268,7 +268,8 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         &fields,
         &palette,
         &buffer,
-        look_for(&grid),
+        // A uniform value doesn't change a pipeline, so the default options warm every one.
+        look_for(&grid, TerrainOptions::default()),
     ));
     let water = water_m.add(water_material(
         &buffer,

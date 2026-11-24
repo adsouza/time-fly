@@ -62,10 +62,25 @@ const EARTH_RADIUS_M: f32 = (EARTH_RADIUS_KM * 1000.0) as f32;
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerrainSceneSystems;
 
+/// Terrain options set at launch.
+#[derive(Resource, Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TerrainOptions {
+    /// Draw the sand seas' dunes. `--no-dunes` (web `?no-dunes`) turns them off for slower
+    /// machines: the shader then skips all dune work, and sand seas draw as flat, still sand.
+    pub dunes: bool,
+}
+
+impl Default for TerrainOptions {
+    fn default() -> Self {
+        TerrainOptions { dunes: true }
+    }
+}
+
 /// The painterly look for a region: the sky's zenith as the shadow hue, the region sun's
-/// illumination, the centre's latitude for the snowline, the snow-shading constants, and the
-/// region's frame (planet position) and prevailing wind for the dunes.
-pub fn look_for(grid: &RegionGrid) -> TerrainLook {
+/// illumination, the centre's latitude for the snowline, the snow-shading constants, the
+/// region's frame (planet position) and prevailing wind for the dunes, and whether the dunes are
+/// drawn at all.
+pub fn look_for(grid: &RegionGrid, options: TerrainOptions) -> TerrainLook {
     let (era, biome) = crate::sky::region_look(grid);
     let (zenith, _, _) = crate::sky::sky_tint(era, biome);
     let z = zenith.to_linear();
@@ -75,6 +90,7 @@ pub fn look_for(grid: &RegionGrid) -> TerrainLook {
         crate::sky::centre_lat_deg(grid),
         grid.spec.sea_level_anomaly_m as f32,
         &grid.spec.frame(),
+        options.dunes,
     )
 }
 
@@ -332,7 +348,9 @@ fn sync_terrain_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
+    options: Option<Res<TerrainOptions>>,
 ) {
+    let options = options.map_or_else(TerrainOptions::default, |o| *o);
     let action = match scene_action(
         region.as_ref().map(|r| &r.grid),
         scene.as_ref().map(|s| &s.grid),
@@ -349,12 +367,19 @@ fn sync_terrain_scene(
                 &mut meshes,
                 &mut buffers,
                 &mut materials,
+                options,
             );
             commands.insert_resource(scene);
         }
         (SceneAction::Replace, Some(region), Some(mut scene)) => {
             // The camera stays put: region navigation places it over the new region.
-            replace_fields(&mut scene, &region.grid, &mut images, &mut materials);
+            replace_fields(
+                &mut scene,
+                &region.grid,
+                &mut images,
+                &mut materials,
+                options,
+            );
         }
         (SceneAction::Teardown, _, Some(scene)) => {
             info!(patches = scene.pool.len(), "terrain scene removed");
@@ -375,13 +400,19 @@ fn build_scene(
     meshes: &mut Assets<Mesh>,
     buffers: &mut Assets<ShaderBuffer>,
     materials: &mut Assets<TerrainMaterial>,
+    options: TerrainOptions,
 ) -> TerrainScene {
     let settings = LodSettings::region();
     let params = TerrainParams::new(grid, &settings);
     let fields = upload_fields(grid, images);
     let palette = images.add(palette_image());
     let buffer = buffers.add(patch_buffer(&params, &[]));
-    let material = materials.add(terrain_material(&fields, &palette, &buffer, look_for(grid)));
+    let material = materials.add(terrain_material(
+        &fields,
+        &palette,
+        &buffer,
+        look_for(grid, options),
+    ));
     let (camera, sun) = spawn_region_view(commands, grid);
     let height_range_m = height_range_m(grid);
     info!(
@@ -453,6 +484,7 @@ fn replace_fields(
     grid: &Arc<RegionGrid>,
     images: &mut Assets<Image>,
     materials: &mut Assets<TerrainMaterial>,
+    options: TerrainOptions,
 ) {
     let fields = upload_fields(grid, images);
     if let Some(mut m) = materials.get_mut(&scene.material) {
@@ -460,7 +492,7 @@ fn replace_fields(
         m.extension.apron_height = fields.apron_height.clone();
         m.extension.inner_surface = fields.inner_surface.clone();
         m.extension.apron_surface = fields.apron_surface.clone();
-        m.extension.look = look_for(grid);
+        m.extension.look = look_for(grid, options);
     }
     scene.grid = grid.clone();
     scene.params = TerrainParams::new(grid, &scene.settings);

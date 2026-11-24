@@ -169,7 +169,8 @@ pub struct TerrainLook {
     /// sphere there. A dune's crest phase is the along-wind distance from the region centre,
     /// `dot(p, W)` for the planet position `p`, which the shader takes from local metres. It
     /// depends on the centre, so crests shift between visits from different centres (a known
-    /// limitation; the plan appendix). `w`: unused.
+    /// limitation; the plan appendix). `w`: 1 when the dunes are drawn, 0 when `--no-dunes`
+    /// turned them off; the shader tests `> 0.5` once, so every pixel takes the same branch.
     pub wind: Vec4,
     /// `x`: [`DUNE_SPACING_M`]; `y`: [`DUNE_SMALL_SPACING_M`]; `z`: [`DUNE_PERIOD_S`]; `w`:
     /// [`DUNE_SMALL_PERIOD_S`].
@@ -193,18 +194,21 @@ impl Default for TerrainLook {
             &RegionFrame {
                 center: RenderDir(DVec3::Z),
             },
+            true,
         )
     }
 }
 
 /// The look for a sky zenith colour (linear), the full-sun illumination, the centre latitude, the
-/// era's sea-level anomaly and the region's frame (for the planet position and the wind).
+/// era's sea-level anomaly, the region's frame (for the planet position and the wind) and
+/// whether the dunes are drawn (`--no-dunes` turns them off).
 pub fn terrain_look(
     zenith: Vec3,
     full_sun: f32,
     centre_lat_deg: f32,
     sea_level_anomaly_m: f32,
     frame: &RegionFrame,
+    dunes: bool,
 ) -> TerrainLook {
     let basis = frame.basis();
     let (_, wind) = wind_axis(frame);
@@ -221,7 +225,7 @@ pub fn terrain_look(
         frame_center: basis.center.as_vec3().extend(EARTH_RADIUS_M as f32),
         frame_north: basis.north.as_vec3().extend(0.0),
         frame_east: basis.east.as_vec3().extend(0.0),
-        wind: wind.as_vec3().extend(0.0),
+        wind: wind.as_vec3().extend(if dunes { 1.0 } else { 0.0 }),
         dunes: Vec4::new(
             DUNE_SPACING_M,
             DUNE_SMALL_SPACING_M,
@@ -586,9 +590,26 @@ mod tests {
             &RegionFrame {
                 center: RenderDir(DVec3::Z),
             },
+            true,
         );
         assert_eq!(look.relief.z, 0.30);
         assert_eq!(look.relief.w, 0.78);
+    }
+
+    #[test]
+    fn look_carries_the_dune_switch() {
+        assert_eq!(TerrainLook::default().wind.w, 1.0);
+        let frame = RegionFrame {
+            center: RenderDir(DVec3::Z),
+        };
+        assert_eq!(
+            terrain_look(Vec3::ONE, 1.0, 0.0, 0.0, &frame, false).wind.w,
+            0.0
+        );
+        assert_eq!(
+            terrain_look(Vec3::ONE, 1.0, 0.0, 0.0, &frame, true).wind.w,
+            1.0
+        );
     }
 
     #[test]
