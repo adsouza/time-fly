@@ -421,6 +421,33 @@ fn assert_finite(region: &ActiveRegion) {
 // Tests
 
 #[test]
+fn region_loads_all_payloads_from_the_published_generation() {
+    let root = tiny_copy("versioned");
+    let dir = root.join("data/tiles");
+    let generation = "b".repeat(64);
+    let payloads = dir.join(&generation);
+    fs::create_dir(&payloads).unwrap();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let file = entry.unwrap();
+        if file.path().extension().is_some_and(|ext| ext == "tfgrid") {
+            fs::rename(file.path(), payloads.join(file.file_name())).unwrap();
+        }
+    }
+    let path = dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["version"] = 2.into();
+    manifest["generation"] = generation.into();
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut app = region_app(&root, SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    assert!(!generated(&app).fallback);
+    assert_eq!(generated(&app).tiles_fetched, 4);
+    assert!(app.world().resource::<TileCache>().overview().is_some());
+}
+
+#[test]
 fn generates_a_region_from_the_tiny_bake() {
     let mut app = region_app(&tiny_root(), RegionSettings::default());
     request(&mut app, 0.0, 0.0, 0.0);

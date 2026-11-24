@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
 use bevy::window::{
-    Monitor, PrimaryMonitor, PrimaryWindow, WindowMode, WindowMoved, WindowPosition, WindowResized,
+    Monitor, PrimaryMonitor, PrimaryWindow, WindowCreated, WindowMode, WindowMoved, WindowPosition,
+    WindowResized,
 };
 use serde::{Deserialize, Serialize};
 
@@ -153,7 +154,7 @@ pub fn fit_to_monitor(geometry: &WindowGeometry, monitor: (IVec2, UVec2)) -> Win
     }
 }
 
-/// Applies a saved geometry to the primary window before it opens.
+/// Applies geometry after the backend has set the window’s scale factor.
 pub fn apply_geometry(window: &mut Window, geometry: &WindowGeometry) {
     window
         .resolution
@@ -180,6 +181,26 @@ fn current_geometry(window: &Window) -> Option<WindowGeometry> {
     Some(WindowGeometry { position, size })
 }
 
+/// Geometry to restore once winit has installed the monitor's scale factor.
+#[derive(Resource)]
+pub struct PendingWindowRestore(pub WindowGeometry);
+
+fn restore_created_window(
+    pending: Option<Res<PendingWindowRestore>>,
+    mut created: MessageReader<WindowCreated>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut commands: Commands,
+) {
+    let Some(saved) = pending else { return };
+    for event in created.read() {
+        if let Ok(mut window) = windows.get_mut(event.window) {
+            apply_geometry(&mut window, &saved.0);
+            commands.remove_resource::<PendingWindowRestore>();
+            break;
+        }
+    }
+}
+
 /// Saves the primary window's geometry to `path` once it settles, and recentres a restored
 /// window that no monitor shows.
 pub struct WindowMemoryPlugin {
@@ -203,18 +224,22 @@ impl Plugin for WindowMemoryPlugin {
             dirty_since: None,
             checked: false,
         })
-        .add_systems(Update, (keep_on_screen, save_when_settled).chain());
+        .add_systems(
+            Update,
+            (restore_created_window, keep_on_screen, save_when_settled).chain(),
+        );
     }
 }
 
 /// Once the monitors are known, recentres a restored window that none of them shows (its
 /// monitor was unplugged, or the layout changed).
 fn keep_on_screen(
+    pending: Option<Res<PendingWindowRestore>>,
     mut memory: ResMut<WindowMemory>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     monitors: Query<(&Monitor, Has<PrimaryMonitor>)>,
 ) {
-    if memory.checked || monitors.is_empty() {
+    if pending.is_some() || memory.checked || monitors.is_empty() {
         return;
     }
     memory.checked = true;
@@ -465,6 +490,7 @@ mod tests {
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
                 100,
             )))
+            .add_message::<WindowCreated>()
             .add_message::<WindowMoved>()
             .add_message::<WindowResized>()
             .add_plugins(WindowMemoryPlugin {
@@ -503,6 +529,34 @@ mod tests {
         }
         assert_eq!(load_geometry(&path), Some(geometry(300, 200, 1600, 900)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relaunch_restores_physical_size_on_a_double_density_display() {
+        let dir = temp_dir();
+        let path = dir.join(WINDOW_FILE);
+        let saved = geometry(60, 80, 1600, 1000);
+        save_geometry(&path, &saved).unwrap();
+        let mut window = Window::default();
+        window
+            .resolution
+            .set_scale_factor_and_apply_to_physical_size(2.0);
+        let mut app = memory_app(&path, window);
+        app.insert_resource(PendingWindowRestore(load_geometry(&path).unwrap()));
+        let entity = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>()
+            .single(app.world())
+            .unwrap();
+        app.world_mut()
+            .write_message(WindowCreated { window: entity });
+        app.update();
+        let window = app.world().get::<Window>(entity).unwrap();
+        assert_eq!(window.width(), 800.0);
+        assert_eq!(window.height(), 500.0);
+        assert_eq!(current_geometry(window), Some(saved));
+        assert!(!app.world().contains_resource::<PendingWindowRestore>());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

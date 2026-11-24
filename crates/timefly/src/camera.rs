@@ -123,7 +123,11 @@ impl Plugin for OrbitCameraPlugin {
             .init_resource::<OrbitDrag>()
             .add_systems(
                 Update,
-                (orbit_camera_system.run_if(on_the_globe), apply_orbit)
+                (
+                    orbit_camera_system.run_if(on_the_globe),
+                    fit_globe_projection,
+                    apply_orbit,
+                )
                     .chain()
                     .in_set(OrbitCameraSystems)
                     .before(GlobeCameraSync),
@@ -175,6 +179,30 @@ fn orbit_camera_system(
     let next = orbit_step(*state, input);
     if next != *state {
         *state = next;
+    }
+}
+
+/// Keep the original field of view across the shorter viewport axis. This also
+/// frames the globe when navigation resets the orbit on return from a region.
+fn fit_globe_projection(mut cameras: Query<&mut Projection, With<GlobeCamera>>) {
+    for mut projection in &mut cameras {
+        let Projection::Perspective(p) = &*projection else {
+            continue;
+        };
+        if p.aspect_ratio <= 0.0 {
+            continue;
+        }
+        let base = PerspectiveProjection::default().fov;
+        let fov = if p.aspect_ratio < 1.0 {
+            2.0 * ((base * 0.5).tan() / p.aspect_ratio).atan()
+        } else {
+            base
+        };
+        if fov != p.fov
+            && let Projection::Perspective(p) = &mut *projection
+        {
+            p.fov = fov;
+        }
     }
 }
 
@@ -249,6 +277,31 @@ mod tests {
             "at the closest zoom the globe spans {:.1}% of the view's height",
             share * 100.0
         );
+    }
+
+    #[test]
+    fn portrait_resize_fits_the_globe_and_landscape_restores_the_field_of_view() {
+        let mut app = App::new();
+        app.add_plugins(OrbitCameraPlugin);
+        let entity = app
+            .world_mut()
+            .spawn((GlobeCamera, Projection::default()))
+            .id();
+        let diameter = 2.0 * (EARTH_RADIUS_KM / MIN_DISTANCE_KM).asin();
+        for aspect in [9.0 / 16.0, 16.0 / 9.0] {
+            let mut projection = app.world_mut().get_mut::<Projection>(entity).unwrap();
+            let Projection::Perspective(p) = &mut *projection else {
+                panic!()
+            };
+            p.aspect_ratio = aspect;
+            app.update();
+            let Projection::Perspective(p) = app.world().get::<Projection>(entity).unwrap() else {
+                panic!()
+            };
+            let horizontal = 2.0 * ((p.fov / 2.0).tan() * aspect).atan();
+            assert!(diameter < f64::from(horizontal.min(p.fov)));
+            assert!((horizontal.min(p.fov) - PerspectiveProjection::default().fov).abs() < 1e-6);
+        }
     }
 
     #[test]

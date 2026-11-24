@@ -88,7 +88,10 @@ pub fn app(session: &Session) -> App {
     let mut window = primary_window(&args);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(geometry) = remembered.as_deref().and_then(window_memory::load_geometry) {
-        window_memory::apply_geometry(&mut window, &geometry);
+        if let Some(position) = geometry.position {
+            window.position = bevy::window::WindowPosition::At(position.into());
+        }
+        app.insert_resource(window_memory::PendingWindowRestore(geometry));
     }
     let plugins = DefaultPlugins
         .set(diagnostics::log_plugin())

@@ -360,7 +360,11 @@ pub(super) fn poll_overview(
             ManifestState::Ready(manifest) => match &manifest.overview {
                 Some(entry) => OverviewState::Loading(
                     Loading {
-                        handle: load_checked(&server, OVERVIEW_PATH, entry.settings()),
+                        handle: load_checked(
+                            &server,
+                            &manifest.payload_path(OVERVIEW_PATH),
+                            entry.settings(),
+                        ),
                         started_s: now_s,
                     },
                     entry.bytes,
@@ -509,7 +513,7 @@ pub(super) fn advance_frames(
             if cache.contains((row, col)) {
                 continue;
             }
-            let path = tile_path(row, col);
+            let path = manifest.payload_path(&tile_path(row, col));
             match manifest.tiles.get(&(row, col)) {
                 Some(entry) => pending.push(PendingTile {
                     key: (row, col),

@@ -4,6 +4,7 @@ import hashlib
 import json
 
 import numpy as np
+import pytest
 
 from timefly_bake import cli, formats, tiles
 
@@ -103,16 +104,16 @@ def test_manifest_lists_every_tile_with_hashes(tmp_path):
     manifest = cli.write_tiles(elev, kop, tmp_path, {"etopo": "e" * 64, "koppen": "k" * 64}, per_deg=1)
     on_disk = json.loads((tmp_path / "manifest.json").read_text())
     assert on_disk == manifest
-    assert manifest["version"] == 1 and manifest["tile_deg"] == 5 and manifest["samples"] == 6
+    assert manifest["version"] == 2 and manifest["tile_deg"] == 5 and manifest["samples"] == 6
     assert manifest["sources"] == {"etopo": "e" * 64, "koppen": "k" * 64}
     assert [(t["row"], t["col"]) for t in manifest["tiles"]] == [
         (r, c) for r in range(36) for c in range(72)
     ]
     for t in manifest["tiles"]:
-        path = tmp_path / f"r{t['row']:02}c{t['col']:02}.tfgrid"
+        path = tmp_path / manifest["generation"] / f"r{t['row']:02}c{t['col']:02}.tfgrid"
         blob = path.read_bytes()
         assert t["bytes"] == len(blob) and t["sha256"] == hashlib.sha256(blob).hexdigest()
-    header, data = formats.read_tfgrid(tmp_path / "r00c00.tfgrid")
+    header, data = formats.read_tfgrid(tmp_path / manifest["generation"] / "r00c00.tfgrid")
     assert header["kind"] == "latlon" and header["dtype"] == "f16" and header["channels"] == 2
     assert data.shape == (6, 6, 2)
 
@@ -153,9 +154,9 @@ def test_overview_is_the_block_mean_and_mode():
 def test_manifest_lists_the_overview(tmp_path):
     elev, kop = _ramp()
     manifest = cli.write_tiles(elev, kop, tmp_path, {"etopo": "e" * 64, "koppen": "k" * 64}, per_deg=1)
-    blob = (tmp_path / "overview.tfgrid").read_bytes()
+    blob = (tmp_path / manifest["generation"] / "overview.tfgrid").read_bytes()
     assert manifest["overview"] == {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
-    header, data = formats.read_tfgrid(tmp_path / "overview.tfgrid")
+    header, data = formats.read_tfgrid(tmp_path / manifest["generation"] / "overview.tfgrid")
     assert header["kind"] == "latlon" and header["channels"] == 2
     assert data.shape == (180 // 5 + 1, 360 // 5 + 1, 2)
 
@@ -179,3 +180,27 @@ def test_everest_survives_the_f16_tile_without_clipping():
     for _, _, peak in found:
         assert abs(peak - 8848.86) <= 4.0
         assert np.isfinite(peak) and peak < 65504.0
+
+
+def test_failed_rebake_preserves_published_generation(tmp_path, monkeypatch):
+    elev, kop = _ramp()
+    first = cli.write_tiles(elev, kop, tmp_path, {}, per_deg=1)
+    active = tmp_path / "manifest.json"
+    original = active.read_bytes()
+    with monkeypatch.context() as patch:
+        def fail_overview(*args):
+            raise OSError("interrupted before overview")
+
+        patch.setattr(tiles, "overview", fail_overview)
+        with pytest.raises(OSError, match="interrupted"):
+            cli.write_tiles(elev + 50, kop, tmp_path, {}, per_deg=1)
+    assert active.read_bytes() == original
+    previous = tmp_path / first["generation"]
+    for entry in first["tiles"]:
+        path = previous / f"r{entry['row']:02}c{entry['col']:02}.tfgrid"
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"]
+    assert hashlib.sha256((previous / "overview.tfgrid").read_bytes()).hexdigest() == first["overview"]["sha256"]
+    second = cli.write_tiles(elev + 50, kop, tmp_path, {}, per_deg=1)
+    assert second["generation"] != first["generation"]
+    assert json.loads(active.read_text()) == second
+    assert previous.is_dir()

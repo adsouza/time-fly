@@ -23,6 +23,13 @@ fn data() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../timefly/assets/data")
 }
 
+fn tile_dir() -> PathBuf {
+    let dir = data().join("tiles");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    dir.join(manifest["generation"].as_str().unwrap_or(""))
+}
+
 struct Bake {
     crust: CrustModel,
     timeline: Timeline,
@@ -104,9 +111,7 @@ fn ten_ma_channels() {
     }
     let mut tiles = TileSet::new();
     tiles
-        .set_overview(
-            read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap(),
-        )
+        .set_overview(read_tfgrid(&fs::read(tile_dir().join("overview.tfgrid")).unwrap()).unwrap())
         .unwrap();
     let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
         grids[i].as_ref().unwrap()
@@ -327,7 +332,7 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
     for i in frames_needed(&b.timeline, age) {
         grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
     }
-    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
+    let overview = read_tfgrid(&fs::read(tile_dir().join("overview.tfgrid")).unwrap()).unwrap();
     let deep = match b.timeline.select_frames(age) {
         FrameSelection::Deep(d) => d,
         other => panic!("{other:?}"),
@@ -360,7 +365,7 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
         })
         .unwrap();
         for (r, c) in probe.tiles_needed(&frame) {
-            let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
+            let path = tile_dir().join(format!("r{r:02}c{c:02}.tfgrid"));
             tiles
                 .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
                 .unwrap();
@@ -486,7 +491,7 @@ fn candidate_stats(
     .unwrap()
     .tiles_needed(&frame);
     for &(r, c) in &needed {
-        let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
+        let path = tile_dir().join(format!("r{r:02}c{c:02}.tfgrid"));
         tiles
             .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
             .unwrap();
@@ -588,7 +593,7 @@ fn candidate_stats(
 fn bench_region_candidates() {
     let globe = data().join("globe");
     let b = bake(&globe);
-    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
+    let overview = read_tfgrid(&fs::read(tile_dir().join("overview.tfgrid")).unwrap()).unwrap();
     let list = std::env::var("TIMEFLY_CANDIDATES")
         .unwrap_or_else(|_| "Himalayas:28,86.9,0;Aegean:38,24.5,1000000".to_string());
     let generate = std::env::var("TIMEFLY_GENERATE").is_ok_and(|v| v == "1");
@@ -626,7 +631,7 @@ fn bench_region_candidates() {
 #[test]
 #[ignore = "reads the real bake"]
 fn everest_tile_keeps_its_peak_in_f16() {
-    let tile = read_tfgrid(&fs::read(data().join("tiles/r12c53.tfgrid")).unwrap()).unwrap();
+    let tile = read_tfgrid(&fs::read(tile_dir().join("r12c53.tfgrid")).unwrap()).unwrap();
     let (mut best, mut at) = (f32::MIN, (0, 0));
     for row in 0..tile.height {
         for col in 0..tile.width {
@@ -664,7 +669,7 @@ fn dry_snowline_on_the_real_bake() {
     use timefly_core::worldgen::biome::{BiomeClass, snowline_m};
     let globe = data().join("globe");
     let b = bake(&globe);
-    let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
+    let overview = read_tfgrid(&fs::read(tile_dir().join("overview.tfgrid")).unwrap()).unwrap();
     let grid_at = |lat: f64, lon: f64| {
         let mut grids: Vec<Option<Grid>> = vec![None; b.files.len()];
         for i in frames_needed(&b.timeline, 0.0) {
@@ -679,7 +684,7 @@ fn dry_snowline_on_the_real_bake() {
         })
         .unwrap();
         for (r, c) in probe.tiles_needed(&frame) {
-            let path = data().join(format!("tiles/r{r:02}c{c:02}.tfgrid"));
+            let path = tile_dir().join(format!("r{r:02}c{c:02}.tfgrid"));
             tiles
                 .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
                 .unwrap();

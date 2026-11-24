@@ -296,7 +296,10 @@ Inputs (both pinned in `data/sources.json`; 33 files in all):
 
 `cd tools/bake && uv run timefly-bake tiles --raw ../../data/raw --out ../../crates/timefly/assets/data/tiles`
 writes 2,592 tiles `r{row:02}c{col:02}.tfgrid` (36 rows × 72 columns, row 0 northernmost, column
-0 from lon −180) plus `manifest.json`. Each tile is a 5° × 5° `latlon` grid of 301 × 301 samples
+0 from lon −180) and the overview in an immutable directory. The version 2 manifest's
+`generation` field names this directory. The baker replaces `manifest.json` after all payloads
+are ready. Earlier generations remain readable, and version 1 manifests still use the flat layout.
+Each tile is a 5° × 5° `latlon` grid of 301 × 301 samples
 (both edges included, so neighbours share edge samples and column 71 meets column 0 across the
 antimeridian), 2 channels, float16: elevation in metres, then the Köppen code. The manifest lists
 every tile with its byte size and SHA-256 and the two source checksums. Sizes:
