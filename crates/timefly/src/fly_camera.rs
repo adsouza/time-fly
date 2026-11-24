@@ -39,7 +39,7 @@
 //! driver (Task 10's bench) writes [`FlyState`] between the two sets.
 
 use bevy::input::mouse::AccumulatedMouseMotion;
-use bevy::math::DVec3;
+use bevy::math::{DQuat, DVec3};
 use bevy::prelude::*;
 use timefly_core::terrain::blended_height_m;
 use timefly_core::worldgen::REGION_SIZE_M;
@@ -48,6 +48,7 @@ use timefly_core::worldgen::generate::RegionGrid;
 use timefly_core::flight::altitudes::{
     CHASE_DISTANCE_PER_AGL, CHASE_ELEVATION_DEG, CHASE_MIN_DISTANCE_M,
 };
+pub use timefly_core::flight::chase::CHASE_START_LOOK_DEG;
 use timefly_core::flight::chase::{ChasePose, chase_pose, fly_scale, lift_above_ground};
 
 use crate::creature::{FlyPose, HOVER_EASE_S, bank_step, hover_offset};
@@ -97,9 +98,6 @@ pub const CHASE_SMOOTHING_S: f64 = 0.2;
 /// The chase camera's look-down pitch stays within this margin of the view's edge, so the fly
 /// (seen [`CHASE_ELEVATION_DEG`] below the horizontal) never leaves the frame.
 pub const CHASE_LOOK_MARGIN_DEG: f64 = 5.0;
-/// The chase view's look-down pitch at the start pitch (degrees): a little shallower than the
-/// fly's elevation, so the fly sits a little below the view's centre (M3 design §5.3).
-pub const CHASE_START_LOOK_DEG: f64 = CHASE_ELEVATION_DEG - 5.0;
 /// The shallowest chase look (degrees below the horizontal; negative looks up): the fly stays
 /// [`CHASE_LOOK_MARGIN_DEG`] inside the bottom of the frame.
 pub const CHASE_LOOK_MIN_DEG: f64 =
@@ -424,17 +422,93 @@ fn step_fly(
     }
 }
 
-/// The chase camera's smoothed pose and the fly's visual state between frames.
-#[derive(Resource, Clone, Debug, Default)]
-struct Chase {
-    /// The smoothed eye and target **offsets from the fly** and their velocities; `None` until
-    /// a region shows (and after it goes), so the next one starts in place.
+/// The chase camera's glide, shared by the region and the globe: the eye's and the target's
+/// **offsets from the fly** glide with [`critically_damped`] smoothing ([`CHASE_SMOOTHING_S`])
+/// and are added to where the fly is now. Translation is followed rigidly (a world-space
+/// follower lags 2τ·v behind steady flight, which at 0.8–3.2 × AGL per second is as long as the
+/// chase distance itself and runs the fly off the top of the frame); only turns, view changes
+/// and height changes glide.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChaseGlide {
+    /// The smoothed eye and target offsets and their velocities; `None` until a world shows
+    /// (and after it goes), so the next one starts in place.
     smooth: Option<[DVec3; 4]>,
-    /// The fly's state last frame, for the yaw rate and whether it is idle.
-    last: Option<FlyState>,
+}
+
+impl ChaseGlide {
+    pub(crate) fn reset(&mut self) {
+        self.smooth = None;
+    }
+
+    /// The eye and target this frame for the fly at `fly` wanting `want`. `carry` turns the held
+    /// offsets first: the rotation of the fly's frame since last frame that is travel, not a
+    /// turn (the globe's up turning beneath a fly crossing it; identity in a flat region). A
+    /// wanted eye more than [`CHASE_SNAP_DISTANCES`] × `chase_distance` from the held one is
+    /// taken at once.
+    pub(crate) fn follow(
+        &mut self,
+        fly: DVec3,
+        want: &ChasePose,
+        chase_distance: f64,
+        carry: DQuat,
+        dt_s: f64,
+    ) -> (DVec3, DVec3) {
+        let (want_eye, want_target) = (want.eye - fly, want.target - fly);
+        let [eye_off, eye_v, target_off, target_v] = match self.smooth {
+            Some(held) => {
+                let [eye, eye_v, target, target_v] = held.map(|v| carry * v);
+                if (eye - want_eye).length() <= CHASE_SNAP_DISTANCES * chase_distance {
+                    let (eye, eye_v) =
+                        critically_damped(eye, eye_v, want_eye, dt_s, CHASE_SMOOTHING_S);
+                    let (target, target_v) =
+                        critically_damped(target, target_v, want_target, dt_s, CHASE_SMOOTHING_S);
+                    [eye, eye_v, target, target_v]
+                } else {
+                    [want_eye, DVec3::ZERO, want_target, DVec3::ZERO]
+                }
+            }
+            None => [want_eye, DVec3::ZERO, want_target, DVec3::ZERO],
+        };
+        self.smooth = Some([eye_off, eye_v, target_off, target_v]);
+        (fly + eye_off, fly + target_off)
+    }
+}
+
+/// The fly's drawn-only motion, shared by the region and the globe: the bank into turns
+/// ([`bank_step`]) and the idle bob ([`hover_offset`]), which fades in while the fly is left
+/// alone. Neither moves the flight state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FlyFlourish {
     bank_rad: f32,
     /// How much of the idle bob shows, 0 to 1.
     hover: f32,
+}
+
+impl FlyFlourish {
+    /// Steps the bank toward `yaw_rate` (rad/s, positive to the left) and the bob toward
+    /// `idle`; returns the bank and the bob's height (along up) for a fly drawn at `scale`.
+    pub(crate) fn step(
+        &mut self,
+        yaw_rate: f32,
+        idle: bool,
+        dt_s: f32,
+        t_s: f32,
+        scale: f32,
+    ) -> (f32, f32) {
+        self.bank_rad = bank_step(self.bank_rad, yaw_rate, dt_s);
+        let ease = 1.0 - (-dt_s / HOVER_EASE_S).exp();
+        self.hover += (f32::from(u8::from(idle)) - self.hover) * ease;
+        (self.bank_rad, self.hover * hover_offset(t_s, scale))
+    }
+}
+
+/// The chase camera's smoothed pose and the fly's visual state between frames.
+#[derive(Resource, Clone, Debug, Default)]
+struct Chase {
+    glide: ChaseGlide,
+    /// The fly's state last frame, for the yaw rate and whether it is idle.
+    last: Option<FlyState>,
+    flourish: FlyFlourish,
 }
 
 /// Places the region camera behind and above [`FlyState`] (smoothed, and always clear of the
@@ -452,7 +526,7 @@ fn apply_fly(
         .as_ref()
         .and_then(|s| cameras.get_mut(s.camera).ok().map(|c| (s, c)));
     let Some((scene, (mut camera, camera_settings))) = region else {
-        chase.smooth = None;
+        chase.glide.reset();
         chase.last = None;
         if matches!(altitude.0, Some(Altitude::Metres(_))) {
             altitude.0 = None;
@@ -464,29 +538,14 @@ fn apply_fly(
     let want = region_chase_pose(&fly, ground);
     let dt = time.delta_secs_f64();
 
-    // Smooth in the fly's frame: the eye's and the target's offsets from the fly glide, and are
-    // added to where the fly is now. Translation is followed rigidly (a world-space follower
-    // lags 2τ·v behind steady flight, which at 0.8–3.2 × AGL per second is as long as the
-    // chase distance itself and runs the fly off the top of the frame); only turns, view-pitch
-    // changes and height changes glide. The result is lifted again, so the glide never dips
-    // into the ground.
+    // Smooth in the fly's frame (`ChaseGlide`); the result is lifted again, so the glide never
+    // dips into the ground.
     let fly_m = fly.pos_m.as_dvec3();
     let chase_distance =
         CHASE_MIN_DISTANCE_M.max(CHASE_DISTANCE_PER_AGL * (fly_m.y - ground(fly_m.x, fly_m.z)));
-    let (want_eye, want_target) = (want.eye - fly_m, want.target - fly_m);
-    let [eye_off, eye_v, target_off, target_v] = match chase.smooth {
-        Some([eye, eye_v, target, target_v])
-            if (eye - want_eye).length() <= CHASE_SNAP_DISTANCES * chase_distance =>
-        {
-            let (eye, eye_v) = critically_damped(eye, eye_v, want_eye, dt, CHASE_SMOOTHING_S);
-            let (target, target_v) =
-                critically_damped(target, target_v, want_target, dt, CHASE_SMOOTHING_S);
-            [eye, eye_v, target, target_v]
-        }
-        _ => [want_eye, DVec3::ZERO, want_target, DVec3::ZERO],
-    };
-    chase.smooth = Some([eye_off, eye_v, target_off, target_v]);
-    let (eye, target) = (fly_m + eye_off, fly_m + target_off);
+    let (eye, target) = chase
+        .glide
+        .follow(fly_m, &want, chase_distance, DQuat::IDENTITY, dt);
     let shown = lift_above_ground(
         ChasePose {
             eye,
@@ -511,19 +570,18 @@ fn apply_fly(
         None => (0.0, true),
     };
     chase.last = Some(*fly);
-    chase.bank_rad = bank_step(chase.bank_rad, yaw_rate, dt_s);
-    let ease = 1.0 - (-dt_s / HOVER_EASE_S).exp();
-    chase.hover += (f32::from(u8::from(idle)) - chase.hover) * ease;
     let scale = fly_scale(
         (shown.eye - fly_m).length(),
         f64::from(REGION_FOV_DEG.to_radians()),
     ) as f32;
-    let bob = chase.hover * hover_offset(time.elapsed_secs(), scale);
+    let (bank_rad, bob) = chase
+        .flourish
+        .step(yaw_rate, idle, dt_s, time.elapsed_secs(), scale);
     let next = FlyPose {
         translation: fly.pos_m + Vec3::Y * bob,
         rotation: Quat::from_rotation_y(fly.yaw),
         scale,
-        bank_rad: chase.bank_rad,
+        bank_rad,
     };
     // Only the world on screen writes the pose: a region held while the globe draws (a
     // preload, a swap) leaves it to the globe.

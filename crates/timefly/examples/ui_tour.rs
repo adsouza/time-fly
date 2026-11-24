@@ -1,6 +1,7 @@
 //! Runs the real game app and saves screenshots of the globe and its UI at review ages
 //! (loading overlay, present, 21 ka, mid-bridge 28 ka, 250 Ma, 540 Ma, credits, idle fade),
-//! then exits. For visual review.
+//! and of the dragonfly over the globe at its top altitude and near the dive altitude (present
+//! and 250 Ma, M3 Task 4), then exits. For visual review.
 //!
 //! The globe camera (and so the UI, which draws on it) renders into an offscreen image of the
 //! window's size, which is what gets saved: window-surface screenshots of a process started
@@ -18,77 +19,128 @@ use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use timefly::args::{LaunchArgs, parse_window_size};
-use timefly::camera::OrbitState;
 use timefly::diagnostics::{self, FirstInteractiveFrame};
-use timefly::globe::{EARTH_RADIUS_KM, GlobeCamera, GlobeRenderStatus};
+use timefly::globe::{GlobeCamera, GlobeRenderStatus};
+use timefly::globe_flight::{GlobeFlightState, GlobeLook};
 use timefly::time::GlobeTime;
 use timefly::ui::credits::CreditsOpen;
 use timefly::ui::slider::UiIdle;
 use timefly_core::deep_time::YearsBp;
+use timefly_core::flight::altitudes::GLOBE_MAX_ALTITUDE_KM;
+use timefly_core::flight::globe::GlobeFlight;
 
-/// One screenshot: name, age, camera (lat, lon, distance in radii), credits open, keep UI awake.
+/// One screenshot: name, age, the fly (lat, lon, altitude km, heading north), the view drag's
+/// offset (degrees, positive looks further down), credits open, keep UI awake.
 struct Shot {
     name: &'static str,
     years: f64,
     view: (f64, f64, f64),
+    look_deg: f64,
     credits: bool,
     awake: bool,
 }
+
+/// The top of globe flight (M1's starting view, with the fly).
+const TOP: f64 = GLOBE_MAX_ALTITUDE_KM;
+/// Closer in, for the bridge shots.
+const NEAR: f64 = 5_000.0;
+/// Just above the dive altitude (Task 4's facet and shell check).
+const DIVE: f64 = 1_250.0;
 
 const SHOTS: &[Shot] = &[
     Shot {
         name: "present",
         years: 0.0,
-        view: (30.0, 10.0, 3.0),
+        view: (30.0, 10.0, TOP),
+        look_deg: 0.0,
         credits: false,
         awake: true,
     },
     Shot {
         name: "21ka-bering",
         years: 21.0e3,
-        view: (62.0, -170.0, 2.4),
+        view: (62.0, -170.0, NEAR),
+        look_deg: 0.0,
         credits: false,
         awake: true,
     },
     Shot {
         name: "28ka-mid-bridge",
         years: 28.0e3,
-        view: (62.0, -170.0, 2.4),
+        view: (62.0, -170.0, NEAR),
+        look_deg: 0.0,
         credits: false,
         awake: true,
     },
     Shot {
         name: "250ma-pangaea",
         years: 250.0e6,
-        view: (0.0, 0.0, 3.0),
+        view: (0.0, 0.0, TOP),
+        look_deg: 0.0,
         credits: false,
         awake: true,
     },
     Shot {
         name: "540ma",
         years: 540.0e6,
-        view: (-30.0, 0.0, 3.0),
+        view: (-30.0, 0.0, TOP),
+        look_deg: 0.0,
         credits: false,
         awake: true,
     },
     Shot {
         name: "credits",
         years: 0.0,
-        view: (30.0, 10.0, 3.0),
+        view: (30.0, 10.0, TOP),
+        look_deg: 0.0,
         credits: true,
         awake: true,
     },
     Shot {
         name: "66ma-idle-faded",
         years: 66.0e6,
-        view: (20.0, 100.0, 3.0),
+        view: (20.0, 100.0, TOP),
+        look_deg: 0.0,
         credits: false,
         awake: false,
     },
+    Shot {
+        name: "fly-dive-present",
+        years: 0.0,
+        view: (30.0, 10.0, DIVE),
+        look_deg: 0.0,
+        credits: false,
+        awake: true,
+    },
+    Shot {
+        name: "fly-dive-present-look-down",
+        years: 0.0,
+        view: (30.0, 10.0, DIVE),
+        look_deg: 30.0,
+        credits: false,
+        awake: true,
+    },
+    Shot {
+        name: "fly-dive-250ma",
+        years: 250.0e6,
+        view: (0.0, 0.0, DIVE),
+        look_deg: 0.0,
+        credits: false,
+        awake: true,
+    },
+    Shot {
+        name: "fly-dive-250ma-look-down",
+        years: 250.0e6,
+        view: (0.0, 0.0, DIVE),
+        look_deg: 30.0,
+        credits: false,
+        awake: true,
+    },
 ];
 
-/// Frames to let a change settle before the capture, and seconds of idle for the faded shot.
-const SETTLE_FRAMES: u32 = 20;
+/// Frames to let a change settle before the capture (the chase camera glides over about a
+/// second), and seconds of idle for the faded shot.
+const SETTLE_FRAMES: u32 = 90;
 const IDLE_SECS: f32 = 4.0;
 /// Seconds to wait for the first interactive frame.
 const GIVE_UP_SECS: f32 = 90.0;
@@ -146,7 +198,8 @@ fn tour(
     real: Res<Time<Real>>,
     mut commands: Commands,
     mut time: ResMut<GlobeTime>,
-    mut orbit: ResMut<OrbitState>,
+    mut flight: ResMut<GlobeFlightState>,
+    mut look: ResMut<GlobeLook>,
     mut credits: ResMut<CreditsOpen>,
     mut idle: ResMut<UiIdle>,
     status: Res<GlobeRenderStatus>,
@@ -180,14 +233,16 @@ fn tour(
         }
         return;
     };
-    let (lat, lon, radii) = shot.view;
-    let wanted = OrbitState {
-        lat_deg: lat,
-        lon_deg: lon,
-        distance_km: radii * EARTH_RADIUS_KM,
+    let (lat, lon, altitude_km) = shot.view;
+    let wanted = GlobeFlight {
+        altitude_km,
+        ..GlobeFlight::start(lat, lon)
     };
-    if *orbit != wanted {
-        *orbit = wanted;
+    if flight.0 != wanted {
+        flight.0 = wanted;
+    }
+    if look.offset_deg != shot.look_deg {
+        look.offset_deg = shot.look_deg;
     }
     if time.years.0 != shot.years {
         time.years = YearsBp(shot.years);

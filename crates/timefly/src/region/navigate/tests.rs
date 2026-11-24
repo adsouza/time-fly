@@ -848,6 +848,35 @@ fn a_frame_stall_does_not_cancel_a_descent() {
     );
 }
 
+/// The double-click entry's descent (a stand-in until Task 7's dive) eases the globe's fly over
+/// the requested spot and down toward the dive altitude.
+#[test]
+fn the_descent_eases_the_fly_over_the_spot_and_down() {
+    let mut app = nav_app(false);
+    let start = app.world().resource::<GlobeFlightState>().0;
+    let since_s = app.world().resource::<LoadClock>().elapsed_s;
+    app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Descending {
+        target: RenderDir(ON_PLATE),
+        since_s,
+        started: false,
+    };
+    // One second, inside the start timeout.
+    for _ in 0..10 {
+        app.update();
+    }
+    assert!(
+        matches!(phase(&app), NavPhase::Descending { .. }),
+        "{:?}",
+        phase(&app)
+    );
+    let flight = app.world().resource::<GlobeFlightState>().0;
+    let target = ON_PLATE.normalize();
+    assert!(flight.dir.angle_between(target) < 0.25 * start.dir.angle_between(target));
+    assert!(flight.altitude_km < start.altitude_km);
+    let gap = flight.altitude_km - NEAR_GLOBE_ALTITUDE_KM;
+    assert!(gap > 0.0 && gap < 0.25 * (start.altitude_km - NEAR_GLOBE_ALTITUDE_KM));
+}
+
 #[test]
 fn snapshot_change_to_missing_crust_returns_to_globe() {
     let mut app = nav_app(true);
@@ -880,12 +909,9 @@ fn snapshot_change_to_missing_crust_returns_to_globe() {
     assert!(app.world().get_resource::<ActiveRegion>().is_none());
     assert!(!app.world().resource::<TerrainSettings>().visible);
     // The globe is centred on the region, close in, at the new time.
-    let orbit = *app.world().resource::<OrbitState>();
-    assert!(
-        (orbit.direction().as_dvec3() - ON_PLATE).length() < 1e-5,
-        "{orbit:?}"
-    );
-    assert_eq!(orbit.distance_km, NEAR_ORBIT_KM);
+    let flight = app.world().resource::<GlobeFlightState>().0;
+    assert!((flight.dir - ON_PLATE).length() < 1e-5, "{flight:?}");
+    assert_eq!(flight.altitude_km, NEAR_GLOBE_ALTITUDE_KM);
     assert_eq!(app.world().resource::<GlobeTime>().years, YearsBp(250e6));
 }
 
@@ -965,11 +991,9 @@ fn backspace_leaves_to_the_globe_centred_on_the_region() {
     assert_eq!(region_state(&app), RegionState::Globe);
     assert_eq!(phase(&app), NavPhase::Globe);
     assert_eq!(app.world().resource::<Seen>().left, 1);
-    let orbit = *app.world().resource::<OrbitState>();
-    assert!(
-        (orbit.direction().as_dvec3() - centre.0).length() < 1e-5,
-        "{orbit:?}"
-    );
+    let flight = app.world().resource::<GlobeFlightState>().0;
+    assert!((flight.dir - centre.0).length() < 1e-5, "{flight:?}");
+    assert_eq!(flight.altitude_km, NEAR_GLOBE_ALTITUDE_KM);
 }
 
 #[test]

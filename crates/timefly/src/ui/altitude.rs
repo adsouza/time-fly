@@ -1,15 +1,13 @@
 //! The fly’s altitude above sea level, sampled twice a second (M3 design §5.3).
 //!
-//! Whichever world shows the fly writes [`FlyAltitude`] in its own units (the region in metres;
-//! the globe in kilometres once it flies the fly, Task 4). Until the globe writes it, an active
-//! globe camera's own altitude stands in.
+//! Whichever world shows the fly writes [`FlyAltitude`] in its own units: the region in metres
+//! (`crate::fly_camera`), the globe in kilometres of true altitude (`crate::globe_flight`).
 
 use std::time::Duration;
 
 use bevy::prelude::*;
 
 use super::{GUTTER_PX, TEXT_COLOR};
-use crate::globe::{EARTH_RADIUS_KM, GlobeCamera};
 
 const REFRESH: Duration = Duration::from_millis(500);
 
@@ -68,7 +66,6 @@ pub fn altitude_label(altitude: Altitude) -> String {
 
 fn update_altitude(
     fly: Res<FlyAltitude>,
-    globe: Query<(&Camera, &Transform), With<GlobeCamera>>,
     time: Res<Time<Real>>,
     mut next_refresh: Local<Duration>,
     mut readout: Single<(&mut Text, &mut Visibility), With<AltitudeText>>,
@@ -79,16 +76,11 @@ fn update_altitude(
         return;
     }
     *next_refresh = now + REFRESH;
-    let label = if let Some(altitude) = fly.0 {
-        altitude_label(altitude)
-    } else if let Some((_, pose)) = globe.iter().find(|(camera, _)| camera.is_active) {
-        let altitude_km = pose.translation.as_dvec3().length() - EARTH_RADIUS_KM;
-        altitude_label(Altitude::Kilometres(altitude_km))
-    } else {
+    let Some(altitude) = fly.0 else {
         visibility.set_if_neq(Visibility::Hidden);
         return;
     };
-    text.set_if_neq(Text::new(label));
+    text.set_if_neq(Text::new(altitude_label(altitude)));
     visibility.set_if_neq(Visibility::Visible);
 }
 
@@ -165,22 +157,15 @@ mod tests {
     }
 
     #[test]
-    fn without_a_fly_the_globe_camera_still_gives_an_altitude() {
+    fn a_camera_alone_gives_no_altitude() {
+        // Only a world that shows the fly gives a reading: an active globe camera with no fly
+        // altitude (no globe flight) leaves the readout hidden.
         let (mut app, entity) = overlay_app();
-        let globe = app
-            .world_mut()
-            .spawn((
-                GlobeCamera,
-                Camera::default(),
-                Transform::from_xyz(0.0, 0.0, EARTH_RADIUS_KM as f32 + 2000.0),
-            ))
-            .id();
-        app.update();
-        app.update();
-        assert_eq!(visible(&app, entity), Visibility::Visible);
-        assert_eq!(text(&app, entity), "Altitude 2000 km");
-        // An inactive globe camera gives nothing.
-        app.world_mut().get_mut::<Camera>(globe).unwrap().is_active = false;
+        app.world_mut().spawn((
+            crate::globe::GlobeCamera,
+            Camera::default(),
+            Transform::from_xyz(0.0, 0.0, 8_000.0),
+        ));
         app.update();
         app.update();
         assert_eq!(visible(&app, entity), Visibility::Hidden);

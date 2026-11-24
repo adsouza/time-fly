@@ -153,9 +153,17 @@ pub(super) fn region_sun_parts() -> impl Bundle {
     )
 }
 
-/// The region camera's and sun's layers: the terrain's and the dragonfly's (the sun lights it).
+/// The region camera's layers: the terrain's and the dragonfly's.
 pub fn region_view_layers() -> RenderLayers {
     RenderLayers::from_layers(&[TERRAIN_LAYER, FLY_LAYER])
+}
+
+/// The region sun's layers: the terrain's only. Bevy lists a directional light in every view
+/// whose layers meet its own and lights every mesh in that view with it, so the sun still
+/// lights the dragonfly in the region's view, but stays out of the globe's (which also sees
+/// [`FLY_LAYER`]), where the globe's sun alone lights the fly.
+pub fn region_sun_layers() -> RenderLayers {
+    RenderLayers::layer(TERRAIN_LAYER)
 }
 
 /// Spawns the region camera (inactive) and the region's sun; returns `(camera, sun)`.
@@ -174,7 +182,7 @@ pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (
             Name::new("Region sun"),
             TerrainSun,
             region_sun_parts(),
-            region_view_layers(),
+            region_sun_layers(),
         ))
         .id();
     debug!(?camera, ?sun, "region camera and sun spawned");
@@ -242,9 +250,20 @@ mod tests {
     }
 
     #[test]
-    fn the_region_camera_and_sun_see_the_dragonfly() {
-        let layers = region_view_layers();
-        assert!(layers.intersects(&RenderLayers::layer(TERRAIN_LAYER)));
-        assert!(layers.intersects(&RenderLayers::layer(FLY_LAYER)));
+    fn the_region_camera_sees_the_dragonfly_and_one_sun_lights_it_in_each_world() {
+        let camera = region_view_layers();
+        assert!(camera.intersects(&RenderLayers::layer(TERRAIN_LAYER)));
+        assert!(camera.intersects(&RenderLayers::layer(FLY_LAYER)));
+        // The region sun is in the region's view only; the globe's sun (default layer 0) in
+        // the globe's only. The globe camera's layers, in every mode, include the fly's.
+        let sun = region_sun_layers();
+        let globe_sun = RenderLayers::default();
+        assert!(sun.intersects(&camera) && !globe_sun.intersects(&camera));
+        use crate::globe::{ATMOSPHERE_LAYER, COMPOSITE_LAYER, DEEP_LAYER, RECENT_LAYER};
+        for layer in [RECENT_LAYER, DEEP_LAYER, COMPOSITE_LAYER] {
+            let globe = RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer, FLY_LAYER]);
+            assert!(globe_sun.intersects(&globe), "{layer}");
+            assert!(!sun.intersects(&globe), "{layer}");
+        }
     }
 }

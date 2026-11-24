@@ -7,7 +7,6 @@ pub mod args;
 pub mod art;
 pub mod bench;
 pub mod build_features;
-pub mod camera;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
 pub mod clock;
@@ -17,6 +16,7 @@ pub mod data;
 pub mod diagnostics;
 pub mod fly_camera;
 pub mod globe;
+pub mod globe_flight;
 pub mod gpu;
 pub mod region;
 pub mod sky;
@@ -30,12 +30,12 @@ pub mod window_memory;
 use args::LaunchArgs;
 use bench::ScrubBenchPlugin;
 use bench::region::{RegionBenchConfig, RegionBenchPlugin};
-use camera::OrbitCameraPlugin;
 use creature::CreaturePlugin;
 use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
 use fly_camera::FlyCameraPlugin;
 use globe::GlobePlugin;
+use globe_flight::GlobeFlightPlugin;
 use region::RegionPlugin;
 use region::launch::LaunchRegion;
 use region::navigate::RegionNavigationPlugin;
@@ -125,7 +125,7 @@ pub fn app(session: &Session) -> App {
         sky::SkyPlugin,
         water::WaterPlugin,
         terrain::warmup::RegionWarmupPlugin,
-        OrbitCameraPlugin,
+        GlobeFlightPlugin,
         RegionNavigationPlugin,
         FlyCameraPlugin,
         CreaturePlugin,

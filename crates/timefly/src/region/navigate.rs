@@ -3,8 +3,9 @@
 //!
 //! - **Entering.** A double-click on the globe ([`is_double_click`]) ray-casts to the direction
 //!   under the cursor ([`globe_hit`]), snaps the time to the nearest snapshot
-//!   ([`nearest_snapshot`]) and sends [`RegionRequested`]. While the region generates, the orbit
-//!   camera eases toward the spot. When it is ready ([`RegionEntered`]), the view fades over
+//!   ([`nearest_snapshot`]) and sends [`RegionRequested`]. While the region generates, the fly
+//!   eases over the spot and down to [`NEAR_GLOBE_ALTITUDE_KM`] ([`ease_flight_toward`]; Task 7
+//!   replaces this stand-in with the dive). When it is ready ([`RegionEntered`]), the view fades over
 //!   [`ENTER_FADE_S`] to the fly camera at its start pose ([`FlyState::start`]).
 //! - **Leaving.** `Backspace` fades back to the globe, centred on the region; [`RegionLeft`] is
 //!   written at the fade's midpoint, once the view is back on the globe.
@@ -54,16 +55,16 @@ use super::{
     ActiveRegion, LargeGenBudget, RegionEntered, RegionGenerated, RegionLeft, RegionRequested,
     RegionSnapshotChanged, RegionState, RegionSystems,
 };
-use crate::camera::{
-    MAX_LATITUDE_DEG, MIN_DISTANCE_KM, OrbitCameraSystems, OrbitState, ease_toward,
-};
 use crate::clock::LoadClock;
 use crate::data::GlobeData;
 use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState};
 use crate::globe::{EARTH_RADIUS_KM, GlobeCamera};
+use crate::globe_flight::{GlobeFlightState, GlobeFlightSystems, ease_flight_toward};
 use crate::terrain::{TerrainSceneSystems, TerrainSettings};
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged, nearest_snapshot};
 use crate::ui::{PointerOverUi, TEXT_COLOR};
+use timefly_core::flight::altitudes::DIVE_ALTITUDE_KM;
+use timefly_core::flight::globe::GlobeFlight;
 
 /// The fade from the globe into a region, and back out (design §6.1: under a second).
 pub const ENTER_FADE_S: f32 = 0.8;
@@ -87,8 +88,9 @@ pub const FALLBACK_NOTICE_S: f64 = 3.0;
 pub const START_TIMEOUT_S: f64 = 2.0;
 /// The haze the views fade through.
 pub const FADE_COLOR: Color = Color::srgb(0.86, 0.89, 0.93);
-/// The orbit distance the camera eases to while descending, and returns at when leaving.
-pub const NEAR_ORBIT_KM: f64 = MIN_DISTANCE_KM;
+/// The globe altitude the fly eases down to while descending, and returns at when leaving: the
+/// dive altitude, where Task 7's dive and climb swap worlds.
+pub const NEAR_GLOBE_ALTITUDE_KM: f64 = DIVE_ALTITUDE_KM;
 
 /// The ICE-6G_C frames, the recent globe's geographic frame, end at 26 ka BP (1950), 26,076
 /// years before the game's present. Up to that age a direction is geographic: crust positions
@@ -259,7 +261,7 @@ pub fn fallback_notice_shown(since_s: Option<f64>, now_s: f64, region_up: bool) 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum NavPhase {
     Globe,
-    /// A region was requested from the globe; the orbit camera eases toward `target`.
+    /// A region was requested from the globe; the fly eases over `target`.
     /// `started` once the region plugin has left `RegionState::Globe` for it. `since_s` is on
     /// the [`LoadClock`].
     Descending {
@@ -379,7 +381,7 @@ pub enum NavAction {
     PlaceAfterChange {
         agl_m: f32,
     },
-    /// Centre the orbit camera over a direction, close in.
+    /// Put the globe's fly over a direction at [`NEAR_GLOBE_ALTITUDE_KM`], heading north.
     CentreGlobe(RenderDir),
 }
 
@@ -648,7 +650,7 @@ impl Plugin for RegionNavigationPlugin {
         crate::clock::add_load_clock(app);
         app.init_resource::<Navigation>()
             .init_resource::<TerrainSettings>()
-            .init_resource::<OrbitState>()
+            .init_resource::<GlobeFlightState>()
             .init_resource::<FlyState>()
             .add_systems(Startup, spawn_overlay)
             .add_systems(
@@ -659,7 +661,7 @@ impl Plugin for RegionNavigationPlugin {
                     // in the same frame; before the terrain, so camera and terrain move together.
                     .after(RegionSystems)
                     .before(TerrainSceneSystems)
-                    .before(OrbitCameraSystems),
+                    .before(GlobeFlightSystems::Step),
             );
     }
 }
@@ -896,7 +898,7 @@ fn show_node(node: &mut Mut<Node>, shown: bool) {
 }
 
 /// Gathers input, events and the region; decides with [`step_nav`]; applies the actions and
-/// the phase's view (which camera, the overlay, the caption, the orbit ease).
+/// the phase's view (which camera, the overlay, the caption, the descent's ease).
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn navigate(
     mut nav: ResMut<Navigation>,
@@ -919,7 +921,7 @@ fn navigate(
     ),
     mut time: ResMut<GlobeTime>,
     mut fly: ResMut<FlyState>,
-    mut orbit: ResMut<OrbitState>,
+    mut flight: ResMut<GlobeFlightState>,
     mut terrain: ResMut<TerrainSettings>,
     mut ui: NavUi,
     large_budget: Option<ResMut<LargeGenBudget>>,
@@ -994,7 +996,7 @@ fn navigate(
             region.as_deref(),
             &mut time,
             &mut fly,
-            &mut orbit,
+            &mut flight,
             requests,
             left,
             changes,
@@ -1005,15 +1007,9 @@ fn navigate(
     }
     nav.phase = phase;
     if let NavPhase::Descending { target, .. } = phase {
-        let (lat, lon) = geo_to_latlon(render_to_geo(target));
-        let goal = OrbitState {
-            lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
-            lon_deg: lon,
-            distance_km: NEAR_ORBIT_KM,
-        };
-        let next = ease_toward(*orbit, goal, f64::from(dt_s));
-        if next != *orbit {
-            *orbit = next;
+        let next = ease_flight_toward(flight.0, target.0, NEAR_GLOBE_ALTITUDE_KM, f64::from(dt_s));
+        if next != flight.0 {
+            flight.0 = next;
         }
     }
     let shown = phase.region_shown();
@@ -1063,7 +1059,7 @@ fn apply_action(
     region: Option<&ActiveRegion>,
     time: &mut GlobeTime,
     fly: &mut FlyState,
-    orbit: &mut OrbitState,
+    flight: &mut GlobeFlightState,
     requests: &mut MessageWriter<RegionRequested>,
     left: &mut MessageWriter<RegionLeft>,
     changes: &mut MessageWriter<TimeChanged>,
@@ -1100,10 +1096,9 @@ fn apply_action(
         }
         NavAction::CentreGlobe(dir) => {
             let (lat, lon) = geo_to_latlon(render_to_geo(dir));
-            *orbit = OrbitState {
-                lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
-                lon_deg: lon,
-                distance_km: NEAR_ORBIT_KM,
+            flight.0 = GlobeFlight {
+                altitude_km: NEAR_GLOBE_ALTITUDE_KM,
+                ..GlobeFlight::start(lat, lon)
             };
         }
     }

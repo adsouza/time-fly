@@ -7,7 +7,7 @@
 //! and a settle has passed at the start pose, the bench drives [`FlyState`] along the region's
 //! scripted path ([`BenchPath`], [`SCRIPT_SECS`] of flight), then writes [`RegionLeft`] and
 //! waits on the globe. A region marked `pan_from_previous` is reached by an 8 s globe pan
-//! from the one before ([`pan_orbit`]). It then re-enters [`CYCLE_REGION`] [`MEMORY_CYCLES`]
+//! from the one before ([`pan_globe`]). It then re-enters [`CYCLE_REGION`] [`MEMORY_CYCLES`]
 //! times, sampling memory on the globe after each leave.
 //!
 //! **Blocks.** One per region, in the scrub bench's format: frame statistics under the R14 rule
@@ -51,11 +51,11 @@ use super::{
     passes, stall_count,
 };
 use crate::args::RegionArg;
-use crate::camera::{MAX_LATITUDE_DEG, OrbitState};
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
 use crate::fly_camera::{FlyState, FlySystems};
 use crate::globe::GlobeRenderStatus;
+use crate::globe_flight::{GlobeFlightState, GlobeFlightSystems};
 use crate::region::launch::launch_request;
 use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
 use crate::region::{
@@ -64,9 +64,10 @@ use crate::region::{
 use crate::terrain::TerrainOptions;
 use crate::time::GlobeTime;
 pub use path::{BenchPath, Coast, SCRIPT_SECS, Segment};
+use timefly_core::flight::globe::GlobeFlight;
 
 /// A bench region: a name and the launch argument that enters it. With `pan_from_previous`,
-/// the bench reaches it from the previous region by a globe pan ([`pan_orbit`]) instead of
+/// the bench reaches it from the previous region by a globe pan ([`pan_globe`]) instead of
 /// entering it from where the globe was left.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BenchRegion {
@@ -78,9 +79,9 @@ pub struct BenchRegion {
 /// Seconds the globe pan between two bench regions takes (eased at both ends).
 pub const PAN_SECS: f64 = 8.0;
 
-/// The orbit camera `t_s` seconds into a pan from `from` to `to` (lat, lon in degrees) at
-/// `distance_km`: along the great circle, eased in and out over [`PAN_SECS`].
-pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -> OrbitState {
+/// The globe's fly `t_s` seconds into a pan from `from` to `to` (lat, lon in degrees) at
+/// `altitude_km`: along the great circle, eased in and out over [`PAN_SECS`], heading along it.
+pub fn pan_globe(from: (f64, f64), to: (f64, f64), altitude_km: f64, t_s: f64) -> GlobeFlight {
     let dir = |(lat, lon): (f64, f64)| geo_to_render(latlon_to_geo(lat, lon)).0.normalize();
     let (a, b) = (dir(from), dir(to));
     let u = (t_s / PAN_SECS).clamp(0.0, 1.0);
@@ -91,11 +92,18 @@ pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -
     } else {
         (a * ((1.0 - s) * angle).sin() + b * (s * angle).sin()) / angle.sin()
     };
-    let (lat, lon) = geo_to_latlon(render_to_geo(RenderDir(p.normalize())));
-    OrbitState {
-        lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
-        lon_deg: lon,
-        distance_km,
+    let p = p.normalize();
+    let (lat, lon) = geo_to_latlon(render_to_geo(RenderDir(p)));
+    let start = GlobeFlight::start(lat, lon);
+    // Along the arc: the great circle's normal crossed with the position.
+    let heading = a
+        .cross(b)
+        .try_normalize()
+        .map_or(start.heading, |n| n.cross(p).normalize());
+    GlobeFlight {
+        dir: p,
+        heading,
+        altitude_km,
     }
 }
 
@@ -312,7 +320,9 @@ impl Plugin for RegionBenchPlugin {
                         .after(RegionSystems)
                         .after(NavigationSystems)
                         .after(FlySystems::Step)
-                        .before(FlySystems::Apply),
+                        .before(FlySystems::Apply)
+                        .after(GlobeFlightSystems::Step)
+                        .before(GlobeFlightSystems::Apply),
                     banner::update_banner.after(drive_region_bench),
                 ),
             );
@@ -349,13 +359,13 @@ enum Stage {
         region: usize,
         since: f64,
     },
-    /// Panning the globe from the previous region toward `region` ([`pan_orbit`]), then
+    /// Panning the globe from the previous region toward `region` ([`pan_globe`]), then
     /// entering it.
     Panning {
         region: usize,
         since: f64,
         from: (f64, f64),
-        distance_km: f64,
+        altitude_km: f64,
     },
     /// [`RegionLeft`] was written; waiting for the globe. `cycle` is the cycle that left.
     Leaving {
@@ -573,7 +583,7 @@ impl Game<'_, '_> {
 struct Controls<'w> {
     time: Option<ResMut<'w, GlobeTime>>,
     fly: Option<ResMut<'w, FlyState>>,
-    orbit: Option<ResMut<'w, OrbitState>>,
+    flight: Option<ResMut<'w, GlobeFlightState>>,
     requests: MessageWriter<'w, RegionRequested>,
     leave: MessageWriter<'w, RegionLeft>,
     exit: MessageWriter<'w, AppExit>,
@@ -762,10 +772,12 @@ fn drive_region_bench(
             match next {
                 Next::Region(region) if bench.config.regions[region].pan_from_previous => {
                     let prev = bench.config.regions[region - 1].arg;
-                    let distance_km = controls
-                        .orbit
+                    let altitude_km = controls
+                        .flight
                         .as_ref()
-                        .map_or(crate::region::navigate::NEAR_ORBIT_KM, |o| o.distance_km);
+                        .map_or(crate::region::navigate::NEAR_GLOBE_ALTITUDE_KM, |f| {
+                            f.0.altitude_km
+                        });
                     info!(
                         from = bench.config.regions[region - 1].name,
                         to = bench.config.regions[region].name,
@@ -775,7 +787,7 @@ fn drive_region_bench(
                         region,
                         since: now,
                         from: (prev.lat_deg, prev.lon_deg),
-                        distance_km,
+                        altitude_km,
                     };
                 }
                 Next::Region(region) => start_region(bench, region, now, &mut controls),
@@ -796,7 +808,7 @@ fn drive_region_bench(
             region,
             since,
             from,
-            distance_km,
+            altitude_km,
         } => {
             bench.runs[region].pan_ms.push(frame_ms);
             let to = (
@@ -804,10 +816,10 @@ fn drive_region_bench(
                 bench.config.regions[region].arg.lon_deg,
             );
             let t = now - since;
-            if let Some(orbit) = controls.orbit.as_mut() {
-                let next = pan_orbit(from, to, distance_km, t);
-                if **orbit != next {
-                    **orbit = next;
+            if let Some(flight) = controls.flight.as_mut() {
+                let next = pan_globe(from, to, altitude_km, t);
+                if flight.0 != next {
+                    flight.0 = next;
                 }
             }
             if t >= PAN_SECS {
@@ -1580,26 +1592,35 @@ mod tests {
     fn the_pan_follows_the_great_circle_eased() {
         let from = (62.0, -175.0);
         let to = (48.5, -113.5);
-        let dir = |o: OrbitState| geo_to_render(latlon_to_geo(o.lat_deg, o.lon_deg)).0;
+        let dir = |f: GlobeFlight| f.dir;
         let (a, b) = (
             geo_to_render(latlon_to_geo(from.0, from.1)).0,
             geo_to_render(latlon_to_geo(to.0, to.1)).0,
         );
-        let start = pan_orbit(from, to, 955.0, 0.0);
+        let start = pan_globe(from, to, 955.0, 0.0);
         assert!((dir(start) - a).length() < 1e-9);
-        assert_eq!(start.distance_km, 955.0);
-        let end = pan_orbit(from, to, 955.0, PAN_SECS);
+        assert_eq!(start.altitude_km, 955.0);
+        let end = pan_globe(from, to, 955.0, PAN_SECS);
         assert!((dir(end) - b).length() < 1e-9);
-        assert_eq!(pan_orbit(from, to, 955.0, PAN_SECS + 3.0), end);
+        assert_eq!(pan_globe(from, to, 955.0, PAN_SECS + 3.0), end);
+        // Heading along the arc, a unit tangent, all the way.
+        for k in 0..=8 {
+            let f = pan_globe(from, to, 955.0, PAN_SECS * f64::from(k) / 8.0);
+            assert!((f.heading.length() - 1.0).abs() < 1e-9 && f.heading.dot(f.dir).abs() < 1e-9);
+            let later = pan_globe(from, to, 955.0, PAN_SECS * (f64::from(k) + 0.5) / 8.0);
+            if k < 8 {
+                assert!((later.dir - f.dir).dot(f.heading) > 0.0, "{k}");
+            }
+        }
         // Halfway in time is halfway along the arc (the ease is symmetric).
-        let mid = dir(pan_orbit(from, to, 955.0, PAN_SECS / 2.0));
+        let mid = dir(pan_globe(from, to, 955.0, PAN_SECS / 2.0));
         assert!((mid.dot(a) - mid.dot(b)).abs() < 1e-9);
         assert!(
             (mid.normalize().dot(a.cross(b).normalize())).abs() < 1e-9,
             "on the great circle"
         );
         // Eased: the first tenth of the time covers under a tenth of the arc.
-        let early = dir(pan_orbit(from, to, 955.0, PAN_SECS / 10.0));
+        let early = dir(pan_globe(from, to, 955.0, PAN_SECS / 10.0));
         let total = a.dot(b).acos();
         assert!(early.dot(a).clamp(-1.0, 1.0).acos() < 0.1 * total);
     }

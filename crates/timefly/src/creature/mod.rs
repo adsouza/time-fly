@@ -9,11 +9,15 @@
 //!   with Bevy's PBR and adds a subtle rim light ([`RIM_COLOR`], [`RIM_STRENGTH`],
 //!   [`RIM_POWER`]) so it reads over dark ground.
 //! - **Pose** ([`FlyPose`]): whichever world is active writes it (the region's
-//!   `crate::fly_camera::apply_fly` today); [`follow_fly_pose`] copies it to the root's
-//!   transform, adding the bank. The bank ([`bank_step`]) and the idle bob ([`hover_offset`])
-//!   are visual only: they never move `FlyState`.
-//! - **Shown** only while the region camera is active, until the globe flies the fly too
-//!   (Task 4).
+//!   `crate::fly_camera::apply_fly`, the globe's `crate::globe_flight`); [`follow_fly_pose`]
+//!   copies it to the root's transform, adding the bank. The bank ([`bank_step`]) and the idle
+//!   bob ([`hover_offset`]) are visual only: they never move the flight state.
+//! - **Shown** while the region camera is active, or while the globe camera is and the globe
+//!   is interactive (not over the loading screen).
+//! - **Lit** by exactly one sun in each world: the region's sun shares the region camera's
+//!   terrain layer, so only the region's view lists it, and the globe's sun (layer 0) is in
+//!   only the globe's view. Bevy keeps a view's directional lights whose layers meet the
+//!   view's, and lights every mesh in that view with them.
 
 pub mod mesh;
 
@@ -32,6 +36,8 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 
 use crate::fly_camera::FlySystems;
+use crate::globe::{GlobeCamera, GlobeRenderStatus};
+use crate::globe_flight::GlobeFlightSystems;
 use crate::terrain::view::RegionCamera;
 pub use mesh::{ATTRIBUTE_WING, dragonfly_body_mesh, dragonfly_mesh, dragonfly_wings_mesh};
 
@@ -240,8 +246,12 @@ impl Plugin for CreaturePlugin {
 
 /// The systems without the render plugin and shader, for headless tests.
 pub(crate) fn add_creature_systems(app: &mut App) {
-    app.init_resource::<FlyPose>()
-        .add_systems(Update, follow_fly_pose.after(FlySystems::Apply));
+    app.init_resource::<FlyPose>().add_systems(
+        Update,
+        follow_fly_pose
+            .after(FlySystems::Apply)
+            .after(GlobeFlightSystems::Apply),
+    );
 }
 
 /// Spawns the dragonfly, hidden: a root with the opaque body and the translucent wings.
@@ -275,13 +285,18 @@ fn spawn_dragonfly(
     ));
 }
 
-/// Places the dragonfly at [`FlyPose`] and shows it only while a region is on screen.
+/// Places the dragonfly at [`FlyPose`] and shows it while a world that flies it is on screen:
+/// a region, or the globe once it is interactive.
 fn follow_fly_pose(
     pose: Res<FlyPose>,
-    cameras: Query<&Camera, With<RegionCamera>>,
+    regions: Query<&Camera, With<RegionCamera>>,
+    globes: Query<&Camera, With<GlobeCamera>>,
+    status: Option<Res<GlobeRenderStatus>>,
     mut flies: Query<(&mut Transform, &mut Visibility), With<Dragonfly>>,
 ) {
-    let shown = cameras.iter().any(|c| c.is_active);
+    let globe_ready = status.is_none_or(|s| matches!(*s, GlobeRenderStatus::Interactive { .. }));
+    let shown =
+        regions.iter().any(|c| c.is_active) || (globe_ready && globes.iter().any(|c| c.is_active));
     for (mut transform, mut visibility) in &mut flies {
         let want = pose.transform();
         if *transform != want {
@@ -330,7 +345,7 @@ mod tests {
     const TURN_RATE: f32 = 1.0;
 
     #[test]
-    fn the_dragonfly_follows_the_pose_only_in_a_region() {
+    fn the_dragonfly_follows_the_pose_in_either_world() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         add_creature_systems(&mut app);
@@ -362,10 +377,19 @@ mod tests {
         // Banked about its own body axis: the heading is kept, the right wing lifts.
         assert!((t.rotation * Vec3::NEG_Z).abs_diff_eq(pose.rotation * Vec3::NEG_Z, 1e-6));
         assert!((t.rotation * Vec3::X).y > 0.2, "{t:?}");
-        // Hidden off the region, shown with it.
+        // Hidden with neither world on screen, shown with the region.
         let visibility = |app: &App| *app.world().get::<Visibility>(fly).unwrap();
         assert_eq!(visibility(&app), Visibility::Hidden);
         app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = true;
+        app.update();
+        assert_eq!(visibility(&app), Visibility::Inherited);
+        // Shown with the globe once it is interactive; not over its loading screen.
+        app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = false;
+        app.world_mut().spawn((GlobeCamera, Camera::default()));
+        app.insert_resource(GlobeRenderStatus::PreparingGpu);
+        app.update();
+        assert_eq!(visibility(&app), Visibility::Hidden);
+        app.insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 });
         app.update();
         assert_eq!(visibility(&app), Visibility::Inherited);
     }

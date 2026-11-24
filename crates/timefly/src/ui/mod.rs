@@ -25,8 +25,8 @@ pub const TEXT_COLOR: Color = Color::srgb(0.93, 0.93, 0.95);
 /// Panels behind text.
 pub const PANEL_COLOR: Color = Color::srgba(0.07, 0.08, 0.11, 0.82);
 
-/// Whether the pointer is over the UI (or a UI overlay is open), so the orbit camera leaves
-/// drags and the scroll wheel alone.
+/// Whether the pointer is over the UI (or a UI overlay is open), so a drag that starts there
+/// steers neither the globe's fly nor the region's.
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointerOverUi(pub bool);
 
