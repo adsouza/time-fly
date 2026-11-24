@@ -1,4 +1,8 @@
-//! The active camera’s altitude above sea level, sampled twice a second.
+//! The fly’s altitude above sea level, sampled twice a second (M3 design §5.3).
+//!
+//! Whichever world shows the fly writes [`FlyAltitude`] in its own units (the region in metres;
+//! the globe in kilometres once it flies the fly, Task 4). Until the globe writes it, an active
+//! globe camera's own altitude stands in.
 
 use std::time::Duration;
 
@@ -6,9 +10,22 @@ use bevy::prelude::*;
 
 use super::{GUTTER_PX, TEXT_COLOR};
 use crate::globe::{EARTH_RADIUS_KM, GlobeCamera};
-use crate::terrain::view::RegionCamera;
 
 const REFRESH: Duration = Duration::from_millis(500);
+
+/// The fly's altitude above sea level, in the active world's units.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Altitude {
+    /// In a region (local metres above sea level).
+    Metres(f32),
+    /// On the globe.
+    Kilometres(f64),
+}
+
+/// The fly's altitude for the overlay, written by whichever world shows the fly; `None` when
+/// neither does.
+#[derive(Resource, Copy, Clone, Debug, Default, PartialEq)]
+pub struct FlyAltitude(pub Option<Altitude>);
 
 #[derive(Component)]
 struct AltitudeText;
@@ -17,7 +34,8 @@ pub(super) struct AltitudeOverlayPlugin;
 
 impl Plugin for AltitudeOverlayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_altitude)
+        app.init_resource::<FlyAltitude>()
+            .add_systems(Startup, spawn_altitude)
             .add_systems(PostUpdate, update_altitude);
     }
 }
@@ -40,9 +58,17 @@ fn spawn_altitude(mut commands: Commands) {
     ));
 }
 
+/// The readout's text for an altitude.
+pub fn altitude_label(altitude: Altitude) -> String {
+    match altitude {
+        Altitude::Metres(m) => format!("Altitude {m:.0} m"),
+        Altitude::Kilometres(km) => format!("Altitude {km:.0} km"),
+    }
+}
+
 fn update_altitude(
+    fly: Res<FlyAltitude>,
     globe: Query<(&Camera, &Transform), With<GlobeCamera>>,
-    region: Query<(&Camera, &Transform), With<RegionCamera>>,
     time: Res<Time<Real>>,
     mut next_refresh: Local<Duration>,
     mut readout: Single<(&mut Text, &mut Visibility), With<AltitudeText>>,
@@ -53,11 +79,11 @@ fn update_altitude(
         return;
     }
     *next_refresh = now + REFRESH;
-    let label = if let Some((_, pose)) = region.iter().find(|(camera, _)| camera.is_active) {
-        format!("Altitude {:.0} m", pose.translation.y)
+    let label = if let Some(altitude) = fly.0 {
+        altitude_label(altitude)
     } else if let Some((_, pose)) = globe.iter().find(|(camera, _)| camera.is_active) {
         let altitude_km = pose.translation.as_dvec3().length() - EARTH_RADIUS_KM;
-        format!("Altitude {altitude_km:.0} km")
+        altitude_label(Altitude::Kilometres(altitude_km))
     } else {
         visibility.set_if_neq(Visibility::Hidden);
         return;
@@ -71,13 +97,76 @@ mod tests {
     use super::*;
     use bevy::time::TimeUpdateStrategy;
 
-    #[test]
-    fn altitude_samples_the_active_camera_every_half_second() {
+    fn overlay_app() -> (App, Entity) {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, AltitudeOverlayPlugin))
+            .init_resource::<FlyAltitude>()
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
                 250,
             )));
+        app.update();
+        let world = app.world_mut();
+        let entity = world
+            .query_filtered::<Entity, With<AltitudeText>>()
+            .single(world)
+            .unwrap();
+        (app, entity)
+    }
+
+    fn text(app: &App, entity: Entity) -> String {
+        app.world().get::<Text>(entity).unwrap().0.clone()
+    }
+
+    fn visible(app: &App, entity: Entity) -> Visibility {
+        *app.world().get::<Visibility>(entity).unwrap()
+    }
+
+    fn set(app: &mut App, altitude: Option<Altitude>) {
+        app.world_mut().resource_mut::<FlyAltitude>().0 = altitude;
+    }
+
+    #[test]
+    fn the_overlay_shows_the_flys_altitude() {
+        let (mut app, entity) = overlay_app();
+        // Nothing shows the fly and no camera is active: hidden.
+        assert_eq!(visible(&app, entity), Visibility::Hidden);
+        // The region's fly, sampled every half second.
+        set(&mut app, Some(Altitude::Metres(8_100.6)));
+        app.update();
+        app.update();
+        assert_eq!(visible(&app, entity), Visibility::Visible);
+        assert_eq!(text(&app, entity), "Altitude 8101 m");
+        set(&mut app, Some(Altitude::Metres(8_200.0)));
+        app.update();
+        assert_eq!(text(&app, entity), "Altitude 8101 m");
+        app.update();
+        assert_eq!(text(&app, entity), "Altitude 8200 m");
+        // The globe's fly, in kilometres.
+        set(&mut app, Some(Altitude::Kilometres(1_234.4)));
+        app.update();
+        app.update();
+        assert_eq!(text(&app, entity), "Altitude 1234 km");
+        // The fly's altitude wins over a camera's: an active region camera far from the fly is
+        // not what the overlay reads.
+        app.world_mut().spawn((
+            crate::terrain::view::RegionCamera,
+            Camera::default(),
+            Transform::from_xyz(0.0, 99_999.0, 0.0),
+        ));
+        set(&mut app, Some(Altitude::Metres(150.0)));
+        app.update();
+        app.update();
+        assert_eq!(text(&app, entity), "Altitude 150 m");
+        // Neither world claims it: hidden again.
+        set(&mut app, None);
+        app.update();
+        app.update();
+        assert_eq!(visible(&app, entity), Visibility::Hidden);
+    }
+
+    #[test]
+    fn without_a_fly_the_globe_camera_still_gives_an_altitude() {
+        let (mut app, entity) = overlay_app();
         let globe = app
             .world_mut()
             .spawn((
@@ -86,41 +175,14 @@ mod tests {
                 Transform::from_xyz(0.0, 0.0, EARTH_RADIUS_KM as f32 + 2000.0),
             ))
             .id();
-        let region = app
-            .world_mut()
-            .spawn((
-                RegionCamera,
-                Camera {
-                    is_active: false,
-                    ..default()
-                },
-                Transform::from_xyz(200.0, 8100.6, -500.0),
-            ))
-            .id();
         app.update();
-        let world = app.world_mut();
-        let entity = world
-            .query_filtered::<Entity, With<AltitudeText>>()
-            .single(world)
-            .unwrap();
-        let text = |app: &App| app.world().get::<Text>(entity).unwrap().0.clone();
-        let visible = |app: &App| *app.world().get::<Visibility>(entity).unwrap();
-        assert_eq!(visible(&app), Visibility::Visible);
-        assert_eq!(text(&app), "Altitude 2000 km");
+        app.update();
+        assert_eq!(visible(&app, entity), Visibility::Visible);
+        assert_eq!(text(&app, entity), "Altitude 2000 km");
+        // An inactive globe camera gives nothing.
         app.world_mut().get_mut::<Camera>(globe).unwrap().is_active = false;
-        app.world_mut().get_mut::<Camera>(region).unwrap().is_active = true;
         app.update();
-        assert_eq!(text(&app), "Altitude 2000 km");
         app.update();
-        assert_eq!(text(&app), "Altitude 8101 m");
-        app.world_mut()
-            .get_mut::<Transform>(region)
-            .unwrap()
-            .translation
-            .y = 8200.0;
-        app.update();
-        assert_eq!(text(&app), "Altitude 8101 m");
-        app.update();
-        assert_eq!(text(&app), "Altitude 8200 m");
+        assert_eq!(visible(&app, entity), Visibility::Hidden);
     }
 }

@@ -4,7 +4,7 @@
 //! Each plugin keeps its decisions in pure functions (unit-tested directly); the systems only
 //! gather input, call them and apply the result.
 
-mod altitude;
+pub mod altitude;
 pub mod credits;
 pub mod fps;
 pub mod slider;

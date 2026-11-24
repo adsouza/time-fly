@@ -22,6 +22,7 @@ use timefly_core::terrain::blended_height_m;
 use timefly_core::worldgen::generate::RegionGrid;
 
 use super::{TERRAIN_LAYER, TerrainScene, TerrainSettings};
+use crate::creature::FLY_LAYER;
 use crate::globe::GlobeCamera;
 use crate::region::CAMERA_START_ALTITUDE_M;
 
@@ -152,6 +153,11 @@ pub(super) fn region_sun_parts() -> impl Bundle {
     )
 }
 
+/// The region camera's and sun's layers: the terrain's and the dragonfly's (the sun lights it).
+pub fn region_view_layers() -> RenderLayers {
+    RenderLayers::from_layers(&[TERRAIN_LAYER, FLY_LAYER])
+}
+
 /// Spawns the region camera (inactive) and the region's sun; returns `(camera, sun)`.
 pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (Entity, Entity) {
     let camera = commands
@@ -160,7 +166,7 @@ pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (
             RegionCamera,
             region_camera(),
             region_camera_parts(grid),
-            RenderLayers::layer(TERRAIN_LAYER),
+            region_view_layers(),
         ))
         .id();
     let sun = commands
@@ -168,7 +174,7 @@ pub(super) fn spawn_region_view(commands: &mut Commands, grid: &RegionGrid) -> (
             Name::new("Region sun"),
             TerrainSun,
             region_sun_parts(),
-            RenderLayers::layer(TERRAIN_LAYER),
+            region_view_layers(),
         ))
         .id();
     debug!(?camera, ?sun, "region camera and sun spawned");
@@ -233,5 +239,12 @@ mod tests {
         assert!(region_view_wanted(true, &on));
         assert!(!region_view_wanted(false, &on));
         assert!(!region_view_wanted(true, &off));
+    }
+
+    #[test]
+    fn the_region_camera_and_sun_see_the_dragonfly() {
+        let layers = region_view_layers();
+        assert!(layers.intersects(&RenderLayers::layer(TERRAIN_LAYER)));
+        assert!(layers.intersects(&RenderLayers::layer(FLY_LAYER)));
     }
 }
