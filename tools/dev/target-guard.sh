@@ -330,16 +330,15 @@ hook_done() {
   exit 0
 }
 
-# emit_pre_deny <systemMessage> <reason>: PreToolUse "deny" hook output.
+# emit_pre_deny <systemMessage> <reason>: PreToolUse "deny" hook output. Only reached after
+# read_hook_input parsed a command, which needs jq or python3, so one of them exists.
 emit_pre_deny() {
   if command -v jq >/dev/null 2>&1; then
     jq -n --arg s "$1" --arg r "$2" \
       '{systemMessage:$s, hookSpecificOutput:{hookEventName:"PreToolUse", permissionDecision:"deny", permissionDecisionReason:$r}}'
-  elif command -v python3 >/dev/null 2>&1; then
+  else
     python3 -c 'import json,sys
 print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":sys.argv[2]}}))' "$1" "$2"
-  else
-    echo "$2" >&2; exit 2
   fi
 }
 
