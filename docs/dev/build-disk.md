@@ -77,7 +77,8 @@ culprits outside `target/` (below).
   `TIMEFLY_XCTRACE_MIN_FREE_MB`; the reason says why and how to proceed. Mentions (`grep`, `rg`,
   `echo`, `git log --grep`), `xctrace list` and `xcrun simctl` are allowed. It allows everything
   else, and allows everything if the input can't be parsed or neither `jq` nor `python3` is
-  available. Known false deny: text in a heredoc body that looks like an `xctrace record` command.
+  available. Heredoc bodies (`<<EOF`, `<<'EOF'`, `<<"EOF"`, `<<-EOF`, also inside `"$(cat <<'EOF' …)"`,
+  the usual commit/PR message form) are text, not commands, for both hooks.
 
 ```sh
 tools/dev/target-guard.sh --status   # sizes and limits, deletes nothing

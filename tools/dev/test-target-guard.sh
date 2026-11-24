@@ -576,6 +576,29 @@ profiles 16b
 out=$(hook_json 'cargo build' | TIMEFLY_FAKE_FREE_STATIC=1 TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook 2>&1)
 check "hook: same stop, reported to Claude" bash -c 'test "$1" = "wasm32-unknown-unknown scratch-a doc debug " && grep -q "tmutil listlocalsnapshots" <<<"$2"' _ "$(left)" "$(ctx_of "$out")"
 
+echo "17. heredoc bodies are text, not commands (at every nesting level)"
+newroot 17
+Q="'"
+xcase allow 20000 "git commit -m \"\$(cat <<${Q}EOF${Q}${NL}target-guard: deny \`xctrace record\` without --time-limit${NL}EOF${NL})\""
+xcase allow 20000 "gh pr create --title x --body \"\$(cat <<${Q}EOF${Q}${NL}- Blocks \`xctrace record\` unless bounded.${NL}EOF${NL})\""
+xcase allow 20000 "git commit -m \"\$(cat <<${Q}EOF${Q}${NL}Summary${NL}${NL}xctrace record is now blocked${NL}EOF${NL})\""
+xcase allow 20000 "git commit -F - <<${Q}EOF${Q}${NL}xctrace record is now blocked${NL}EOF"
+xcase allow 20000 "cat > notes.md <<${Q}EOF${Q}${NL}Never run \`xctrace record\` bare.${NL}xctrace record --template X${NL}EOF"
+xcase allow 20000 "git commit -m \"\$(cat <<${Q}EOF${Q}${NL}1) Fix \"quotes\" (and parens${NL}xctrace record --template X${NL}EOF${NL})\""
+xcase allow 20000 "cat <<\"EOF\"${NL}xctrace record --template X${NL}EOF"
+xcase allow 20000 "cat <<-EOF${NL}	xctrace record --template X${NL}	EOF"
+xcase allow 20000 "cat <<EOF${NL}xctrace record --template X"
+xcase deny  20000 "xctrace record --template X <<EOF${NL}hello${NL}EOF"
+xcase deny  20000 "cat <<EOF${NL}hello${NL}EOF${NL}xctrace record --template X"
+xcase deny  20000 "cat <<-EOF${NL}	hello${NL}	EOF${NL}xctrace record --template X"
+xcase deny  20000 "cat <<EOF >a${NL}x${NL}EOF${NL}cat <<${Q}END${Q}${NL}y${NL}END${NL}xctrace record --template X"
+xcase deny  20000 "cat <<< \"here string\"${NL}xctrace record --template X"
+xcase deny  20000 "out=\"\$(cat <<EOF${NL}x${NL}EOF${NL}xctrace record --template X)\""
+xcase deny  20000 "bash -c ${Q}cat <<EOF${NL}x${NL}EOF${NL}xctrace record --template X${Q}"
+cargo_case no  "git commit -m \"\$(cat <<${Q}EOF${Q}${NL}Run \`cargo build\` first${NL}EOF${NL})\""
+cargo_case no  "git commit -F - <<${Q}EOF${Q}${NL}cargo build fixed${NL}EOF"
+cargo_case yes "cat <<EOF${NL}notes${NL}EOF${NL}cargo build"
+
 echo
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -59,19 +59,67 @@ fi
 # Nested commands, i.e. the script of `sh|bash|zsh|dash|ksh -c SCRIPT` and the body of a
 # `$(...)` or backtick substitution inside double quotes, come out as extra lines: \034 then
 # the (encoded) nested command; all_segments tokenizes those in turn.
+# Heredoc bodies (<<WORD, <<'WORD', <<"WORD", <<-WORD; not the <<< here-string) are text and
+# are dropped up to their terminator line; an unterminated heredoc drops the rest.
 # A rough tokenizer: unusual syntax may hide a command, never invent one.
 command_segments() {
   TF_CMD="$1" awk '
     function enc(t) { gsub(/\n/, "\036", t); gsub(/\t/, "\035", t); return t }
     function endword() { if (inword) { w[++n] = enc(word) }; word = ""; inword = 0 }
-    # substitution body starting at st inside double quotes; returns the index of its end
-    function capsub(st, tick,   j, ch, depth) {
+    # heredoc operator "<<" at j (not "<<<"): sets HW (delimiter, quotes removed) and HS
+    # (1 for <<-); returns the index of the last character of the operator and word.
+    function hd_parse(j,   k, ch, w, qq) {
+      k = j + 2; HS = 0
+      if (substr(s, k, 1) == "-") { HS = 1; k++ }
+      while (substr(s, k, 1) == " " || substr(s, k, 1) == "\t") k++
+      w = ""; qq = ""
+      for (; k <= L; k++) {
+        ch = substr(s, k, 1)
+        if (qq != "") { if (ch == qq) qq = ""; else w = w ch; continue }
+        if (ch == "\047" || ch == "\"") { qq = ch; continue }
+        if (ch == "\\") { k++; w = w substr(s, k, 1); continue }
+        if (ch ~ /[ \t\n;|&()<>]/) break
+        w = w ch
+      }
+      HW = w
+      return k - 1
+    }
+    # heredoc body after the newline at j: skips lines up to and including the one equal to
+    # w (leading tabs stripped if strip); returns the index of the last character skipped.
+    function hd_skip(j, w, strip,   k, line) {
+      while (j < L) {
+        for (k = j + 1; k <= L && substr(s, k, 1) != "\n"; k++) ;
+        line = substr(s, j + 1, k - j - 1)
+        if (strip) sub(/^\t+/, "", line)
+        j = (k <= L) ? k : L
+        if (line == w) return j
+      }
+      return L
+    }
+    # substitution body starting at st inside double quotes; returns the index of its end.
+    # For $(...), finds the matching ")" outside quotes and heredoc bodies.
+    function capsub(st, tick,   j, ch, depth, q2, nh2, h, cw, cs) {
       if (tick) {
         j = index(substr(s, st), "`"); j = j ? st + j - 1 : L + 1
       } else {
-        depth = 1
+        depth = 1; q2 = ""; nh2 = 0
         for (j = st; j <= L; j++) {
           ch = substr(s, j, 1)
+          if (q2 == "\047") { if (ch == "\047") q2 = ""; continue }
+          if (q2 == "\"") { if (ch == "\\") j++; else if (ch == "\"") q2 = ""; continue }
+          if (ch == "\\") { j++; continue }
+          if (ch == "\047" || ch == "\"") { q2 = ch; continue }
+          if (ch == "<" && substr(s, j + 1, 1) == "<") {
+            if (substr(s, j + 2, 1) == "<") { j += 2; continue }
+            j = hd_parse(j)
+            if (HW != "") { cw[++nh2] = HW; cs[nh2] = HS }
+            continue
+          }
+          if (ch == "\n" && nh2) {
+            for (h = 1; h <= nh2; h++) j = hd_skip(j, cw[h], cs[h])
+            nh2 = 0
+            continue
+          }
           if (ch == "(") depth++
           else if (ch == ")" && --depth == 0) break
         }
@@ -142,7 +190,7 @@ command_segments() {
       n = 0
     }
     BEGIN {
-      s = ENVIRON["TF_CMD"]; L = length(s); q = ""; n = 0; ns = 0; word = ""; inword = 0
+      s = ENVIRON["TF_CMD"]; L = length(s); q = ""; n = 0; ns = 0; nh = 0; word = ""; inword = 0
       for (i = 1; i <= L; i++) {
         c = substr(s, i, 1); nx = substr(s, i + 1, 1)
         if (q == "\047") { if (c == "\047") q = ""; else word = word c; continue }
@@ -161,6 +209,18 @@ command_segments() {
         if (c == "\047" || c == "\"") { q = c; inword = 1; continue }
         if (c == "#" && !inword) { while (i <= L && substr(s, i, 1) != "\n") i++; endseg(); continue }
         if (c == " " || c == "\t") { endword(); continue }
+        if (c == "<" && nx == "<") {
+          if (substr(s, i + 2, 1) == "<") { word = word "<<<"; inword = 1; i += 2; continue }
+          endword(); i = hd_parse(i)
+          if (HW != "") { hw[++nh] = HW; hs[nh] = HS }
+          continue
+        }
+        if (c == "\n" && nh) {
+          endseg()
+          for (h = 1; h <= nh; h++) i = hd_skip(i, hw[h], hs[h])
+          nh = 0
+          continue
+        }
         if (c == "\n" || c == ";" || c == "(" || c == ")" || c == "`") { endseg(); continue }
         if (c == "$" && nx == "(") { i++; endseg(); continue }
         if (c == "&") {
