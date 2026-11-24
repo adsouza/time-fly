@@ -852,8 +852,27 @@ result: PASS
 - Why the two runs got different render sizes is not known. Neither build fits the canvas to the
   window. Main's `fit_canvas_to_parent` (PR #11, merged later) ties the render size to the
   window, so a pair on a build with it compares like for like.
-- **Still to do:** a same-window pair, Pangaea alone with and without `&no-dunes`, on a build that
-  fits the canvas to the window.
+
+**Chrome WebGPU, Pangaea alone, a same-window pair** (art-pass with main merged, `568cf9c`
+plus the FPS readout `5ec62c3`, so the canvas fits the window; the owner's Incognito window at
+1600 × 900 on a 1× display, both runs back to back; build labels read `ba99e39`, stale as above):
+
+| | Dunes on (`38e14ab9`) | Dunes off (`028d3889`) |
+|---|---|---|
+| Render resolution | 1600 × 779 | 1600 × 779 |
+| Flight median / p95 / worst | 16.61 / 18.43 / 27.91 ms | 16.67 / 17.97 / 20.64 ms |
+| Missed (> 50 ms) | 0 of 3,600 | 0 of 3,600 |
+| R11 first-region worst frame | 344.28 ms (FAIL) | 491.70 ms (FAIL) |
+| First-entry generation | 1,527 ms (longest slice 13.4 ms) | 1,893 ms (longest slice 50.3 ms) |
+
+- **At this size the dunes don't change the frame rate:** both flights hold the 60 Hz display.
+  Only the p95 (0.46 ms) and the worst frame differ. The dunes' cost shows where the GPU is the
+  limit: natively at 2560 × 1440 (2–4 ms a frame, above) and in the 3200 × 1800 run.
+- **R11 fails both ways, worse with the dunes off,** so it isn't the dunes. Both are well above the
+  pre-merge single run (226.66 ms at 1280 × 720) and M2's 231.67 ms. The dunes-off load also had a
+  50.3 ms generation slice (13 ms elsewhere). Two samples can't tell noise from a regression
+  brought in by the merge (main's tile changes, the canvas fitting, the FPS readout); that needs
+  its own look.
 
 ## Sizes: packages and Pages (Task 10)
 
