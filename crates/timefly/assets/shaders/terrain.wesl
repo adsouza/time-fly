@@ -276,7 +276,14 @@ fn ramp(l: f32, floor_level: f32, lift: f32) -> f32 {
 fn paint_light(lit: vec3<f32>, albedo: vec3<f32>, snow: f32) -> vec3<f32> {
     let l = dot(lit, LUMA) / max(dot(albedo, LUMA), 1e-4) / max(look.light.x, 1e-6);
     let lift = mix(0.42, 0.58 - look.relief.z, snow);
-    var c = lit * (ramp(l, mix(0.16, look.relief.z, snow), lift) / max(l, 1e-4));
+    let ramp_level = ramp(l, mix(0.16, look.relief.z, snow), lift);
+    // In deep shade `lit` is nearly all blue sky ambient, and scaling it up to the ramp's floor
+    // would amplify that blue (vivid blotches on shaded cliffs). Below l = 0.15 the colour comes
+    // from the albedo in full-sun light instead, at the same luminance; at and above 0.15 it is
+    // the scaled `lit` exactly.
+    let scaled = lit * (ramp_level / max(l, 1e-4));
+    let in_sun_colour = albedo * (look.light.x * ramp_level);
+    var c = mix(in_sun_colour, scaled, smoothstep(0.05, 0.15, l));
     let shade = 1.0 - smoothstep(0.12, 0.6, l);
     c = c * mix(vec3<f32>(1.0), look.shadow.rgb, shade * look.shadow.a * mix(1.0, look.relief.w, snow));
     return c;
