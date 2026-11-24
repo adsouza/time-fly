@@ -152,6 +152,12 @@ TIMEFLY_LOG_DIR=<fresh dir> BEVY_ASSET_ROOT=crates/timefly \
   target/release/timefly --region-bench --target-fps 60 --window 2560x1440
 ```
 
+**One region only** (2026-11-24): add `--region=LAT,LON,AGE_YEARS` (web
+`?region-bench&region=LAT,LON,AGE_YEARS`) to bench just that place. It's one 60 s flight with
+no globe pan and no memory cycles, about a minute in all. The place counts as the first region,
+so R11 applies to it. Its block is titled `Chosen region (LAT, LON at AGE years)`, and the
+summary says `regions: single (…)`, where the full bench says `regions: all 8`.
+
 ### Native, Apple M4 (Metal), 2026-11-23
 
 Release build of `a27355a` plus the Task 10 changes (thin LTO), macOS 27.2.1, 60 Hz display.

@@ -136,12 +136,13 @@ pub fn app(session: &Session) -> App {
     let target_fps = args.target_fps.unwrap_or(default_fps);
     let exit_when_done = !cfg!(target_arch = "wasm32");
     if args.region_bench {
-        // The region bench enters its own regions; it takes precedence over the scrub bench
-        // and the launch region.
-        app.add_plugins(RegionBenchPlugin(RegionBenchConfig::new(
-            target_fps,
-            exit_when_done,
-        )));
+        // The region bench enters its own regions and takes precedence over the scrub bench.
+        // With `--region` it benches only that region (one flight, no pan or memory cycles).
+        let config = match args.region {
+            Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
+            None => RegionBenchConfig::new(target_fps, exit_when_done),
+        };
+        app.add_plugins(RegionBenchPlugin(config));
     } else {
         if let Some(region) = args.region {
             app.insert_resource(LaunchRegion(region));

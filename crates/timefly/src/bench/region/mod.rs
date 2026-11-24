@@ -189,18 +189,18 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
 /// it fetches tiles, so re-entries exercise the tile cache's eviction and refetch.
 pub const CYCLE_REGION: &str = "Himalayas";
 
-/// [`CYCLE_REGION`]'s index in [`BENCH_REGIONS`].
-pub fn cycle_region() -> usize {
-    BENCH_REGIONS
-        .iter()
-        .position(|r| r.name == CYCLE_REGION)
-        .unwrap_or(0)
+/// [`CYCLE_REGION`]'s index in `regions`, if it is there (a single-region run has none).
+pub fn cycle_region(regions: &[BenchRegion]) -> Option<usize> {
+    regions.iter().position(|r| r.name == CYCLE_REGION)
 }
 
 /// Bench stops: the regions plus the globe pans before panned regions.
-pub fn stop_count() -> usize {
-    BENCH_REGIONS.len() + BENCH_REGIONS.iter().filter(|r| r.pan_from_previous).count()
+pub fn stop_count(regions: &[BenchRegion]) -> usize {
+    regions.len() + regions.iter().filter(|r| r.pan_from_previous).count()
 }
+
+/// The name a single-region run gives the region it was asked to bench.
+pub const CHOSEN_REGION: &str = "Chosen region";
 
 /// Enter/leave cycles after the regions, re-entering the first region.
 pub const MEMORY_CYCLES: u32 = 10;
@@ -227,6 +227,9 @@ pub struct RegionBenchConfig {
     pub path_secs: f32,
     pub cycles: u32,
     pub timeout_secs: f64,
+    /// The regions to fly, in order: [`BENCH_REGIONS`] for the full bench, or one
+    /// [`CHOSEN_REGION`] for `--region-bench --region=…`.
+    pub regions: Vec<BenchRegion>,
 }
 
 impl RegionBenchConfig {
@@ -237,7 +240,45 @@ impl RegionBenchConfig {
             path_secs: SCRIPT_SECS,
             cycles: MEMORY_CYCLES,
             timeout_secs: REGION_TIMEOUT_SECS,
+            regions: BENCH_REGIONS.to_vec(),
         }
+    }
+
+    /// The bench over one region (`--region-bench --region=…`): its flight only, with no globe
+    /// pan and no memory cycles. The region is the first, so R11 applies to it.
+    pub fn single(target_fps: u32, exit_when_done: bool, arg: RegionArg) -> Self {
+        RegionBenchConfig {
+            cycles: 0,
+            regions: vec![BenchRegion {
+                name: CHOSEN_REGION,
+                arg,
+                pan_from_previous: false,
+            }],
+            ..RegionBenchConfig::new(target_fps, exit_when_done)
+        }
+    }
+
+    /// The region a single-region run benches, if this is one.
+    pub fn single_region(&self) -> Option<RegionArg> {
+        match self.regions.as_slice() {
+            [only] if only.name == CHOSEN_REGION => Some(only.arg),
+            _ => None,
+        }
+    }
+}
+
+/// The summary's line naming what was benched: `regions: all 8` or
+/// `regions: single (LAT, LON at AGE years)`.
+pub fn regions_line(config: &RegionBenchConfig) -> String {
+    match config.single_region() {
+        Some(a) => format!(
+            "regions: single ({}, {} at {} years)",
+            a.lat_deg, a.lon_deg, a.years
+        ),
+        None if config.regions.as_slice() == BENCH_REGIONS => {
+            format!("regions: all {}", BENCH_REGIONS.len())
+        }
+        None => format!("regions: {} chosen", config.regions.len()),
     }
 }
 
@@ -370,9 +411,9 @@ pub struct RegionBench {
 impl RegionBench {
     pub fn new(config: RegionBenchConfig) -> Self {
         RegionBench {
+            runs: vec![RegionRun::default(); config.regions.len()],
             config,
             stage: Stage::WaitingForGlobe,
-            runs: vec![RegionRun::default(); BENCH_REGIONS.len()],
             cycles: Vec::new(),
             js_heap_peak: None,
             reports: Vec::new(),
@@ -380,6 +421,21 @@ impl RegionBench {
             passed: None,
             segment: Segment::LowPass,
         }
+    }
+
+    /// The regions this run flies.
+    pub fn regions(&self) -> &[BenchRegion] {
+        &self.config.regions
+    }
+
+    /// Stops in this run: its regions plus the globe pans before panned regions.
+    pub fn stop_count(&self) -> usize {
+        stop_count(&self.config.regions)
+    }
+
+    /// The memory cycles' region in this run, if it has one.
+    pub fn cycle_region(&self) -> Option<usize> {
+        cycle_region(&self.config.regions)
     }
 
     /// The per-region blocks logged so far.
@@ -621,7 +677,7 @@ fn drive_region_bench(
             } else if now - since >= SETTLE_SECS {
                 run.load_secs = Some(now - run.requested_at);
                 info!(
-                    region = BENCH_REGIONS[region].name,
+                    region = bench.config.regions[region].name,
                     "region bench: flying the path"
                 );
                 bench.stage = Stage::Flying { region, since: now };
@@ -655,7 +711,7 @@ fn drive_region_bench(
                 bench.reports.push(block);
                 controls.leave.write(RegionLeft);
                 bench.stage = Stage::Leaving {
-                    next: after_region(region, bench.config.cycles),
+                    next: after_region(region, bench.config.regions.len(), bench.config.cycles),
                     cycle: None,
                     since: now,
                 };
@@ -686,15 +742,15 @@ fn drive_region_bench(
                 info!(cycle = c + 1, on_globe = ?record.on_globe, "region bench: cycle left");
             }
             match next {
-                Next::Region(region) if BENCH_REGIONS[region].pan_from_previous => {
-                    let prev = BENCH_REGIONS[region - 1].arg;
+                Next::Region(region) if bench.config.regions[region].pan_from_previous => {
+                    let prev = bench.config.regions[region - 1].arg;
                     let distance_km = controls
                         .orbit
                         .as_ref()
                         .map_or(crate::region::navigate::NEAR_ORBIT_KM, |o| o.distance_km);
                     info!(
-                        from = BENCH_REGIONS[region - 1].name,
-                        to = BENCH_REGIONS[region].name,
+                        from = bench.config.regions[region - 1].name,
+                        to = bench.config.regions[region].name,
                         "region bench: panning the globe"
                     );
                     bench.stage = Stage::Panning {
@@ -707,7 +763,8 @@ fn drive_region_bench(
                 Next::Region(region) => start_region(bench, region, now, &mut controls),
                 Next::Cycle(c) => {
                     bench.cycles.push(CycleRun::default());
-                    controls.enter(&BENCH_REGIONS[cycle_region()]);
+                    let cycled = bench.config.regions[bench.cycle_region().unwrap_or(0)];
+                    controls.enter(&cycled);
                     bench.stage = Stage::CycleLoading {
                         cycle: c,
                         since: now,
@@ -725,8 +782,8 @@ fn drive_region_bench(
         } => {
             bench.runs[region].pan_ms.push(frame_ms);
             let to = (
-                BENCH_REGIONS[region].arg.lat_deg,
-                BENCH_REGIONS[region].arg.lon_deg,
+                bench.config.regions[region].arg.lat_deg,
+                bench.config.regions[region].arg.lon_deg,
             );
             let t = now - since;
             if let Some(orbit) = controls.orbit.as_mut() {
@@ -790,8 +847,8 @@ fn drive_region_bench(
 }
 
 /// What follows region `region`.
-fn after_region(region: usize, cycles: u32) -> Next {
-    if region + 1 < BENCH_REGIONS.len() {
+fn after_region(region: usize, regions: usize, cycles: u32) -> Next {
+    if region + 1 < regions {
         Next::Region(region + 1)
     } else if cycles > 0 {
         Next::Cycle(0)
@@ -801,10 +858,11 @@ fn after_region(region: usize, cycles: u32) -> Next {
 }
 
 fn start_region(bench: &mut RegionBench, region: usize, now: f64, controls: &mut Controls) {
+    let spec = bench.config.regions[region];
     let run = &mut bench.runs[region];
     run.requested_at = now;
     run.memory_before = cycle_memory();
-    controls.enter(&BENCH_REGIONS[region]);
+    controls.enter(&spec);
     bench.stage = Stage::Loading {
         region,
         since: now,
@@ -838,7 +896,7 @@ fn fail_region(
     controls: &mut Controls,
 ) {
     warn!(
-        region = BENCH_REGIONS[region].name,
+        region = bench.config.regions[region].name,
         reason, "region bench: region failed"
     );
     bench.runs[region].failure = Some(reason.to_string());
@@ -849,7 +907,7 @@ fn fail_region(
         controls.leave.write(RegionLeft);
     }
     bench.stage = Stage::Leaving {
-        next: after_region(region, bench.config.cycles),
+        next: after_region(region, bench.config.regions.len(), bench.config.cycles),
         cycle: None,
         since: now,
     };
@@ -954,7 +1012,10 @@ fn r11_line(bench: &RegionBench) -> String {
 /// The cycle region's load-window worst frame (its tiles fetched cold), reported only beside
 /// the R11 gate on the first region.
 fn cycle_region_load_line(bench: &RegionBench) -> String {
-    let run = &bench.runs[cycle_region()];
+    let Some(cycled) = bench.cycle_region() else {
+        return format!("{CYCLE_REGION} load-window worst frame (cold tiles): not in this run");
+    };
+    let run = &bench.runs[cycled];
     if run.load_ms.is_empty() {
         return format!("{CYCLE_REGION} load-window worst frame (cold tiles): not measured");
     }
@@ -967,7 +1028,7 @@ fn cycle_region_load_line(bench: &RegionBench) -> String {
 /// One region's block; also records whether it passed.
 fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &Screen) -> String {
     let fps = bench.config.target_fps;
-    let spec = &BENCH_REGIONS[region];
+    let spec = bench.config.regions[region];
     let info = display.info();
     let r = &bench.runs[region];
     let title = format!(
@@ -1020,7 +1081,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     if region == 0 {
         out.push(r11_line(bench));
     }
-    if region == cycle_region() && region != 0 {
+    if bench.cycle_region() == Some(region) && region != 0 {
         out.push(cycle_region_load_line(bench));
     }
     if let Some(path) = &r.path {
@@ -1058,7 +1119,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         let ok = passes(&r.pan_ms, fps, pan_pacing);
         out.push(format!(
             "globe pan from {} ({PAN_SECS:.0} s, great circle): frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms -> {} ({} rule)",
-            BENCH_REGIONS[region.saturating_sub(1)].name,
+            bench.config.regions[region.saturating_sub(1)].name,
             p.frames,
             p.median_ms,
             p.p95_ms,
@@ -1159,8 +1220,11 @@ fn finish(
         game.session.as_deref(),
         display.adapter.as_deref(),
     );
+    out.push(regions_line(&bench.config));
     let mut pass = failure.is_none();
-    let regions: Vec<String> = BENCH_REGIONS
+    let regions: Vec<String> = bench
+        .config
+        .regions
         .iter()
         .zip(&bench.runs)
         .map(|(spec, run)| {
@@ -1179,7 +1243,9 @@ fn finish(
     pass &= bench.runs.iter().all(|r| r.pass);
     out.push(format!("regions (R14 frame rate): {}", regions.join(", ")));
     out.push(r11_line(bench));
-    out.push(cycle_region_load_line(bench));
+    if bench.cycle_region().is_some() {
+        out.push(cycle_region_load_line(bench));
+    }
     if web {
         pass &= first_region_gate(bench).is_some_and(|(_, ok)| ok);
     }
@@ -1194,9 +1260,14 @@ fn finish(
         .iter()
         .filter_map(|c| c.generation_ms)
         .collect();
+    let skipped = if bench.config.single_region().is_some() {
+        " (single-region run)"
+    } else {
+        ""
+    };
     if warm.is_empty() {
         out.push(format!(
-            "warm generation (target <= {target} ms): not measured"
+            "warm generation (target <= {target} ms): not measured{skipped}"
         ));
     } else {
         let mut sorted = warm.clone();
@@ -1207,14 +1278,16 @@ fn finish(
         out.push(format!(
             "warm generation ({} re-entries of {}, target <= {target} ms): median {} ms, max {} ms -> {}",
             warm.len(),
-            BENCH_REGIONS[cycle_region()].name,
+            bench.config.regions[bench.cycle_region().unwrap_or(0)].name,
             sorted[(sorted.len() - 1) / 2],
             max,
             if ok { "PASS" } else { "FAIL" }
         ));
     }
     let mut cold_pass = true;
-    let cold: Vec<String> = BENCH_REGIONS
+    let cold: Vec<String> = bench
+        .config
+        .regions
         .iter()
         .zip(&bench.runs)
         .filter(|(_, run)| run.generated.is_some() || run.failure.is_some())
@@ -1267,6 +1340,9 @@ fn finish(
                 if ok { "PASS" } else { "FAIL" }
             ));
             out.push(format!("  in the region: {}", listed(|c| c.in_region)));
+        }
+        None if !skipped.is_empty() => {
+            out.push(format!("memory cycles: not measured{skipped}"));
         }
         None => out.push(format!(
             "memory cycles: not measured ({} cycles, memory {})",
@@ -1428,20 +1504,50 @@ mod tests {
             [false, false, false, false, false, false, true, false]
         );
         assert_eq!(BENCH_REGIONS[5].arg.years, BENCH_REGIONS[6].arg.years);
-        assert_eq!(stop_count(), 9);
-        assert_eq!(after_region(0, 10), Next::Region(1));
-        assert_eq!(after_region(6, 10), Next::Region(7));
-        assert_eq!(after_region(7, 10), Next::Cycle(0));
-        assert_eq!(after_region(7, 0), Next::Summary);
+        assert_eq!(stop_count(&BENCH_REGIONS), 9);
+        assert_eq!(after_region(0, 8, 10), Next::Region(1));
+        assert_eq!(after_region(6, 8, 10), Next::Region(7));
+        assert_eq!(after_region(7, 8, 10), Next::Cycle(0));
+        assert_eq!(after_region(7, 8, 0), Next::Summary);
+        // A single-region run goes from its one region straight to the summary.
+        assert_eq!(after_region(0, 1, 0), Next::Summary);
+    }
+
+    #[test]
+    fn single_config_flies_one_region_without_cycles() {
+        let arg = RegionArg {
+            lat_deg: 20.0,
+            lon_deg: 37.5,
+            years: 0.0,
+        };
+        let c = RegionBenchConfig::single(30, true, arg);
+        assert_eq!(c.regions.len(), 1);
+        assert_eq!(c.regions[0].name, "Chosen region");
+        assert_eq!(c.regions[0].arg, arg);
+        assert!(!c.regions[0].pan_from_previous);
+        assert_eq!(c.cycles, 0);
+        let bench = RegionBench::new(c.clone());
+        assert_eq!(bench.stop_count(), 1);
+        assert_eq!(bench.cycle_region(), None);
+        assert_eq!(regions_line(&c), "regions: single (20, 37.5 at 0 years)");
+        assert_eq!(
+            regions_line(&RegionBenchConfig::new(30, true)),
+            "regions: all 8"
+        );
+        // The full bench is unchanged.
+        let full = RegionBench::new(RegionBenchConfig::new(30, true));
+        assert_eq!(full.stop_count(), 9);
+        assert_eq!(full.config.regions, BENCH_REGIONS.to_vec());
     }
 
     #[test]
     fn the_memory_cycles_re_enter_the_himalayas_by_name() {
         assert_eq!(CYCLE_REGION, "Himalayas");
-        assert_eq!(BENCH_REGIONS[cycle_region()].name, CYCLE_REGION);
+        let cycled = cycle_region(&BENCH_REGIONS).unwrap();
+        assert_eq!(BENCH_REGIONS[cycled].name, CYCLE_REGION);
         // Not the first region: the cycles must not depend on the order.
-        assert_ne!(cycle_region(), 0);
-        assert!(BENCH_REGIONS[cycle_region()].arg.years == 0.0);
+        assert_ne!(cycled, 0);
+        assert!(BENCH_REGIONS[cycled].arg.years == 0.0);
     }
 
     #[test]

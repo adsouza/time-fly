@@ -12,6 +12,7 @@ use bevy::asset::AssetMetaCheck;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
+use timefly::args::RegionArg;
 use timefly::bench::bench_exit;
 use timefly::bench::region::banner::BenchBannerText;
 use timefly::bench::region::{BENCH_REGIONS, RegionBench, RegionBenchConfig, RegionBenchPlugin};
@@ -223,6 +224,65 @@ fn region_bench_reports_all_regions() {
     );
     // Written only on change: a few dozen texts over thousands of frames.
     assert!(shown.len() < 60, "{}", shown.len());
+}
+
+#[test]
+fn a_single_region_run_reaches_the_summary() {
+    let arg = RegionArg {
+        lat_deg: 20.0,
+        lon_deg: 37.5,
+        years: 0.0,
+    };
+    let mut config = RegionBenchConfig::single(60, true, arg);
+    config.path_secs = 6.0;
+    config.timeout_secs = 1.0e6;
+    let mut app = bench_app(config);
+    let deadline = Instant::now() + WALL_LIMIT;
+    let mut exit = Vec::new();
+    while app.world().resource::<RegionBench>().summary().is_none() {
+        app.update();
+        if *app.world().resource::<State<GlobeLoadState>>().get() == GlobeLoadState::Ready {
+            app.insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 });
+        }
+        exit.extend(exits(&mut app));
+        assert!(Instant::now() < deadline, "the bench did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let bench = app.world().resource::<RegionBench>();
+    let reports = bench.reports();
+    assert_eq!(reports.len(), 1, "{reports:#?}");
+    assert!(
+        reports[0].starts_with("===== Time Fly region bench: Chosen region (20, 37.5 at 0 years)"),
+        "{}",
+        reports[0]
+    );
+    assert!(
+        reports[0].contains("first-region worst frame (R11"),
+        "{}",
+        reports[0]
+    );
+    assert!(!reports[0].contains("globe pan from "), "{}", reports[0]);
+    let summary = bench.summary().unwrap();
+    for line in [
+        "regions: single (20, 37.5 at 0 years)",
+        "regions (R14 frame rate): Chosen region ",
+        "warm generation (target <= ",
+        "not measured (single-region run)",
+        "memory cycles: not measured (single-region run)",
+    ] {
+        assert!(summary.contains(line), "missing {line:?} in\n{summary}");
+    }
+    assert!(!summary.contains("Himalayas load-window"), "{summary}");
+    let pass = summary.contains("\nresult: PASS\n");
+    assert_eq!(exit, vec![bench_exit(pass)], "{summary}");
+    let shown = &app.world().resource::<BannerTexts>().0;
+    assert!(
+        shown
+            .iter()
+            .any(|s| s == "Chosen region · Present · 1 of 1"),
+        "{shown:#?}"
+    );
+    assert!(!shown.iter().any(|s| s.contains("of 9")), "{shown:#?}");
 }
 
 #[test]

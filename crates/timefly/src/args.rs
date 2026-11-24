@@ -17,9 +17,9 @@ pub struct LaunchArgs {
     pub diagnostics_probe: Option<ProbeMode>,
     /// `--scrub-bench` (web: `?scrub-bench`): run the automated scrub benchmark and report.
     pub scrub_bench: bool,
-    /// `--region-bench` (web: `?region-bench`): fly the scripted path in the four bench regions,
-    /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`
-    /// and `--region`.
+    /// `--region-bench` (web: `?region-bench`): fly the scripted path in the eight bench regions,
+    /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`.
+    /// With `--region` it benches only that region: one flight, no globe pan or memory cycles.
     pub region_bench: bool,
     /// `--target-fps N`: the frame rate the benchmarks check their frames against.
     pub target_fps: Option<u32>,
@@ -206,6 +206,21 @@ pub fn percent_decode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn region_bench_with_a_region_in_either_order() {
+        for q in [
+            "?region=20,37.5,0&region-bench",
+            "?region-bench&region=20,37.5,0",
+        ] {
+            let p = parse_query_args(q);
+            assert!(p.region_bench && p.region.is_some(), "{q}");
+        }
+        let bad = parse_launch_args(["--region-bench", "--region=200,0,0"].map(String::from));
+        assert!(bad.region_bench && bad.region.is_none());
+        assert_eq!(bad.unknown, vec!["--region=200,0,0".to_string()]);
+    }
+
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
