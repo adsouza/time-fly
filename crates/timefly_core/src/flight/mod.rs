@@ -3,3 +3,4 @@
 pub mod altitudes;
 pub mod chase;
 pub mod cloud;
+pub mod globe;
