@@ -573,7 +573,7 @@ output 64.97 MB): `/?region-bench`, `assets/data/tiles/manifest.json` (353,054 B
 `assets/data/tiles/overview.tfgrid` (12,430,497 B), `assets/data/tiles/r08c38.tfgrid`,
 `r05c39.tfgrid` and `assets/data/globe/manifest.json` all return 200.
 
-### Art pass (native rerun, the dune path, Chrome pending), 2026-11-23
+### Art pass (native rerun, the dune path, Chrome: R11 waived), 2026-11-23
 
 The art pass (`docs/superpowers/plans/2026-11-23-art-pass.md`, reference renders in
 `docs/testing/art-pass/`) adds work to the terrain and water shaders:
@@ -726,33 +726,74 @@ GPU device utilisation (passes 3 and 4), with the equivalent GPU time per 16.67 
   - So the web number for a sand sea is still unmeasured. A Chrome flight over the erg (or an
     erg bench stop, which needs the owner: R8) would settle it.
 
-#### Chrome WebGPU, real Chrome: pending (owner's run)
+#### Chrome WebGPU, real Chrome, art pass merged with main (`5434520`), 2026-11-24
 
-**Pending: owner's Chrome run.** The gated web bench (R23) needs a real Chrome window in front,
-hands off, which the implementer can't drive. To repeat it on the art-pass build:
+**Result: FAIL, on R11 alone** (first-region worst frame 256.08 ms against ≤ 250 ms). Every
+other gate passes. **The owner waived R11 for the art pass (2026-11-24)**; the frame cost and
+the low-pass stalls below stay open as follow-ups.
 
-1. Build and serve the web release from `crates/timefly`:
+| | |
+|---|---|
+| Who ran it | Claude opened the window, the owner kept it in front, hands off |
+| Browser and machine | Chrome 158, an Incognito window, on the M4 (Metal behind WebGPU) |
+| Build | the art-pass branch after main was merged in, `5434520` (wasm32, `web-release`, no features, wasm-bindgen output 61.37 MB) |
+| Build label | the log says `20c9097`, the commit before the merge: `build.rs` misses commits in a worktree. The `.wasm` holds main's `invalid tile generation digest` string and the art pass's `ramp_level`, so the code is the merge's |
+| Render size | 3200 × 1800 (a 1600 × 900 window at 2×), as in the `8d7c427` run |
+| Session | `76afd028`; the log was copied from the page's localStorage |
+| Host stalls | none (no frame over 1 s in any load window, flight or the pan) |
 
-   ```sh
-   cd crates/timefly
-   PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo run --profile web-release -p timefly \
-     --target wasm32-unknown-unknown
-   ```
+Against the M2 gated run (`8d7c427`, same size and machine):
 
-2. Open `http://127.0.0.1:1334/?region-bench` in a Chrome window with no other tabs.
-3. Keep the window in front and leave it alone for about 11 minutes, until the banner reads
-   `Region bench finished: PASS` (or `FAIL`).
-4. Copy the log from DevTools → Console with the `copy(...)` one-liner under "Chrome WebGPU, real
-   Chrome (gated)" above.
-5. Record here:
-   - the summary block;
-   - the Red Sea row against the M2 run (16.57 / 18.25 / 19.83 ms, 0 missed);
-   - R11 (Pangaea, ≤ 250 ms);
-   - every first entry (≤ 8,000 ms);
-   - the warm generation (≤ 8,000 ms);
-   - the memory cycles.
+| Stop | First entry | Load worst | Flight median / p95 / worst | Missed (> 50 ms) | Result |
+|---|---|---|---|---|---|
+| Pangaea interior (250 Ma) | 1,491 ms (was 1,427) | **256.08 ms** (was 231.67; R11 ≤ 250: **FAIL**) | **32.14** / 41.88 / **267.94** ms (was 16.95 / 19.59 / 27.33) | 7 (0.38%), 2 stalls over 66.7 ms (was 0) | PASS |
+| Red Sea (0 ka) | 1,475 ms (was 1,474) | 28.40 ms | 22.10 / 34.37 / 40.11 ms (was 16.57 / 18.25 / 19.83) | 0 | PASS |
+| Himalayas (0 ka) | 1,194 ms | 30.89 ms (reported only) | 25.12 / 30.08 / 35.15 ms (was 17.40 / 19.45 / 22.45) | 0 | PASS |
+| Sundaland (21 ka) | 1,177 ms | 33.31 ms | 23.55 / 28.39 / 31.78 ms (was 16.74 / 18.56 / 21.61) | 0 | PASS |
+| Japan (1 Ma) | 4,455 ms (was 4,453) | 32.29 ms | 21.15 / 26.38 / 32.38 ms (was 16.60 / 18.60 / 23.27) | 0 | PASS |
+| Beringia (21 ka) | 1,284 ms | 31.75 ms | 21.96 / 27.43 / 31.71 ms (was 16.61 / 18.50 / 20.67) | 0 | PASS |
+| Globe pan (8 s, 481 frames) | — | — | 16.68 / 18.33 / 20.42 ms (was 16.62 / 18.32 / 19.43) | — | PASS |
+| Rockies ice margin (21 ka) | 1,895 ms | 33.64 ms | 24.33 / 29.73 / 33.18 ms (was 16.99 / 19.58 / 27.54) | 0 | PASS |
+| Panama (3 Ma) | 1,192 ms | 33.23 ms | 20.32 / 23.92 / 27.32 ms (was 16.57 / 18.39 / 19.99) | 0 | PASS |
 
-Don't use the Claude desktop app's browser pane for the gated numbers (R23).
+Summary block, verbatim:
+
+```text
+regions (R14 frame rate): Pangaea interior PASS, Red Sea PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS
+first-region worst frame (R11 gate <= 250 ms, request to first path frame, overview decode included): 256.08 ms -> FAIL (decides the result)
+Himalayas load-window worst frame (cold tiles; reported only): 30.89 ms
+warm generation (10 re-entries of Himalayas, target <= 8000 ms): median 1185 ms, max 1193 ms -> PASS
+first entries (cold tiles, web gate <= 8000 ms each): Pangaea interior 1491 ms PASS, Red Sea 1475 ms PASS, Himalayas 1194 ms PASS, Sundaland 1177 ms PASS, Japan 4455 ms PASS, Beringia 1284 ms PASS, Rockies ice margin 1895 ms PASS, Panama 1192 ms PASS -> PASS
+memory cycles (wasm linear memory, which grows but never shrinks, on the globe after each leave): 1: 278.9 MiB, 2: 278.9 MiB, 3: 278.9 MiB, 4: 278.9 MiB, 5: 278.9 MiB, 6: 278.9 MiB, 7: 278.9 MiB, 8: 278.9 MiB, 9: 278.9 MiB, 10: 278.9 MiB; worst of cycles 2-10 is +0.0% of cycle 1 (limit +10%) -> PASS
+  in the region: 1: 278.9 MiB, 2: 278.9 MiB, 3: 278.9 MiB, 4: 278.9 MiB, 5: 278.9 MiB, 6: 278.9 MiB, 7: 278.9 MiB, 8: 278.9 MiB, 9: 278.9 MiB, 10: 278.9 MiB
+result: FAIL
+```
+
+What changed, and what it says:
+
+- **Generation is unchanged** (CPU work): first entries within 64 ms of M2's, warm generation
+  1,185 ms median both times. Memory is lower: 278.9 MiB (was 294.4 MiB). JS heap peak 33.9 MiB.
+- **Every region flight lost 60 Hz.** At M2 every flight was display-paced at about 60 Hz
+  (medians 16.6–17.4 ms). Now the medians are 20.3–32.1 ms, while the globe pan, which draws
+  no region, still holds 16.68 ms. So the extra cost is the art pass's region shading at
+  3200 × 1800, about 3× the native run's 1920 × 951 pixels, which stayed paced at 60 Hz.
+  Every flight still passes the 30 fps target.
+- **Pangaea is the expensive stop.** A 250 Ma hot desert is dunes nearly everywhere. Its
+  median is 32.14 ms against the 35.00 ms limit. Its climb segment's median is 37.72 ms,
+  under 30 fps for that stretch. It passes only because the rule judges the whole flight.
+- **R11, 256.08 ms.** It was 231.67 ms. The frame includes the overview decode. The rise is
+  about the same as the rise in one Pangaea frame (17 to 32 ms), which fits the decode frame
+  also paying one art-pass frame's GPU time. That is a likely reading, not a measured one.
+- **Two stalls in Pangaea's low pass** (worst 267.94 ms; M2's worst was 27.33 ms). The log
+  does not say what they were. The native run's one stall (56.44 ms, Red Sea) was also in a
+  low pass. Something done the first time the camera goes below about 1 km (swell, near-field
+  dunes) is the first suspect: a pipeline compiled late would cost this much on WebGPU.
+
+To repeat it, serve from `crates/timefly` (`cargo run --profile web-release -p timefly --target
+wasm32-unknown-unknown`), open `http://127.0.0.1:1334/?region-bench` in a 1600 × 900 Chrome
+window with no other tabs, keep it in front for about 10 minutes, and copy the log with the
+`copy(...)` one-liner under "Chrome WebGPU, real Chrome (gated)" above. Don't use the Claude
+desktop app's browser pane for the gated numbers (R23).
 
 ## Sizes: packages and Pages (Task 10)
 
