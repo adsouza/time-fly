@@ -27,6 +27,9 @@
 //!   frame before. Then the camera stops and the shadows go off, and [`RETIRE_FRAMES`] later the
 //!   entities are despawned and every handle dropped: no asset outlives it. Bevy keeps the
 //!   compiled pipelines, so the first region finds them ready.
+//! - **The cloud.** The transition cloud (`crate::cloud`) draws in the region camera too, at
+//!   density 0 here (it outputs nothing), so a snapshot change never waits on its pipeline
+//!   while the views must be covered.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -46,6 +49,7 @@ use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 use super::material::{TerrainMaterial, TerrainParams, palette_image, patch_instances};
 use super::view::{REGION_SKY, region_camera_parts, region_sun, region_sun_parts};
 use super::{TerrainOptions, grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
+use crate::cloud::{CloudMaterial, CloudParams};
 use crate::globe::{GlobeRenderStatus, RenderProbe};
 use crate::sky::{SkyMaterial, distance_fog, region_look, sky_params};
 use crate::water::{WaterMaterial, water_look, water_material};
@@ -182,6 +186,7 @@ struct WarmupAssets<'w> {
     terrain: ResMut<'w, Assets<TerrainMaterial>>,
     water: ResMut<'w, Assets<WaterMaterial>>,
     sky: ResMut<'w, Assets<SkyMaterial>>,
+    cloud: ResMut<'w, Assets<CloudMaterial>>,
 }
 
 /// Gathers the globe's status and the render probe, decides with [`warmup_action`], and
@@ -251,6 +256,7 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         terrain: terrain_m,
         water: water_m,
         sky: sky_m,
+        cloud: cloud_m,
     } = assets;
     let grid = warmup_grid();
     let settings = LodSettings::region();
@@ -283,6 +289,11 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
     let (era, biome) = region_look(&grid);
     let sky = sky_m.add(SkyMaterial {
         params: sky_params(era, biome),
+    });
+    // Positions only, triangle lists: the quad gives the cloud's pipeline the same key as the
+    // full-screen triangle's.
+    let cloud = cloud_m.add(CloudMaterial {
+        params: CloudParams::default(),
     });
     let drawn = |name: &'static str| {
         (
@@ -330,6 +341,9 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         commands
             .spawn((drawn("Warm-up sky"), MeshMaterial3d(sky)))
             .id(),
+        commands
+            .spawn((drawn("Warm-up cloud"), MeshMaterial3d(cloud)))
+            .id(),
         camera,
         sun,
     ];
@@ -346,6 +360,7 @@ mod tests {
     use bevy::asset::AssetPlugin;
 
     use super::*;
+    use crate::cloud::CloudMaterial;
     use crate::terrain::view::RegionCamera;
 
     #[test]
@@ -429,12 +444,13 @@ mod tests {
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
             .init_asset::<SkyMaterial>()
+            .init_asset::<CloudMaterial>()
             .insert_resource(GlobeRenderStatus::LoadingData)
             .add_plugins(RegionWarmupPlugin);
         app
     }
 
-    fn asset_counts(app: &App) -> [usize; 6] {
+    fn asset_counts(app: &App) -> [usize; 7] {
         let w = app.world();
         [
             w.resource::<Assets<Image>>().len(),
@@ -443,6 +459,7 @@ mod tests {
             w.resource::<Assets<TerrainMaterial>>().len(),
             w.resource::<Assets<WaterMaterial>>().len(),
             w.resource::<Assets<SkyMaterial>>().len(),
+            w.resource::<Assets<CloudMaterial>>().len(),
         ]
     }
 
@@ -452,17 +469,17 @@ mod tests {
         let mut app = warmup_app();
         app.update();
         assert!(app.world().get_resource::<RegionWarmup>().is_none());
-        assert_eq!(asset_counts(&app), [0; 6]);
+        assert_eq!(asset_counts(&app), [0; 7]);
 
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();
         let entities = app.world().resource::<RegionWarmup>().entities.clone();
-        assert_eq!(entities.len(), 5);
+        assert_eq!(entities.len(), 6);
         // Its camera has no clusters (ruling R28), without the app-wide observer.
         crate::clusters::assert_no_clusters(app.world_mut());
         // Six textures (four fields, the palette, the 1 x 1 target), one mesh, one buffer, one
-        // of each material.
-        assert_eq!(asset_counts(&app), [6, 1, 1, 1, 1, 1]);
+        // of each material, the transition cloud's included (M3 Task 5).
+        assert_eq!(asset_counts(&app), [6, 1, 1, 1, 1, 1, 1]);
         {
             let world = app.world_mut();
             // Everything on its own layer, none of it the region's camera or sun.
@@ -526,7 +543,7 @@ mod tests {
         for e in entities {
             assert!(app.world().get_entity(e).is_err());
         }
-        assert_eq!(asset_counts(&app), [0; 6]);
+        assert_eq!(asset_counts(&app), [0; 7]);
         // Never again.
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();

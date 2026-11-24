@@ -17,7 +17,7 @@
 //!    [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool) task, then the rows
 //!    across the pool. Web: time-boxed slices of [`WEB_GEN_BUDGET_MS`] per frame, or
 //!    [`WEB_GEN_LARGE_BUDGET_MS`] while no region is on screen to keep smooth: a first entry
-//!    from the globe, or a snapshot change held under the fade overlay ([`LargeGenBudget`],
+//!    from the globe, or a snapshot change held under the opaque cloud ([`LargeGenBudget`],
 //!    [`gen_budget`]).
 //!
 //! Then [`ActiveRegion`] is inserted, [`RegionGenerated`] and [`RegionEntered`] (or
@@ -56,8 +56,8 @@ use tiles::{TileCache, TileManifest, TileManifestLoader};
 /// The web's generation budget per frame (design spec §6.1).
 pub const WEB_GEN_BUDGET_MS: f64 = 6.0;
 /// The web's generation budget per frame while no region is on screen to keep smooth (a first
-/// entry, generated while the globe stays in view, or a snapshot change held under the fade
-/// overlay): the run takes most of a 60 Hz frame. At 6 ms a slice gets about a third of each
+/// entry, generated while the globe stays in view, or a snapshot change held under the opaque
+/// cloud): the run takes most of a 60 Hz frame. At 6 ms a slice gets about a third of each
 /// 16.7 ms frame (wall time ≈ 2.8 × CPU time); at 12 ms about two thirds (≈ 1.4 ×). The
 /// Aegean's first entry took 628 slices of 6 ms in Chrome (≈ 10.5 s); at 12 ms about half as
 /// many.

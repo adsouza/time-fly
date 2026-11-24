@@ -528,16 +528,23 @@ impl MaterialExtension for TerrainExtension {
     }
 }
 
+/// Adds the shared noise module (`noise.wesl`), which the terrain, the sea and the cloud import.
+/// Idempotent: each plugin that imports it calls this, so plugin order does not matter.
+pub fn add_noise_shader(shaders: &mut Assets<Shader>) {
+    let noise = Shader::from_wesl(
+        include_str!("../../assets/shaders/noise.wesl"),
+        "embedded://timefly/noise.wesl",
+    );
+    let _ = shaders.insert(NOISE_SHADER.id(), noise);
+}
+
 /// Adds the embedded terrain shaders to the shader assets, so the terrain renders from any
 /// asset root. `terrain_cdlod.wesl` registers as the WESL module `package::terrain_cdlod`,
 /// `noise.wesl` as `package::noise` (`import package::noise::gradient_noise3;`) and
 /// `snowline.wesl` as `package::snowline`, `planet.wesl` as `package::planet` and `waves.wesl`
 /// as `package::waves`.
 pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
-    let noise = Shader::from_wesl(
-        include_str!("../../assets/shaders/noise.wesl"),
-        "embedded://timefly/noise.wesl",
-    );
+    add_noise_shader(shaders);
     let planet = Shader::from_wesl(
         include_str!("../../assets/shaders/planet.wesl"),
         "embedded://timefly/planet.wesl",
@@ -562,7 +569,6 @@ pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
         include_str!("../../assets/shaders/terrain_prepass.wesl"),
         "embedded://timefly/terrain_prepass.wesl",
     );
-    let _ = shaders.insert(NOISE_SHADER.id(), noise);
     let _ = shaders.insert(PLANET_SHADER.id(), planet);
     let _ = shaders.insert(SNOWLINE_SHADER.id(), snowline);
     let _ = shaders.insert(WAVES_SHADER.id(), waves);

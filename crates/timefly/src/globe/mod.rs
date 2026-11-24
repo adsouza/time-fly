@@ -32,6 +32,7 @@ use timefly_core::surface::{FrameSelection, Timeline};
 use tracing::instrument;
 
 use crate::clock::{LoadClock, add_load_clock};
+use crate::cloud::CLOUD_LAYER;
 use crate::creature::FLY_LAYER;
 use crate::data::{GlobeData, GlobeLoadError, GlobeLoadState};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
@@ -391,6 +392,12 @@ impl Plugin for GlobePlugin {
     }
 }
 
+/// The globe camera's layers when it draws the globe on `layer`: that globe, the atmosphere,
+/// the dragonfly and the transition cloud.
+pub fn globe_view_layers(layer: usize) -> RenderLayers {
+    RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer, FLY_LAYER, CLOUD_LAYER])
+}
+
 /// Whether the globe is on screen: its camera is active (or there is none, in headless runs).
 fn globe_camera_active(cameras: Query<&Camera, With<GlobeCamera>>) -> bool {
     cameras.is_empty() || cameras.iter().any(|c| c.is_active)
@@ -414,7 +421,7 @@ fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamer
         Tonemapping::None,
         DebandDither::Disabled,
         Transform::from_xyz(0.0, 0.0, CAMERA_DISTANCE_KM).looking_at(Vec3::ZERO, Vec3::Y),
-        RenderLayers::from_layers(&[ATMOSPHERE_LAYER, RECENT_LAYER, FLY_LAYER]),
+        globe_view_layers(RECENT_LAYER),
         // The game UI draws over the globe (the bridge cameras render offscreen).
         IsDefaultUiCamera,
     ));
@@ -870,7 +877,7 @@ fn sync_bridge_cameras(
     };
     // The offscreen cameras prepare both inputs. Draw the composite on the actual
     // presentation camera during loading so its target-specific pipeline warms up too.
-    let mut wanted = RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer, FLY_LAYER]);
+    let mut wanted = globe_view_layers(layer);
     if warming_up {
         wanted = wanted.with(COMPOSITE_LAYER);
     }

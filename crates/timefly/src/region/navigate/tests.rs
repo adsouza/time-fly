@@ -313,7 +313,7 @@ fn generation_takes_the_large_budget_only_while_no_region_is_on_screen() {
         }
         .allows_large_gen_budget()
     );
-    // A snapshot change held under the fade overlay.
+    // A snapshot change held under the opaque cloud.
     let held = Fade::new(SNAPSHOT_FADE_S).advance(2.0, true);
     assert!(changing(held).allows_large_gen_budget());
     // Flying, or a fade with the region still showing through: the small budget.
@@ -470,7 +470,7 @@ fn entering_fades_to_the_start_pose() {
     assert_eq!(placed_at, Some(4));
     assert_eq!(phase, NavPhase::Flying);
     assert!(phase.region_shown());
-    assert_eq!(phase.overlay_alpha(), 0.0);
+    assert_eq!(phase.cloud_density(), 0.0);
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn snapshot_change_holds_until_the_region_is_ready() {
         phase = next;
     }
     assert!(phase.region_shown());
-    assert!((phase.overlay_alpha() - 1.0).abs() < 1e-6, "held covered");
+    assert!((phase.cloud_density() - 1.0).abs() < 1e-6, "held covered");
     // Back in `InRegion` with the old region still active: not ready.
     let (still, actions) = step_nav(phase, &flying);
     assert!(actions.is_empty(), "{actions:?}");
@@ -942,7 +942,7 @@ fn snapshot_change_regenerates_around_the_carried_position() {
     for _ in 0..15 {
         app.update();
     }
-    let alpha = phase(&app).overlay_alpha();
+    let alpha = phase(&app).cloud_density();
     assert!((alpha - 1.0).abs() < 1e-6, "{alpha}");
     let second = grid(requests[0].era_dir, YearsBp(100e6), 1_100.0);
     app.insert_resource(ActiveRegion {
@@ -996,39 +996,56 @@ fn backspace_leaves_to_the_globe_centred_on_the_region() {
     assert_eq!(flight.altitude_km, NEAR_GLOBE_ALTITUDE_KM);
 }
 
+/// Design §6: a snapshot change happens behind the cloud, which is opaque (density exactly 1)
+/// on the frame the views swap and clear again once flying; M2's haze overlay is gone. Whether
+/// the region is ready before the midpoint or only long after.
 #[test]
-fn the_overlay_follows_the_fade() {
-    let mut app = nav_app(false);
-    let alpha = |app: &mut App| {
-        let world = app.world_mut();
-        let (node, color) = world
-            .query_filtered::<(&Node, &BackgroundColor), With<FadeOverlay>>()
-            .single(world)
-            .unwrap();
-        (node.display, color.0.alpha())
-    };
-    assert_eq!(alpha(&mut app), (Display::None, 0.0));
-    let g = grid(RenderDir(ON_PLATE), YearsBp(0.0), 0.0);
-    app.insert_resource(ActiveRegion {
-        grid: g.clone(),
-        frame: RegionFrame {
-            center: g.spec.center,
-        },
-    });
-    app.world_mut()
-        .resource_mut::<NextState<RegionState>>()
-        .set(RegionState::InRegion);
-    app.world_mut()
-        .write_message(RegionEntered { spec: g.spec });
-    let mut peak: f32 = 0.0;
-    for _ in 0..10 {
-        app.update();
-        let (display, a) = alpha(&mut app);
-        assert_eq!(display == Display::Flex, a > 0.0);
-        peak = peak.max(a);
+fn the_snapshot_change_uses_the_cloud() {
+    for after in [0, 12] {
+        let mut app = nav_app(false);
+        app.insert_resource(FakeJob {
+            after,
+            ground_m: 900.0,
+            pending: None,
+        })
+        .add_systems(Update, fake_job.in_set(crate::region::RegionSystems));
+        enter(&mut app, &grid(RenderDir(ON_PLATE), YearsBp(0.0), 500.0));
+        {
+            let world = app.world_mut();
+            let overlays = world
+                .query::<&Name>()
+                .iter(world)
+                .filter(|n| n.as_str() == "Fade overlay")
+                .count();
+            assert_eq!(overlays, 0, "no haze overlay");
+        }
+        assert_eq!(app.world().resource::<crate::cloud::CloudDensity>().0, 0.0);
+
+        set_time(&mut app, 100e6);
+        let placed = |p: NavPhase| matches!(p, NavPhase::ChangingSnapshot { placed: true, .. });
+        let mut swap = None;
+        let mut peak: f32 = 0.0;
+        let mut flying_again = false;
+        for frame in 0..60 {
+            let before = phase(&app);
+            app.update();
+            let now = phase(&app);
+            let density = app.world().resource::<crate::cloud::CloudDensity>().0;
+            peak = peak.max(density);
+            if placed(now) && !placed(before) {
+                swap = Some((frame, density));
+            }
+            if swap.is_some() && now == NavPhase::Flying {
+                assert_eq!(density, 0.0, "after {after}: clear once flying");
+                flying_again = true;
+                break;
+            }
+        }
+        let (frame, at_swap) = swap.unwrap_or_else(|| panic!("after {after}: never swapped"));
+        assert_eq!(at_swap, 1.0, "after {after}: the swap at frame {frame}");
+        assert_eq!(peak, 1.0, "after {after}");
+        assert!(flying_again, "after {after}: {:?}", phase(&app));
     }
-    assert!(peak > 0.99, "{peak}");
-    assert_eq!(alpha(&mut app), (Display::None, 0.0));
 }
 
 // ---------------------------------------------------------------------------------------------

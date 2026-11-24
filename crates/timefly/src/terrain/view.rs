@@ -22,6 +22,7 @@ use timefly_core::terrain::blended_height_m;
 use timefly_core::worldgen::generate::RegionGrid;
 
 use super::{TERRAIN_LAYER, TerrainScene, TerrainSettings};
+use crate::cloud::CLOUD_LAYER;
 use crate::creature::FLY_LAYER;
 use crate::globe::GlobeCamera;
 use crate::region::CAMERA_START_ALTITUDE_M;
@@ -153,9 +154,9 @@ pub(super) fn region_sun_parts() -> impl Bundle {
     )
 }
 
-/// The region camera's layers: the terrain's and the dragonfly's.
+/// The region camera's layers: the terrain's, the dragonfly's and the transition cloud's.
 pub fn region_view_layers() -> RenderLayers {
-    RenderLayers::from_layers(&[TERRAIN_LAYER, FLY_LAYER])
+    RenderLayers::from_layers(&[TERRAIN_LAYER, FLY_LAYER, CLOUD_LAYER])
 }
 
 /// The region sun's layers: the terrain's only. Bevy lists a directional light in every view
@@ -254,14 +255,21 @@ mod tests {
         let camera = region_view_layers();
         assert!(camera.intersects(&RenderLayers::layer(TERRAIN_LAYER)));
         assert!(camera.intersects(&RenderLayers::layer(FLY_LAYER)));
+        assert!(camera.intersects(&RenderLayers::layer(CLOUD_LAYER)));
         // The region sun is in the region's view only; the globe's sun (default layer 0) in
-        // the globe's only. The globe camera's layers, in every mode, include the fly's.
+        // the globe's only. The globe camera's layers, in every mode, include the fly's and the
+        // cloud's.
         let sun = region_sun_layers();
         let globe_sun = RenderLayers::default();
         assert!(sun.intersects(&camera) && !globe_sun.intersects(&camera));
-        use crate::globe::{ATMOSPHERE_LAYER, COMPOSITE_LAYER, DEEP_LAYER, RECENT_LAYER};
+        use crate::globe::{COMPOSITE_LAYER, DEEP_LAYER, RECENT_LAYER, globe_view_layers};
         for layer in [RECENT_LAYER, DEEP_LAYER, COMPOSITE_LAYER] {
-            let globe = RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer, FLY_LAYER]);
+            let globe = globe_view_layers(layer);
+            assert!(globe.intersects(&RenderLayers::layer(FLY_LAYER)), "{layer}");
+            assert!(
+                globe.intersects(&RenderLayers::layer(CLOUD_LAYER)),
+                "{layer}"
+            );
             assert!(globe_sun.intersects(&globe), "{layer}");
             assert!(!sun.intersects(&globe), "{layer}");
         }

@@ -10,6 +10,7 @@ pub mod build_features;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
 pub mod clock;
+pub mod cloud;
 pub mod clusters;
 pub mod creature;
 pub mod data;
@@ -129,6 +130,7 @@ pub fn app(session: &Session) -> App {
         RegionNavigationPlugin,
         FlyCameraPlugin,
         CreaturePlugin,
+        cloud::CloudPlugin,
         GameUiPlugins,
     ));
     #[cfg(not(target_arch = "wasm32"))]

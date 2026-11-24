@@ -22,11 +22,12 @@
 //!   [`RegionSnapshotChanged`]) whose [`RegionGenerated`] says it fell back (a tile it needs is
 //!   missing or corrupt, so part of it uses globe-resolution data; the job logged a `warn`).
 //!
-//! **The crossfade** is a fade through a full-screen overlay ([`FadeOverlay`], [`FADE_COLOR`])
-//! drawn under the rest of the UI: the old view fades out to a pale haze over the first half,
-//! the views swap at the midpoint (only one camera is ever active, so the frame cost never
-//! doubles), and the new view fades in over the second half. A true two-image crossfade would
-//! render both worlds for the whole fade; this costs one UI quad on Metal and WebGPU alike.
+//! **The crossfade** goes through the transition cloud (M3 design §6, `crate::cloud`): a
+//! [`Fade`]'s [`fade_alpha`] is the [`CloudDensity`] it raises, so the old view clouds over in
+//! the first half, the views swap at the midpoint, on the frame the cloud is exactly opaque (a
+//! fade stops there for that frame; only one camera is ever active, so the frame cost never
+//! doubles), and the new view clears in the second half. The "Descending..." caption and the
+//! fallback notice stay UI nodes over it.
 //!
 //! The systems gather → decide → apply: [`step_nav`] is the decision, a pure function of
 //! [`NavInputs`] that returns the next [`NavPhase`] and the [`NavAction`]s to apply.
@@ -56,6 +57,7 @@ use super::{
     RegionSnapshotChanged, RegionState, RegionSystems,
 };
 use crate::clock::LoadClock;
+use crate::cloud::{CloudDensity, add_cloud_density};
 use crate::data::GlobeData;
 use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState};
 use crate::globe::{EARTH_RADIUS_KM, GlobeCamera};
@@ -86,8 +88,6 @@ pub const FALLBACK_NOTICE_S: f64 = 3.0;
 /// `warn`) stops the descent after this long, on the [`LoadClock`]: a hidden tab or paused page
 /// does not cancel it.
 pub const START_TIMEOUT_S: f64 = 2.0;
-/// The haze the views fade through.
-pub const FADE_COLOR: Color = Color::srgb(0.86, 0.89, 0.93);
 /// The globe altitude the fly eases down to while descending, and returns at when leaving: the
 /// dive altitude, where Task 7's dive and climb swap worlds.
 pub const NEAR_GLOBE_ALTITUDE_KM: f64 = DIVE_ALTITUDE_KM;
@@ -171,7 +171,7 @@ pub fn carry_crust_position(
 /// in `f32`).
 const FADE_EPSILON: f32 = 1e-4;
 
-/// A fade through the overlay: out over the first half, in over the second.
+/// A fade through the cloud: closing over the first half, clearing over the second.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Fade {
     pub elapsed_s: f32,
@@ -210,7 +210,7 @@ impl Fade {
         (self.elapsed_s / self.duration_s).clamp(0.0, 1.0)
     }
 
-    /// The overlay's opacity: [`fade_alpha`] of the progress.
+    /// The cloud's density: [`fade_alpha`] of the progress.
     pub fn alpha(self) -> f32 {
         fade_alpha(self.progress())
     }
@@ -225,7 +225,7 @@ impl Fade {
     }
 }
 
-/// The overlay's opacity at fade progress `t`: 0 at both ends, 1 at the midpoint, eased
+/// The cloud's density at fade progress `t`: 0 at both ends, 1 at the midpoint, eased
 /// (smoothstep) both ways.
 pub fn fade_alpha(t: f32) -> f32 {
     if !(0.0..=1.0).contains(&t) {
@@ -308,8 +308,8 @@ impl NavPhase {
         }
     }
 
-    /// The fade overlay's opacity.
-    pub fn overlay_alpha(&self) -> f32 {
+    /// The cloud density the phase raises ([`CloudDensity`]).
+    pub fn cloud_density(&self) -> f32 {
         match *self {
             NavPhase::Entering { fade, .. }
             | NavPhase::ChangingSnapshot { fade, .. }
@@ -318,11 +318,11 @@ impl NavPhase {
         }
     }
 
-    /// Whether the overlay fully covers the view (a fade at its midpoint, such as a snapshot
+    /// Whether the cloud fully covers the view (a fade at its midpoint, such as a snapshot
     /// change held until its region is ready): a time-boxed generation may then take a larger
     /// slice of the frame (`crate::region::gen_budget`).
     pub fn covers_view(&self) -> bool {
-        self.overlay_alpha() >= 1.0 - 1e-3
+        self.cloud_density() >= 1.0 - 1e-3
     }
 
     /// Whether a region generating now may take the large web budget
@@ -469,7 +469,8 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             }
         }
         NavPhase::Entering { fade, placed } => {
-            let fade = fade.advance(i.dt_s, false);
+            // Stops at the midpoint for the swap frame, so the views swap under an opaque cloud.
+            let fade = fade.advance(i.dt_s, !placed);
             let placed = placed || {
                 let swap = fade.swapped();
                 if swap {
@@ -579,7 +580,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             }
         }
         NavPhase::Leaving { fade, centre, left } => {
-            let fade = fade.advance(i.dt_s, false);
+            let fade = fade.advance(i.dt_s, !left);
             let left = left || {
                 let swap = fade.swapped();
                 if swap {
@@ -628,10 +629,6 @@ impl Default for Navigation {
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NavigationSystems;
 
-/// The full-screen fade overlay.
-#[derive(Component)]
-pub struct FadeOverlay;
-
 /// The "Descending..." caption.
 #[derive(Component)]
 pub struct DescendingCaption;
@@ -648,11 +645,12 @@ pub struct RegionNavigationPlugin;
 impl Plugin for RegionNavigationPlugin {
     fn build(&self, app: &mut App) {
         crate::clock::add_load_clock(app);
+        add_cloud_density(app);
         app.init_resource::<Navigation>()
             .init_resource::<TerrainSettings>()
             .init_resource::<GlobeFlightState>()
             .init_resource::<FlyState>()
-            .add_systems(Startup, spawn_overlay)
+            .add_systems(Startup, spawn_notices)
             .add_systems(
                 Update,
                 navigate
@@ -666,24 +664,7 @@ impl Plugin for RegionNavigationPlugin {
     }
 }
 
-fn spawn_overlay(mut commands: Commands) {
-    commands.spawn((
-        Name::new("Fade overlay"),
-        FadeOverlay,
-        // Under the rest of the UI (the slider stays readable through a fade).
-        GlobalZIndex(-1),
-        Pickable::IGNORE,
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(0),
-            right: px(0),
-            top: px(0),
-            bottom: px(0),
-            display: Display::None,
-            ..default()
-        },
-        BackgroundColor(FADE_COLOR.with_alpha(0.0)),
-    ));
+fn spawn_notices(mut commands: Commands) {
     commands
         .spawn((
             Name::new("Descending caption"),
@@ -861,32 +842,11 @@ struct NavInput<'w, 's> {
     globe_cameras: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<GlobeCamera>>,
 }
 
-/// The fade overlay's node and colour.
-type OverlayQuery<'w, 's> = Query<
-    'w,
-    's,
-    (&'static mut Node, &'static mut BackgroundColor),
-    (With<FadeOverlay>, Without<DescendingCaption>),
->;
-
-/// The fallback notice's node.
-type NoticeQuery<'w, 's> = Query<
-    'w,
-    's,
-    &'static mut Node,
-    (
-        With<FallbackNotice>,
-        Without<FadeOverlay>,
-        Without<DescendingCaption>,
-    ),
->;
-
-/// The overlay, caption and notice nodes.
+/// The caption and notice nodes.
 #[derive(SystemParam)]
 struct NavUi<'w, 's> {
-    overlay: OverlayQuery<'w, 's>,
-    caption: Query<'w, 's, &'static mut Node, (With<DescendingCaption>, Without<FadeOverlay>)>,
-    notice: NoticeQuery<'w, 's>,
+    caption: Query<'w, 's, &'static mut Node, (With<DescendingCaption>, Without<FallbackNotice>)>,
+    notice: Query<'w, 's, &'static mut Node, (With<FallbackNotice>, Without<DescendingCaption>)>,
 }
 
 /// Shows or hides a UI node.
@@ -898,7 +858,7 @@ fn show_node(node: &mut Mut<Node>, shown: bool) {
 }
 
 /// Gathers input, events and the region; decides with [`step_nav`]; applies the actions and
-/// the phase's view (which camera, the overlay, the caption, the descent's ease).
+/// the phase's view (which camera, the cloud, the caption, the descent's ease).
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn navigate(
     mut nav: ResMut<Navigation>,
@@ -924,7 +884,7 @@ fn navigate(
     mut flight: ResMut<GlobeFlightState>,
     mut terrain: ResMut<TerrainSettings>,
     mut ui: NavUi,
-    large_budget: Option<ResMut<LargeGenBudget>>,
+    (large_budget, mut cloud): (Option<ResMut<LargeGenBudget>>, ResMut<CloudDensity>),
 ) {
     let now_s = real.elapsed_secs_f64();
     let dt_s = real.delta_secs();
@@ -1025,21 +985,7 @@ fn navigate(
     if terrain.hold_swap != hold {
         terrain.hold_swap = hold;
     }
-    let alpha = phase.overlay_alpha();
-    for (mut node, mut color) in &mut ui.overlay {
-        let display = if alpha > 0.0 {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        if node.display != display {
-            node.display = display;
-        }
-        let want = FADE_COLOR.with_alpha(alpha);
-        if color.0 != want {
-            color.0 = want;
-        }
-    }
+    cloud.raise(phase.cloud_density());
     let leaving = matches!(phase, NavPhase::Leaving { .. });
     let show_caption = !leaving && caption_shown(nav.generating_since.map(|since| now_s - since));
     for mut node in &mut ui.caption {

@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|fly|cruise|time] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|fly|cruise|cloud|time|cloudtime] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
 //! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
@@ -36,6 +36,19 @@
 //! flying, then holds `Shift`+`W` (boost) as long and saves `<prefix>-boost.png`. Each shot logs
 //! a `region tour chase view` line with how far the fly sits below the view's centre.
 //!
+//! A fifth argument `cloud` checks the transition cloud (M3 Task 5): after the start shot it
+//! presses `]` (the next younger snapshot; start the region at an older one) and, as the cloud
+//! gathers, holds its density at 0.5 for [`PIN_FRAMES`] and saves `<prefix>-cloud-half.png`,
+//! then, once the cloud is opaque, holds it at 1.0 as long and saves `<prefix>-cloud-full.png`,
+//! and after the change saves `<prefix>-cloud-after.png`. A fifth argument `cloudtime` is `time`
+//! with the cloud held at density 0.5 throughout, so the two read the cloud pass's cost as a
+//! difference.
+//!
+//! `--offscreen`, anywhere among the arguments, makes `time` and `cloudtime` render into the
+//! offscreen image as the other modes do: a window the compositor is not showing (behind
+//! others, on another Space) gets no main pass at all, only the shadow and compute passes, so
+//! GPU costs read from a trace (Metal System Trace) are only real offscreen.
+//!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
 //! (as in the benches), the camera is held `AGL_M` above the centre, and after the settle it
@@ -52,16 +65,17 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PresentMode, PrimaryWindow};
 use timefly::args::{LaunchArgs, parse_region, parse_window_size};
 use timefly::bench::frame_time_stats;
+use timefly::cloud::CloudDensity;
 use timefly::diagnostics;
 use timefly::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems};
 use timefly::region::launch::launch_request;
-use timefly::region::navigate::{NavPhase, Navigation, same_region};
+use timefly::region::navigate::{NavPhase, Navigation, NavigationSystems, same_region};
 use timefly::region::{
     ActiveRegion, CAMERA_START_ALTITUDE_M, RegionEntered, RegionRequested, RegionState,
 };
 use timefly::terrain::view::RegionCamera;
 use timefly::terrain::{TerrainScene, WIREFRAME_KEY};
-use timefly::time::{GlobeTime, OLDER_KEY};
+use timefly::time::{GlobeTime, OLDER_KEY, YOUNGER_KEY};
 
 /// Seconds after the region appears before the first shot, so its pipelines compile and the
 /// shadow cascades settle.
@@ -81,6 +95,12 @@ const AFTER_CHANGE_SECS: f32 = 4.0;
 const TIME_SECS: f32 = 30.0;
 /// Seconds of steady flight (`cruise`) before each in-flight shot.
 const FLIGHT_SHOT_SECS: f32 = 2.0;
+/// Frames the `cloud` mode holds the cloud's density for each shot: the shot resolves within
+/// (two or three frames), and the change goes on underneath, so the hold at full cover is still
+/// to come when the half shot is done.
+const PIN_FRAMES: u32 = 8;
+/// The density `cloudtime` holds the cloud at.
+const TIMED_CLOUD_DENSITY: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -101,6 +121,12 @@ enum Step {
     /// Sustained flight (`cruise`): plain, then boosted.
     Plain,
     Boosted,
+    /// The cloud (`cloud`): gathering to half, held at half, closing, held opaque, clearing.
+    CloudGather,
+    CloudHalf,
+    CloudClose,
+    CloudFull,
+    CloudClear,
     Done,
 }
 
@@ -111,6 +137,7 @@ enum Mode {
     Shaded,
     Fly,
     Cruise,
+    Cloud,
     Time,
 }
 
@@ -138,6 +165,10 @@ struct Tour {
     left_generating: bool,
     /// Frame deltas recorded in `time` mode, milliseconds.
     frame_ms: Vec<f32>,
+    /// The density the cloud is held at, if any (`cloud`, `cloudtime`).
+    pin: Option<f32>,
+    /// `time` renders into the offscreen image too (`--offscreen`).
+    offscreen: bool,
 }
 
 fn shoot(commands: &mut Commands, tour: &Tour, name: &str) {
@@ -159,7 +190,7 @@ fn render_offscreen(
     cameras: Query<Entity, Added<RegionCamera>>,
     mut commands: Commands,
 ) {
-    if tour.mode == Mode::Time {
+    if tour.mode == Mode::Time && !tour.offscreen {
         return;
     }
     let (w, h) = tour.size;
@@ -246,6 +277,7 @@ fn tour(
         tour.left_generating = true;
     }
     let timed_flight = tour.mode == Mode::Time;
+    let density = nav.phase.cloud_density();
     let on_course = *state.get() == RegionState::InRegion
         && nav.phase == NavPhase::Flying
         && region.as_ref().is_some_and(|r| {
@@ -309,7 +341,17 @@ fn tour(
             }
         }
         Step::Shaded => {
-            if tour.mode == Mode::Cruise && tour.frames >= WIRE_FRAMES {
+            if tour.mode == Mode::Cloud && tour.frames >= WIRE_FRAMES {
+                if tour.frames == WIRE_FRAMES {
+                    keys.press(YOUNGER_KEY);
+                } else {
+                    keys.release(YOUNGER_KEY);
+                    info!("region tour: snapshot change requested");
+                    tour.step = Step::CloudGather;
+                    tour.since = now;
+                    tour.frames = 0;
+                }
+            } else if tour.mode == Mode::Cruise && tour.frames >= WIRE_FRAMES {
                 tour.step = Step::Plain;
                 tour.since = now;
                 tour.shot_taken = false;
@@ -399,6 +441,54 @@ fn tour(
                 tour.frames = 0;
             }
         }
+        Step::CloudGather | Step::CloudClose => {
+            let (target, next, name) = if tour.step == Step::CloudGather {
+                (0.5, Step::CloudHalf, "cloud-half")
+            } else {
+                (1.0, Step::CloudFull, "cloud-full")
+            };
+            if density >= target {
+                info!(density, pinned = target, phase = ?nav.phase, "region tour cloud shot");
+                tour.pin = Some(target);
+                shoot(&mut commands, &tour, name);
+                tour.step = next;
+                tour.frames = 0;
+            } else if now - tour.since > GIVE_UP_SECS
+                || matches!(
+                    nav.phase,
+                    NavPhase::Flying | NavPhase::ChangingSnapshot { placed: true, .. }
+                )
+            {
+                error!(phase = ?nav.phase, "region tour: the cloud never gathered");
+                exit.write(AppExit::error());
+            }
+        }
+        Step::CloudHalf | Step::CloudFull => {
+            if tour.frames >= PIN_FRAMES {
+                tour.pin = None;
+                tour.frames = 0;
+                tour.step = if tour.step == Step::CloudHalf {
+                    Step::CloudClose
+                } else {
+                    tour.since = now;
+                    Step::CloudClear
+                };
+            }
+        }
+        Step::CloudClear => {
+            if nav.phase != NavPhase::Flying {
+                tour.since = now;
+            } else if now - tour.since >= AFTER_CHANGE_SECS {
+                log_flight("after the cloud", &fly, region.as_deref(), &time);
+                shoot(&mut commands, &tour, "cloud-after");
+                tour.step = Step::Done;
+                tour.frames = 0;
+            }
+            if *state.get() == RegionState::Globe {
+                error!(phase = ?nav.phase, "region tour: the snapshot change did not finish");
+                exit.write(AppExit::error());
+            }
+        }
         Step::Low => {
             if tour.frames == WIRE_FRAMES {
                 keys.press(OLDER_KEY);
@@ -465,6 +555,15 @@ fn tour(
     }
 }
 
+/// Holds the cloud's density at the tour's pin, after navigation has raised it this frame.
+fn pin_cloud(tour: Res<Tour>, mut density: ResMut<CloudDensity>) {
+    if let Some(pin) = tour.pin
+        && density.0 != pin
+    {
+        density.0 = pin;
+    }
+}
+
 /// `time` mode: vsync off, as `--region-bench` sets it, so frame times show the real cost.
 fn uncap_frames(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
     for mut window in &mut windows {
@@ -473,14 +572,16 @@ fn uncap_frames(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
 }
 
 fn main() -> AppExit {
-    // `--no-dunes` may come anywhere; the rest are positional.
-    let (flags, args): (Vec<String>, Vec<String>) =
-        std::env::args().skip(1).partition(|a| a == "--no-dunes");
-    let no_dunes = !flags.is_empty();
+    // `--no-dunes` and `--offscreen` may come anywhere; the rest are positional.
+    let (flags, args): (Vec<String>, Vec<String>) = std::env::args()
+        .skip(1)
+        .partition(|a| a == "--no-dunes" || a == "--offscreen");
+    let no_dunes = flags.iter().any(|f| f == "--no-dunes");
+    let offscreen = flags.iter().any(|f| f == "--offscreen");
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
-            "usage: region_tour [--no-dunes] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|cruise|time] [AGL_M] [LATER_S]"
+            "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
+             [shaded|fly|cruise|cloud|time|cloudtime] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -493,11 +594,13 @@ fn main() -> AppExit {
         return AppExit::error();
     };
     let prefix = args.get(3).cloned().unwrap_or_else(|| "cdlod".to_string());
+    let timed_cloud = args.get(4).is_some_and(|m| m == "cloudtime");
     let mode = match args.get(4).map(String::as_str) {
         Some("shaded") => Mode::Shaded,
         Some("fly") => Mode::Fly,
         Some("cruise") => Mode::Cruise,
-        Some("time") => Mode::Time,
+        Some("cloud") => Mode::Cloud,
+        Some("time" | "cloudtime") => Mode::Time,
         _ => Mode::Wire,
     };
     let agl_m = match args.get(5) {
@@ -556,8 +659,11 @@ fn main() -> AppExit {
         frames: 0,
         left_generating: false,
         frame_ms: Vec::new(),
+        pin: timed_cloud.then_some(TIMED_CLOUD_DENSITY),
+        offscreen,
     })
-    .add_systems(Update, render_offscreen);
+    .add_systems(Update, render_offscreen)
+    .add_systems(Update, pin_cloud.after(NavigationSystems));
     let exit = app.run();
     session.finish(&exit);
     exit
@@ -614,6 +720,8 @@ mod tests {
                 frames: 0,
                 left_generating: false,
                 frame_ms: Vec::new(),
+                pin: None,
+                offscreen: false,
             })
             .add_systems(Update, tour);
         app
