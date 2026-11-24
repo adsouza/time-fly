@@ -11,7 +11,8 @@
 #
 # Env: TIMEFLY_TARGET_BUDGET_MB (default 15360), TIMEFLY_MIN_FREE_MB (default 5120),
 #      TIMEFLY_WARN_FREE_MB (default 10240), TIMEFLY_XCTRACE_MIN_FREE_MB (default 10240).
-# Test-only: TIMEFLY_FAKE_FREE_MB, TIMEFLY_GUARD_ROOT, TIMEFLY_RUSTUP_BIN.
+# Test-only: TIMEFLY_FAKE_FREE_MB (free space in MB; grows as the guard deletes in target/),
+#            TIMEFLY_GUARD_ROOT, TIMEFLY_RUSTUP_BIN.
 
 MODE=manual
 case "${1:-}" in
@@ -168,10 +169,17 @@ except Exception: pass' 2>/dev/null
 }
 
 # --- measurements (KB internally) -------------------------------------------
-target_kb() { du -sk "$TARGET" 2>/dev/null | awk '{print $1+0}'; }
+target_kb() { du -sk "$TARGET" 2>/dev/null | awk '{ s = $1 + 0 } END { print s + 0 }'; }
+# Fake free space (tests): TIMEFLY_FAKE_FREE_MB plus whatever was deleted from target/
+# since FAKE_START_KB was taken, so "stop as soon as there is enough" is testable.
 free_kb() {
-  if [ -n "${TIMEFLY_FAKE_FREE_MB:-}" ]; then echo $(($(num_or TIMEFLY_FAKE_FREE_MB "$TIMEFLY_FAKE_FREE_MB" 0) * 1024)); return; fi
-  df -Pk "$ROOT" 2>/dev/null | awk 'NR==2 {print $4+0}'
+  if [ -n "${TIMEFLY_FAKE_FREE_MB:-}" ]; then
+    local base=$(($(num_or TIMEFLY_FAKE_FREE_MB "$TIMEFLY_FAKE_FREE_MB" 0) * 1024))
+    if [ -n "${FAKE_START_KB:-}" ]; then echo $((base + FAKE_START_KB - $(target_kb))); else echo "$base"; fi
+    return
+  fi
+  # Unknown (df failed) reads as plenty: never delete or block on a guess.
+  df -Pk "$ROOT" 2>/dev/null | awk 'NR == 2 { v = $4 + 0; ok = 1 } END { if (ok) print v; else print "1125899906842624" }'
 }
 mb() { echo $(($1 / 1024)); }
 limits_ok() {
@@ -197,12 +205,13 @@ culprits() {
   done | awk -F '\t' -v min="$CULPRIT_MIN_BYTES" '$1 + 0 >= min' | sort -t "$(printf '\t')" -k1,1nr | head -5 |
     awk -F '\t' '{ printf "%d MB %s\n", $1 / 1048576, $2 }'
 }
-# low_free_warning: when free space is under TIMEFLY_WARN_FREE_MB, set WARN_SYS (short) and
-# WARN_CTX (free space, target/ size, likely culprits) and succeed; otherwise fail.
+# low_free_warning [force]: when free space is under TIMEFLY_WARN_FREE_MB (or "force"), set
+# WARN_SYS (short) and WARN_CTX (free space, target/ size, likely culprits) and succeed;
+# otherwise fail.
 low_free_warning() {
   local free t list
   free="$(free_kb)"
-  [ "$free" -lt $((WARN_FREE_MB * 1024)) ] || return 1
+  [ "${1:-}" = force ] || [ "$free" -lt $((WARN_FREE_MB * 1024)) ] || return 1
   if [ -d "$TARGET" ] && [ ! -L "$TARGET" ]; then t="$(mb "$(target_kb)") MB"; else t="absent"; fi
   list="$(culprits | awk 'NR > 1 { printf "; " } { printf "%s", $0 }')"
   WARN_SYS="target-guard: low disk space, $(mb "$free") MB free (warning below $WARN_FREE_MB MB)."
@@ -223,6 +232,12 @@ emit_post() {
     python3 -c 'import json,sys
 print(json.dumps({"systemMessage":sys.argv[1],"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":sys.argv[2]}}))' "$1" "$2"
   fi
+}
+# culprit_lines: the culprit list as one sentence, for the manual report.
+culprit_lines() {
+  local list; list="$(culprits | awk 'NR > 1 { printf "; " } { printf "%s", $0 }')"
+  if [ -n "$list" ]; then echo "Largest files directly in $(scan_dir): $list. The guard never deletes anything outside target/; delete them only with the owner's approval."
+  else echo "No files of 500 MB or more directly in $(scan_dir)."; fi
 }
 # hook_done: in hook mode, report low free space (if any) and exit.
 hook_done() {
@@ -251,7 +266,7 @@ if [ "$MODE" = prehook ]; then
   [ -n "$recs" ] || exit 0
   free="$(free_kb)"
   case "$free" in ""|*[!0-9]*) free="" ;; esac
-  why=""
+  why=""; low=""
   case "$recs" in *nolimit*) why="it has no --time-limit" ;; esac
   if [ -n "$free" ] && [ "$free" -lt $((XCTRACE_MIN_FREE_MB * 1024)) ]; then
     low="only $(mb "$free") MB free, under TIMEFLY_XCTRACE_MIN_FREE_MB ($XCTRACE_MIN_FREE_MB MB)"
@@ -263,7 +278,7 @@ if [ "$MODE" = prehook ]; then
   reason+=" On 2026-11-24 two aborted recordings left 3.4 + 4.3 GB of .ktrace there, the disk filled (ENOSPC) and Bash could no longer start."
   reason+=" To proceed:"
   case "$recs" in *nolimit*) reason+=" add --time-limit (e.g. --time-limit 30s) to every xctrace record;" ;; esac
-  [ -n "${low:-}" ] && reason+=" free space first (check df -h; look for instruments*.ktrace and other large files in $(scan_dir) and delete them only with the owner's approval);"
+  [ -n "$low" ] && reason+=" free space first (check df -h; look for instruments*.ktrace and other large files in $(scan_dir) and delete them only with the owner's approval);"
   reason+=" for GPU cost prefer sampling ioreg instead (ioreg -c IOAccelerator, PerformanceStatistics \"Device Utilization %\" every 0.25 s; see docs/dev/build-disk.md)."
   emit_pre_deny "target-guard: blocked xctrace record ($why)." "$reason"
   exit 0
@@ -277,6 +292,8 @@ fi
 
 if [ -L "$TARGET" ]; then warn "$TARGET is a symlink; refusing to touch it."; hook_done; fi
 if [ ! -d "$TARGET" ]; then warn "$TARGET does not exist; nothing to do."; hook_done; fi
+
+[ -n "${TIMEFLY_FAKE_FREE_MB:-}" ] && FAKE_START_KB="$(target_kb)"
 
 if [ "$MODE" = status ]; then
   echo "target-guard status for $TARGET"
@@ -292,6 +309,19 @@ PHYSICAL_TARGET="$(cd -P -- "$TARGET" && pwd -P)" || hook_done
 BEFORE="$(describe_state)"
 REMOVED=()
 SKIPPED=()
+NOTES=()
+MIN_FREE_KB=$((MIN_FREE_MB * 1024))
+free_ok() { [ "$(free_kb)" -ge "$MIN_FREE_KB" ]; }
+under_budget() { [ "$(target_kb)" -le $((BUDGET_MB * 1024)) ]; }
+# If free space is short of the minimum by more than all of target/ holds, deleting
+# builds cannot fix it: then only the budget may drive deletions.
+SHORT_KB=$((MIN_FREE_KB - $(free_kb)))
+FREE_FIXABLE=1
+[ "$SHORT_KB" -gt 0 ] && [ "$SHORT_KB" -gt "$(target_kb)" ] && FREE_FIXABLE=0
+need_prune() {
+  under_budget || return 0
+  [ "$FREE_FIXABLE" = 1 ] && ! free_ok
+}
 
 build_running() { pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; }
 
@@ -320,17 +350,17 @@ newest_mtime() {   # newest mtime (epoch) of a dir and its subdirs down to depth
 for d in "$TARGET"/*/incremental/* "$TARGET"/*/*/incremental/*; do
   [ -d "$d" ] && [ ! -L "$d" ] || continue
   fresh "$d" && continue
+  need_prune || break
   remove "$d"
-  limits_ok && break
 done
 
 # Step 2: cargo sweep, if installed.
-if ! limits_ok && command -v cargo-sweep >/dev/null 2>&1; then
+if need_prune && command -v cargo-sweep >/dev/null 2>&1; then
   (cd "$ROOT" && env CARGO_TARGET_DIR="$TARGET" cargo sweep --time 2 >/dev/null 2>&1) && REMOVED+=("cargo sweep --time 2")
 fi
 
 # Step 3: whole build dirs, least recently modified first, never the newest.
-if ! limits_ok; then
+if need_prune; then
   if build_running; then
     SKIPPED+=("removing build dirs (cargo/rustc is running)")
   else
@@ -347,21 +377,57 @@ if ! limits_ok; then
       [ -n "$d" ] && [ "$d" != "$newest" ] || continue
       fresh "$d" && continue
       remove "$d"
-      limits_ok && break
+      need_prune || break
     done <<EOF2
 $ordered
 EOF2
   fi
 fi
 
-# Step 4: last resort, only for low free disk space.
-if [ "$(free_kb)" -lt $((MIN_FREE_MB * 1024)) ]; then
-  if build_running; then
-    SKIPPED+=("cargo clean (cargo/rustc is running)")
-  elif command -v cargo >/dev/null 2>&1; then
-    (cd "$ROOT" && env -u CARGO_TARGET_DIR cargo clean --target-dir "$TARGET" >/dev/null 2>&1) && REMOVED+=("cargo clean")
+# last_resort_dirs: build dirs in deletion order: release, <triple>/ dirs, scratch-*,
+# any others, debug last. One path per line; symlinks are skipped by the caller.
+last_resort_dirs() {
+  local d n pass
+  for pass in release triple scratch other debug; do
+    for d in "$TARGET"/*/; do
+      d="${d%/}"; n="${d##*/}"
+      [ -d "$d" ] || continue
+      case "$pass:$n" in
+        release:release|debug:debug|scratch:scratch-*) echo "$d" ;;
+        triple:release|triple:debug|triple:scratch-*|other:release|other:debug|other:scratch-*) ;;
+        triple:*-*-*) echo "$d" ;;
+        other:*-*-*) ;;
+        other:*) echo "$d" ;;
+      esac
+    done
+  done
+}
+
+# Step 4: last resort, only for low free disk space: whole build dirs, fresh or not, in
+# a fixed order, stopping as soon as free space is back above the minimum.
+HOPELESS=0
+if ! free_ok; then
+  if [ "$FREE_FIXABLE" = 0 ]; then
+    HOPELESS=1
+    NOTES+=("free disk is $(mb $((MIN_FREE_KB - $(free_kb)))) MB short of the minimum, more than all of target/ ($(mb "$(target_kb)") MB) could give back, so nothing in target/ was deleted for free space: deleting builds would not fix it, the space is used elsewhere")
+  elif build_running; then
+    SKIPPED+=("last resort: deleting whole build dirs for free space (cargo/rustc is running)")
   else
-    SKIPPED+=("cargo clean (cargo not found)")
+    LR_FREE="$(mb "$(free_kb)")"
+    LR_COUNT=0
+    while IFS= read -r d; do
+      [ -n "$d" ] && [ -d "$d" ] && [ ! -L "$d" ] || continue
+      remove "$d" && LR_COUNT=$((LR_COUNT + 1))
+      free_ok && break
+    done <<EOF3
+$(last_resort_dirs)
+EOF3
+    if [ "$LR_COUNT" -gt 0 ]; then
+      NOTE="last resort: free disk was $LR_FREE MB, under the minimum $MIN_FREE_MB MB, so whole build dirs were deleted in the order release, <triple>, scratch-*, others, debug until free space was back above the minimum"
+      [ -z "$(last_resort_dirs | while IFS= read -r d; do [ -L "$d" ] || echo "$d"; done)" ] &&
+        NOTE+="; every build dir had to go (the same as cargo clean)"
+      NOTES+=("$NOTE")
+    fi
   fi
 fi
 
@@ -372,6 +438,7 @@ join() { local IFS=,; echo "$*"; }
 SUMMARY="target-guard: "
 if [ "${#REMOVED[@]}" -gt 0 ]; then SUMMARY+="removed $(join "${REMOVED[@]}"). "; fi
 if [ "${#SKIPPED[@]}" -gt 0 ]; then SUMMARY+="Skipped: $(join "${SKIPPED[@]}"). "; fi
+for n in "${NOTES[@]}"; do SUMMARY+="Note: $n. "; done
 SUMMARY+="Now: ${AFTER}."
 [ "$STILL_OVER" = 1 ] && SUMMARY+=" Still over limits."
 
@@ -379,9 +446,10 @@ if [ "$MODE" = hook ]; then
   [ "${#REMOVED[@]}" -eq 0 ] && [ "$STILL_OVER" = 0 ] && hook_done
   CONTEXT="$SUMMARY"
   if [ "$STILL_OVER" = 1 ]; then
-    CONTEXT+=" To free space: close other cargo/rustc processes and re-run tools/dev/target-guard.sh, delete target/scratch-* dirs, or run cargo clean. See docs/dev/build-disk.md."
+    CONTEXT+=" To free space: close other cargo/rustc processes and re-run tools/dev/target-guard.sh, or delete target/scratch-* dirs. See docs/dev/build-disk.md."
   fi
-  if low_free_warning; then SUMMARY+=" $WARN_SYS"; CONTEXT+=" $WARN_CTX"; fi
+  force=""; [ "$HOPELESS" = 1 ] && force=force
+  if low_free_warning $force; then SUMMARY+=" $WARN_SYS"; CONTEXT+=" $WARN_CTX"; fi
   emit_post "$SUMMARY" "$CONTEXT"
   exit 0
 fi
@@ -394,6 +462,8 @@ else
   echo "removed: nothing"
 fi
 for s in "${SKIPPED[@]}"; do echo "skipped: $s"; done
+for n in "${NOTES[@]}"; do echo "note: $n"; done
+[ "$HOPELESS" = 1 ] && echo "$(culprit_lines)"
 echo "after:  $AFTER"
 [ "$STILL_OVER" = 1 ] && echo "WARNING: still over limits."
 exit 0

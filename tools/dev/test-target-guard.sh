@@ -120,13 +120,14 @@ rmdir "$ROOT/target"
 out=$(guard 2>&1); rc=$?
 check "missing target: exit 0 with warning" bash -c 'test "$1" -eq 0 && test -n "$2"' _ "$rc" "$out"
 
-echo "4d. CARGO_TARGET_DIR outside the repo is never what cargo clean/sweep act on"
+echo "4d. CARGO_TARGET_DIR outside the repo is never what the last resort/sweep act on"
 newroot 4d
-mkdir -p "$TMP/outside-target"
-mkfile "$ROOT/target/debug/d.bin" 1
-CARGO_TARGET_DIR="$TMP/outside-target" TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=10 guard >/dev/null 2>&1
-check "clean called with --target-dir <root>/target" grep -qF -- "clean --target-dir $ROOT/target " "$CALLS"
-check "CARGO_TARGET_DIR not in cargo clean env" grep -q 'CTD=unset' "$CALLS"
+mkfile "$TMP/outside-target/debug/o.bin" 1
+mkfile "$ROOT/target/debug/d.bin" 4
+CARGO_TARGET_DIR="$TMP/outside-target" TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=98 guard >/dev/null 2>&1
+check "last resort removed <root>/target/debug" test ! -e "$ROOT/target/debug"
+check "outside CARGO_TARGET_DIR untouched" test -f "$TMP/outside-target/debug/o.bin"
+check "cargo not called for the last resort" test ! -s "$CALLS"
 printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/cargo-sweep"; chmod +x "$FAKEBIN/cargo-sweep"
 mkfile "$ROOT/target/release/r.bin" 4; age "$ROOT/target/release" $OLD
 : > "$CALLS"
@@ -184,16 +185,18 @@ check "cargo not called" test ! -s "$CALLS"
 
 echo "7. cargo clean / cargo sweep / running builds"
 newroot 7
-mkfile "$ROOT/target/debug/d.bin" 1
+mkfile "$ROOT/target/debug/d.bin" 2
 TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=1000 guard >/dev/null 2>&1
-check "enough free space: cargo clean not called" test ! -s "$CALLS"
-TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=10 guard >/dev/null 2>&1
-check "free space stays low: cargo clean called" grep -q '^clean' "$CALLS"
+check "enough free space: nothing removed, cargo not called" bash -c 'test -f "$1/target/debug/d.bin" && test ! -s "$2"' _ "$ROOT" "$CALLS"
+TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=99 guard >/dev/null 2>&1
+check "free space stays low: cargo clean never called" bash -c '! grep -q clean "$1"' _ "$CALLS"
+check "free space stays low: last resort removed the build dir" test ! -e "$ROOT/target/debug"
 check "cargo sweep not invoked when absent" bash -c '! grep -q sweep "$1"' _ "$CALLS"
 : > "$CALLS"
+mkfile "$ROOT/target/debug/d.bin" 2
 printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/pgrep"; chmod +x "$FAKEBIN/pgrep"   # a build is running
-out=$(TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=10 guard 2>&1)
-check "build running: cargo clean skipped" test ! -s "$CALLS"
+out=$(TIMEFLY_TARGET_BUDGET_MB=50 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=99 guard 2>&1)
+check "build running: last resort skipped" bash -c 'test -f "$1/target/debug/d.bin" && test ! -s "$2"' _ "$ROOT" "$CALLS"
 check "build running: skip is reported" grep -qi 'skipped' <<<"$out"
 mkfile "$ROOT/target/release/r.bin" 4; age "$ROOT/target/release" $OLD
 TIMEFLY_TARGET_BUDGET_MB=1 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=1000 guard >/dev/null 2>&1
@@ -332,6 +335,12 @@ import os,subprocess,sys,time
 env=dict(os.environ, TIMEFLY_WARN_FREE_MB="0", TIMEFLY_GUARD_ROOT=sys.argv[2])
 best=min((lambda t0: (subprocess.run([sys.argv[1],"--hook"],input=b"{\"tool_input\":{\"command\":\"ls -la\"}}",env=env,capture_output=True), time.monotonic()-t0)[1])(time.monotonic()) for _ in range(3))
 assert best < 0.5, best' "$GUARD" "$ROOT"
+printf '#!/bin/sh\nexit 1\n' > "$FAKEBIN/df"; chmod +x "$FAKEBIN/df"   # df fails
+out=$(hook_json 'cargo build' | TIMEFLY_WARN_FREE_MB=999999 guard --hook 2>&1); rc=$?
+check "df failing: exit 0, silent, nothing deleted" bash -c 'test "$1" -eq 0 && test -z "$2" && test -d "$3/target/debug"' _ "$rc" "$out" "$ROOT"
+out=$(hook_json 'xctrace record --time-limit 5s --template X' | guard --pre-hook 2>&1); rc=$?
+check "df failing: pre-hook allows a bounded recording" bash -c 'test "$1" -eq 0 && test -z "$2"' _ "$rc" "$out"
+rm -f "$FAKEBIN/df"
 unset TIMEFLY_TARGET_BUDGET_MB TIMEFLY_MIN_FREE_MB
 
 echo "10. --pre-hook denies runaway xctrace recordings, allows everything else"
@@ -406,6 +415,50 @@ pre=[x for e in h["PreToolUse"] if e["matcher"]=="Bash" for x in e["hooks"]]
 assert any(x["type"]=="command" and x["command"].endswith("tools/dev/target-guard.sh --pre-hook") for x in pre)
 post=[x for e in h["PostToolUse"] if e["matcher"]=="Bash" for x in e["hooks"]]
 assert any(x["command"].endswith("tools/dev/target-guard.sh --hook") for x in post)' "$SCRIPT_DIR/../../.claude/settings.json"
+
+echo "11. last resort for low free space: whole build dirs in a fixed order, only as many as needed"
+# five fresh 4 MB build dirs: fresh, so the 24 h rule would protect all of them in step 3
+profiles() {
+  newroot "$1"
+  for d in release wasm32-unknown-unknown scratch-a doc debug; do mkfile "$ROOT/target/$d/x.bin" 4; done
+}
+lr() { TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB="$1" TMPDIR="$CUL" guard 2>&1; }
+left() { (cd "$ROOT/target" && for d in release wasm32-unknown-unknown scratch-a doc debug; do [ -e "$d" ] && printf '%s ' "$d"; done); }
+profiles 11a; out="$(lr 95)"   # 5 MB short
+check "5 MB short: release, then the triple dir; rest kept" test "$(left)" = "scratch-a doc debug "
+check "report names what was deleted" bash -c 'grep -q "target/release" <<<"$1" && grep -q "target/wasm32-unknown-unknown" <<<"$1"' _ "$out"
+check "report says why (last resort, free space under the minimum)" grep -qi 'last resort.*free' <<<"$out"
+check "cargo clean never called" bash -c '! grep -q clean "$1"' _ "$CALLS"
+profiles 11b; lr 89 >/dev/null   # 11 MB short
+check "11 MB short: then scratch-*" test "$(left)" = "doc debug "
+profiles 11c; lr 85 >/dev/null   # 15 MB short
+check "15 MB short: then other dirs, debug kept" test "$(left)" = "debug "
+profiles 11d; out="$(lr 82)"     # 18 MB short, 20 MB in target/
+check "18 MB short: every build dir goes, debug last" test -z "$(left)"
+check "every dir gone is reported as a full clean" grep -qi 'every build dir' <<<"$out"
+profiles 11e
+mkfile "$ROOT/target/debug/incremental/stale/x" 1; age "$ROOT/target/debug/incremental/stale" $OLD
+age "$ROOT/target/release" $OLD
+out="$(lr 60)"                   # 40 MB short, only 21 MB in target/
+check "short by more than target/ holds: nothing in target/ deleted" bash -c 'test "$(cd "$1/target" && ls | tr "\n" " ")" = "debug doc release scratch-a wasm32-unknown-unknown " && test -d "$1/target/debug/incremental/stale"' _ "$ROOT"
+check "...and says deleting builds would not fix it" grep -qi 'nothing in target/ was deleted' <<<"$out"
+check "...and lists the culprits outside target/" grep -q "instrumentsA.ktrace" <<<"$out"
+check "...and the culprits are left in place" test -f "$CUL/instrumentsA.ktrace"
+profiles 11f
+rm -rf "$ROOT/target/release"; mkfile "$TMP/ext-release/x.bin" 4; ln -s "$TMP/ext-release" "$ROOT/target/release"
+lr 95 >/dev/null
+check "symlinked build dir: neither followed nor removed" bash -c 'test -L "$1/target/release" && test -f "$2/ext-release/x.bin"' _ "$ROOT" "$TMP"
+check "symlinked build dir: the next ones go instead" test "$(left)" = "release doc debug "
+profiles 11g
+out=$(hook_json 'cargo build' | TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook 2>&1)
+check "hook: last resort runs after a cargo command" test "$(left)" = "scratch-a doc debug "
+check "hook: reports what and why" python3 -c '
+import json,sys
+d=json.load(sys.stdin); c=d["hookSpecificOutput"]["additionalContext"]
+assert "target/release" in d["systemMessage"] and "last resort" in c.lower(), c' <<<"$out"
+profiles 11h
+hook_json 'ls -la' | TIMEFLY_TARGET_BUDGET_MB=1000 TIMEFLY_MIN_FREE_MB=100 TIMEFLY_FAKE_FREE_MB=95 TMPDIR="$CUL" guard --hook >/dev/null 2>&1
+check "hook: no last resort after a non-cargo command" test "$(left)" = "release wasm32-unknown-unknown scratch-a doc debug "
 
 echo
 echo "passed: $PASS  failed: $FAIL"
