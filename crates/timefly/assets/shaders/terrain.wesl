@@ -49,7 +49,8 @@ struct TerrainLook {
     // x: main dune spacing (m); y: small dune spacing (m); z: main period (s); w: small period (s).
     dunes: vec4<f32>,
     // x: the sand-sea mask's noise scale (m); y: mean rock band thickness (m); z: the band warp's
-    // amplitude (m); w: the slope from which dry bare ground shows bands (rise over run).
+    // amplitude (m); w: the slope (rise over run) from which dry bare
+    // ground shows bands (BAND_FULL_SLOPE below is where they reach full weight).
     patterns: vec4<f32>,
 }
 
@@ -200,6 +201,10 @@ fn planet_noise(p: vec3<f32>, scale_m: f32, seed: u32) -> f32 {
     let c = floor(q);
     return gradient_noise3(vec3<i32>(c), q - c, seed);
 }
+
+// The slope at which bands on dry, bare ground reach full weight (BAND_FULL_SLOPE in material.rs);
+// they ramp in from look.patterns.w (0.06), so steeper ground reads stronger and level plains none.
+const BAND_FULL_SLOPE: f32 = 0.2;
 
 // Rock strata (spec §5.5). Each layer cuts the warped height into cells of its own thickness and
 // gives every cell a random (value, hue) in -1..1; three layers at 0.4, 1 and 1.7 times
@@ -438,6 +443,25 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     let rock = smoothstep(0.5, 0.7, slope + 0.12 * n60 + 0.06 * n9);
     c = mix(c, surf.rock, rock);
 
+    // Rock strata (spec §5.5), before the snow so snow edges keep their full cover: on cliffs,
+    // and on slopes of dry or bare ground (exposure >= 0.8) with a weight that grows from
+    // look.patterns.w to BAND_FULL_SLOPE, scaled by how exposed the rock is. Not under canopy
+    // (a true zero) or dune sand. The weight also fades with the strata's visibility, so ground
+    // too far away to show bands keeps its own colour instead of turning rock-coloured.
+    // Pixels with no weight evaluate no noise.
+    let moderate = smoothstep(0.7, 0.8, surf.exposure)
+        * smoothstep(look.patterns.w, BAND_FULL_SLOPE, slope);
+    let vertical_m = slope * footprint;
+    let visible = octave_weight(vertical_m, 1.7 * look.patterns.y);
+    let band_weight = surf.exposure * max(rock, moderate)
+        * (1.0 - min(canopy / 0.9, 1.0)) * (1.0 - dune_sea) * visible;
+    if band_weight > 0.0 {
+        let bp = planet_position_m(
+            xz, look.frame_center.xyz, look.frame_north.xyz, look.frame_east.xyz, look.frame_center.w
+        );
+        c = mix(c, surf.rock * band_tint(bp, height, vertical_m), band_weight);
+    }
+
     // Snow: the ice byte, sharpened per pixel by the snowline at the pixel's latitude (north is
     // -z), shed by cliffs, with a painted edge.
     let lat = look.light.w - xz.y / METRES_PER_DEGREE;
@@ -447,21 +471,6 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     let snow_amount = max(ice * (1.0 - 0.6 * cliff), above * step(0.0, height) * (1.0 - cliff));
     let snow = smoothstep(0.35, 0.65, snow_amount + 0.12 * n60 + 0.06 * n9);
     c = mix(c, SNOW, snow);
-
-    // Rock strata (spec §5.5): on cliffs, and on moderate slopes (from look.patterns.w, 15
-    // degrees) of dry or bare ground, weighted by how exposed the rock is. Not under snow,
-    // canopy or dune sand. Pixels with no weight evaluate no noise.
-    let moderate = smoothstep(0.7, 0.8, surf.exposure)
-        * smoothstep(look.patterns.w - 0.05, look.patterns.w + 0.05, slope);
-    let band_weight = surf.exposure * max(rock, moderate) * (1.0 - canopy) * (1.0 - snow)
-        * (1.0 - dune_sea);
-    if band_weight > 0.0 {
-        let bp = planet_position_m(
-            xz, look.frame_center.xyz, look.frame_north.xyz, look.frame_east.xyz, look.frame_center.w
-        );
-        let tint = band_tint(bp, height, slope * footprint);
-        c = mix(c, surf.rock * tint, band_weight);
-    }
 
     // Brush: value jitter, and a warm-cool hue jitter, a few percent each.
     let k = look.light.z;

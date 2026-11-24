@@ -766,14 +766,8 @@ fn dry_snowline_on_the_real_bake() {
     }
 }
 
-/// The Grand Canyon (36.1 N, -112.1 E at 0 ka): how much relief the ETOPO-sourced inner field
-/// carries near the centre, for the rock-banding art pass (slope thresholds 0.27 = 15 degrees,
-/// where moderate-slope strata begin, and 0.6 = 31 degrees, the cliff rock test). Prints the
-/// height range within 15 km and the share of land texels above each slope; asserts only that the
-/// field generated.
-#[test]
-#[ignore = "reads the real bake; run in release"]
-fn grand_canyon_relief() {
+/// The inner field at `lat, lon` and 0 ka over the real bake (the Task 7 rock-banding probes).
+fn inner_field_at(lat: f64, lon: f64) -> timefly_core::worldgen::generate::Field {
     let globe = data().join("globe");
     let b = bake(&globe);
     let age = 0.0;
@@ -782,7 +776,7 @@ fn grand_canyon_relief() {
         grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
     }
     let overview = read_tfgrid(&fs::read(data().join("tiles/overview.tfgrid")).unwrap()).unwrap();
-    let centre = geo_to_render(latlon_to_geo(36.1, -112.1));
+    let centre = geo_to_render(latlon_to_geo(lat, lon));
     let frame = RegionFrame { center: centre };
     let mut tiles = TileSet::new();
     tiles.set_overview(overview).unwrap();
@@ -804,14 +798,40 @@ fn grand_canyon_relief() {
         seed: 0x7F1E_0002,
         ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
     };
-    let grid = RegionGenerator::new(spec, &field).finish();
-    let f = &grid.inner;
+    RegionGenerator::new(spec, &field).finish().inner
+}
+
+/// The shader's band ramp on dry bare ground (`terrain.wesl`: smoothstep from `BAND_MIN_SLOPE`
+/// to `BAND_FULL_SLOPE`, exposure 1 for deserts); constants mirror `material.rs`.
+fn band_weight(slope: f32) -> f32 {
+    let t = ((slope - 0.06) / (0.2 - 0.06)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Central-difference slope (rise over run) at an interior texel.
+fn texel_slope(f: &timefly_core::worldgen::generate::Field, r: usize, c: usize) -> f32 {
     let n = f.res as usize;
     let h = |r: usize, c: usize| f.elevation_m[r * n + c];
     let step = f.spacing_m() as f32;
+    let gx = (h(r, c + 1) - h(r, c - 1)) / (2.0 * step);
+    let gz = (h(r + 1, c) - h(r - 1, c)) / (2.0 * step);
+    gx.hypot(gz)
+}
+
+/// The Grand Canyon (36.1 N, -112.1 E at 0 ka): how much relief the ETOPO-sourced inner field
+/// carries near the centre, for the rock-banding art pass. Prints the height range within 15 km
+/// and the share of land texels above slope 0.06 (bands begin), 0.27 and 0.6; asserts only that
+/// the field generated.
+#[test]
+#[ignore = "reads the real bake; run in release"]
+fn grand_canyon_relief() {
+    let f = inner_field_at(36.1, -112.1);
+    let n = f.res as usize;
+    let h = |r: usize, c: usize| f.elevation_m[r * n + c];
+    let step = f.spacing_m();
     for radius in [15_000.0_f64, 150_000.0] {
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        let (mut land, mut over_015, mut over_06) = (0usize, 0usize, 0usize);
+        let (mut land, mut over) = (0usize, [0usize; 3]);
         for r in 1..n - 1 {
             for c in 1..n - 1 {
                 let (x, z) = f.local_of(r as u32, c as u32);
@@ -823,24 +843,107 @@ fn grand_canyon_relief() {
                 if h(r, c) <= 0.0 {
                     continue;
                 }
-                let gx = (h(r, c + 1) - h(r, c - 1)) / (2.0 * step);
-                let gz = (h(r + 1, c) - h(r - 1, c)) / (2.0 * step);
-                let slope = gx.hypot(gz);
+                let slope = texel_slope(&f, r, c);
                 land += 1;
-                over_015 += usize::from(slope > 0.27);
-                over_06 += usize::from(slope > 0.6);
+                for (k, t) in [0.06, 0.27, 0.6].iter().enumerate() {
+                    over[k] += usize::from(slope > *t);
+                }
             }
         }
         let pct = |k: usize| 100.0 * k as f64 / land.max(1) as f64;
         println!(
-            "grand canyon within {:.0} km (inner texel {:.0} m): height {lo:.0} .. {hi:.0} m \
-             (range {:.0} m); land texels {land}; slope > 0.27: {:.2} %; slope > 0.6: {:.2} %",
+            "grand canyon within {:.0} km (texel {step:.0} m): height {lo:.0} .. {hi:.0} m \
+             (range {:.0} m); land {land}; slope > 0.06: {:.2} %; > 0.27: {:.2} %; > 0.6: {:.2} %",
             radius / 1000.0,
-            step,
             hi - lo,
-            pct(over_015),
-            pct(over_06)
+            pct(over[0]),
+            pct(over[1]),
+            pct(over[2])
         );
     }
     assert!(!f.elevation_m.is_empty());
+}
+
+/// The share of hot/cold-desert land texels whose band weight exceeds 0.1, over the Grand
+/// Canyon and the Sahara (23 N, 10 E) at 0 ka, within 15 km and 150 km of the centre. Flat plains
+/// (slope < 0.05) must get zero weight.
+#[test]
+#[ignore = "reads the real bake; run in release"]
+fn desert_band_share() {
+    for (name, lat, lon) in [("grand canyon", 36.1, -112.1), ("sahara", 23.0, 10.0)] {
+        let f = inner_field_at(lat, lon);
+        let n = f.res as usize;
+        for radius in [15_000.0_f64, 150_000.0] {
+            let (mut desert, mut banded, mut flat) = (0usize, 0usize, 0usize);
+            for r in 1..n - 1 {
+                for c in 1..n - 1 {
+                    let (x, z) = f.local_of(r as u32, c as u32);
+                    let biome = f.surface[r * n + c][0];
+                    if x.hypot(z) > radius
+                        || f.elevation_m[r * n + c] <= 0.0
+                        || !(biome == 2 || biome == 3)
+                    {
+                        continue;
+                    }
+                    let slope = texel_slope(&f, r, c);
+                    let w = band_weight(slope);
+                    desert += 1;
+                    banded += usize::from(w > 0.1);
+                    if slope < 0.05 {
+                        flat += 1;
+                        assert_eq!(w, 0.0, "a flat plain (slope {slope}) got band weight");
+                    }
+                }
+            }
+            println!(
+                "{name} within {:.0} km: desert land {desert}; band weight > 0.1: {:.2} %; \
+                 flat (< 0.05) {:.1} %",
+                radius / 1000.0,
+                100.0 * banded as f64 / desert.max(1) as f64,
+                100.0 * flat as f64 / desert.max(1) as f64
+            );
+        }
+    }
+}
+
+/// A coarse map of the Grand Canyon's inner field (1.5 km cells, 40 km square, north up) for
+/// choosing the showcase camera: elevation in hundreds of metres (digit, capped at 9 above
+/// 3,000 m... printed as `h/400` clipped) and `#` where the mean band weight of the cell > 0.5.
+#[test]
+#[ignore = "reads the real bake; run in release"]
+fn grand_canyon_map() {
+    let f = inner_field_at(36.1, -112.1);
+    let n = f.res as usize;
+    let cell = 5usize; // texels
+    let half = 20_000.0;
+    println!("x: -20..20 km east, rows north to south; digit = elevation/400 m, # = banded cell");
+    let mut r0 = 1usize;
+    while r0 + cell < n {
+        let (_, z) = f.local_of(r0 as u32, 0);
+        if z.abs() <= half {
+            let mut line = String::new();
+            let mut c0 = 1usize;
+            while c0 + cell < n {
+                let (x, _) = f.local_of(0, c0 as u32);
+                if x.abs() <= half {
+                    let (mut sum, mut w, mut cnt) = (0.0, 0.0, 0.0);
+                    for r in r0..r0 + cell {
+                        for c in c0..c0 + cell {
+                            sum += f.elevation_m[r * n + c];
+                            w += band_weight(texel_slope(&f, r, c));
+                            cnt += 1.0;
+                        }
+                    }
+                    line.push(if w / cnt > 0.5 {
+                        '#'
+                    } else {
+                        char::from_digit(((sum / cnt) / 400.0).clamp(0.0, 9.0) as u32, 10).unwrap()
+                    });
+                }
+                c0 += cell;
+            }
+            println!("z {:6.1} km {line}", z / 1000.0);
+        }
+        r0 += cell;
+    }
 }

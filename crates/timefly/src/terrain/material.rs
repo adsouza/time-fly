@@ -104,9 +104,14 @@ pub const SAND_SEA_SCALE_M: f32 = 40_000.0;
 pub const BAND_SCALE_M: f32 = 35.0;
 /// The amplitude (m) of the km-scale noise that warps the strata, so layers dip and fold.
 pub const BAND_WARP_M: f32 = 40.0;
-/// The slope (rise over run, 15 degrees) from which dry, bare ground shows strata on moderate
-/// slopes (the shader ramps over this +-0.05).
-pub const BAND_MIN_SLOPE: f32 = 0.27;
+/// The slope (rise over run, about 3.4 degrees) from which dry, bare ground (rock exposure
+/// of at least 0.8) starts to show strata. The weight ramps up to full at [`BAND_FULL_SLOPE`], so steeper
+/// ground reads stronger and there is no visible gate edge. The ETOPO source softens canyon walls
+/// to slopes of 0.08-0.25, so a 15 degree gate would miss the Grand Canyon.
+pub const BAND_MIN_SLOPE: f32 = 0.06;
+/// The slope at which that ramp reaches full weight. Mirrored as `BAND_FULL_SLOPE` in
+/// `terrain.wesl`.
+pub const BAND_FULL_SLOPE: f32 = 0.2;
 
 /// The painterly look's uniform (`TerrainLook` in `terrain.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
@@ -552,11 +557,13 @@ mod tests {
     fn band_constants() {
         assert_eq!(BAND_SCALE_M, 35.0);
         assert_eq!(BAND_WARP_M, 40.0);
-        assert_eq!(BAND_MIN_SLOPE, 0.27);
+        assert_eq!(BAND_MIN_SLOPE, 0.06);
+        assert_eq!(BAND_FULL_SLOPE, 0.2);
+        assert!(TERRAIN_WESL.contains("const BAND_FULL_SLOPE: f32 = 0.2;"));
         let look = TerrainLook::default();
         assert_eq!(look.patterns.y, 35.0);
         assert_eq!(look.patterns.z, 40.0);
-        assert_eq!(look.patterns.w, 0.27);
+        assert_eq!(look.patterns.w, 0.06);
     }
 
     #[test]
