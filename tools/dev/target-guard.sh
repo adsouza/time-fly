@@ -463,7 +463,7 @@ else
 fi
 for s in "${SKIPPED[@]}"; do echo "skipped: $s"; done
 for n in "${NOTES[@]}"; do echo "note: $n"; done
-[ "$HOPELESS" = 1 ] && echo "$(culprit_lines)"
+[ "$HOPELESS" = 1 ] && culprit_lines
 echo "after:  $AFTER"
 [ "$STILL_OVER" = 1 ] && echo "WARNING: still over limits."
 exit 0
