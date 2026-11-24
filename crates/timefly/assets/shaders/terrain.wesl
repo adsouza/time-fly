@@ -260,17 +260,23 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
 // The ramp: illumination l (1 = a surface facing the sun; level ground in the region's sun is
 // about 0.55 with the ambient) pulled toward three soft bands: shade, half-light and full light.
 // Level ground sits inside the middle band, so slopes turned to or from the sun step out of it.
-fn ramp(l: f32, floor_level: f32) -> f32 {
-    let banded = floor_level + 0.42 * smoothstep(0.22, 0.38, l) + 0.42 * smoothstep(0.70, 0.86, l);
+//
+// `floor_level` is the shade band's level (0.16 for everything but snow) and `lift` the height
+// of the first step; the half-light band stays at 0.58 and full light at 1.0 (floor + lift = 0.58),
+// so only the shade is lifted. For snow = 0 this is the original ramp.
+fn ramp(l: f32, floor_level: f32, lift: f32) -> f32 {
+    let banded = floor_level + lift * smoothstep(0.22, 0.38, l) + 0.42 * smoothstep(0.70, 0.86, l);
     let bands = banded + max(l - 1.0, 0.0);
     return mix(l, bands, look.light.y);
 }
 
 // Repaints PBR light: the ramp on the illumination, then a hue shift of shadowed light.
-// Snow (0..1) lifts the ramp's floor to look.relief.z and takes only look.relief.w of the hue.
+// Snow (0..1) lifts the ramp's shade floor to look.relief.z (the half-light and full-light bands stay put) and takes
+// look.relief.w of the shadow hue.
 fn paint_light(lit: vec3<f32>, albedo: vec3<f32>, snow: f32) -> vec3<f32> {
     let l = dot(lit, LUMA) / max(dot(albedo, LUMA), 1e-4) / max(look.light.x, 1e-6);
-    var c = lit * (ramp(l, mix(0.16, look.relief.z, snow)) / max(l, 1e-4));
+    let lift = mix(0.42, 0.58 - look.relief.z, snow);
+    var c = lit * (ramp(l, mix(0.16, look.relief.z, snow), lift) / max(l, 1e-4));
     let shade = 1.0 - smoothstep(0.12, 0.6, l);
     c = c * mix(vec3<f32>(1.0), look.shadow.rgb, shade * look.shadow.a * mix(1.0, look.relief.w, snow));
     return c;
