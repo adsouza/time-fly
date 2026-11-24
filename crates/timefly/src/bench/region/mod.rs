@@ -61,6 +61,7 @@ use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
 use crate::region::{
     ActiveRegion, RegionGenerated, RegionLeft, RegionRequested, RegionState, RegionSystems,
 };
+use crate::terrain::TerrainOptions;
 use crate::time::GlobeTime;
 pub use path::{BenchPath, Coast, SCRIPT_SECS, Segment};
 
@@ -265,6 +266,22 @@ impl RegionBenchConfig {
             _ => None,
         }
     }
+}
+
+/// `dunes: on` or `dunes: off` (`--no-dunes`), so a run with the dunes off is never read as one
+/// with them on.
+pub fn dunes_line(dunes: bool) -> String {
+    format!("dunes: {}", if dunes { "on" } else { "off" })
+}
+
+/// Puts [`dunes_line`] right after the header's `system spans:` line.
+fn push_dunes_line(out: &mut Vec<String>, game: &Game) {
+    let dunes = game.options.as_deref().is_none_or(|o| o.dunes);
+    let at = out
+        .iter()
+        .position(|l| l.starts_with("system spans: "))
+        .map_or(out.len(), |i| i + 1);
+    out.insert(at, dunes_line(dunes));
 }
 
 /// The summary's line naming what was benched: `regions: all 8` or
@@ -524,6 +541,7 @@ struct Game<'w, 's> {
     region: Option<Res<'w, ActiveRegion>>,
     session: Option<Res<'w, SessionInfo>>,
     globe: Option<Res<'w, GlobeData>>,
+    options: Option<Res<'w, TerrainOptions>>,
     generated: MessageReader<'w, 's, RegionGenerated>,
 }
 
@@ -1036,6 +1054,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         spec.name, spec.arg.lat_deg, spec.arg.lon_deg, spec.arg.years
     );
     let mut out = header_lines_titled(&title, game.session.as_deref(), display.adapter.as_deref());
+    push_dunes_line(&mut out, game);
     if let Some(size) = info.size {
         out.push(format!("render resolution: {}x{}", size.x, size.y));
     }
@@ -1220,6 +1239,7 @@ fn finish(
         game.session.as_deref(),
         display.adapter.as_deref(),
     );
+    push_dunes_line(&mut out, game);
     out.push(regions_line(&bench.config));
     let mut pass = failure.is_none();
     let regions: Vec<String> = bench
@@ -1511,6 +1531,12 @@ mod tests {
         assert_eq!(after_region(7, 8, 0), Next::Summary);
         // A single-region run goes from its one region straight to the summary.
         assert_eq!(after_region(0, 1, 0), Next::Summary);
+    }
+
+    #[test]
+    fn reports_say_whether_dunes_were_drawn() {
+        assert_eq!(dunes_line(true), "dunes: on");
+        assert_eq!(dunes_line(false), "dunes: off");
     }
 
     #[test]

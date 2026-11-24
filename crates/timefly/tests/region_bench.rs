@@ -20,6 +20,7 @@ use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::globe::GlobeRenderStatus;
 use timefly::region::navigate::RegionNavigationPlugin;
 use timefly::region::{GenMode, RegionPlugin, RegionSettings};
+use timefly::terrain::TerrainOptions;
 use timefly::time::TimePlugin;
 
 const STEP: Duration = Duration::from_micros(16_667);
@@ -226,8 +227,9 @@ fn region_bench_reports_all_regions() {
     assert!(shown.len() < 60, "{}", shown.len());
 }
 
-#[test]
-fn a_single_region_run_reaches_the_summary() {
+/// Runs a single-region bench over the Red Sea stop's centre to its summary, with `options` if
+/// given (otherwise the app has no `TerrainOptions`, as a test app may not).
+fn run_single(options: Option<TerrainOptions>) -> (App, Vec<AppExit>) {
     let arg = RegionArg {
         lat_deg: 20.0,
         lon_deg: 37.5,
@@ -237,6 +239,9 @@ fn a_single_region_run_reaches_the_summary() {
     config.path_secs = 6.0;
     config.timeout_secs = 1.0e6;
     let mut app = bench_app(config);
+    if let Some(options) = options {
+        app.insert_resource(options);
+    }
     let deadline = Instant::now() + WALL_LIMIT;
     let mut exit = Vec::new();
     while app.world().resource::<RegionBench>().summary().is_none() {
@@ -248,9 +253,24 @@ fn a_single_region_run_reaches_the_summary() {
         assert!(Instant::now() < deadline, "the bench did not finish");
         std::thread::sleep(Duration::from_millis(1));
     }
+    (app, exit)
+}
+
+#[test]
+fn a_single_region_run_reaches_the_summary() {
+    let (app, exit) = run_single(None);
     let bench = app.world().resource::<RegionBench>();
     let reports = bench.reports();
     assert_eq!(reports.len(), 1, "{reports:#?}");
+    // Without the option, the dunes are on, and every block says so after the spans line.
+    for text in [&reports[0], bench.summary().unwrap()] {
+        let lines: Vec<&str> = text.lines().collect();
+        let spans = lines
+            .iter()
+            .position(|l| l.starts_with("system spans: "))
+            .unwrap();
+        assert_eq!(lines[spans + 1], "dunes: on", "{text}");
+    }
     assert!(
         reports[0].starts_with("===== Time Fly region bench: Chosen region (20, 37.5 at 0 years)"),
         "{}",
@@ -283,6 +303,16 @@ fn a_single_region_run_reaches_the_summary() {
         "{shown:#?}"
     );
     assert!(!shown.iter().any(|s| s.contains("of 9")), "{shown:#?}");
+}
+
+#[test]
+fn a_no_dunes_run_says_so() {
+    let (app, _) = run_single(Some(TerrainOptions { dunes: false }));
+    let bench = app.world().resource::<RegionBench>();
+    for text in [&bench.reports()[0], bench.summary().unwrap()] {
+        assert!(text.contains("\ndunes: off\n"), "{text}");
+        assert!(!text.contains("dunes: on"), "{text}");
+    }
 }
 
 #[test]
