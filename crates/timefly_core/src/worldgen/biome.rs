@@ -295,6 +295,38 @@ pub fn palette(era: VegetationEra, biome: BiomeClass) -> SurfacePalette {
     }
 }
 
+/// How much of a biome's ground is sand where it meets the sea: 1.0 for the deserts, else 0.0.
+pub fn sand_sea_weight(biome: BiomeClass) -> f32 {
+    match biome {
+        BiomeClass::HotDesert | BiomeClass::ColdDesert => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// How much bare rock shows through a biome's cover in an era (0..1): everything but ice in the
+/// `Barren` era, and a per-biome share once plants grow.
+pub fn rock_exposure(era: VegetationEra, biome: BiomeClass) -> f32 {
+    if era == VegetationEra::Barren {
+        return if biome == BiomeClass::IceCap {
+            0.0
+        } else {
+            1.0
+        };
+    }
+    match biome {
+        BiomeClass::HotDesert | BiomeClass::ColdDesert => 1.0,
+        BiomeClass::Steppe => 0.8,
+        BiomeClass::Mediterranean => 0.4,
+        BiomeClass::Tundra | BiomeClass::Alpine => 0.35,
+        BiomeClass::MonsoonSavanna => 0.2,
+        BiomeClass::TropicalRainforest
+        | BiomeClass::TemperateBroadleaf
+        | BiomeClass::TemperateRainforest
+        | BiomeClass::Boreal
+        | BiomeClass::IceCap => 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +617,54 @@ mod tests {
             snowline_with_raise_m(46.5, -50.0, 0.0),
             snowline_m(46.5, -50.0)
         );
+    }
+
+    #[test]
+    fn sand_only_in_deserts() {
+        for b in ALL_BIOMES {
+            let want = if matches!(b, BiomeClass::HotDesert | BiomeClass::ColdDesert) {
+                1.0
+            } else {
+                0.0
+            };
+            assert_eq!(sand_sea_weight(b), want, "{b:?}");
+        }
+    }
+
+    #[test]
+    fn exposure_table() {
+        use BiomeClass::*;
+        for b in ALL_BIOMES {
+            let want = if b == IceCap { 0.0 } else { 1.0 };
+            assert_eq!(
+                rock_exposure(VegetationEra::Barren, b),
+                want,
+                "Barren {b:?}"
+            );
+        }
+        let table = [
+            (HotDesert, 1.0),
+            (ColdDesert, 1.0),
+            (Steppe, 0.8),
+            (Mediterranean, 0.4),
+            (Tundra, 0.35),
+            (Alpine, 0.35),
+            (MonsoonSavanna, 0.2),
+            (TropicalRainforest, 0.0),
+            (TemperateBroadleaf, 0.0),
+            (TemperateRainforest, 0.0),
+            (Boreal, 0.0),
+            (IceCap, 0.0),
+        ];
+        assert_eq!(table.len(), ALL_BIOMES.len());
+        for era in ALL_ERAS {
+            if era == VegetationEra::Barren {
+                continue;
+            }
+            for (b, want) in table {
+                assert_eq!(rock_exposure(era, b), want, "{era:?} {b:?}");
+            }
+        }
+        assert_eq!(rock_exposure(VegetationEra::Modern, Boreal), 0.0);
     }
 }

@@ -91,6 +91,9 @@ struct Surface {
     flags: vec4<f32>,
     // The snowline's dryness raise (m, ruling R27).
     snow_raise: f32,
+    // Sand weight at the sea (ground texel alpha) and rock exposure (rock texel alpha), 0..1.
+    sand: f32,
+    exposure: f32,
 }
 
 fn texel_surface(code: vec4<f32>) -> Surface {
@@ -99,9 +102,13 @@ fn texel_surface(code: vec4<f32>) -> Surface {
     let at = vec2<i32>(i32(biome * 3u), i32(era));
     let canopy = textureLoad(palette, at + vec2<i32>(1, 0), 0);
     var s: Surface;
-    s.ground = textureLoad(palette, at, 0).rgb;
     s.canopy = canopy.rgb;
-    s.rock = textureLoad(palette, at + vec2<i32>(2, 0), 0).rgb;
+    let rock = textureLoad(palette, at + vec2<i32>(2, 0), 0);
+    let ground = textureLoad(palette, at, 0);
+    s.ground = ground.rgb;
+    s.rock = rock.rgb;
+    s.sand = ground.a;
+    s.exposure = rock.a;
     // The fourth byte: the shore flag in its top bit, the snowline's dryness raise below it.
     let byte3 = u32(round(code.w * 255.0));
     let shore = select(0.0, 1.0, byte3 >= 128u);
@@ -117,6 +124,8 @@ fn mix_surface(a: Surface, b: Surface, t: f32) -> Surface {
     s.rock = mix(a.rock, b.rock, t);
     s.flags = mix(a.flags, b.flags, t);
     s.snow_raise = mix(a.snow_raise, b.snow_raise, t);
+    s.sand = mix(a.sand, b.sand, t);
+    s.exposure = mix(a.exposure, b.exposure, t);
     return s;
 }
 

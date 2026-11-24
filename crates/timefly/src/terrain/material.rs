@@ -38,7 +38,9 @@ use bevy::shader::ShaderRef;
 use bytemuck::{Pod, Zeroable};
 use timefly_core::globe::EARTH_RADIUS_KM;
 use timefly_core::terrain::{BLEND_APRON_TEXELS, LodSettings, Patch};
-use timefly_core::worldgen::biome::{BiomeClass, VegetationEra, palette};
+use timefly_core::worldgen::biome::{
+    BiomeClass, VegetationEra, palette, rock_exposure, sand_sea_weight,
+};
 use timefly_core::worldgen::generate::{Field, RegionGrid};
 
 /// `terrain.wesl`: the main-pass vertex and fragment shaders.
@@ -307,18 +309,21 @@ pub fn canopy_cover(biome: BiomeClass) -> f32 {
 }
 
 /// The palette texture's texels ([`PALETTE_SIZE`], row-major, sRGB bytes): Task 3's
-/// [`palette`] for every era and biome, ground, canopy and rock side by side. Alpha is 255,
-/// except the canopy's, which holds [`canopy_cover`].
+/// [`palette`] for every era and biome, ground, canopy and rock side by side. Alpha (linear) is
+/// the ground's [`sand_sea_weight`], the canopy's [`canopy_cover`] and the rock's
+/// [`rock_exposure`].
 pub fn palette_texels() -> Vec<[u8; 4]> {
     let mut texels = vec![[0u8; 4]; (PALETTE_SIZE.x * PALETTE_SIZE.y) as usize];
     for era in ALL_ERAS {
         for biome in ALL_BIOMES {
             let p = palette(era, biome);
             let cover = (canopy_cover(biome) * 255.0).round() as u8;
+            let sand = (sand_sea_weight(biome) * 255.0).round() as u8;
+            let exposure = (rock_exposure(era, biome) * 255.0).round() as u8;
             for (kind, colour, alpha) in [
-                (PaletteKind::Ground, p.ground, 255),
+                (PaletteKind::Ground, p.ground, sand),
                 (PaletteKind::Canopy, p.canopy, cover),
-                (PaletteKind::Rock, p.rock, 255),
+                (PaletteKind::Rock, p.rock, exposure),
             ] {
                 let [r, g, b, _] =
                     Srgba::from(LinearRgba::rgb(colour[0], colour[1], colour[2])).to_u8_array();
@@ -590,6 +595,21 @@ mod tests {
     }
 
     #[test]
+    fn palette_alphas_carry_sand_and_exposure() {
+        let texels = palette_texels();
+        let alpha = |era, biome, kind| texels[palette_texel_index(era, biome, kind)][3];
+        use PaletteKind::*;
+        let (m, d) = (VegetationEra::Modern, BiomeClass::HotDesert);
+        assert_eq!((alpha(m, d, Ground), alpha(m, d, Rock)), (255, 255));
+        let b = BiomeClass::Boreal;
+        assert_eq!((alpha(m, b, Ground), alpha(m, b, Rock)), (0, 0));
+        let t = BiomeClass::TemperateBroadleaf;
+        assert_eq!(alpha(VegetationEra::Barren, t, Rock), 255);
+        assert_eq!(alpha(m, d, Canopy), (canopy_cover(d) * 255.0).round() as u8);
+        assert_eq!(alpha(m, b, Canopy), (canopy_cover(b) * 255.0).round() as u8);
+    }
+
+    #[test]
     fn palette_texture_matches_core() {
         for (i, b) in ALL_BIOMES.iter().enumerate() {
             assert_eq!(*b as usize, i);
@@ -617,8 +637,9 @@ mod tests {
                         );
                     }
                     let alpha = match kind {
+                        PaletteKind::Ground => (sand_sea_weight(biome) * 255.0).round() as u8,
                         PaletteKind::Canopy => (canopy_cover(biome) * 255.0).round() as u8,
-                        _ => 255,
+                        PaletteKind::Rock => (rock_exposure(era, biome) * 255.0).round() as u8,
                     };
                     assert_eq!(t[3], alpha, "{era:?} {biome:?} {kind:?}");
                 }
