@@ -10,6 +10,7 @@ pub mod noise;
 #[cfg(test)]
 mod testkit;
 pub mod tiles;
+pub mod wind;
 
 /// Side of a region's inner field, in metres.
 pub const REGION_SIZE_M: f64 = 300_000.0;

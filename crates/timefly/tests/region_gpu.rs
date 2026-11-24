@@ -13,6 +13,8 @@
 //! - `wesl_snowline_matches_rust` runs `snowline.wesl` (with ruling R18's glacial lowering and
 //!   ruling R27's dryness raise decoded from the surface byte) against
 //!   `timefly_core::worldgen::biome::snowline_with_raise_m`.
+//! - `wesl_planet_position_matches_rust` runs `planet.wesl`'s `planet_position_m` against
+//!   `EARTH_RADIUS_M * FrameBasis::local_to_dir`.
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -801,4 +803,176 @@ fn wesl_snowline_matches_rust() {
         );
     }
     println!("{} snowlines: worst diff {worst:.2e} m", queries.len());
+}
+
+const PLANET: &str = include_str!("../assets/shaders/planet.wesl");
+
+const PLANET_ENTRY: &str = r#"
+struct Query {
+    xz: vec2<f32>,
+    pad: vec2<f32>,
+    center: vec4<f32>,
+    north: vec4<f32>,
+    east: vec4<f32>,
+}
+@group(0) @binding(0) var<storage, read> queries: array<Query>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&out)) {
+        return;
+    }
+    let q = queries[n];
+    out[n] = vec4<f32>(
+        planet_position_m(q.xz, q.center.xyz, q.north.xyz, q.east.xyz, q.center.w),
+        0.0,
+    );
+}
+"#;
+
+/// `planet_position_m` (`planet.wesl`) against `EARTH_RADIUS_M * FrameBasis::local_to_dir`, for
+/// frames at (0, 0), (45, 10), (89, 0) and (36.1, -179.9) with x and z over +-1.7e6 m. The bound
+/// is 2 m, which covers f32 rounding at Earth's radius (one ulp there is 0.5 m).
+/// Measured maximum error: 0.906 m (324 positions, Apple GPU/Metal).
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_planet_position_matches_rust() {
+    use timefly_core::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
+    let frames: Vec<RegionFrame> = [(0.0, 0.0), (45.0, 10.0), (89.0, 0.0), (36.1, -179.9)]
+        .iter()
+        .map(|&(lat, lon)| RegionFrame {
+            center: geo_to_render(latlon_to_geo(lat, lon)),
+        })
+        .collect();
+    let steps = [
+        -1.7e6f64, -1.2e6, -5.0e5, -1.0e4, 0.0, 3.3e3, 4.0e5, 9.0e5, 1.7e6,
+    ];
+    // (xz, pad, center.xyzw, north.xyz0, east.xyz0) as f32s.
+    let mut queries: Vec<[f32; 16]> = Vec::new();
+    let mut truth: Vec<DVec3> = Vec::new();
+    for f in &frames {
+        let basis = f.basis();
+        for &x in &steps {
+            for &z in &steps {
+                let c = basis.center;
+                let (n, e) = (basis.north, basis.east);
+                queries.push([
+                    x as f32,
+                    z as f32,
+                    0.0,
+                    0.0,
+                    c.x as f32,
+                    c.y as f32,
+                    c.z as f32,
+                    EARTH_RADIUS_M as f32,
+                    n.x as f32,
+                    n.y as f32,
+                    n.z as f32,
+                    0.0,
+                    e.x as f32,
+                    e.y as f32,
+                    e.z as f32,
+                    0.0,
+                ]);
+                // Truth from the same f32-rounded inputs, so only the shader's arithmetic is
+                // measured.
+                let xf = f64::from(x as f32);
+                let zf = f64::from(z as f32);
+                truth.push(basis.local_to_dir(xf, zf).0 * EARTH_RADIUS_M);
+            }
+        }
+    }
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("planet parity"),
+        source: wgpu::ShaderSource::Wgsl(format!("{PLANET}\n{PLANET_ENTRY}").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("planet parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let query_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("queries"),
+        contents: bytemuck::cast_slice(&queries),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bytes = (queries.len() * 16) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(queries.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<f32> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    let mut worst = 0.0f64;
+    for (i, want) in truth.iter().enumerate() {
+        let g = DVec3::new(
+            f64::from(got[i * 4]),
+            f64::from(got[i * 4 + 1]),
+            f64::from(got[i * 4 + 2]),
+        );
+        let diff = (g - *want).length();
+        worst = worst.max(diff);
+        assert!(
+            diff < 2.0,
+            "query {i} ({}, {}): gpu {g} vs rust {want}: {diff} m",
+            queries[i][0],
+            queries[i][1]
+        );
+    }
+    println!("{} positions: worst diff {worst:.3} m", queries.len());
 }

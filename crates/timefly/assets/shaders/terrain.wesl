@@ -19,6 +19,7 @@ import package::terrain_cdlod::{
     TerrainBuffer, TerrainParams, cdlod_vertex, grid_index_of, terrain_normal,
 };
 import package::noise::gradient_noise3;
+import package::planet::planet_position_m;
 import package::snowline::{snowline_m, snowline_raise_from_byte};
 import bevy_pbr::render::mesh_functions::get_tag;
 import bevy_pbr::render::view_transformations::position_world_to_clip;
@@ -33,6 +34,14 @@ struct TerrainLook {
     light: vec4<f32>,
     // x: relief exaggeration for shading; y: the era's sea-level anomaly (m), for the snowline.
     relief: vec4<f32>,
+    // xyz: the region centre's unit direction (era frame); w: Earth's radius (m).
+    frame_center: vec4<f32>,
+    // xyz: unit tangent toward north at the centre (local -z).
+    frame_north: vec4<f32>,
+    // xyz: unit tangent toward east at the centre (local +x).
+    frame_east: vec4<f32>,
+    // xyz: the prevailing wind's 3D axis W (tangent at the centre); dune phase is dot(p, W).
+    wind: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<storage, read> terrain: TerrainBuffer;

@@ -32,6 +32,7 @@ use bevy::render::render_resource::BufferUsages;
 use bevy::render::storage::ShaderBuffer;
 use timefly_core::globe::EARTH_RADIUS_KM;
 use timefly_core::terrain::{LodSettings, PATCH_QUADS, Patch, select_patches};
+use timefly_core::worldgen::frame::RegionFrame;
 use timefly_core::worldgen::generate::RegionGrid;
 use tracing::instrument;
 
@@ -73,6 +74,9 @@ pub fn look_for(grid: &RegionGrid) -> TerrainLook {
         view::full_sun_illumination(),
         crate::sky::centre_lat_deg(grid),
         grid.spec.sea_level_anomaly_m as f32,
+        &RegionFrame {
+            center: grid.spec.center,
+        },
     )
 }
 

@@ -28,6 +28,7 @@
 //! and WebGPU, which has no bindless support at all.
 
 use bevy::asset::{RenderAssetUsages, uuid_handle};
+use bevy::math::DVec3;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -36,12 +37,15 @@ use bevy::render::render_resource::{
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bytemuck::{Pod, Zeroable};
+use timefly_core::geo::RenderDir;
 use timefly_core::globe::EARTH_RADIUS_KM;
 use timefly_core::terrain::{BLEND_APRON_TEXELS, LodSettings, Patch};
 use timefly_core::worldgen::biome::{
     BiomeClass, VegetationEra, palette, rock_exposure, sand_sea_weight,
 };
+use timefly_core::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
 use timefly_core::worldgen::generate::{Field, RegionGrid};
+use timefly_core::worldgen::wind::wind_axis;
 
 /// `terrain.wesl`: the main-pass vertex and fragment shaders.
 pub const TERRAIN_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e11");
@@ -55,6 +59,9 @@ pub const TERRAIN_CDLOD_SHADER: Handle<Shader> =
 pub const NOISE_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e14");
 /// `snowline.wesl`: the snowline (`snowline_m`), imported as `package::snowline`.
 pub const SNOWLINE_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e15");
+
+/// `planet.wesl`: the planet-fixed position (`planet_position_m`), imported as `package::planet`.
+pub const PLANET_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e16");
 
 /// How strongly shadowed light takes the sky's cool, era-tinted hue (0 = not at all).
 pub const SHADOW_HUE_STRENGTH: f32 = 0.30;
@@ -80,27 +87,53 @@ pub struct TerrainLook {
     /// `x`: [`RELIEF_EXAGGERATION`]; `y`: the era's sea-level anomaly (m), which lowers the
     /// snowline in glacial eras (ruling R18, `snowline.wesl`); `zw`: reserved.
     pub relief: Vec4,
+    /// `xyz`: the region centre's unit direction in the era frame; `w`: `EARTH_RADIUS_M`.
+    /// With `frame_north` and `frame_east`, the input of `planet_position_m`.
+    pub frame_center: Vec4,
+    /// `xyz`: the unit tangent toward north at the centre (region-local `-z`); `w`: 0.
+    pub frame_north: Vec4,
+    /// `xyz`: the unit tangent toward east at the centre (region-local `+x`); `w`: 0.
+    pub frame_east: Vec4,
+    /// `xyz`: the prevailing wind's 3D axis `W` at the centre (`wind_axis`), tangent to the
+    /// sphere there, so a dune's crest phase is `dot(p, W)` for the planet position `p`; `w`:
+    /// unused.
+    pub wind: Vec4,
 }
 
 impl Default for TerrainLook {
     fn default() -> Self {
-        terrain_look(Vec3::ONE, 1.0, 0.0, 0.0)
+        terrain_look(
+            Vec3::ONE,
+            1.0,
+            0.0,
+            0.0,
+            &RegionFrame {
+                center: RenderDir(DVec3::Z),
+            },
+        )
     }
 }
 
-/// The look for a sky zenith colour (linear), the full-sun illumination, the centre latitude and
-/// the era's sea-level anomaly.
+/// The look for a sky zenith colour (linear), the full-sun illumination, the centre latitude, the
+/// era's sea-level anomaly and the region's frame (for the planet position and the wind).
 pub fn terrain_look(
     zenith: Vec3,
     full_sun: f32,
     centre_lat_deg: f32,
     sea_level_anomaly_m: f32,
+    frame: &RegionFrame,
 ) -> TerrainLook {
+    let basis = frame.basis();
+    let (_, wind) = wind_axis(frame);
     let luminance = zenith.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(1e-6);
     TerrainLook {
         shadow: (zenith / luminance).extend(SHADOW_HUE_STRENGTH),
         light: Vec4::new(full_sun, RAMP_AMOUNT, BRUSH_STRENGTH, centre_lat_deg),
         relief: Vec4::new(RELIEF_EXAGGERATION, sea_level_anomaly_m, 0.0, 0.0),
+        frame_center: basis.center.as_vec3().extend(EARTH_RADIUS_M as f32),
+        frame_north: basis.north.as_vec3().extend(0.0),
+        frame_east: basis.east.as_vec3().extend(0.0),
+        wind: wind.as_vec3().extend(0.0),
     }
 }
 
@@ -398,11 +431,15 @@ impl MaterialExtension for TerrainExtension {
 /// Adds the embedded terrain shaders to the shader assets, so the terrain renders from any
 /// asset root. `terrain_cdlod.wesl` registers as the WESL module `package::terrain_cdlod`,
 /// `noise.wesl` as `package::noise` (`import package::noise::gradient_noise3;`) and
-/// `snowline.wesl` as `package::snowline`.
+/// `snowline.wesl` as `package::snowline`, `planet.wesl` as `package::planet`.
 pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
     let noise = Shader::from_wesl(
         include_str!("../../assets/shaders/noise.wesl"),
         "embedded://timefly/noise.wesl",
+    );
+    let planet = Shader::from_wesl(
+        include_str!("../../assets/shaders/planet.wesl"),
+        "embedded://timefly/planet.wesl",
     );
     let snowline = Shader::from_wesl(
         include_str!("../../assets/shaders/snowline.wesl"),
@@ -421,6 +458,7 @@ pub fn add_terrain_shaders(shaders: &mut Assets<Shader>) {
         "embedded://timefly/terrain_prepass.wesl",
     );
     let _ = shaders.insert(NOISE_SHADER.id(), noise);
+    let _ = shaders.insert(PLANET_SHADER.id(), planet);
     let _ = shaders.insert(SNOWLINE_SHADER.id(), snowline);
     let _ = shaders.insert(TERRAIN_CDLOD_SHADER.id(), cdlod);
     let _ = shaders.insert(TERRAIN_SHADER.id(), terrain);

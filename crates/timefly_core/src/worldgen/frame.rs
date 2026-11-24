@@ -8,7 +8,8 @@ use crate::geo::RenderDir;
 use crate::globe::EARTH_RADIUS_KM;
 use bevy_math::DVec3;
 
-pub(crate) const EARTH_RADIUS_M: f64 = EARTH_RADIUS_KM * 1000.0;
+/// Earth's radius in metres: the sphere the frame projects onto.
+pub const EARTH_RADIUS_M: f64 = EARTH_RADIUS_KM * 1000.0;
 
 /// Below this horizontal length of the centre (render X and Z) the centre counts as a pole.
 const POLE_EPS: f64 = 1e-12;
