@@ -39,7 +39,8 @@ Stills can't show the motion. Each scene below says what to watch for when flyin
   - Hover at 400 m over a sand sea for a minute: the crest lines slide, the ground doesn't.
 - **Swash.** In the shallows the water level rises and falls every 8 s.
   - The water's edge slides 10–40 m up the beach and back.
-  - Measured in the coastal scenes: a median of 30–36 m, and at most about 52 m peak to peak.
+  - Measured in the coastal scenes: a per-row median shift of 31–36 m east–west, and at most
+    about 52 m peak to peak.
   - The phase changes slowly along the coast, so the shore doesn't pulse in lockstep.
   - A broken foam line rides the moving edge.
 - **Swell.** Three long, low waves (100–156 m apart, 8–10 s, 0.5 m each) spread around the

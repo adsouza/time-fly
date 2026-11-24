@@ -798,7 +798,8 @@ docs/testing/region-m2/              screenshots, performance.md
   and the view fades through haze over 0.8 s to the fly camera 8 km above the ground. The smooth
   descent is M3's zoom-and-swap (owner decision, 2026-11-23).
 - **Paint follows the morphing geometry.** Beach, mat and snow thresholds use the interpolated
-  CDLOD height, so snowlines and beach edges crawl slightly as patches morph. ~~Foam is a solid
+  CDLOD height, so snowlines and beach edges crawl slightly as patches morph. (The art pass's
+  rock strata read the true bilinear surface instead, so they hold still.) ~~Foam is a solid
   pale band from high up (an art-pass item).~~ **Resolved by the art pass:** foam now fades to
   nothing where its texture would alias, the shallow tint no longer glows from altitude, and on
   gentle coasts the foam band stays about 60 m wide. See `docs/testing/art-pass/README.md`.
@@ -822,6 +823,11 @@ docs/testing/region-m2/              screenshots, performance.md
   - Suggested fix: make the shade floor and the hue strength snow-aware (floor about 0.45, about
     half the hue shift where the pixel is snow).
   - It joins the other art-pass items: foam bands and featureless deserts.
+- **Dune crests depend on the region centre (art pass).** The crest phase is the along-wind
+  distance from each region's own centre, so the crests shift between visits entered from
+  different centres and would seam under M3's region streaming. The sand-sea mask and the dune
+  warp are planet-fixed and don't shift. The fix, deferred to M3, is a per-region f64 phase
+  offset from a global along-wind field (art-pass plan appendix).
 - **Featureless deserts (resolved by the art pass).** Deserts were one flat ochre wash. Now about
   30 % of desert ground is sand sea, with creeping painted dunes; the rest is stony plain with
   gravel patches and mottling. Exposed rock on dry or bare slopes shows horizontal colour banding.

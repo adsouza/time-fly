@@ -101,6 +101,11 @@ It also adds the life the owner asked for (owner's words, 2026-11-23):
   - The existing small brush jitter can stay region-local.
   - My call (2026-11-23): the sand seas decide where the dunes are, so they belong to the
     place, not to the visit.
+  - **As shipped:** the sand-sea mask, the dune warp and the band warp are planet-fixed, but the
+    dunes' crest phase is the along-wind distance from the region centre (no per-region offset
+    yet). So the crests shift between visits entered from different centres, and would seam under
+    M3 streaming. The per-region phase offset is deferred to M3 (plan appendix, "Dune crests
+    depend on the region centre").
 - **Reference images live in `docs/testing/art-pass/`.**
 
 ## 4. Approaches
@@ -210,7 +215,8 @@ snowline):
   - It is evaluated once per region at the centre (a region spans ±1.35° of latitude) and
     passed to the shaders, so it needs no WESL copy.
   - The dune phase uses that wind as one fixed 3D axis per region, because a coordinate along
-    each pixel's own tangent axes is identically zero on a sphere (plan, Task 3).
+    each pixel's own tangent axes is identically zero on a sphere (plan, Task 3). That phase is
+    measured from the region centre, so it depends on the centre (see Determinism above).
 
 **Motion:** the pattern creeps downwind, slowly.
 
