@@ -470,7 +470,14 @@ fn the_fallback_notice_shows_for_three_seconds_after_a_fallback_region() {
     assert_eq!(FALLBACK_NOTICE_TEXT, "terrain detail unavailable here");
 }
 
+thread_local! {
+    /// The frames [`frame`]'s stand-in for the terrain scene still holds the cloud for; every
+    /// test's inputs start from [`inputs`], which clears it.
+    static SETTLING_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 fn inputs() -> NavInputs {
+    SETTLING_FRAMES.set(0);
     NavInputs {
         now_s: 10.0,
         load_s: 10.0,
@@ -507,13 +514,20 @@ fn frame(phase: NavPhase, i: &mut NavInputs) -> (NavPhase, Vec<NavAction>, f32, 
     let before = phase.cloud_density(i);
     let (next, actions) = step_nav(phase, i);
     // As the terrain scene: a swap this frame (a hop's, a snapshot change's) leaves the next
-    // frame's fields incomplete (`TerrainScene::holds_cloud`); one frame later they are not.
-    i.fields_settling = actions.iter().any(|a| {
+    // `REPLACE_EXTRA_HELD_FRAMES` frames' fields incomplete (`TerrainScene::holds_cloud`).
+    let swapped = actions.iter().any(|a| {
         matches!(
             a,
             NavAction::SwapToNeighbour | NavAction::PlaceAfterChange { .. }
         )
     });
+    let left = if swapped {
+        crate::terrain::REPLACE_EXTRA_HELD_FRAMES
+    } else {
+        SETTLING_FRAMES.get().saturating_sub(1)
+    };
+    SETTLING_FRAMES.set(left);
+    i.fields_settling = left > 0;
     for action in &actions {
         match *action {
             NavAction::SnapTime(t) => i.time = t,

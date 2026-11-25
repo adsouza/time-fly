@@ -5,10 +5,11 @@
 //!   (heights, surface codes and water, inner and apron), builds one grid mesh, one
 //!   [`TerrainMaterial`] and one patch buffer, and spawns the [`RegionCamera`] and the
 //!   [`TerrainSun`], then frees the grid's river texels, which only the GPU reads. A replaced
-//!   region (a snapshot change, a hop) swaps the textures in place over three frames: the old
-//!   water released on the swap frame, the new water on the next, the heights and surface codes
-//!   on the third ([`TerrainScene::steps_remaining`]), so the upload's memory never peaks with
-//!   both water sets; navigation holds the cloud opaque meanwhile
+//!   region (a snapshot change, a hop) swaps the textures in place over four frames: the old
+//!   water released on the swap frame, the new water on the next, nothing on the third while
+//!   its staging drains, the heights and surface codes on the fourth
+//!   ([`TerrainScene::steps_remaining`]), so the upload's memory never peaks with both water
+//!   sets or both uploads' staging; navigation holds the cloud opaque meanwhile
 //!   ([`REPLACE_EXTRA_HELD_FRAMES`]).
 //!   A removed one despawns everything and drops every handle, so the GPU memory goes back to
 //!   where it was.
@@ -169,11 +170,12 @@ pub struct TerrainScene {
 }
 
 /// Frames a replace draws incomplete or mixed fields after its swap frame, for which navigation
-/// keeps the cloud at density exactly 1 (`NavInputs::fields_settling`): the owner's ruling of
-/// 2026-11-25, one more frame in cloud than M3. The swap frame itself binds no water (the old
+/// keeps the cloud at density exactly 1 (`NavInputs::fields_settling`): the owner's rulings of
+/// 2026-11-25, two more frames in cloud than M3. The swap frame itself binds no water (the old
 /// water is freed in the render world the frame after its removal); the next draws the new
-/// water over the old heights; the third is complete.
-pub const REPLACE_EXTRA_HELD_FRAMES: u32 = 1;
+/// water over the old heights, and so does the one after, which uploads nothing while the
+/// water's staging drains; the fourth is complete.
+pub const REPLACE_EXTRA_HELD_FRAMES: u32 = 2;
 
 /// A replace's uploads still to make ([`begin_replace`], [`advance_replace`]).
 enum Staged {
@@ -181,6 +183,9 @@ enum Staged {
     /// The new grid's water, built on the swap frame (when the grid's rivers could be freed),
     /// added to the assets the frame after.
     Water(Box<[Image; 2]>),
+    /// A frame with no upload, while the water's staging drains (the GPU still holds it for the
+    /// frames in flight).
+    Drain,
     /// The new grid's heights and surface codes.
     Heights,
 }
@@ -190,19 +195,22 @@ impl std::fmt::Debug for Staged {
         f.write_str(match self {
             Staged::Done => "Done",
             Staged::Water(_) => "Water",
+            Staged::Drain => "Drain",
             Staged::Heights => "Heights",
         })
     }
 }
 
 impl TerrainScene {
-    /// The frames of uploads a replace still has to make: 2 after its swap frame (the water,
-    /// then the heights and surface codes), 1 after the next, 0 once the fields are the grid's.
+    /// The frames a replace still has to step through: 3 after its swap frame (the water, a
+    /// frame for its staging to drain, then the heights and surface codes), 2 and 1 after the
+    /// next two, 0 once the fields are the grid's.
     pub fn steps_remaining(&self) -> u32 {
         match self.staged {
             Staged::Done => 0,
             Staged::Heights => 1,
-            Staged::Water(_) => 2,
+            Staged::Drain => 2,
+            Staged::Water(_) => 3,
         }
     }
 
@@ -608,14 +616,15 @@ fn terrain_material(
     }
 }
 
-/// A replaced region at the same LOD settings, its uploads spread over three frames so the old
+/// A replaced region at the same LOD settings, its uploads spread over four frames so the old
 /// and new image data, their staging and the old and new GPU textures never all peak together
 /// (the hop's memory, M3's gate). This frame, the swap's (at cloud density 1): the old water's
 /// images are removed, the scene takes the new grid, and the new water is built while the
 /// region alone holds the grid, so its rivers can be freed; nothing binds water this frame. The
-/// next two ([`advance_replace`]): the new water, once the render world has freed the old; then
-/// the heights and surface codes, with the patches' header, the bounds and the look. The
-/// terrain draws the old heights until then; the same material and pool throughout.
+/// next three ([`advance_replace`]): the new water, once the render world has freed the old; a
+/// frame without uploads while the water's staging drains; then the heights and surface codes,
+/// with the patches' header, the bounds and the look. The terrain draws the old heights until
+/// then; the same material and pool throughout.
 fn begin_replace(scene: &mut TerrainScene, grid: &mut Arc<RegionGrid>, images: &mut Assets<Image>) {
     release(images, &mut scene.inner_water);
     release(images, &mut scene.apron_water);
@@ -626,7 +635,8 @@ fn begin_replace(scene: &mut TerrainScene, grid: &mut Arc<RegionGrid>, images: &
     debug!("terrain water released; the new water follows next frame, then the heights");
 }
 
-/// The next step of a staged replace, if one is under way: the water, then the heights.
+/// The next step of a staged replace, if one is under way: the water, a frame to drain its
+/// staging, then the heights.
 fn advance_replace(
     scene: &mut TerrainScene,
     images: &mut Assets<Image>,
@@ -639,9 +649,10 @@ fn advance_replace(
             let [inner, apron] = *water;
             scene.inner_water = images.add(inner);
             scene.apron_water = images.add(apron);
-            scene.staged = Staged::Heights;
-            debug!("terrain water replaced; the heights follow next frame");
+            scene.staged = Staged::Drain;
+            debug!("terrain water replaced; the heights follow in two frames");
         }
+        Staged::Drain => scene.staged = Staged::Heights,
         Staged::Heights => finish_replace(scene, images, materials, options),
     }
 }

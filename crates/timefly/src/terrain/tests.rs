@@ -646,17 +646,18 @@ fn the_active_grid_frees_its_rivers_once_uploaded() {
     }
 }
 
-/// The hop's memory (third stage, the owner's ruling of 2026-11-25): a replace spreads its
-/// uploads over three frames. The swap frame removes the old water (the render world frees it
-/// a frame later); the next makes the new water, when the old is gone; the third replaces the
-/// heights and surface codes. Navigation keeps the cloud opaque for the frames that end
-/// incomplete (`holds_cloud`): the swap frame and [`REPLACE_EXTRA_HELD_FRAMES`] more.
+/// The hop's memory (third and fourth stages, the owner's rulings of 2026-11-25): a replace
+/// spreads its uploads over four frames. The swap frame removes the old water (the render world
+/// frees it a frame later); the next makes the new water, when the old is gone; the third
+/// uploads nothing, so the water's staging drains; the fourth replaces the heights and surface
+/// codes. Navigation keeps the cloud opaque for the frames that end incomplete (`holds_cloud`):
+/// the swap frame and [`REPLACE_EXTRA_HELD_FRAMES`] more.
 #[test]
 fn a_replace_frees_the_old_water_before_making_the_new() {
     use crate::water::{RegionWater, WaterMaterial, add_water_systems};
     assert_eq!(
-        REPLACE_EXTRA_HELD_FRAMES, 1,
-        "the owner's ruling: one more frame in cloud"
+        REPLACE_EXTRA_HELD_FRAMES, 2,
+        "the owner's rulings: two more frames in cloud"
     );
     let mut app = pool_app();
     app.init_asset::<crate::sky::SkyMaterial>()
@@ -694,7 +695,7 @@ fn a_replace_frees_the_old_water_before_making_the_new() {
         let s = app.world().resource::<TerrainScene>();
         assert_eq!(
             (s.steps_remaining(), s.fields_pending(), s.holds_cloud()),
-            (2, true, true)
+            (3, true, true)
         );
         let images = app.world().resource::<Assets<Image>>();
         assert!(images.get(&s.inner_water).is_none() && images.get(&s.apron_water).is_none());
@@ -714,19 +715,21 @@ fn a_replace_frees_the_old_water_before_making_the_new() {
         );
         assert_eq!(images.len(), 5, "no water set at all");
     }
-    // The next frame: the new water, still the old heights.
-    app.update();
-    {
+    // The next frame: the new water, still the old heights; then a frame that uploads nothing.
+    for (k, left) in [(1, 2), (2, 1)] {
+        app.update();
         let s = app.world().resource::<TerrainScene>();
         assert_eq!(
             (s.steps_remaining(), s.fields_pending(), s.holds_cloud()),
-            (1, true, false)
+            (left, true, left > 1),
+            "swap + {k}"
         );
         assert_eq!(first_f32(&app, s.inner_water.id()), new_w);
         assert_eq!(first_f32(&app, s.inner_height.id()), old_h);
+        assert_eq!(s.inner_height.id(), old[0], "swap + {k}: heights untouched");
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 7);
     }
-    // The third: the new heights and surfaces; the old ones go.
+    // The fourth: the new heights and surfaces; the old ones go.
     app.update();
     let world = app.world();
     let s = world.resource::<TerrainScene>();
@@ -868,8 +871,8 @@ fn sky_and_water_follow_the_scene() {
     deep.spec.snapshot = YearsBp(540.0e6);
     let deep = Arc::new(deep);
     enter(&mut app, &deep);
-    // A replace takes three frames (`a_replace_frees_the_old_water_before_making_the_new`).
-    for _ in 0..3 {
+    // A replace takes four frames (`a_replace_frees_the_old_water_before_making_the_new`).
+    for _ in 0..4 {
         app.update();
     }
     {

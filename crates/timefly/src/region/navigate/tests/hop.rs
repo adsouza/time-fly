@@ -512,10 +512,13 @@ fn after_the_hop_the_fly_returns_to_its_height_above_ground() {
         "{}",
         end.height_m
     );
-    // Down all the way, and the cloud only clearing, gone within its clear time.
+    // Down all the way, and the cloud only clearing, gone within its clear time once the swap's
+    // fields are complete (`REPLACE_EXTRA_HELD_FRAMES` frames held first).
     assert!(frames.windows(2).all(|w| w[1].height_m <= w[0].height_m));
     assert!(frames.windows(2).all(|w| w[1].density <= w[0].density));
-    let clear = (CLOUD_CLEAR_S / 0.1).ceil() as usize;
+    let held = crate::terrain::REPLACE_EXTRA_HELD_FRAMES as usize;
+    assert!(frames[..held].iter().all(|f| f.density == 1.0));
+    let clear = (CLOUD_CLEAR_S / 0.1).ceil() as usize + held;
     assert!(frames[clear..].iter().all(|f| f.density == 0.0));
     assert!(frames.iter().all(|f| !has(&f.actions, leaves)));
 
@@ -919,10 +922,11 @@ fn a_hops_staged_swap_draws_mixed_fields_only_under_the_opaque_cloud() {
         "the swap frame starts the staged replace"
     );
     assert_mixed_fields_only_under_the_cloud(&frames, 1);
-    // The owner's ruling (2026-11-25): one more frame in cloud than M3, whose clear started on
+    // The owner's rulings (2026-11-25): two more frames in cloud than M3, whose clear started on
     // the frame after the swap.
     let extra = crate::terrain::REPLACE_EXTRA_HELD_FRAMES as usize;
-    assert_eq!(extra, 1);
+    assert_eq!(extra, 2);
+    assert_eq!(1 + extra, 3, "three opaque frames from the swap on");
     let opaque = frames[swap..]
         .iter()
         .take_while(|f| f.density == 1.0)
