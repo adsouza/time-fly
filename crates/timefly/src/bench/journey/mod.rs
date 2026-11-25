@@ -279,8 +279,9 @@ pub const SWAP_WINDOW_FRAMES: u32 = 3;
 /// The most a hop may add to the in-region footprint natively (design §10, gated). The owner's
 /// +64 MiB of 2026-11-25, over the design's +40: measured, a hop peaks at about +22 MiB and the
 /// first hop of a run at up to +37.5 MiB (the swap's upload transient plus pages malloc has no
-/// freed block of the right size for), and with no reuse at all the parts add up to about
-/// +44 MiB (`docs/testing/m3/performance.md`, "Hop memory").
+/// freed block of the right size for); a hop after the OS reclaimed the retained pages read
+/// +48.0 MiB on the route set (`docs/testing/m3/performance.md`, "Hop memory" and "Journey
+/// route set").
 pub const HOP_MEMORY_LIMIT_MIB: u64 = 64;
 /// Seconds on the globe before the first journey.
 pub const SETTLE_SECS: f64 = 1.0;

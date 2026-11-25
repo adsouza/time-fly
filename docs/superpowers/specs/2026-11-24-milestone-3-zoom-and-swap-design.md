@@ -332,8 +332,9 @@ below the cloud reads as the same place (§10).
   stay within the existing 96-tile cache cap. On the web, wasm memory grows once by the extra
   grid and stays flat across later hops. *(Measured in M3, natively: the swap's upload adds
   about +22 MiB for two or three frames (staging, and the new textures beside the old), and the
-  first hop of a run up to +37.5 MiB; the generator's lattice, 19.5–24.5 MiB, now reuses the last
-  region's pages. See `docs/testing/m3/performance.md`, "Hop memory".)*
+  first hop of a run up to +37.5 MiB, or +48.0 MiB when the OS has just reclaimed freed pages;
+  the generator's lattice, 14–35 MiB (largest at a cube corner), now reuses the last region's
+  pages. See `docs/testing/m3/performance.md`, "Hop memory".)*
 - **Web frame budget:** a preload generates while the player flies, so its slices must not break
   the flight gates *(call: a smaller per-frame budget during flight, the full 12 ms budget while
   the cloud is opaque)*. A longer hold in the cloud is acceptable; dropped frames are not.
@@ -389,7 +390,8 @@ packages on Vulkan. Record the adapter and backend.
   - peak memory during a hop: native ≤ +40 MiB over the in-region baseline; wasm linear memory
     flat across hops after the first. *(Raised to +64 MiB natively by the owner, 2026-11-25,
     on the measured breakdown in `docs/testing/m3/performance.md`, "Hop memory": the first hop
-    of a run reads up to +37.5 MiB, and with no page reuse the parts add up to about +44 MiB.)*
+    of a run reads up to +37.5 MiB, and a hop after the OS reclaimed freed pages +48.0 MiB on
+    the owner's route set.)*
   - memory returning to its first-cycle level across repeated journeys (as M2's cycles)
 - `--region=LAT,LON,AGE` still starts in a region (with the fly at M2's start pose) for testing.
 
