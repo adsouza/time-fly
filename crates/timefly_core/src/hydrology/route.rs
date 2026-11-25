@@ -65,7 +65,8 @@ pub struct Routed {
     pub receiver: Vec<u8>,
     /// The non-ocean nodes in pop order: every receiver comes before its node.
     pub order: Vec<u32>,
-    /// Basins in the order their exits were popped.
+    /// Basins in the order their exits were popped. With data lakes, `HydroPrep` appends the
+    /// data's flats after them (their `spill_m` is the flat's level).
     pub basins: Vec<Basin>,
     /// Each node's index into `basins`, or [`NO_BASIN`].
     pub basin_of: Vec<u32>,

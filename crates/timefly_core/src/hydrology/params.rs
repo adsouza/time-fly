@@ -24,6 +24,13 @@ pub const ICE_NODE_FRACTION: f64 = 0.5;
 pub const DATA_LAKE_FLAT_TOL_M: f64 = 0.5;
 pub const DATA_LAKE_MIN_NODES: u32 = 2;
 pub const DATA_LAKE_MIN_BALANCE: f64 = 0.25;
+/// A depression's data lake also needs `Q_in ≤ DATA_LAKE_MAX_BALANCE × capacity` of its flat:
+/// far more water than the flat evaporates means the data's flat is a pit, not a lake surface,
+/// and the water balance decides (fix round 1).
+pub const DATA_LAKE_MAX_BALANCE: f64 = 10.0;
+/// A flat outside every depression is a data lake (one that drains, like Victoria) when it has
+/// at least this many connected nodes within [`DATA_LAKE_FLAT_TOL_M`] of its lowest.
+pub const DATA_LAKE_FLAT_MIN_NODES: u32 = 20;
 pub const DATA_LAKE_MAX_DEPTH_M: f64 = 50.0;
 pub const DATA_LAKE_DEPTH_RAMP_NODES: f64 = 2.0;
 /// A lake by the water balance must stand at least this deep over its basin's lowest node *(Task

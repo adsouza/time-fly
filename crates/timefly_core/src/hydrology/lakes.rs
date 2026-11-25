@@ -1,37 +1,57 @@
 //! Discharge and the lake water balance (rivers and lakes design §4.1, steps 3 and 4).
 //!
-//! Discharge accumulates in reverse pop order. A basin's nodes hold their own runoff and the
-//! inflow from outside the basin; at the basin's exit (the last of its nodes in reverse pop order)
-//! the basin is resolved:
+//! The rules, which the golden fixture (`tests/fixtures/hydro_golden.json`) and the Python
+//! reference (Task 11) pin. `e` is a node's elevation, `c` its evaporation capacity (net
+//! evaporation × area, m³/s; 0 on ice), "tol" is `DATA_LAKE_FLAT_TOL_M`.
 //!
-//! - `Q_in` is the sum of its nodes' values, in ascending node id, in f64. Each non-ice node can
-//!   evaporate `c_i` (net evaporation × area). Group the nodes by distinct elevation, ascending;
-//!   `C_g` is the cumulative capacity through group `g`.
-//! - **Data** (only for sources with present-day lake surfaces): the connected non-ice nodes
-//!   within [`DATA_LAKE_FLAT_TOL_M`] of the basin minimum number at least
-//!   [`DATA_LAKE_MIN_NODES`], and `Q_in ≥ DATA_LAKE_MIN_BALANCE ×` their capacity. The level is
-//!   their median; the footprint is them plus the nodes below the level. The lake spills
-//!   `max(0, Q_in − footprint capacity)` if the level is within the tolerance of the spill.
-//! - Otherwise **Open** if `C_last < Q_in` (level = spill, evaporation `C_last`), else
-//!   **Terminal** (evaporation `Q_in`, level interpolated in the first group with `C_g ≥ Q_in`,
-//!   [`balance`]); its footprint is the groups through that one.
-//! - **No lake** where the water would stand less than [`MIN_LAKE_DEPTH_M`] deep: an open basin
-//!   passes its inflow through, and a terminal one is a playa unless a river could reach it
-//!   (`Q_in ≥ RIVER_MIN_DISCHARGE_M3S`).
-//!
-//! Then routing inside the basin. A basin that passes water on keeps routing's receivers, which
-//! form a tree into the exit, and re-accumulates along it in descending depth (ties ascending
-//! id); its outflow goes to the exit's receiver (the rim, or a lower neighbour outside). A terminal basin's sinks (its footprint, with any ice below
-//! the level) keep their water; every other node routes to the neighbour one BFS step closer to
-//! the sinks with the lowest elevation (ties: neighbour order), and re-accumulates in descending
-//! BFS distance (ties ascending id). Footprints exclude ice, and each footprint node records its
-//! BFS distance in nodes from the shore (1 on the shore).
+//! ```text
+//! Data flats (only if data_lakes), before discharge, after routing:
+//!   eligible: non-ocean, non-ice, in no depression basin.
+//!   Scan node ids ascending; each eligible node not yet in a component seeds one. Grow it by BFS
+//!     (FIFO, neighbour order) over eligible free neighbours, taking a node only if the
+//!     component's max e − min e stays ≤ tol. Every grown node is taken, kept or not.
+//!   Keep components of ≥ DATA_LAKE_FLAT_MIN_NODES nodes. Each kept flat becomes a basin appended
+//!     after routing's: its nodes, spill_m = its minimum e, exit = its node first in pop order,
+//!     rim = the exit's receiver. Every other flat node whose receiver leaves the flat (or has
+//!     none) is redirected to the exit.
+//! Discharge: own runoff per land node, then nodes in reverse pop order. A node outside every
+//!   basin adds its q to its receiver (none into the ocean). A basin node other than the exit
+//!   keeps its q (own runoff + inflow from outside the basin). At the exit the basin resolves:
+//!   Q_in = Σ q over its nodes, ascending node id, in f64.
+//! A flat basin: if Q_in ≥ DATA_LAKE_MIN_BALANCE × Σc: Data lake at level = spill = min e,
+//!   footprint = all its nodes, outflow = max(0, Q_in − Σc), evaporation = Q_in − outflow.
+//!   Otherwise no lake (it passes Q_in on). Either way it routes as a spilling basin (below).
+//! A depression basin:
+//!   - Data (only if data_lakes): F = the connected non-ice basin nodes within tol of the basin
+//!     minimum (ties: lowest id), grown by BFS from it. If |F| ≥ DATA_LAKE_MIN_NODES and
+//!     DATA_LAKE_MIN_BALANCE × Σ_F c ≤ Q_in ≤ DATA_LAKE_MAX_BALANCE × Σ_F c: level = median e of F
+//!     (mean of the middle two for an even count); footprint = (F ∪ {e < level}) minus ice;
+//!     outflow = max(0, Q_in − Σ_footprint c) if level ≥ spill − tol, else 0.
+//!   - Otherwise the balance: group basin nodes by distinct e, ascending; C_g = Σc through g.
+//!     C_last < Q_in: Open, level = spill, evaporation = C_last, outflow = Q_in − C_last,
+//!       footprint = all non-ice basin nodes; no lake if spill − min e < MIN_LAKE_DEPTH_M.
+//!     Else Terminal: g = first group with C_g ≥ Q_in, level = e_g + (Q_in − C_{g−1}) /
+//!       (C_g − C_{g−1}) × (e_{g+1} − e_g) (0 when that step is 0; e_{last+1} = spill),
+//!       evaporation = Q_in, outflow = 0; sinks = nodes with e ≤ e_g; footprint = sinks minus
+//!       ice; no lake if the footprint is empty, or if level − min e < MIN_LAKE_DEPTH_M and
+//!       Q_in < RIVER_MIN_DISCHARGE_M3S (a playa).
+//! Routing inside a basin that passes water on (Open, Data with outflow, a flat, no lake):
+//!   receivers stay routing's (a tree into the exit); re-accumulate q and area along it in
+//!   descending tree depth, ties ascending id. A Data lake with outflow adds its exit to the
+//!   footprint unless ice. The outflow (the lake's, or q[exit] with no lake) and the exit's area
+//!   go to the exit's receiver (the rim, or a lower neighbour outside), unless ocean.
+//! Routing inside any other basin (Terminal, a playa, Data without outflow):
+//!   sinks (Data: F ∪ {e < level}) keep their water and have no receiver. Every other node routes
+//!   to the neighbour inside the basin one BFS step closer to the sinks with the lowest e (ties:
+//!   neighbour order); re-accumulate in descending BFS distance, ties ascending id.
+//! Shore steps: 1 on a footprint node with any neighbour off the footprint, then BFS inward.
+//! ```
 
 use std::collections::VecDeque;
 
 use super::params::{
-    DATA_LAKE_FLAT_TOL_M, DATA_LAKE_MIN_BALANCE, DATA_LAKE_MIN_NODES, MIN_LAKE_DEPTH_M,
-    RIVER_MIN_DISCHARGE_M3S,
+    DATA_LAKE_FLAT_MIN_NODES, DATA_LAKE_FLAT_TOL_M, DATA_LAKE_MAX_BALANCE, DATA_LAKE_MIN_BALANCE,
+    DATA_LAKE_MIN_NODES, MIN_LAKE_DEPTH_M, RIVER_MIN_DISCHARGE_M3S,
 };
 use super::{HydroGraph, NO_BASIN, RECEIVER_EXIT, RECEIVER_NONE, Routed};
 
@@ -149,11 +169,193 @@ pub(crate) struct Accumulation {
     pub evaporated_m3s: f64,
     next_init: u32,
     next_walk: u32,
+    /// `routed.basins[first_flat..]` are the data's flats ([`Flats`]), not depressions.
+    first_flat: u32,
+}
+
+/// The data's flats outside every depression, found resumably and registered as basins after
+/// routing's own ([`Flats::register`]).
+pub(crate) struct Flats {
+    /// The next node id to scan.
+    next: u32,
+    /// One bit per node: already in a component.
+    taken: Vec<u64>,
+    /// One bit per node: in a kept flat.
+    member: Vec<u64>,
+    queue: VecDeque<u32>,
+    /// Kept components, each sorted by node.
+    flats: Vec<Vec<u32>>,
+    /// `(node, flat)` for every kept node, sorted by node once the scan is done.
+    lookup: Vec<(u32, u32)>,
+    /// Each flat's exit (its node popped first), `u32::MAX` until found.
+    exits: Vec<u32>,
+    /// The next position in `routed.order` for the exit search.
+    pos: u32,
+    found: usize,
+    scanned: bool,
+}
+
+fn bit_of(bits: &[u64], i: u32) -> bool {
+    bits[(i / 64) as usize] >> (i % 64) & 1 == 1
+}
+
+fn set_bit(bits: &mut [u64], i: u32) {
+    bits[(i / 64) as usize] |= 1 << (i % 64);
+}
+
+impl Flats {
+    pub fn new(len: u32) -> Self {
+        let words = len.div_ceil(64) as usize;
+        Self {
+            next: 0,
+            taken: vec![0; words],
+            member: vec![0; words],
+            queue: VecDeque::new(),
+            flats: Vec::new(),
+            lookup: Vec::new(),
+            exits: Vec::new(),
+            pos: 0,
+            found: 0,
+            scanned: false,
+        }
+    }
+
+    pub fn working_bytes(&self) -> usize {
+        8 * (self.taken.capacity() + self.member.capacity() + self.lookup.capacity())
+            + 4 * (self.queue.capacity()
+                + self.exits.capacity()
+                + self.flats.iter().map(Vec::capacity).sum::<usize>())
+    }
+
+    /// Scans for flats in ascending node id, then finds each one's exit. Returns `(done, units
+    /// used)`.
+    pub fn step(
+        &mut self,
+        g: &impl HydroGraph,
+        routed: &Routed,
+        ice: &impl Fn(u32) -> bool,
+        budget: u32,
+    ) -> (bool, u32) {
+        let len = g.len();
+        let mut used = 0;
+        let free = |taken: &[u64], i: u32| {
+            !bit_of(taken, i)
+                && !routed.ocean[i as usize]
+                && routed.basin_of[i as usize] == NO_BASIN
+                && !ice(i)
+        };
+        while used < budget {
+            used += 1;
+            if self.next < len {
+                let seed = self.next;
+                self.next += 1;
+                if !free(&self.taken, seed) {
+                    continue;
+                }
+                // Grow while the component's range stays within the tolerance.
+                let e = |i: u32| routed.elevation_m[i as usize];
+                let (mut lo, mut hi) = (e(seed), e(seed));
+                set_bit(&mut self.taken, seed);
+                let mut component = vec![seed];
+                self.queue.push_back(seed);
+                while let Some(v) = self.queue.pop_front() {
+                    used += 1;
+                    for u in g.neighbours(v).into_iter().flatten() {
+                        if !free(&self.taken, u) {
+                            continue;
+                        }
+                        let (l, h) = (lo.min(e(u)), hi.max(e(u)));
+                        if f64::from(h) - f64::from(l) <= DATA_LAKE_FLAT_TOL_M {
+                            (lo, hi) = (l, h);
+                            set_bit(&mut self.taken, u);
+                            component.push(u);
+                            self.queue.push_back(u);
+                        }
+                    }
+                }
+                if component.len() >= DATA_LAKE_FLAT_MIN_NODES as usize {
+                    component.sort_unstable();
+                    let f = self.flats.len() as u32;
+                    for &v in &component {
+                        set_bit(&mut self.member, v);
+                        self.lookup.push((v, f));
+                    }
+                    self.flats.push(component);
+                }
+                continue;
+            }
+            if !self.scanned {
+                self.scanned = true;
+                self.taken = Vec::new();
+                self.queue = VecDeque::new();
+                self.lookup.sort_unstable();
+                self.exits = vec![u32::MAX; self.flats.len()];
+                continue;
+            }
+            if self.found == self.flats.len() || self.pos as usize == routed.order.len() {
+                return (true, used);
+            }
+            let v = routed.order[self.pos as usize];
+            self.pos += 1;
+            if bit_of(&self.member, v) {
+                let k = self
+                    .lookup
+                    .binary_search_by_key(&v, |&(n, _)| n)
+                    .expect("a member is listed");
+                let f = self.lookup[k].1 as usize;
+                if self.exits[f] == u32::MAX {
+                    self.exits[f] = v;
+                    self.found += 1;
+                }
+            }
+        }
+        (false, used)
+    }
+
+    /// Appends each flat to `routed.basins`, with its lowest elevation as its `spill_m` and its
+    /// exit's receiver as its rim, and redirects every receiver that leaves the flat to the
+    /// exit. Returns the index of the first flat basin.
+    pub fn register(self, g: &impl HydroGraph, routed: &mut Routed) -> u32 {
+        let first = routed.basins.len() as u32;
+        for (f, nodes) in self.flats.into_iter().enumerate() {
+            let exit = self.exits[f];
+            assert_ne!(exit, u32::MAX, "every flat node is popped");
+            let b = first + f as u32;
+            let rim = super::receiver_of(g, routed, exit).unwrap_or(exit);
+            let level = nodes
+                .iter()
+                .map(|&v| routed.elevation_m[v as usize])
+                .fold(f32::INFINITY, f32::min);
+            for &v in &nodes {
+                routed.basin_of[v as usize] = b;
+                if v == exit {
+                    continue;
+                }
+                let to = match routed.receiver[v as usize] {
+                    RECEIVER_NONE => None,
+                    k => g.neighbours(v)[usize::from(k)],
+                };
+                if to.is_none_or(|j| nodes.binary_search(&j).is_err()) {
+                    routed.receiver[v as usize] = RECEIVER_EXIT;
+                }
+            }
+            routed.basins.push(super::Basin {
+                nodes,
+                spill_m: level,
+                exit,
+                rim,
+            });
+        }
+        first
+    }
 }
 
 impl Accumulation {
-    pub fn new(len: u32) -> Self {
+    /// `first_flat` is the index of the first basin [`Flats::register`] added, or the basin
+    /// count when there are none.
+    pub fn new(len: u32, first_flat: u32) -> Self {
         Self {
+            first_flat,
             q: vec![0.0; len as usize],
             area_km2: vec![0.0; len as usize],
             lakes: Vec::new(),
@@ -290,6 +492,7 @@ impl Accumulation {
         let e_min = f64::from(e[kmin]);
         let spill = basin.spill_m;
         let lake_id = self.lakes.len();
+        let is_flat = b as u32 >= self.first_flat;
         let make_lake = |kind, level: f64, evaporation, outflow, footprint: &[bool]| {
             let area: f64 = (0..m)
                 .filter(|&k| footprint[k])
@@ -309,7 +512,7 @@ impl Accumulation {
 
         // The data's own lake surface.
         let mut data: Option<(f64, Vec<bool>)> = None;
-        if data_lakes && !iced[kmin] {
+        if data_lakes && !iced[kmin] && !is_flat {
             let mut flat = vec![false; m];
             let mut queue = VecDeque::from([kmin]);
             flat[kmin] = true;
@@ -326,6 +529,7 @@ impl Accumulation {
             let flat_capacity: f64 = members.iter().map(|&k| cap[k]).sum();
             if members.len() >= DATA_LAKE_MIN_NODES as usize
                 && q_in >= DATA_LAKE_MIN_BALANCE * flat_capacity
+                && q_in <= DATA_LAKE_MAX_BALANCE * flat_capacity
             {
                 let mut levels: Vec<f64> = members.iter().map(|&k| f64::from(e[k])).collect();
                 levels.sort_by(f64::total_cmp);
@@ -339,7 +543,21 @@ impl Accumulation {
             }
         }
 
-        let outcome = if let Some((level, flat)) = data {
+        let outcome = if is_flat {
+            // The data's flat: a lake at its lowest level that passes its inflow on, less what
+            // its surface evaporates, if the inflow meets the veto. Its nodes are never ice.
+            let footprint = vec![true; m];
+            let capacity: f64 = cap.iter().sum();
+            if q_in >= DATA_LAKE_MIN_BALANCE * capacity {
+                let outflow = (q_in - capacity).max(0.0);
+                let lake = make_lake(LakeKind::Data, e_min, q_in - outflow, outflow, &footprint);
+                Outcome::Spill {
+                    lake: Some((lake, footprint)),
+                }
+            } else {
+                Outcome::Spill { lake: None }
+            }
+        } else if let Some((level, flat)) = data {
             let sinks: Vec<bool> = (0..m).map(|k| flat[k] || f64::from(e[k]) < level).collect();
             let mut footprint: Vec<bool> = (0..m).map(|k| sinks[k] && !iced[k]).collect();
             let below: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
@@ -567,7 +785,14 @@ mod tests {
         data_lakes: bool,
         budget: u32,
     ) -> Accumulation {
-        let mut acc = Accumulation::new(g.len());
+        let first_flat = if data_lakes {
+            let mut flats = Flats::new(g.len());
+            while !flats.step(g, routed, &ice, budget).0 {}
+            flats.register(g, routed)
+        } else {
+            routed.basins.len() as u32
+        };
+        let mut acc = Accumulation::new(g.len(), first_flat);
         while !acc.init_step(g, routed, |i, _| own(i), budget).0 {}
         while !acc
             .walk_step(g, routed, &ice, |i, _, _| capacity(i), data_lakes, budget)
@@ -791,6 +1016,73 @@ mod tests {
             // Footprints hold no ice, and their nodes are sorted.
             prop_assert!(acc.lake_nodes.iter().all(|n| !iced(n.node)));
             prop_assert!(acc.lake_nodes.windows(2).all(|w| w[0].node < w[1].node));
+        }
+    }
+
+    /// A 9 x 14 grid at 10 km: ocean in column 0, a ramp rising east, a channel along row 4 to
+    /// a shelf at exactly 50 m in rows 2..=6, columns 6..=9 (20 nodes; 19 without (2, 9)).
+    fn shelf(nodes: u32) -> (GridGraph, Vec<f32>, Vec<u32>) {
+        let g = GridGraph {
+            rows: 9,
+            cols: 14,
+            spacing_m: 10_000.0,
+        };
+        let mut flat = Vec::new();
+        let elevation = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (4, c @ 1..=5) => 8.0 * c as f32,
+                (2, 9) if nodes == 19 => 93.0,
+                (2..=6, 6..=9) => {
+                    flat.push(i);
+                    50.0
+                }
+                (_, c) => 10.0 * c as f32 + 3.0,
+            })
+            .collect();
+        (g, elevation, flat)
+    }
+
+    #[test]
+    fn a_flat_needs_twenty_nodes() {
+        for (nodes, data_lakes, lake) in [(20, true, true), (19, true, false), (20, false, false)] {
+            let (g, elevation, flat) = shelf(nodes);
+            assert_eq!(flat.len() as u32, nodes);
+            let mut r = route(&g, elevation);
+            // The hazard: the shelf is no depression; it drains through the channel.
+            assert!(r.basins.is_empty());
+            let acc = accumulate(&g, &mut r, |_| 1.0, |_| 0.1, |_| false, data_lakes, 4);
+            let lakes = &acc.lakes;
+            assert_eq!(
+                lakes.len(),
+                usize::from(lake),
+                "{nodes} {data_lakes}: {lakes:?}"
+            );
+            if !lake {
+                assert!(acc.lake_nodes.is_empty());
+                continue;
+            }
+            let l = &lakes[0];
+            assert_eq!((l.kind, l.level_m, l.spill_m), (LakeKind::Data, 50.0, 50.0));
+            assert_eq!(l.exit, g.node(4, 6));
+            assert_eq!(l.area_km2, 2000.0);
+            assert!((l.evaporation_m3s - 2.0).abs() < 1e-9, "{l:?}");
+            assert_eq!(l.outflow_m3s, l.inflow_m3s - l.evaporation_m3s);
+            assert!(l.inflow_m3s > 20.0, "{l:?}");
+            let nodes: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+            assert_eq!(nodes, flat);
+            // The outflow leaves by the exit's receiver, the channel's head.
+            let head = g.node(4, 5);
+            assert_eq!(receiver_of(&g, &r, l.exit), Some(head));
+            assert_eq!(acc.q[head as usize], 1.0 + l.outflow_m3s as f32);
+            // Every shelf node drains inside the shelf, to the exit in the end.
+            for &v in &flat {
+                let mut at = v;
+                while at != l.exit {
+                    at = receiver_of(&g, &r, at).unwrap();
+                    assert!(flat.contains(&at), "{v} leaves the shelf at {at}");
+                }
+            }
         }
     }
 

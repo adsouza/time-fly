@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use super::climate::{Climate, ClimateSource, ClimateTable, SECONDS_PER_YEAR};
 use super::graph::{Down, RiverGraph};
-use super::lakes::Accumulation;
+use super::lakes::{Accumulation, Flats};
 use super::params::{
     CORRIDOR_FRACTION, HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, INCISION_WINDOW_M,
     PRESENT_FRAME_MAX_MYR, RIVER_MIN_DISCHARGE_M3S,
@@ -258,6 +258,7 @@ impl Coast {
 enum Stage {
     Sample,
     Route(Box<Routing>),
+    Flats(Box<Routed>, Flats),
     Coast(Box<Routed>, Coast),
     Runoff(Box<Routed>, Vec<u16>, Accumulation),
     Walk(Box<Routed>, Vec<u16>, Accumulation),
@@ -275,6 +276,8 @@ pub struct HydroPrep {
     age: YearsBp,
     units: u64,
     data_lakes: bool,
+    /// The index of the first basin that is a data flat, not a depression.
+    first_flat: u32,
     elevation: Vec<f32>,
     /// One bit per node: ice fraction ≥ [`ICE_NODE_FRACTION`].
     ice: Vec<u64>,
@@ -312,6 +315,7 @@ impl HydroPrep {
             age,
             units: 0,
             data_lakes: false,
+            first_flat: 0,
             elevation: Vec::with_capacity(len as usize),
             ice: vec![0; len.div_ceil(64) as usize],
             stage: Stage::Sample,
@@ -359,20 +363,32 @@ impl HydroPrep {
                     if done {
                         let mut routed = Box::new(routing.finish());
                         routed.filled_m = Vec::new();
-                        if climate.needs_coast_km() {
-                            Stage::Coast(routed, Coast::new(len))
+                        self.first_flat = routed.basins.len() as u32;
+                        if self.data_lakes {
+                            Stage::Flats(routed, Flats::new(len))
                         } else {
-                            Stage::Runoff(routed, Vec::new(), Accumulation::new(len))
+                            self.after_flats(routed, climate.needs_coast_km())
                         }
                     } else {
                         Stage::Route(routing)
+                    }
+                }
+                Stage::Flats(mut routed, mut flats) => {
+                    let ice = &self.ice;
+                    let (done, u) = flats.step(&lattice, &routed, &|i| bit(ice, i), left);
+                    used += u;
+                    if done {
+                        self.first_flat = flats.register(&lattice, &mut routed);
+                        self.after_flats(routed, climate.needs_coast_km())
+                    } else {
+                        Stage::Flats(routed, flats)
                     }
                 }
                 Stage::Coast(routed, mut coast) => {
                     let (done, u) = coast.step(&lattice, &routed, left);
                     used += u;
                     if done {
-                        Stage::Runoff(routed, coast.cost, Accumulation::new(len))
+                        Stage::Runoff(routed, coast.cost, Accumulation::new(len, self.first_flat))
                     } else {
                         Stage::Coast(routed, coast)
                     }
@@ -451,6 +467,16 @@ impl HydroPrep {
         }
         self.units += u64::from(used);
         matches!(self.stage, Stage::Done(_))
+    }
+
+    /// The stage after the flats: the coast distance if the climate needs it, else runoff.
+    fn after_flats(&self, routed: Box<Routed>, needs_coast_km: bool) -> Stage {
+        let len = self.lattice.len();
+        if needs_coast_km {
+            Stage::Coast(routed, Coast::new(len))
+        } else {
+            Stage::Runoff(routed, Vec::new(), Accumulation::new(len, self.first_flat))
+        }
     }
 
     fn push_sample(&mut self, i: u32, s: NodeSample) {
@@ -548,6 +574,7 @@ impl HydroPrep {
         own + match &self.stage {
             Stage::Sample | Stage::Moving => 0,
             Stage::Route(r) => r.working_bytes(),
+            Stage::Flats(r, f) => routed_bytes(r) + f.working_bytes(),
             Stage::Coast(r, c) => routed_bytes(r) + c.bytes(),
             Stage::Runoff(r, c, a) | Stage::Walk(r, c, a) => {
                 routed_bytes(r) + 2 * c.capacity() + a.working_bytes()
@@ -603,8 +630,9 @@ mod tests {
     use crate::hydrology::climate::tests::shipped_table;
     use crate::hydrology::climate::{Climate, ZonalClimate};
     use crate::hydrology::params::{
-        DATA_LAKE_FLAT_TOL_M, DATA_LAKE_MIN_BALANCE, DATA_LAKE_MIN_NODES, HYDRO_RECENT_N,
-        ICE_NODE_FRACTION, LARGE_LAKE_KM2, RIVER_MIN_DISCHARGE_M3S,
+        DATA_LAKE_FLAT_MIN_NODES, DATA_LAKE_FLAT_TOL_M, DATA_LAKE_MAX_BALANCE,
+        DATA_LAKE_MIN_BALANCE, DATA_LAKE_MIN_NODES, HYDRO_RECENT_N, ICE_NODE_FRACTION,
+        LARGE_LAKE_KM2, RIVER_MIN_DISCHARGE_M3S,
     };
     use crate::hydrology::{Down, HydroGraph, LakeKind, RiverGraph};
     use crate::worldgen::biome::BiomeClass;
@@ -620,7 +648,8 @@ mod tests {
     #[derive(Copy, Clone, Debug)]
     enum Shape {
         /// A bowl: the floor out to `floor_r`, walls up to the spill at `wall_r`, a ring at the
-        /// spill out to `ring_r`, then down to -20 m at the coast, `coast_r` (km).
+        /// spill out to `ring_r`, then down to -20 m at the coast, `coast_r` (km). The fixture's
+        /// bowls have no ring (`ring_r = wall_r`): a flat ring would be a data flat.
         Bowl {
             floor_m: f64,
             floor_r: f64,
@@ -634,15 +663,26 @@ mod tests {
             valleys: f64,
         },
         /// A cone from `peak_m` down to -20 m at `coast_r`, with an optional crater
-        /// `(km north of the centre, radius km, depth m)`. A terraced dome is flat from 100 to
-        /// 200 km out, with a dip 0.3 m deep 110 to 150 km out on the terrace's north side: a
-        /// basin too shallow for a lake, which rivers pass through and climb out of onto the
-        /// terrace.
+        /// `(km north of the centre, radius km, depth m)`. A terraced dome has a flat ledge
+        /// 100 to 200 km out within 35° of north (fewer than `DATA_LAKE_FLAT_MIN_NODES` nodes),
+        /// with a dip 0.3 m deep 115 to 150 km out within 25°: a basin too shallow for a lake,
+        /// which rivers pass through and climb out of onto the ledge.
         Dome {
             peak_m: f64,
             coast_r: f64,
             crater: Option<(f64, f64, f64)>,
             terrace: bool,
+        },
+        /// A lake shelf like Victoria's in the data: exactly flat at `level_m` out to `flat_r`,
+        /// walls rising to `rim_m` at `wall_r`, then down to -20 m at `coast_r`; a notch within
+        /// `notch_deg` of north descends from the shelf straight to the coast. Not a depression.
+        Shelf {
+            level_m: f64,
+            flat_r: f64,
+            rim_m: f64,
+            wall_r: f64,
+            coast_r: f64,
+            notch_deg: f64,
         },
     }
 
@@ -654,6 +694,8 @@ mod tests {
     const ICE: usize = 5;
     const DESERT: usize = 6;
     const WET: usize = 7;
+    const VICTORIA: usize = 8;
+    const DRY_FLAT: usize = 9;
 
     #[derive(Clone, Debug)]
     struct Island {
@@ -667,7 +709,9 @@ mod tests {
     impl Island {
         fn coast_r(&self) -> f64 {
             match self.shape {
-                Shape::Bowl { coast_r, .. } | Shape::Dome { coast_r, .. } => coast_r,
+                Shape::Bowl { coast_r, .. }
+                | Shape::Dome { coast_r, .. }
+                | Shape::Shelf { coast_r, .. } => coast_r,
             }
         }
     }
@@ -707,8 +751,16 @@ mod tests {
                     tilt,
                     valleys,
                 };
-            let cone = bowl(100.0, 0.0, 200.0, 500.0, 260.0, 450.0, 0.05, 0.0);
-            let flat = bowl(-28.0, 150.0, 400.0, 30.0, 450.0, 650.0, 0.0, 0.0);
+            let cone = bowl(100.0, 0.0, 200.0, 500.0, 200.0, 450.0, 0.05, 0.0);
+            let flat = bowl(-28.0, 150.0, 400.0, 30.0, 400.0, 650.0, 0.0, 0.0);
+            let shelf = Shape::Shelf {
+                level_m: 600.0,
+                flat_r: 137.0,
+                rim_m: 1100.0,
+                wall_r: 420.0,
+                coast_r: 600.0,
+                notch_deg: 12.0,
+            };
             let dome = Shape::Dome {
                 peak_m: 1200.0,
                 coast_r: 350.0,
@@ -724,13 +776,22 @@ mod tests {
             let mut islands = vec![
                 island(dir(20.0, -100.0), cone, b(BiomeClass::HotDesert)),
                 island(dir(-15.0, -40.0), cone, b(BiomeClass::TropicalRainforest)),
-                island(dir(40.0, 20.0), flat, b(BiomeClass::TemperateBroadleaf)),
-                island(dir(-40.0, 60.0), flat, b(BiomeClass::HotDesert)),
-                // Across the cube corner where +X, +Y and +Z meet. The floor is off the corner
-                // and tilted, so no two lowest nodes tie within the data tolerance.
+                // Inflow about 3 x what the flat evaporates: a data lake, though the balance
+                // alone would raise it up the walls.
                 island(
-                    RenderDir(DVec3::new(1.0, 1.03, 0.98)),
-                    bowl(0.0, 0.0, 650.0, 800.0, 700.0, 900.0, 0.2, 40.0),
+                    dir(40.0, 20.0),
+                    flat,
+                    Climate {
+                        precip_mm: 650.0,
+                        temp_c: 13.0,
+                    },
+                ),
+                island(dir(-40.0, 60.0), flat, b(BiomeClass::HotDesert)),
+                // On the cube corner where +X, +Y and +Z meet: the apex's three corner texels are
+                // equidistant, so the lowest nodes tie within the data tolerance.
+                island(
+                    RenderDir(DVec3::ONE),
+                    bowl(0.0, 0.0, 650.0, 800.0, 650.0, 900.0, 0.05, 40.0),
                     b(BiomeClass::Steppe),
                 ),
                 island(
@@ -752,6 +813,8 @@ mod tests {
                     },
                 ),
                 island(dir(25.0, 150.0), dome, b(BiomeClass::TemperateBroadleaf)),
+                island(dir(5.0, 95.0), shelf, b(BiomeClass::MonsoonSavanna)),
+                island(dir(-50.0, -120.0), shelf, b(BiomeClass::HotDesert)),
             ];
             islands[ICE].ice_r = 350.0;
             World {
@@ -826,10 +889,10 @@ mod tests {
                     }
                     let cone = |r: f64| peak_m + (-20.0 - peak_m) * r / coast_r;
                     let mut e = cone(r);
-                    if terrace && (100.0..=200.0).contains(&r) {
+                    let bearing = x.atan2(y).to_degrees();
+                    if terrace && (100.0..=200.0).contains(&r) && bearing.abs() < 35.0 {
                         e = cone(200.0);
-                        let bearing = x.atan2(y).to_degrees();
-                        if (110.0..=150.0).contains(&r) && bearing.abs() < 25.0 {
+                        if (115.0..=150.0).contains(&r) && bearing.abs() < 25.0 {
                             e -= 0.3;
                         }
                     }
@@ -840,6 +903,28 @@ mod tests {
                         }
                     }
                     e
+                }
+                Shape::Shelf {
+                    level_m,
+                    flat_r,
+                    rim_m,
+                    wall_r,
+                    coast_r,
+                    notch_deg,
+                } => {
+                    if r > coast_r {
+                        return (-2000.0, 0.0);
+                    }
+                    let bearing = x.atan2(y).to_degrees();
+                    if r <= flat_r {
+                        level_m
+                    } else if bearing.abs() < notch_deg {
+                        level_m + (-20.0 - level_m) * (r - flat_r) / (coast_r - flat_r)
+                    } else if r <= wall_r {
+                        level_m + (rim_m - level_m) * (r - flat_r) / (wall_r - flat_r)
+                    } else {
+                        rim_m + (-20.0 - rim_m) * (r - wall_r) / (coast_r - wall_r)
+                    }
                 }
             };
             (e, ice)
@@ -997,15 +1082,16 @@ mod tests {
         assert_eq!(lakes.len(), 1, "{:?}", lakes);
         let lake = &s.h.lakes[lakes[0]];
         assert_eq!(lake.kind, LakeKind::Open, "{lake:?}");
-        assert_eq!(lake.level_m, 500.0);
-        assert_eq!(lake.spill_m, 500.0);
+        assert_eq!(lake.level_m, lake.spill_m);
+        // No flat ring: the spill is the crest as the lattice samples it.
+        assert!(lake.spill_m > 440.0 && lake.spill_m <= 500.0, "{lake:?}");
         assert!(
             lake.outflow_m3s > 0.0 && lake.evaporation_m3s >= 0.0,
             "{lake:?}"
         );
         let bowl = s.area_within(HUMID, 200.0);
         assert!(
-            lake.area_km2 > 0.8 * bowl,
+            lake.area_km2 > 0.6 * bowl,
             "{} of {bowl} km2",
             lake.area_km2
         );
@@ -1044,18 +1130,15 @@ mod tests {
         let lake = &s.h.lakes[lakes[0]];
         assert_eq!(lake.kind, LakeKind::Data, "{lake:?}");
         assert!((lake.level_m + 28.0).abs() <= 0.01, "{lake:?}");
-        assert_eq!(lake.spill_m, 30.0);
+        assert!(lake.spill_m > 25.0 && lake.spill_m <= 30.0, "{lake:?}");
+        assert!(lake.level_m < lake.spill_m - 50.0);
         assert_eq!(lake.outflow_m3s, 0.0);
-        // By water balance alone it would fill to the spill: the inflow exceeds what the whole
-        // basin could evaporate.
+        // The hazard: the inflow is about 3 x what the flat evaporates, inside both data
+        // bounds, so by water balance alone the lake would rise above the flat.
         let c = s.world.islands[CASPIAN].climate;
-        let basin = s.area_within(CASPIAN, 400.0);
-        let capacity = m3s(f64::from(s.table.net_evaporation_mm(c)), basin);
-        assert!(
-            lake.inflow_m3s > 2.0 * capacity,
-            "{} vs {capacity}",
-            lake.inflow_m3s
-        );
+        let capacity = m3s(f64::from(s.table.net_evaporation_mm(c)), lake.area_km2);
+        let ratio = lake.inflow_m3s / capacity;
+        assert!((2.0..5.0).contains(&ratio), "inflow / capacity {ratio}");
         // The footprint is the flat (plus wall nodes within the tolerance).
         assert!(
             floor
@@ -1089,6 +1172,134 @@ mod tests {
         assert_eq!(s.lakes_on(SALT), Vec::<usize>::new());
         assert!(floor.iter().all(|&i| s.h.lake_of(i).is_none()));
         let _ = DATA_LAKE_FLAT_TOL_M;
+    }
+
+    /// The wet dome's dip nodes: 0.3 m below its ledge.
+    fn dip_nodes(s: &Shared) -> Vec<u32> {
+        let lattice = s.lattice();
+        let ledge = 1200.0 + (-20.0 - 1200.0) * 200.0 / 350.0;
+        (0..lattice.len())
+            .filter(|&i| {
+                s.island_of(i).is_some_and(|(k, _)| k == WET)
+                    && (f64::from(s.elevation(i)) - (ledge - 0.3)).abs() < 1e-3
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shallow_dip_on_a_river_is_not_a_data_lake() {
+        let s = shared();
+        assert!(s.h.data_lakes);
+        let lattice = s.lattice();
+        let dip = dip_nodes(s);
+        // The hazard: two or more connected dip nodes within the data tolerance, carrying a
+        // river far larger than what they evaporate.
+        assert!(dip.len() >= DATA_LAKE_MIN_NODES as usize, "{dip:?}");
+        assert!(dip.iter().any(|&i| {
+            lattice
+                .neighbours(i)
+                .into_iter()
+                .flatten()
+                .any(|j| dip.contains(&j))
+        }));
+        let c = s.world.islands[WET].climate;
+        let cap = m3s(
+            f64::from(s.table.net_evaporation_mm(c)),
+            dip.iter().map(|&i| lattice.area_m2(i) * 1e-6).sum(),
+        );
+        assert!(dip.iter().all(|&i| s.h.lake_of(i).is_none()));
+        assert!(s.lakes_on(WET).is_empty(), "{:?}", s.lakes_on(WET));
+        let fed = dip
+            .iter()
+            .filter_map(|&i| s.h.rivers.index_of(i))
+            .map(|k| f64::from(s.h.rivers.nodes()[k as usize].discharge_m3s))
+            .fold(0.0, f64::max);
+        assert!(
+            fed > DATA_LAKE_MAX_BALANCE * cap,
+            "a river of {fed} through {cap}"
+        );
+    }
+
+    #[test]
+    fn a_victoria_like_flat_is_an_open_data_lake() {
+        let s = shared();
+        let flat = floor_nodes(s, VICTORIA, 137.0);
+        // The hazard: a flat of more than DATA_LAKE_FLAT_MIN_NODES nodes at exactly one
+        // level, which is not a depression (it drains through its notch).
+        assert!(
+            flat.len() > DATA_LAKE_FLAT_MIN_NODES as usize,
+            "{}",
+            flat.len()
+        );
+        assert!(flat.iter().all(|&i| s.elevation(i) == 600.0));
+        let lakes = s.lakes_on(VICTORIA);
+        assert_eq!(lakes.len(), 1, "{lakes:?}");
+        let id = lakes[0] as u16;
+        let lake = &s.h.lakes[lakes[0]];
+        assert_eq!(lake.kind, LakeKind::Data, "{lake:?}");
+        assert_eq!(lake.level_m, 600.0);
+        assert!(flat.iter().all(|&i| s.h.lake_of(i) == Some(id)));
+        // Inflow passes through, minus evaporation over the footprint.
+        let c = s.world.islands[VICTORIA].climate;
+        let evap = m3s(f64::from(s.table.net_evaporation_mm(c)), lake.area_km2);
+        assert!(
+            (lake.evaporation_m3s - evap).abs() <= 1e-6 * evap,
+            "{lake:?} vs {evap}"
+        );
+        assert_eq!(lake.outflow_m3s, lake.inflow_m3s - lake.evaporation_m3s);
+        assert!(lake.outflow_m3s > 0.5 * lake.inflow_m3s, "{lake:?}");
+        // The river continues out of the notch carrying the outflow, to the sea.
+        let (k, out) =
+            s.h.rivers
+                .nodes()
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| {
+                    s.island_of(n.node)
+                        .is_some_and(|(i, r)| i == VICTORIA && r > 137.0)
+                })
+                .filter(|(_, n)| f64::from(n.discharge_m3s) >= lake.outflow_m3s * (1.0 - 1e-6))
+                .min_by(|a, b| a.1.discharge_m3s.total_cmp(&b.1.discharge_m3s))
+                .expect("a river leaves the lake");
+        let one_node = lake.area_km2 / flat.len() as f64;
+        let local = m3s(f64::from(s.table.runoff_mm(c)), 4.0 * one_node);
+        assert!(
+            f64::from(out.discharge_m3s) - lake.outflow_m3s <= local,
+            "{out:?} vs outflow {}",
+            lake.outflow_m3s
+        );
+        assert!(matches!(chain_end(&s.h.rivers, k as u32), Down::Ocean(_)));
+        // Rivers off the walls end in the lake.
+        assert!(
+            s.h.rivers
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.down, Down::Lake(l, _) if l == id))
+        );
+        // Without data lakes the flat is just land.
+        assert!(shared_without_data().lakes_on(VICTORIA).is_empty());
+    }
+
+    #[test]
+    fn an_arid_flat_stays_dry() {
+        let s = shared();
+        let flat = floor_nodes(s, DRY_FLAT, 137.0);
+        assert!(flat.len() > DATA_LAKE_FLAT_MIN_NODES as usize);
+        assert!(flat.iter().all(|&i| s.elevation(i) == 600.0));
+        // The hazard: water reaches the flat, but less than the veto's share of what it
+        // evaporates.
+        let c = s.world.islands[DRY_FLAT].climate;
+        let inflow = m3s(
+            f64::from(s.table.runoff_mm(c)),
+            s.area_within(DRY_FLAT, 420.0),
+        );
+        let cap = m3s(
+            f64::from(s.table.net_evaporation_mm(c)),
+            s.area_within(DRY_FLAT, 137.0),
+        );
+        assert!(inflow > 0.0 && inflow < DATA_LAKE_MIN_BALANCE * cap);
+        assert!(s.lakes_on(DRY_FLAT).is_empty());
+        assert!(flat.iter().all(|&i| s.h.lake_of(i).is_none()));
     }
 
     #[test]
@@ -1142,11 +1353,12 @@ mod tests {
 
     #[test]
     fn river_beds_never_rise_downstream() {
-        beds_never_rise(shared());
-        // The hazard: some reaches climb in elevation, out of the terrace's shallow dip (a
-        // pass-through basin; with data lakes on, the flat dip is a data lake instead).
-        let climbs = beds_never_rise(shared_without_data());
-        assert!(climbs > 0, "{climbs}");
+        // The hazard: some reaches climb in elevation, out of the ledge's shallow dip (a
+        // pass-through basin), with data lakes on or off.
+        for s in [shared(), shared_without_data()] {
+            let climbs = beds_never_rise(s);
+            assert!(climbs > 0, "{climbs}");
+        }
     }
 
     /// Checks every river node's bed; returns how many lie below their own node.
@@ -1178,6 +1390,34 @@ mod tests {
         let lake = &s.h.lakes[lakes[0]];
         assert_eq!(lake.kind, LakeKind::Terminal, "{lake:?}");
         assert!(lake.level_m < lake.spill_m - 100.0, "{lake:?}");
+        assert!(lake.area_km2 > 50_000.0, "{lake:?}");
+        // The hazard: the apex's corner texels tie within the data tolerance (a 2+ node flat),
+        // but the inflow is far over DATA_LAKE_MAX_BALANCE x what they evaporate.
+        let lattice = s.lattice();
+        let bowl: Vec<u32> = (0..lattice.len())
+            .filter(|&i| {
+                s.island_of(i)
+                    .is_some_and(|(k, r)| k == TERMINAL && r < 650.0)
+            })
+            .collect();
+        let lowest = *bowl
+            .iter()
+            .min_by(|&&a, &&b| s.elevation(a).total_cmp(&s.elevation(b)))
+            .unwrap();
+        let low = s.elevation(lowest);
+        let ties: Vec<u32> = lattice
+            .neighbours(lowest)
+            .into_iter()
+            .flatten()
+            .filter(|&j| f64::from(s.elevation(j) - low) <= DATA_LAKE_FLAT_TOL_M)
+            .collect();
+        assert!(!ties.is_empty(), "no tie at the apex");
+        let c = s.world.islands[TERMINAL].climate;
+        let flat_cap = m3s(
+            f64::from(s.table.net_evaporation_mm(c)),
+            (ties.len() + 1) as f64 * lattice.area_m2(lowest) * 1e-6,
+        );
+        assert!(lake.inflow_m3s > DATA_LAKE_MAX_BALANCE * flat_cap);
         let inside: Vec<u32> = (0..s.h.rivers.nodes().len() as u32)
             .filter(|&k| {
                 let node = s.h.rivers.nodes()[k as usize].node;
