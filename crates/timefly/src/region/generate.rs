@@ -17,8 +17,8 @@ use std::time::Duration;
 use bevy::platform::time::Instant;
 use timefly_core::formats::Grid;
 use timefly_core::geodynamics::CrustModel;
-use timefly_core::hydrology::EraHydrology;
 use timefly_core::hydrology::params::MAX_BOULDERS;
+use timefly_core::hydrology::{EraHydrology, LatticeSizes, hydro_lattice_for, river_tile_margin_m};
 use timefly_core::surface::Timeline;
 use timefly_core::worldgen::coarse::{
     CoarseField, FieldError, SnapshotField, frames_needed, snapshot_field,
@@ -26,7 +26,7 @@ use timefly_core::worldgen::coarse::{
 use timefly_core::worldgen::generate::{
     FieldKind, FieldRows, RegionGenerator, RegionGrid, RegionPrep, RegionSpec,
 };
-use timefly_core::worldgen::tiles::TileSet;
+use timefly_core::worldgen::tiles::{TILE_MARGIN_M, TileSet};
 use tracing::{info, instrument, warn};
 
 /// Rows per parallel task on native: small enough to balance the pool's threads.
@@ -68,8 +68,8 @@ pub struct GenInputs {
     /// Some needed tile is missing (`tiles.missing(&needed)` is not empty).
     pub fallback: bool,
     /// The era's continental pass ([`crate::hydro`]), or `None` when it is disabled or failed.
-    /// The generator can refine it (Task 6, `RegionPrep::new`'s `hydro`); Task 7 hands it over
-    /// with the water upload. For now it only travels with the inputs.
+    /// The generator refines its rivers and lakes on the region's terrain (`RegionPrep::new`'s
+    /// `hydro`); with `None` the region has M3's heights and only the sea for water.
     pub hydro: Option<Arc<EraHydrology>>,
 }
 
@@ -93,18 +93,31 @@ fn field<'a>(
     .map_err(GenError::Field)
 }
 
-/// The tiles the region's inner field reads, from a probe field built without tiles
-/// (`tiles_needed` does not depend on the tiles loaded or on `fallback`).
-#[instrument(level = "debug", skip_all, fields(snapshot_myr = spec.snapshot.myr()), err)]
+/// The tiles the region's inner field reads, widened by `margin_m` beyond the inner square
+/// ([`tile_margin_m`]), from a probe field built without tiles (`tiles_needed` does not depend
+/// on the tiles loaded or on `fallback`).
+#[instrument(level = "debug", skip_all, fields(snapshot_myr = spec.snapshot.myr(), margin_m), err)]
 pub fn tiles_needed(
     spec: &RegionSpec,
     timeline: &Timeline,
     crust: &CrustModel,
     frames: &[Option<Arc<Grid>>],
+    margin_m: f64,
 ) -> Result<Vec<(u8, u8)>, GenError> {
     let empty = TileSet::new();
     let probe = field(spec, timeline, crust, &empty, frames, false)?;
-    Ok(probe.tiles_needed(&spec.frame()))
+    Ok(probe.tiles_needed_with_margin(&spec.frame(), margin_m))
+}
+
+/// How far beyond the inner square a region reads its tiles: [`TILE_MARGIN_M`], or with the
+/// era's pass enabled ([`HydroSettings`](crate::hydro::HydroSettings), `hydro_sizes`), the reach
+/// of its rivers' refinement on the era's lattice ([`river_tile_margin_m`], about 116 km on the
+/// recent lattice), whichever is wider.
+pub fn tile_margin_m(timeline: &Timeline, age_myr: f64, hydro_sizes: Option<LatticeSizes>) -> f64 {
+    hydro_sizes.map_or(TILE_MARGIN_M, |sizes| {
+        let (lattice, _) = hydro_lattice_for(timeline, age_myr, sizes);
+        TILE_MARGIN_M.max(river_tile_margin_m(&lattice))
+    })
 }
 
 impl GenInputs {
@@ -155,7 +168,7 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
 
     let started = Instant::now();
     let field = inputs.field()?;
-    let owned = RegionPrep::new(inputs.spec, &field, None).finish();
+    let owned = RegionPrep::new(inputs.spec, &field, inputs.hydro.as_deref()).finish();
     let prep_ms = started.elapsed().as_secs_f64() * 1e3;
     warn_dropped_boulders(&owned);
     trace_generation("prep done: lattice and coast field", || {
@@ -283,7 +296,7 @@ async fn run_budgeted(
     slice.longest = earlier;
     let field = inputs.field()?;
     slice.yield_if_spent().await;
-    let mut prep = RegionPrep::new(inputs.spec, &field, None);
+    let mut prep = RegionPrep::new(inputs.spec, &field, inputs.hydro.as_deref());
     while !prep.step(WEB_PREP_STEP) {
         slice.yield_if_spent().await;
     }

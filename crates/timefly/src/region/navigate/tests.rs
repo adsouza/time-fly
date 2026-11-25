@@ -28,7 +28,7 @@ use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, fly_speed};
 use crate::globe::EARTH_RADIUS_KM;
 use crate::region::{RegionGenerated, RegionPlugin, RegionSnapshotChanged, RequestPurpose};
 use crate::time::TimePlugin;
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::blended_surface_m;
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -2273,7 +2273,7 @@ fn check_clearance(
         return;
     };
     let p = t.translation;
-    let ground = blended_height_m(&scene.grid, f64::from(p.x), f64::from(p.z)).max(0.0);
+    let ground = blended_surface_m(&scene.grid, f64::from(p.x), f64::from(p.z));
     seen.checked += 1;
     if p.y < ground + CAMERA_CLEARANCE_M - 1e-3 {
         seen.violations.push(format!(

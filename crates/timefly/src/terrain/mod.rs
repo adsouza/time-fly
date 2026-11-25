@@ -1,11 +1,12 @@
 //! CDLOD terrain in the shell (design spec §4.2, §6.3): the region's grid drawn as pooled patch
 //! entities with Bevy's PBR lighting and shadows.
 //!
-//! - **Scene.** When an [`ActiveRegion`] appears, the plugin uploads its four fields as textures,
-//!   builds one grid mesh, one [`TerrainMaterial`] and one patch buffer, and spawns the
-//!   [`RegionCamera`] and the [`TerrainSun`]. A replaced region (a snapshot change) swaps the
-//!   textures in place; a removed one despawns everything and drops every handle, so the GPU
-//!   memory goes back to where it was.
+//! - **Scene.** When an [`ActiveRegion`] appears, the plugin uploads its fields as six textures
+//!   (heights, surface codes and water, inner and apron), builds one grid mesh, one
+//!   [`TerrainMaterial`] and one patch buffer, and spawns the [`RegionCamera`] and the
+//!   [`TerrainSun`]. A replaced region (a snapshot change) swaps the textures in place; a
+//!   removed one despawns everything and drops every handle, so the GPU memory goes back to
+//!   where it was.
 //! - **Patches.** Every frame, [`select_patches`] runs for the region camera. Patch `i` goes into
 //!   buffer slot `i`, drawn by the pool entity whose [`MeshTag`] is `i`. The pool only grows, in
 //!   chunks of [`PATCH_POOL_CHUNK`] up to [`MAX_TERRAIN_PATCHES`]; spare entities are hidden,
@@ -39,7 +40,7 @@ use crate::region::ActiveRegion;
 use material::{
     PatchInstance, TerrainExtension, TerrainLook, TerrainMaterial, TerrainParams,
     add_terrain_shaders, height_image, palette_image, patch_instances, surface_image,
-    terrain_buffer_bytes, terrain_look,
+    terrain_buffer_bytes, terrain_look, water_image,
 };
 use view::{RegionCamera, apply_view_ranges, fly_view_ranges, spawn_region_view, sync_region_view};
 
@@ -131,8 +132,7 @@ pub struct TerrainPatch {
 }
 
 /// The terrain's GPU resources and entities for the current region. Present exactly while the
-/// terrain has a region to draw. Read-only for other plugins (Task 8's water binds the same
-/// height textures).
+/// terrain has a region to draw. Read-only for other plugins (the water binds its textures).
 #[derive(Resource, Debug)]
 pub struct TerrainScene {
     /// The grid the textures hold (compared by pointer to notice a replaced region).
@@ -145,6 +145,9 @@ pub struct TerrainScene {
     pub apron_height: Handle<Image>,
     pub inner_surface: Handle<Image>,
     pub apron_surface: Handle<Image>,
+    /// The fields' water ([`material::water_image`]), for the water's material (Task 8).
+    pub inner_water: Handle<Image>,
+    pub apron_water: Handle<Image>,
     pub palette: Handle<Image>,
     /// The header without the per-frame camera and debug values.
     pub params: TerrainParams,
@@ -334,16 +337,33 @@ struct FieldImages {
     apron_height: Handle<Image>,
     inner_surface: Handle<Image>,
     apron_surface: Handle<Image>,
+    inner_water: Handle<Image>,
+    apron_water: Handle<Image>,
+}
+
+/// The bytes of a region's field textures: what one upload copies to the GPU (each texture once
+/// more through the queue's staging), and the GPU textures it allocates.
+pub fn field_texture_bytes(grid: &RegionGrid) -> usize {
+    let texels = |f: &timefly_core::worldgen::generate::Field| (f.res as usize).pow(2);
+    let per_texel = 4 + 4 + material::WATER_TEXEL_BYTES; // height, surface, water
+    (texels(&grid.inner) + texels(&grid.apron)) * per_texel
 }
 
 #[instrument(level = "debug", skip_all, fields(inner = grid.inner.res, apron = grid.apron.res))]
 fn upload_fields(grid: &RegionGrid, images: &mut Assets<Image>) -> FieldImages {
-    FieldImages {
+    let fields = FieldImages {
         inner_height: images.add(height_image(&grid.inner)),
         apron_height: images.add(height_image(&grid.apron)),
         inner_surface: images.add(surface_image(&grid.inner)),
         apron_surface: images.add(surface_image(&grid.apron)),
-    }
+        inner_water: images.add(water_image(&grid.inner)),
+        apron_water: images.add(water_image(&grid.apron)),
+    };
+    debug!(
+        mib = format!("{:.1}", field_texture_bytes(grid) as f64 / 1_048_576.0),
+        "terrain field textures uploaded"
+    );
+    fields
 }
 
 /// Gathers the region, decides with [`scene_action`], and builds, replaces or tears down the
@@ -440,6 +460,8 @@ fn build_scene(
         apron_height: fields.apron_height,
         inner_surface: fields.inner_surface,
         apron_surface: fields.apron_surface,
+        inner_water: fields.inner_water,
+        apron_water: fields.apron_water,
         palette,
         params,
         height_range_m,
@@ -511,6 +533,8 @@ fn replace_fields(
     scene.apron_height = fields.apron_height;
     scene.inner_surface = fields.inner_surface;
     scene.apron_surface = fields.apron_surface;
+    scene.inner_water = fields.inner_water;
+    scene.apron_water = fields.apron_water;
     info!("terrain fields replaced");
 }
 

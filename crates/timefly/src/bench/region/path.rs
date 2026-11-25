@@ -1,5 +1,6 @@
-//! The region bench's scripted flight: a pure function of the region's ground, so the same
-//! region always gives the same camera path.
+//! The region bench's scripted flight: a pure function of the region's ground (where the coast
+//! is) and its drawn surface (what the fly keeps clear of: the ground or the water over it), so
+//! the same region always gives the same camera path.
 //!
 //! [`SCRIPT_SECS`] of flight in five segments of [`SEGMENT_SECS`] ([`Segment`]). Each pitch is
 //! set by the chase look it gives ([`pitch_for_look_deg`]): the chase camera looks that far below
@@ -31,7 +32,7 @@
 use std::f32::consts::{PI, TAU};
 
 use bevy::prelude::*;
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::{blended_height_m, blended_surface_m};
 use timefly_core::worldgen::generate::RegionGrid;
 
 use crate::fly_camera::{EDGE_M, FlyState, START_PITCH_DEG, pitch_for_look_deg};
@@ -200,13 +201,14 @@ fn perp(v: Vec2) -> Vec2 {
     Vec2::new(-v.y, v.x)
 }
 
-/// The highest `max(ground, 0)` on a 3 × 3 grid [`FOLLOW_SPAN_M`] apart around `p`.
-fn surface_around(ground: &impl Fn(f32, f32) -> f32, p: Vec2) -> f32 {
+/// The highest `surface` (the drawn one: the ground or the water over it) on a 3 × 3 grid
+/// [`FOLLOW_SPAN_M`] apart around `p`.
+fn surface_around(surface: &impl Fn(f32, f32) -> f32, p: Vec2) -> f32 {
     let mut top = f32::MIN;
     for i in -1..=1 {
         for j in -1..=1 {
             let q = p + Vec2::new(i as f32, j as f32) * FOLLOW_SPAN_M;
-            top = top.max(ground(q.x, q.y).max(0.0));
+            top = top.max(surface(q.x, q.y));
         }
     }
     top
@@ -317,9 +319,11 @@ fn along(t: f32) -> f32 {
 }
 
 impl BenchPath {
-    /// Plans the path over `ground(x, z)` (metres, sea level 0), e.g. [`BenchPath::for_grid`].
-    pub fn plan(ground: impl Fn(f32, f32) -> f32) -> BenchPath {
-        let start_y = ground(0.0, 0.0).max(0.0) + CAMERA_START_ALTITUDE_M;
+    /// Plans the path over `ground(x, z)` (metres, sea level 0: the coast is where it crosses
+    /// 0) and the drawn `surface(x, z)` (the ground or the water over it, which the fly keeps
+    /// clear of), e.g. [`BenchPath::for_grid`].
+    pub fn plan(ground: impl Fn(f32, f32) -> f32, surface: impl Fn(f32, f32) -> f32) -> BenchPath {
+        let start_y = surface(0.0, 0.0) + CAMERA_START_ALTITUDE_M;
         let coast = find_coast(&ground);
         let climb_end_d = along(2.0 * SEGMENT_SECS);
         let (run_start, run_end, run_yaw, run_high, toward) = match coast {
@@ -378,17 +382,20 @@ impl BenchPath {
         }
     }
 
-    /// The path over a region's blended ground.
+    /// The path over a region's blended ground and drawn surface.
     pub fn for_grid(grid: &RegionGrid) -> BenchPath {
-        BenchPath::plan(|x, z| blended_height_m(grid, f64::from(x), f64::from(z)))
+        BenchPath::plan(
+            |x, z| blended_height_m(grid, f64::from(x), f64::from(z)),
+            |x, z| blended_surface_m(grid, f64::from(x), f64::from(z)),
+        )
     }
 
-    /// The camera at `script_s` seconds (clamped to `[0, SCRIPT_SECS]`), over the same `ground`
-    /// the path was planned on.
-    pub fn at(&self, script_s: f32, ground: impl Fn(f32, f32) -> f32) -> FlyState {
+    /// The camera at `script_s` seconds (clamped to `[0, SCRIPT_SECS]`), over the same
+    /// `surface` the path was planned on.
+    pub fn at(&self, script_s: f32, surface: impl Fn(f32, f32) -> f32) -> FlyState {
         let t = script_s.clamp(0.0, SCRIPT_SECS);
         let q = SEGMENT_SECS;
-        let follow = |p: Vec2, agl: f32| surface_around(&ground, p) + agl;
+        let follow = |p: Vec2, agl: f32| surface_around(&surface, p) + agl;
         let heading_yaw = yaw_of(self.heading);
         let start_pitch = -START_PITCH_DEG.to_radians();
         // M2's pitches (6°, 30°, 10° and 3° down) as chase looks (Task 3 changed what a pitch
@@ -510,22 +517,32 @@ mod tests {
         }
     }
 
-    fn samples(path: &BenchPath, ground: impl Fn(f32, f32) -> f32 + Copy) -> Vec<FlyState> {
+    /// The drawn surface over `ground`: the sea where it is below 0.
+    fn sea(ground: fn(f32, f32) -> f32) -> impl Fn(f32, f32) -> f32 + Copy {
+        move |x, z| ground(x, z).max(0.0)
+    }
+
+    /// The path over `ground` with the sea over it.
+    fn plan(ground: fn(f32, f32) -> f32) -> BenchPath {
+        BenchPath::plan(ground, sea(ground))
+    }
+
+    fn samples(path: &BenchPath, ground: fn(f32, f32) -> f32) -> Vec<FlyState> {
         (0..=(SCRIPT_SECS * 60.0) as u32)
-            .map(|i| path.at(i as f32 / 60.0, ground))
+            .map(|i| path.at(i as f32 / 60.0, sea(ground)))
             .collect()
     }
 
     #[test]
     fn region_bench_script_is_deterministic() {
         for ground in [coastal as fn(f32, f32) -> f32, inland, far_coast] {
-            let a = BenchPath::plan(ground);
-            let b = BenchPath::plan(ground);
+            let a = plan(ground);
+            let b = plan(ground);
             assert_eq!(a, b);
             assert_eq!(samples(&a, ground), samples(&b, ground));
         }
         // A different region gives a different path.
-        assert_ne!(BenchPath::plan(coastal), BenchPath::plan(inland));
+        assert_ne!(plan(coastal), plan(inland));
     }
 
     #[test]
@@ -567,7 +584,7 @@ mod tests {
             .fold(f32::MIN, f32::max);
         assert!(top > 8_700.0, "the himalaya ground reaches 8.7 km: {top}");
         for ground in [coastal as fn(f32, f32) -> f32, inland, far_coast, himalaya] {
-            let path = BenchPath::plan(ground);
+            let path = plan(ground);
             let frames = samples(&path, ground);
             for (i, f) in frames.iter().enumerate() {
                 let p = f.pos_m;
@@ -576,7 +593,7 @@ mod tests {
                     p.x.abs() <= FIELD_LIMIT_M && p.z.abs() <= FIELD_LIMIT_M,
                     "{i}: {p}"
                 );
-                let floor = ground(p.x, p.z).max(0.0);
+                let floor = sea(ground)(p.x, p.z);
                 assert!(p.y >= floor + MIN_AGL_M - 1e-3, "{i}: {p} over {floor}");
                 assert!(p.y >= floor + CAMERA_CLEARANCE_M);
                 assert!(p.y <= CAMERA_CEILING_M);
@@ -593,8 +610,8 @@ mod tests {
 
     #[test]
     fn the_path_starts_at_the_start_pose_and_follows_its_script() {
-        let path = BenchPath::plan(coastal);
-        let start = path.at(0.0, coastal);
+        let path = plan(coastal);
+        let start = path.at(0.0, sea(coastal));
         let pose = FlyState {
             pos_m: Vec3::new(0.0, coastal(0.0, 0.0) + CAMERA_START_ALTITUDE_M, 0.0),
             ..default()
@@ -603,22 +620,22 @@ mod tests {
         assert!((start.yaw - pose.yaw).abs() < 1e-6 && (start.pitch - pose.pitch).abs() < 1e-6);
         // The low pass holds 300 m over the highest ground around it.
         for t in [4.0, 8.0, 14.9] {
-            let f = path.at(t, coastal);
-            let around = surface_around(&coastal, Vec2::new(f.pos_m.x, f.pos_m.z));
+            let f = path.at(t, sea(coastal));
+            let around = surface_around(&sea(coastal), Vec2::new(f.pos_m.x, f.pos_m.z));
             assert!(
                 (f.pos_m.y - around - LOW_PASS_AGL_M).abs() < 1e-2,
                 "{t}: {f:?}"
             );
         }
         // The climb tops out at 30 km.
-        assert!((path.at(29.999, coastal).pos_m.y - CLIMB_TOP_M).abs() < 1.0);
+        assert!((path.at(29.999, sea(coastal)).pos_m.y - CLIMB_TOP_M).abs() < 1.0);
         // The run follows the coast: the ground under it stays near sea level.
         for t in [37.0, 40.0, 44.9] {
-            let p = path.at(t, coastal).pos_m;
+            let p = path.at(t, sea(coastal)).pos_m;
             assert!(coastal(p.x, p.z).abs() < 400.0, "{t}: {p}");
         }
         // The sweep ends at the field's edge in the coast's direction (east).
-        let end = path.at(4.0 * SEGMENT_SECS - 1e-3, coastal).pos_m;
+        let end = path.at(4.0 * SEGMENT_SECS - 1e-3, sea(coastal)).pos_m;
         assert!((end.x - FIELD_LIMIT_M).abs() < 1.0, "{end}");
         assert_eq!(Segment::at(0.0), Segment::LowPass);
         assert_eq!(Segment::at(15.0), Segment::Climb);
@@ -636,7 +653,7 @@ mod tests {
     #[test]
     fn the_coast_run_follows_a_coast_in_the_field() {
         for ground in [coastal as fn(f32, f32) -> f32, archipelago] {
-            let path = BenchPath::plan(ground);
+            let path = plan(ground);
             assert!(
                 matches!(path.coast, Coast::InField { .. }),
                 "{:?}",
@@ -646,11 +663,8 @@ mod tests {
             assert!(worst <= 10_000.0, "{worst} m from the coast");
         }
         // No coast in the field: nothing to measure.
-        assert_eq!(coast_run_distance(&BenchPath::plan(inland), inland), None);
-        assert_eq!(
-            coast_run_distance(&BenchPath::plan(far_coast), far_coast),
-            None
-        );
+        assert_eq!(coast_run_distance(&plan(inland), inland), None);
+        assert_eq!(coast_run_distance(&plan(far_coast), far_coast), None);
         // The distance search itself.
         assert!(distance_to_coast(&coastal, Vec2::ZERO, 50_000.0).is_some());
         assert_eq!(distance_to_coast(&inland, Vec2::ZERO, 50_000.0), None);
@@ -669,7 +683,7 @@ mod tests {
         use timefly_core::flight::altitudes::REGION_CLOUD_BASE_M;
         let trigger = (REGION_CLOUD_BASE_M - 1_000.0) as f32;
         for ground in [coastal as fn(f32, f32) -> f32, inland, far_coast, himalaya] {
-            let path = BenchPath::plan(ground);
+            let path = plan(ground);
             let high: Vec<FlyState> = samples(&path, ground)
                 .into_iter()
                 .enumerate()

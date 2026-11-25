@@ -616,9 +616,10 @@ fn bench_grounds() -> Vec<Box<dyn Fn(f32, f32) -> f32>> {
 fn the_region_bench_path_never_triggers_a_hop() {
     let dt = 1.0 / 60.0;
     for (g, ground) in bench_grounds().iter().enumerate() {
-        let path = BenchPath::plan(ground);
+        let surface = |x: f32, z: f32| ground(x, z).max(0.0);
+        let path = BenchPath::plan(ground, surface);
         let samples: Vec<_> = (0..=(SCRIPT_SECS / dt) as u32)
-            .map(|k| path.at(k as f32 * dt, ground))
+            .map(|k| path.at(k as f32 * dt, surface))
             .collect();
         for (k, w) in samples.windows(2).enumerate() {
             let xz = |f: &FlyState| Vec2::new(f.pos_m.x, f.pos_m.z);

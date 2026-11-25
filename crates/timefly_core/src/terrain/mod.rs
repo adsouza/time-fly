@@ -102,9 +102,13 @@ pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
 }
 
 /// The drawn surface at local `(x, z)` metres: the higher of the ground ([`blended_height_m`])
-/// and the water ([`blended_water`]'s level).
+/// and the water ([`blended_water`]'s level). The fly's floor: it reads only the levels, not the
+/// river texels, since the fly steps call it once per substep.
 pub fn blended_surface_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
-    blended_height_m(grid, x_m, z_m).max(blended_water(grid, x_m, z_m).level_m)
+    let s = blend_weight(grid, x_m, z_m);
+    let level = |f: &Field| sample_field(f, x_m, z_m, |i| f.water_level_m[i]);
+    let (i, a) = (level(&grid.inner), level(&grid.apron));
+    blended_height_m(grid, x_m, z_m).max(i + (a - i) * s)
 }
 
 /// How far the ground has dropped below the tangent plane at a horizontal distance from the

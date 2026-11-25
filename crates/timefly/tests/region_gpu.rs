@@ -1363,3 +1363,161 @@ fn the_cloud_veils_geometry_nearer_than_its_plane() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The water texture (Task 7), as the water shader (Task 8) will read it
+
+const WATER_ENTRY: &str = r#"
+@group(0) @binding(0) var water: texture_2d<u32>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>; // two per texel
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(water);
+    if (id.x >= size.x || id.y >= size.y) {
+        return;
+    }
+    let w = textureLoad(water, vec2<i32>(id.xy), 0);
+    let river = unpack2x16float(w.z); // (ribbon, offset)
+    let flow = unpack2x16float(w.w);  // (+x, +z)
+    let n = (id.y * size.x + id.x) * 2u;
+    out[n] = vec4<f32>(bitcast<f32>(w.x), bitcast<f32>(w.y), river.x, river.y);
+    out[n + 1u] = vec4<f32>(flow.x, flow.y, 0.0, 0.0);
+}
+"#;
+
+/// `water_image`'s `Rgba32Uint` texels decode on the GPU, with `bitcast` and
+/// `unpack2x16float`, to the grid's level, `level − height`, ribbon, offset and flow in region
+/// axes (`+z` south): the layout Task 8's water shader reads.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn the_water_texture_decodes_on_the_gpu() {
+    use timefly::terrain::material::water_image;
+    use timefly_core::worldgen::generate::RIVER_NONE;
+    use timefly_core::worldgen::generate::water::{decode_river, encode_river};
+    let res = 37;
+    let mut field = rough_field(res, REGION_SIZE_M, 11);
+    let mut rng = SplitMix(5);
+    for i in 0..(res * res) as usize {
+        let h = field.elevation_m[i];
+        // A third dry, a third standing water, a third rivers.
+        match i % 3 {
+            0 => field.water_level_m[i] = h - 64.0,
+            1 => field.water_level_m[i] = h + 300.0 * rng.unit(),
+            _ => {
+                field.water_level_m[i] = h + 4.0 * rng.unit();
+                field.river[i] = encode_river(
+                    200.0 * (rng.unit() - 0.5),
+                    6.0 * (rng.unit() - 0.5),
+                    6.0 * (rng.unit() - 0.5),
+                    300.0 * (rng.unit() - 0.5),
+                );
+            }
+        }
+    }
+    assert!(field.river.contains(&RIVER_NONE));
+    let image = water_image(&field);
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let texture = device.create_texture_with_data(
+        &queue,
+        &wgpu::TextureDescriptor {
+            label: Some("water"),
+            size: wgpu::Extent3d {
+                width: res,
+                height: res,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        image.data.as_ref().expect("image data"),
+    );
+    let view = texture.create_view(&Default::default());
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("water decode"),
+        source: wgpu::ShaderSource::Wgsl(WATER_ENTRY.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("water decode"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bytes = u64::from(res * res) * 32;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(res.div_ceil(8), res.div_ceil(8), 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<f32> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    for i in 0..(res * res) as usize {
+        let g = &got[i * 8..i * 8 + 8];
+        let level = field.water_level_m[i];
+        let [ribbon, east, north, offset] = decode_river(field.river[i]);
+        assert_eq!(g[0].to_bits(), level.to_bits(), "texel {i} level");
+        assert_eq!(g[1], level - field.elevation_m[i], "texel {i} thickness");
+        assert_eq!(
+            [g[2], g[3]],
+            [ribbon, offset],
+            "texel {i} ribbon and offset"
+        );
+        assert_eq!([g[4], g[5]], [east, -north], "texel {i} flow");
+    }
+    println!("{} water texels decode on the GPU", res * res);
+}

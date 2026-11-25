@@ -43,7 +43,7 @@ use bevy::render::renderer::RenderAdapterInfo;
 use bevy::window::{Monitor, PresentMode, PrimaryMonitor, PrimaryWindow};
 use timefly_core::deep_time::YearsBp;
 use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::{blended_height_m, blended_surface_m};
 
 use super::{
     MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
@@ -919,7 +919,7 @@ fn fly(bench: &RegionBench, region: usize, script: f32, game: &Game, controls: &
     };
     let grid = &active.grid;
     **fly = path.at(script, |x, z| {
-        blended_height_m(grid, f64::from(x), f64::from(z))
+        blended_surface_m(grid, f64::from(x), f64::from(z))
     });
 }
 

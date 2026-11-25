@@ -341,7 +341,7 @@ fn aegean_coast_run_follows_a_real_coast() {
     use timefly::bench::region::{BenchPath, Coast};
     use timefly::region::launch::launch_request;
     use timefly::region::{ActiveRegion, RegionState};
-    use timefly_core::terrain::blended_height_m;
+    use timefly_core::terrain::{blended_height_m, blended_surface_m};
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
     assert!(
@@ -380,7 +380,8 @@ fn aegean_coast_run_follows_a_real_coast() {
     }
     let grid = app.world().resource::<ActiveRegion>().grid.clone();
     let ground = |x: f32, z: f32| blended_height_m(&grid, f64::from(x), f64::from(z));
-    let path = BenchPath::plan(ground);
+    let surface = |x: f32, z: f32| blended_surface_m(&grid, f64::from(x), f64::from(z));
+    let path = BenchPath::plan(ground, surface);
     let Coast::InField { point, .. } = path.coast else {
         panic!(
             "the Aegean's nearest coast should be in the field: {:?}",

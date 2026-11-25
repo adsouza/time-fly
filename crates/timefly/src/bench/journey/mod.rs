@@ -69,7 +69,7 @@ use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::HOP_ALTITUDE_M;
 use timefly_core::flight::globe::GlobeFlight;
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::{blended_height_m, blended_surface_m};
 use timefly_core::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
 use timefly_core::worldgen::generate::RegionGrid;
 
@@ -1038,7 +1038,7 @@ fn drive_journey_keys(
             cruising,
         } => fly.map_or(Vec::new(), |f| {
             let ground = region.as_deref().map_or(0.0, |r| {
-                blended_height_m(&r.grid, f64::from(f.pos_m.x), f64::from(f.pos_m.z)).max(0.0)
+                blended_surface_m(&r.grid, f64::from(f.pos_m.x), f64::from(f.pos_m.z))
             });
             let agl_m = f.pos_m.y - ground;
             // Down at the cruise once (while flying): cruising from then on.

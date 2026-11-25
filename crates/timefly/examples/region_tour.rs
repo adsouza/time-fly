@@ -380,7 +380,7 @@ fn tour(
             return;
         }
         if let Some(r) = region.as_ref() {
-            let surface = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
+            let surface = timefly_core::terrain::blended_surface_m(&r.grid, 0.0, 0.0);
             if !(CAMERA_CLEARANCE_M..=CAMERA_CEILING_M - surface).contains(&tour.agl_m) {
                 error!(
                     requested_agl_m = tour.agl_m,
@@ -765,7 +765,7 @@ fn hop_tour(
     let n = hop.hop + 1;
     let region = region.as_deref();
     let ground = |r: &ActiveRegion, x: f32, z: f32| {
-        timefly_core::terrain::blended_height_m(&r.grid, f64::from(x), f64::from(z)).max(0.0)
+        timefly_core::terrain::blended_surface_m(&r.grid, f64::from(x), f64::from(z))
     };
     if hop.frames > HOP_GIVE_UP_FRAMES {
         error!(step = ?hop.step, phase = ?nav.phase, "region tour: the hop never finished");
@@ -1255,7 +1255,11 @@ mod tests {
     fn timing_app(agl_m: f32, ground: f32) -> App {
         let request = launch_request(&parse_region("0,0,0").unwrap());
         let spec = RegionSpec::new(request.era_dir, request.snapshot, 0);
-        let field = Field::dry(2, 1000.0, vec![ground; 4], vec![[0; 4]; 4]);
+        let mut field = Field::dry(2, 1000.0, vec![ground; 4], vec![[0; 4]; 4]);
+        if ground < 0.0 {
+            // Below sea level, the sea: its texels' water stands at 0, as generated.
+            field.water_level_m.fill(0.0);
+        }
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_message::<RegionEntered>()

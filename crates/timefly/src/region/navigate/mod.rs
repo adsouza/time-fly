@@ -52,7 +52,7 @@ use timefly_core::globe::{
     ranking_surface_km,
 };
 use timefly_core::surface::{FrameSelection, Timeline};
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::blended_surface_m;
 use tracing::instrument;
 
 use super::frames::FrameCache;
@@ -389,7 +389,7 @@ fn gather_time_change(
         return None;
     }
     let (x, z) = (f64::from(fly.pos_m.x), f64::from(fly.pos_m.z));
-    let ground = blended_height_m(&region.grid, x, z).max(0.0);
+    let ground = blended_surface_m(&region.grid, x, z);
     let camera_dir = region.frame.local_to_dir(x, z);
     let carried = globe.and_then(|g| {
         let ranker = SurfaceRanker::new(&g.timeline, &g.crust, snapshot, |slot| {
@@ -514,7 +514,7 @@ fn navigate(
     let shown_frame = shown_grid.map(|g| g.spec.frame());
     let p = flies.fly.pos_m;
     let ground_m = shown_grid.map_or(0.0, |g| {
-        blended_height_m(g, f64::from(p.x), f64::from(p.z)).max(0.0)
+        blended_surface_m(g, f64::from(p.x), f64::from(p.z))
     });
 
     // The slider waits during a transition: a change since last frame is queued and put back.
@@ -720,7 +720,7 @@ fn apply_action(
         }
         NavAction::PlaceAfterChange { agl_m } => {
             if let Some(region) = region {
-                let ground = blended_height_m(&region.grid, 0.0, 0.0).max(0.0);
+                let ground = blended_surface_m(&region.grid, 0.0, 0.0);
                 let y = (ground + agl_m)
                     .min(CAMERA_CEILING_M)
                     .max(ground + CAMERA_CLEARANCE_M);
@@ -803,7 +803,7 @@ fn apply_action(
             };
             let p = flies.fly.pos_m;
             let (q, yaw) = carry_pose(&old.frame, &new.frame, p.as_dvec3(), flies.fly.yaw);
-            let ground = blended_height_m(&new.grid, q.x, q.z).max(0.0);
+            let ground = blended_surface_m(&new.grid, q.x, q.z);
             let y = (ground + (p.y - ease.ground_m))
                 .min(CAMERA_CEILING_M)
                 .max(ground + CAMERA_CLEARANCE_M);
@@ -839,7 +839,7 @@ fn apply_action(
             fly.yaw = yaw;
             if let Some(region) = region {
                 let ground =
-                    blended_height_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y)).max(0.0);
+                    blended_surface_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y));
                 fly.pos_m.y = fly.pos_m.y.max(ground + CAMERA_CLEARANCE_M);
             }
             reset_fly_chase(flies);
@@ -855,7 +855,7 @@ fn apply_action(
             fly.pos_m.z = pos_m.y;
             if let Some(region) = region {
                 let ground =
-                    blended_height_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y)).max(0.0);
+                    blended_surface_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y));
                 fly.pos_m.y = fly.pos_m.y.max(ground + CAMERA_CLEARANCE_M);
             }
             reset_fly_chase(flies);

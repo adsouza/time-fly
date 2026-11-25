@@ -39,10 +39,10 @@ use timefly::region::{
 use timefly_core::deep_time::YearsBp;
 use timefly_core::formats::{Grid, read_tfgrid};
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
-use timefly_core::hydrology::LatticeSizes;
+use timefly_core::hydrology::{EraHydrology, LatticeSizes, river_tile_margin_m};
 use timefly_core::sha256::sha256_hex;
 use timefly_core::worldgen::generate::RegionSpec;
-use timefly_core::worldgen::tiles::{TILE_SAMPLES, TileSet};
+use timefly_core::worldgen::tiles::{TILE_MARGIN_M, TILE_SAMPLES, TileSet};
 
 /// Generation must finish within this (the brief's bound).
 const REGION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1147,6 +1147,11 @@ fn the_large_budget_reaches_the_time_boxed_slices() {
 
 /// The generation inputs for a present-day region at (0°, 0°), read straight from the files.
 fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
+    inputs_with(app, spec, None)
+}
+
+/// [`inputs`] with the era's pass, and the tiles its rivers read.
+fn inputs_with(app: &App, spec: RegionSpec, hydro: Option<Arc<EraHydrology>>) -> GenInputs {
     let data = app.world().resource::<GlobeData>();
     let frames: Vec<Option<Arc<Grid>>> = (0..data.timeline.frames().len())
         .map(|f| {
@@ -1154,10 +1159,16 @@ fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
             Some(Arc::new(read_tfgrid(&fs::read(path).unwrap()).unwrap()))
         })
         .collect();
-    let needed = tiles_needed(&spec, &data.timeline, &data.crust, &frames).unwrap();
+    let margin = hydro.as_deref().map_or(TILE_MARGIN_M, |h| {
+        TILE_MARGIN_M.max(river_tile_margin_m(&h.lattice))
+    });
+    let needed = tiles_needed(&spec, &data.timeline, &data.crust, &frames, margin).unwrap();
     let mut tiles = TileSet::new();
     for &(r, c) in &needed {
-        let bytes = fs::read(tiny_root().join(tile_path(r, c))).unwrap();
+        // The fixture holds four tiles; a wider set falls back outside them.
+        let Ok(bytes) = fs::read(tiny_root().join(tile_path(r, c))) else {
+            continue;
+        };
         tiles.insert(r, c, read_tfgrid(&bytes).unwrap()).unwrap();
     }
     let overview = fs::read(tiny_root().join(OVERVIEW_PATH)).unwrap();
@@ -1169,7 +1180,7 @@ fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
         fallback: !tiles.missing(&needed).is_empty(),
         tiles,
         frames,
-        hydro: None,
+        hydro,
     }
 }
 
@@ -1201,6 +1212,48 @@ fn budgeted_run_is_time_boxed() {
     // One slice overshoots its budget by at most one prep step or one row; generous for
     // unoptimised builds.
     assert!(longest < budget + Duration::from_millis(30), "{longest:?}");
+}
+
+/// Task 6's refinement runs the same in time-boxed slices as across the pool: a region with
+/// the era's rivers and lakes generates bit for bit the same grid under the web's budget.
+#[test]
+fn a_region_with_rivers_generates_the_same_on_the_web_budget() {
+    use timefly_core::worldgen::generate::RIVER_NONE;
+    let mut app = hydro_app(&tiny_root(), None, |_| {});
+    update_until(&mut app, "the 0 ka pass", |app| {
+        !hydro_seen(app).finished().is_empty()
+    });
+    let hydro = app
+        .world_mut()
+        .resource_mut::<HydroCache>()
+        .get(YearsBp(0.0))
+        .expect("the 0 ka pass");
+    let spec = RegionSpec {
+        inner_res: 257,
+        apron_res: 129,
+        ..RegionSpec::new(dir(0.0, 0.0), YearsBp(0.0), 7)
+    };
+    let inputs = inputs_with(&app, spec, Some(hydro));
+    let expected = generate_parallel(&inputs).unwrap();
+    // Not vacuous: the region has rivers (and the refinement carved them).
+    let rivers = |f: &timefly_core::worldgen::generate::Field| {
+        f.river.iter().filter(|&&r| r != RIVER_NONE).count()
+    };
+    let (inner, apron) = (rivers(&expected.inner), rivers(&expected.apron));
+    println!("river texels: {inner} inner, {apron} apron");
+    assert!(inner + apron > 0, "the test needs a region with rivers");
+    let dry = generate_parallel(&inputs_with(&app, spec, None)).unwrap();
+    assert_ne!(dry.inner.elevation_m, expected.inner.elevation_m);
+    let mut run = BudgetedRun::new(inputs, Duration::from_millis(6), Duration::ZERO);
+    let mut slices = 0;
+    let grid = loop {
+        slices += 1;
+        if let Some(result) = run.poll_slice() {
+            break result.unwrap();
+        }
+    };
+    assert!(slices > 3, "{slices} slices");
+    assert_eq!(grid, expected);
 }
 
 /// The last "region tiles ready" log line's `bytes` and `needed` fields.

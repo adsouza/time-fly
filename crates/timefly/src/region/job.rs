@@ -37,7 +37,7 @@ use crate::clock::LoadClock;
 #[cfg(test)]
 use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, advance_load_clock};
 use crate::data::{GlobeData, describe_load_error};
-use crate::hydro::{HydroGate, HydroWait};
+use crate::hydro::{HydroGate, HydroSettings, HydroWait};
 
 /// A load that has not finished after this long is abandoned, so a stalled fetch (not a 404,
 /// which fails at once) never leaves "Descending..." up: a tile or the overview counts as
@@ -555,6 +555,7 @@ pub(super) fn advance_frames(
     mut next: ResMut<NextState<RegionState>>,
     mut preload_failed: MessageWriter<RegionPreloadFailed>,
     clock: Res<LoadClock>,
+    hydro: Option<Res<HydroSettings>>,
 ) {
     let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
@@ -584,18 +585,23 @@ pub(super) fn advance_frames(
         );
     };
     let probe_started = Instant::now();
-    let needed = match generate::tiles_needed(&spec, &globe.timeline, &globe.crust, &frames) {
-        Ok(needed) => needed,
-        Err(e) => {
-            return fail(
-                &mut commands,
-                &mut next,
-                &mut preload_failed,
-                purpose,
-                &e.to_string(),
-            );
-        }
-    };
+    // The rivers' reads reach past the inner square when the era's pass will refine them; a
+    // pass that later fails or times out leaves the extra tiles unread.
+    let sizes = hydro.as_deref().filter(|h| h.enabled).map(|h| h.sizes);
+    let margin_m = generate::tile_margin_m(&globe.timeline, spec.snapshot.myr(), sizes);
+    let needed =
+        match generate::tiles_needed(&spec, &globe.timeline, &globe.crust, &frames, margin_m) {
+            Ok(needed) => needed,
+            Err(e) => {
+                return fail(
+                    &mut commands,
+                    &mut next,
+                    &mut preload_failed,
+                    purpose,
+                    &e.to_string(),
+                );
+            }
+        };
     let probe = probe_started.elapsed();
     let mut pending = Vec::new();
     if let Some(manifest) = index.manifest() {

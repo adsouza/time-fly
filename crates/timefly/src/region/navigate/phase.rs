@@ -543,7 +543,7 @@ impl NavPhase {
 }
 
 /// A time change seen while flying: the new snapshot, where the camera's crust lies then, and
-/// the camera's height above `max(ground, 0)`.
+/// the camera's height above the drawn surface (`blended_surface_m`: the ground or the water).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct TimeChange {
     pub to: YearsBp,
@@ -582,7 +582,8 @@ pub struct NavInputs {
     pub region_fly: Option<(RenderDir, DVec3)>,
     /// The cloud density navigation raised last frame: what the frame before this one drew.
     pub shown_density: f32,
-    /// The height of `max(ground, sea)` under the region's fly in the terrain drawn.
+    /// The height of the drawn surface (the ground or the water over it) under the region's fly
+    /// in the terrain drawn.
     pub region_ground_m: f32,
     /// The region's fly: where it is, `(x, z)` in local metres, and how fast it moved there
     /// over the last frame.

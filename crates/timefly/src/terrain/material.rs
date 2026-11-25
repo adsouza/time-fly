@@ -14,6 +14,9 @@
 //! | 105 | the palette, `Rgba8UnormSrgb` ([`palette_texels`]: ground, canopy, rock per era and biome) |
 //! | 106 | uniform [`TerrainLook`]: the painterly light (shadow hue, ramp, brush, snowline latitude, snow shading), the region frame and wind (planet position, dunes) and the region sun's direction (the dune tilt bound) |
 //!
+//! The water textures ([`water_image`], `Rgba32Uint`) are uploaded beside these for the water's
+//! material; the terrain does not bind them.
+//!
 //! None of the textures has a sampler: `R32Float` is not filterable in baseline WebGPU, and the
 //! codes and palette are looked up texel by texel.
 //!
@@ -388,6 +391,52 @@ pub fn surface_image(field: &Field) -> Image {
         TextureDimension::D2,
         bytes,
         TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+/// Bytes per texel of [`water_image`].
+pub const WATER_TEXEL_BYTES: usize = 16;
+
+/// A field's water as an `Rgba32Uint` texture, laid out like [`height_image`]. Texel `(col,
+/// row)` holds four `u32` words:
+///
+/// | word | value | WGSL decode |
+/// |---|---|---|
+/// | 0 | the water level `W` (m), f32 bits | `bitcast<f32>(w.x)` |
+/// | 1 | `W − h` (m), f32 bits, `h` the field's stored height | `bitcast<f32>(w.y)` |
+/// | 2 | the river texel's ribbon (low half) and signed centreline offset (high half), f16 | `unpack2x16float(w.z)` |
+/// | 3 | the river's flow in region axes, `(east, −north)` = `(+x, +z)`, f16 | `unpack2x16float(w.w)` |
+///
+/// Words 2 and 3 are the grid's own f16 bits, reordered (the offset beside the ribbon) and the
+/// north flow's sign bit flipped (region `+z` points south), so nothing is rounded twice. A
+/// reader rebuilds the ribbon between texels exactly as
+/// [`blended_water`](timefly_core::terrain::blended_water) does: it interpolates the half-width
+/// `ribbon + |offset|` and the offset, then takes `half-width − |offset|`. Word 1 interpolates to
+/// the blended level minus the blended height, so the water shader needs no height texture.
+/// Render-world only: built at upload, freed once extracted (the grid keeps the CPU copy).
+pub fn water_image(field: &Field) -> Image {
+    const SIGN: u32 = 0x8000;
+    let mut bytes = Vec::with_capacity(field.water_level_m.len() * WATER_TEXEL_BYTES);
+    for ((&level, &h), &[ribbon, east, north, offset]) in field
+        .water_level_m
+        .iter()
+        .zip(&field.elevation_m)
+        .zip(&field.river)
+    {
+        let words = [
+            level.to_bits(),
+            (level - h).to_bits(),
+            u32::from(ribbon) | u32::from(offset) << 16,
+            u32::from(east) | (u32::from(north) ^ SIGN) << 16,
+        ];
+        bytes.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+    }
+    Image::new(
+        field_extent(field),
+        TextureDimension::D2,
+        bytes,
+        TextureFormat::Rgba32Uint,
         RenderAssetUsages::RENDER_WORLD,
     )
 }

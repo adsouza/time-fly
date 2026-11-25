@@ -514,10 +514,10 @@ mod tests {
         assert_eq!(entities.len(), 8);
         // Its camera has no clusters (ruling R28), without the app-wide observer.
         crate::clusters::assert_no_clusters(app.world_mut());
-        // Six textures (four fields, the palette, the 1 x 1 target), two meshes (the quad and
+        // Eight textures (six fields, the palette, the 1 x 1 target), two meshes (the quad and
         // the dragonfly), one buffer, one of each material, the transition cloud's included (M3
         // Task 5), and the dragonfly's body and wing materials (final review).
-        assert_eq!(asset_counts(&app), [6, 2, 1, 1, 1, 1, 1, 2]);
+        assert_eq!(asset_counts(&app), [8, 2, 1, 1, 1, 1, 1, 2]);
         {
             let world = app.world_mut();
             // Everything on its own layer, none of it the region's camera or sun.

@@ -10,10 +10,12 @@
 //!
 //! The step is a pure function ([`fly_step`]), like M1's orbit camera. Its rules:
 //!
-//! - **Speed scales with height above ground** ([`fly_speed`]): one [`SPEED_PER_M_AGL`] of the
-//!   height per second, so every height feels as quick to cross.
-//! - **Clearance.** The camera never ends a step below `max(ground, 0) + CAMERA_CLEARANCE_M`
-//!   (sea level is `y = 0`). A step is split into horizontal substeps of at most
+//! - **Speed scales with height above the surface** ([`fly_speed`]): one [`SPEED_PER_M_AGL`] of
+//!   the height per second, so every height feels as quick to cross.
+//! - **Clearance.** The camera never ends a step below `surface + CAMERA_CLEARANCE_M`, the
+//!   surface being the drawn one ([`blended_surface_m`]): the higher of the ground and the
+//!   water (the sea at `y = 0`, a lake, a river). A dry basin below sea level is ground like any
+//!   other. A step is split into horizontal substeps of at most
 //!   [`MAX_SUBSTEP_M`] and the floor is applied after each, so a long boosted step follows the
 //!   terrain instead of tunnelling through a ridge.
 //! - **A soft ceiling** at [`CAMERA_CEILING_M`], the region's cloud base: climbing slows over
@@ -43,7 +45,7 @@
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::math::{DQuat, DVec3};
 use bevy::prelude::*;
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::blended_surface_m;
 use timefly_core::worldgen::generate::RegionGrid;
 
 use timefly_core::flight::altitudes::{
@@ -61,7 +63,8 @@ use crate::terrain::{RegionViewSystems, TerrainScene, TerrainSceneSystems};
 use crate::ui::PointerOverUi;
 use crate::ui::altitude::{Altitude, FlyAltitude};
 
-/// The least height above `max(terrain, 0)` the camera ends any step at (design §6.6).
+/// The least height above the drawn surface ([`blended_surface_m`]: the ground or the water over
+/// it) the camera ends any step at (design §6.6).
 pub const CAMERA_CLEARANCE_M: f32 = 150.0;
 /// The fly's ceiling above sea level: the region's cloud base (M3 design §7.3; M2's was 60 km).
 pub const CAMERA_CEILING_M: f32 = REGION_CLOUD_BASE_M as f32;
@@ -155,7 +158,7 @@ pub fn critically_damped(
 
 /// The chase pose the camera wants for `fly`: [`chase_pose`] behind and above it at
 /// [`chase_look_pitch_deg`], then lifted to [`CAMERA_CLEARANCE_M`] over `ground_m(x, z)` (the
-/// higher of the terrain and the sea).
+/// drawn surface, [`blended_surface_m`]: the higher of the terrain and the water).
 pub fn region_chase_pose(fly: &FlyState, ground_m: impl Fn(f64, f64) -> f64) -> ChasePose {
     let p = fly.pos_m.as_dvec3();
     let forward = (Quat::from_rotation_y(fly.yaw) * Vec3::NEG_Z).as_dvec3();
@@ -197,10 +200,11 @@ impl Default for FlyState {
 }
 
 impl FlyState {
-    /// The start of a region (M2 design §6.1): [`CAMERA_START_ALTITUDE_M`] above the higher of
-    /// the ground and the sea at the centre, looking north and pitched down [`START_PITCH_DEG`].
+    /// The start of a region (M2 design §6.1): [`CAMERA_START_ALTITUDE_M`] above the drawn
+    /// surface at the centre (the higher of the ground and the water), looking north and pitched
+    /// down [`START_PITCH_DEG`].
     pub fn start(grid: &RegionGrid) -> FlyState {
-        let ground = blended_height_m(grid, 0.0, 0.0).max(0.0);
+        let ground = blended_surface_m(grid, 0.0, 0.0);
         FlyState {
             pos_m: Vec3::new(0.0, ground + CAMERA_START_ALTITUDE_M, 0.0),
             ..default()
@@ -235,14 +239,15 @@ pub struct FlyInput {
     pub confined: bool,
 }
 
-/// Cruise speed (m/s) at `agl_m` above `max(ground, 0)`, before the boost.
+/// Cruise speed (m/s) at `agl_m` above the drawn surface, before the boost.
 pub fn fly_speed(agl_m: f32) -> f32 {
     (agl_m * SPEED_PER_M_AGL).clamp(MIN_SPEED_MPS, MAX_SPEED_MPS)
 }
 
-/// The next camera state. `ground_m(x, z)` is the terrain height at local metres (sea level is
-/// `y = 0`; below it, the sea is the floor). See the module docs for the rules.
-pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) -> f32) -> FlyState {
+/// The next camera state. `surface_m(x, z)` is the drawn surface's height at local metres, the
+/// floor: the region's [`blended_surface_m`] (the ground, or the water standing over it; sea
+/// level is `y = 0`). See the module docs for the rules.
+pub fn fly_step(state: FlyState, input: FlyInput, surface_m: impl Fn(f32, f32) -> f32) -> FlyState {
     let dt = if input.dt_s.is_finite() {
         input.dt_s.clamp(0.0, MAX_STEP_S)
     } else {
@@ -252,7 +257,6 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
     let yaw = state.yaw - input.look_delta.x * LOOK_RADIANS_PER_PX - turn;
     let pitch = (state.pitch - input.look_delta.y * LOOK_RADIANS_PER_PX)
         .clamp(MIN_PITCH_DEG.to_radians(), MAX_PITCH_DEG.to_radians());
-    let surface = |x: f32, z: f32| ground_m(x, z).max(0.0);
     let p = state.pos_m;
 
     // The direction asked for, in world axes: forward along the heading and strafing, both
@@ -268,7 +272,7 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
         wish
     };
     let boost = if input.boost { BOOST } else { 1.0 };
-    let mut velocity = wish * fly_speed(p.y - surface(p.x, p.z)) * boost;
+    let mut velocity = wish * fly_speed(p.y - surface_m(p.x, p.z)) * boost;
     if velocity.y > 0.0 {
         velocity.y *= ((CAMERA_CEILING_M - p.y) / CEILING_EASE_M).clamp(CEILING_MIN_EASE, 1.0);
     }
@@ -288,7 +292,7 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
     let mut pos = p;
     for _ in 0..substeps as u32 {
         pos += step;
-        let floor = surface(pos.x, pos.z) + CAMERA_CLEARANCE_M;
+        let floor = surface_m(pos.x, pos.z) + CAMERA_CLEARANCE_M;
         pos.y = pos.y.min(CAMERA_CEILING_M).max(floor);
     }
     FlyState {
@@ -423,7 +427,7 @@ fn step_fly(
         confined: controls.confined,
     };
     let grid = &region.grid;
-    let ground = |x: f32, z: f32| blended_height_m(grid, f64::from(x), f64::from(z));
+    let ground = |x: f32, z: f32| blended_surface_m(grid, f64::from(x), f64::from(z));
     // Inside the inner field (`input.confined`): past its edge only under a hop's opaque cloud.
     let next = fly_step(*fly, input, ground);
     if next != *fly {
@@ -569,7 +573,7 @@ fn apply_fly(
         return;
     };
     let grid = &scene.grid;
-    let ground = |x: f64, z: f64| f64::from(blended_height_m(grid, x, z).max(0.0));
+    let ground = |x: f64, z: f64| f64::from(blended_surface_m(grid, x, z));
     let want = region_chase_pose(&fly, ground);
     let dt = time.delta_secs_f64();
 
@@ -682,8 +686,8 @@ mod tests {
         keys_to_input(&keys)
     }
 
-    fn floor(ground: &impl Fn(f32, f32) -> f32, p: Vec3) -> f32 {
-        ground(p.x, p.z).max(0.0) + CAMERA_CLEARANCE_M
+    fn floor(surface: &impl Fn(f32, f32) -> f32, p: Vec3) -> f32 {
+        surface(p.x, p.z) + CAMERA_CLEARANCE_M
     }
 
     /// Steep, rough terrain spanning −5,000 to +8,000 m: two crossed ridgelines, a short-wave
@@ -700,7 +704,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(400))]
 
-        /// After every step, the camera is at least the clearance above `max(ground, 0)` and at
+        /// After every step, the camera is at least the clearance above the surface and at
         /// most at the ceiling, at boost speed and frame times up to 0.5 s, over steep terrain.
         #[test]
         fn clearance_holds_for_large_steps(
@@ -769,17 +773,18 @@ mod tests {
         assert!((high - 8_000.0 * SPEED_PER_M_AGL).abs() < 1.0, "{high}");
         assert!(high > 10.0 * low, "{low} vs {high}");
         assert!((level(500.0 + 8_000.0, true) - BOOST * high).abs() < 2.0);
-        // Over the sea, height counts from sea level, not the sea floor.
-        let sea = fly_step(
+        // Height counts from the surface, wherever it is: over a dry basin below sea level, from
+        // its floor.
+        let basin = fly_step(
             FlyState {
                 pos_m: Vec3::new(0.0, 1_000.0, 0.0),
                 yaw: 0.0,
                 pitch: 0.0,
             },
             input(forward, false, 0.1),
-            flat(-4_000.0),
+            flat(-300.0),
         );
-        assert!((-sea.pos_m.z / 0.1 - fly_speed(1_000.0)).abs() < 0.5);
+        assert!((-basin.pos_m.z / 0.1 - fly_speed(1_300.0)).abs() < 0.5);
         // The limits.
         assert_eq!(fly_speed(0.0), MIN_SPEED_MPS);
         assert_eq!(fly_speed(1.0e6), MAX_SPEED_MPS);
@@ -1222,6 +1227,7 @@ mod tests {
         use crate::terrain::material::TerrainMaterial;
         use crate::terrain::view::{REGION_FOV_DEG, RegionCamera};
         use crate::ui::altitude::{Altitude, FlyAltitude};
+        use timefly_core::terrain::{blended_height_m, blended_water};
 
         const STEP: std::time::Duration = std::time::Duration::from_micros(16_667);
 
@@ -1288,7 +1294,7 @@ mod tests {
         }
 
         fn ground(grid: &RegionGrid, p: Vec3) -> f32 {
-            blended_height_m(grid, f64::from(p.x), f64::from(p.z)).max(0.0)
+            blended_surface_m(grid, f64::from(p.x), f64::from(p.z))
         }
 
         /// The angle (degrees) by which `p` sits below the camera's view centre, and its
@@ -1517,6 +1523,125 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// [`grid`] with water standing at `level(x, z)` where it is `Some` (a lake or a river
+        /// surface), dry elsewhere.
+        fn wet_grid(
+            height: impl Fn(f64, f64) -> f32 + Copy,
+            level: impl Fn(f64, f64) -> Option<f32> + Copy,
+        ) -> Arc<RegionGrid> {
+            let mut grid = (*grid(height)).clone();
+            for f in [&mut grid.inner, &mut grid.apron] {
+                for row in 0..f.res {
+                    for col in 0..f.res {
+                        let (x, z) = f.local_of(row, col);
+                        if let Some(w) = level(x, z) {
+                            f.water_level_m[(row * f.res + col) as usize] = w;
+                        }
+                    }
+                }
+            }
+            Arc::new(grid)
+        }
+
+        /// The fly in flight (the navigation's `Flying`), with `keys` held for every frame.
+        fn flying(app: &mut App, keys: &[KeyCode]) {
+            let mut held = ButtonInput::<KeyCode>::default();
+            for &k in keys {
+                held.press(k);
+            }
+            app.insert_resource(held).insert_resource(Navigation {
+                phase: crate::region::navigate::NavPhase::Flying,
+                ..default()
+            });
+        }
+
+        /// Descends with the keys held (boosted forward, so it also crosses the water) until the
+        /// height stops changing; returns every frame's fly and camera positions.
+        fn descend(app: &mut App) -> Vec<(Vec3, Vec3)> {
+            flying(
+                app,
+                &[KeyCode::ControlLeft, KeyCode::KeyW, KeyCode::ShiftLeft],
+            );
+            let mut frames = Vec::new();
+            for _ in 0..3_000 {
+                app.update();
+                let p = app.world().resource::<FlyState>().pos_m;
+                frames.push((p, camera(app).translation));
+                let n = frames.len();
+                if n > 60 && frames[n - 60].0.y == p.y {
+                    break;
+                }
+            }
+            frames
+        }
+
+        /// Review Focus 4: over Titicaca (a 3,812 m lake on a 3,700 m bed) the fly keeps its
+        /// clearance over the water, not over the lake bed.
+        #[test]
+        fn the_fly_stays_above_a_lake_surface() {
+            const LAKE_M: f32 = 3_812.0;
+            let grid = wet_grid(|_, _| 3_700.0, |_, _| Some(LAKE_M));
+            let floor = LAKE_M + CAMERA_CLEARANCE_M;
+            // The hazard: the water really stands over the ground, higher than the clearance
+            // over the ground alone would keep the fly.
+            for (x, z) in [(0.0, 0.0), (5_000.0, -60_000.0), (-149_000.0, 149_000.0)] {
+                let h = blended_height_m(&grid, x, z);
+                assert_eq!(h, 3_700.0);
+                assert_eq!(blended_surface_m(&grid, x, z), LAKE_M);
+                assert!(h + CAMERA_CLEARANCE_M < floor - 100.0);
+            }
+            let start = FlyState {
+                pos_m: Vec3::new(0.0, LAKE_M + 2_000.0, 0.0),
+                yaw: 0.0,
+                pitch: -START_PITCH_DEG.to_radians(),
+            };
+            let mut app = app(&grid, start);
+            let frames = descend(&mut app);
+            for (i, (fly, eye)) in frames.iter().enumerate() {
+                assert!(
+                    fly.y >= floor,
+                    "frame {i}: the fly at {fly} is under {floor}"
+                );
+                assert!(
+                    eye.y >= floor - 1e-2,
+                    "frame {i}: the camera at {eye} is under {floor}"
+                );
+            }
+            let (last, _) = *frames.last().unwrap();
+            assert_eq!(last.y, floor, "the fly settles at the lake's clearance");
+            assert!(last.z < -1_000.0, "the fly crossed the lake: {last}");
+        }
+
+        /// Review Focus 4: a dry basin below sea level (no sea in it) is ground the fly may
+        /// descend into, down to its clearance over the basin's floor.
+        #[test]
+        fn the_fly_descends_into_a_dry_basin_below_sea_level() {
+            const BASIN_M: f32 = -300.0;
+            let grid = grid(|_, _| BASIN_M);
+            // The hazard: the basin is below the sea, and no water stands in it.
+            assert_eq!(blended_height_m(&grid, 0.0, 0.0), BASIN_M);
+            assert_eq!(blended_surface_m(&grid, 0.0, 0.0), BASIN_M);
+            assert!(blended_water(&grid, 0.0, 0.0).thickness_m < 0.0);
+            let start = FlyState::start(&grid);
+            assert_eq!(start.pos_m.y, BASIN_M + CAMERA_START_ALTITUDE_M);
+            let mut app = app(&grid, start);
+            let frames = descend(&mut app);
+            let floor = BASIN_M + CAMERA_CLEARANCE_M;
+            for (i, (fly, eye)) in frames.iter().enumerate() {
+                assert!(
+                    fly.y >= floor,
+                    "frame {i}: the fly at {fly} is under {floor}"
+                );
+                assert!(eye.y >= floor - 1e-2, "frame {i}: the camera at {eye}");
+            }
+            let (last, _) = *frames.last().unwrap();
+            assert_eq!(
+                last.y, floor,
+                "the fly settles at the basin's clearance, below the sea"
+            );
+            assert!(last.y < 0.0);
         }
 
         /// Spec §5.1: the body "banks into turns and pitches with climbs" (the final review).
