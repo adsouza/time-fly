@@ -21,12 +21,12 @@ fn field(res: u32, size_m: f64) -> Field {
             elevation_m.push((1000.0 + 40.0 * x - 25.0 * z + 300.0 * (x * 0.7).sin()) as f32);
         }
     }
-    Field {
+    Field::dry(
         res,
         size_m,
-        surface: vec![[0, 0, 0, 0]; (res * res) as usize],
         elevation_m,
-    }
+        vec![[0, 0, 0, 0]; (res * res) as usize],
+    )
 }
 
 fn grid() -> Arc<RegionGrid> {
@@ -39,6 +39,7 @@ fn grid() -> Arc<RegionGrid> {
         },
         inner: field(33, REGION_SIZE_M),
         apron: field(17, APRON_SIZE_M),
+        boulders: Vec::new(),
     })
 }
 

@@ -423,12 +423,7 @@ fn field(res: u32, size_m: f64, f: fn(f64, f64) -> f64) -> Field {
             elevation_m.push(f(x, z) as f32);
         }
     }
-    Field {
-        res,
-        size_m,
-        elevation_m,
-        surface: vec![[0; 4]; n],
-    }
+    Field::dry(res, size_m, elevation_m, vec![[0; 4]; n])
 }
 
 fn test_grid() -> RegionGrid {
@@ -436,6 +431,7 @@ fn test_grid() -> RegionGrid {
         spec: RegionSpec::new(RenderDir(DVec3::Y), YearsBp(0.0), 1),
         inner: field(REGION_RES, REGION_SIZE_M, inner_fn),
         apron: field(APRON_RES, APRON_SIZE_M, apron_fn),
+        boulders: Vec::new(),
     }
 }
 
@@ -516,6 +512,110 @@ fn blend_is_the_inner_field_inside_and_the_apron_outside() {
     assert!((h - (hi + ha) / 2.0).abs() < 1e-2, "{h} vs {hi} and {ha}");
 }
 
+/// `f` at each texel of a field shaped like `like`.
+fn texels_of(like: &Field, f: impl Fn(f64, f64) -> f32) -> Vec<f32> {
+    (0..like.res)
+        .flat_map(|row| (0..like.res).map(move |col| (row, col)))
+        .map(|(row, col)| {
+            let (x, z) = like.local_of(row, col);
+            f(x, z)
+        })
+        .collect()
+}
+
+#[test]
+fn blended_water_mirrors_blended_height() {
+    use crate::worldgen::generate::water::{decode_river, encode_river};
+    let mut grid = test_grid();
+    // Water levels, flows and a sub-texel river (22 m wide, along x = 1,234.5 m in the inner
+    // field: its texels hold the signed offset and ribbon, the apron's none).
+    let level = |x: f64, z: f64| (40.0 + 30.0 * (x / 11_000.0).cos() + z / 9_000.0) as f32;
+    let east = |x: f64, _z: f64| (1.5 * (x / 20_000.0).sin()) as f32;
+    let north = |_x: f64, z: f64| (0.75 * (z / 30_000.0).cos()) as f32;
+    let x0 = 1_234.5;
+    for (f, river) in [(&mut grid.inner, true), (&mut grid.apron, false)] {
+        f.water_level_m = texels_of(f, level);
+        let offsets = texels_of(f, |x, _| (x - x0) as f32);
+        let (es, ns) = (texels_of(f, east), texels_of(f, north));
+        f.river = (0..offsets.len())
+            .map(|i| {
+                let o = if river { offsets[i] } else { 0.0 };
+                let ribbon = if river { 11.0 - o.abs() } else { 1000.0 };
+                encode_river(ribbon, es[i], ns[i], o)
+            })
+            .collect();
+    }
+    // A grid whose heights are each quantity: blended_water must match blended_height_m on it.
+    let mirror = |pick: &dyn Fn(&Field, usize) -> f32| {
+        let mut m = grid.clone();
+        for f in [&mut m.inner, &mut m.apron] {
+            f.elevation_m = (0..f.river.len()).map(|i| pick(f, i)).collect();
+        }
+        m
+    };
+    let levels = mirror(&|f, i| f.water_level_m[i]);
+    let easts = mirror(&|f, i| decode_river(f.river[i])[1]);
+    let norths = mirror(&|f, i| decode_river(f.river[i])[2]);
+    let e1 = REGION_SIZE_M / 2.0;
+    let mut points: Vec<(f64, f64)> = vec![(0.0, 0.0), (e1, e1), (-e1, 3.0), (2.0e6, -1.0e6)];
+    for k in 0..400 {
+        let t = f64::from(k);
+        // Through the inner field, the blend (131-150 km) and the apron beyond.
+        points.push((
+            (t * 0.618_034).fract() * 3.2e5 - 1.6e5,
+            (t * 0.754_878).fract() * 3.2e5 - 1.6e5,
+        ));
+        points.push((
+            (t * 0.381_966).fract() * 2.6e6 - 1.3e6,
+            (t * 0.569_840).fract() * 2.6e6 - 1.3e6,
+        ));
+    }
+    for &(x, z) in &points {
+        let w = blended_water(&grid, x, z);
+        assert_eq!(
+            w.level_m.to_bits(),
+            blended_height_m(&levels, x, z).to_bits(),
+            "({x}, {z})"
+        );
+        assert_eq!(w.thickness_m, w.level_m - blended_height_m(&grid, x, z));
+        assert_eq!(
+            w.flow[0].to_bits(),
+            blended_height_m(&easts, x, z).to_bits()
+        );
+        assert_eq!(
+            w.flow[1].to_bits(),
+            blended_height_m(&norths, x, z).to_bits()
+        );
+        assert_eq!(
+            blended_surface_m(&grid, x, z),
+            blended_height_m(&grid, x, z).max(w.level_m)
+        );
+    }
+    // The sub-texel river keeps its width between texels 293 m apart, where every texel's own
+    // ribbon is negative: the ribbon is positive exactly within 11 m of the centreline.
+    let texel = grid.inner.spacing_m();
+    let mut inside = 0;
+    for k in 0..2000 {
+        let x = x0 - 40.0 + 0.04 * f64::from(k);
+        let z = -50_000.0 + 7.3 * f64::from(k);
+        let r = blended_water(&grid, x, z).ribbon_m;
+        let exact = 11.0 - (x - x0).abs() as f32;
+        assert!(
+            (r - exact).abs() < 0.3,
+            "({x}, {z}): ribbon {r}, exact {exact}"
+        );
+        inside += usize::from(r > 0.0);
+    }
+    assert!(inside > 500);
+    let col = ((x0 + e1) / texel).floor() as usize;
+    for c in [col, col + 1] {
+        assert!(
+            decode_river(grid.inner.river[512 * 1025 + c])[0] < -50.0,
+            "texel ribbons"
+        );
+    }
+}
+
 #[test]
 fn curvature_drop_is_the_sagitta() {
     assert_eq!(curvature_drop_m(0.0), 0.0);
@@ -531,6 +631,7 @@ fn flat_grid(f: fn(f64, f64) -> f64) -> RegionGrid {
         spec: RegionSpec::new(RenderDir(DVec3::Y), YearsBp(0.0), 1),
         inner: field(REGION_RES, REGION_SIZE_M, f),
         apron: field(APRON_RES, APRON_SIZE_M, f),
+        boulders: Vec::new(),
     }
 }
 

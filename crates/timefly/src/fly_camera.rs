@@ -968,6 +968,7 @@ mod tests {
             ),
             inner: flat_field(timefly_core::worldgen::REGION_SIZE_M),
             apron: flat_field(timefly_core::worldgen::APRON_SIZE_M),
+            boulders: Vec::new(),
         });
         let look = chase_look_pitch_deg(s.pitch);
         assert!((look - CHASE_START_LOOK_DEG).abs() < 1e-4, "{look}");
@@ -982,12 +983,7 @@ mod tests {
     }
 
     fn flat_field(size_m: f64) -> timefly_core::worldgen::generate::Field {
-        timefly_core::worldgen::generate::Field {
-            res: 3,
-            size_m,
-            surface: vec![[0, 0, 0, 0]; 9],
-            elevation_m: vec![0.0; 9],
-        }
+        timefly_core::worldgen::generate::Field::dry(3, size_m, vec![0.0; 9], vec![[0, 0, 0, 0]; 9])
     }
 
     #[test]
@@ -1239,12 +1235,12 @@ mod tests {
                     elevation_m.push(height(x, z));
                 }
             }
-            Field {
+            Field::dry(
                 res,
                 size_m,
-                surface: vec![[0, 0, 0, 0]; (res * res) as usize],
                 elevation_m,
-            }
+                vec![[0, 0, 0, 0]; (res * res) as usize],
+            )
         }
 
         /// A grid with heights `height(x, z)`. The apron is fine enough (9.4 km) that the blend
@@ -1259,6 +1255,7 @@ mod tests {
                 },
                 inner: field(257, REGION_SIZE_M, height),
                 apron: field(257, APRON_SIZE_M, height),
+                boulders: Vec::new(),
             })
         }
 

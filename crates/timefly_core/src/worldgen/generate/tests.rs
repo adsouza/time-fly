@@ -22,7 +22,7 @@ fn spec_at(centre: RenderDir, ma: f64, inner_res: u32, apron_res: u32) -> Region
 }
 
 fn generate<F: CoarseField>(spec: RegionSpec, field: &F) -> RegionGrid {
-    RegionGenerator::new(spec, field).finish()
+    RegionGenerator::new(spec, field, None).finish()
 }
 
 /// A grid as comparable bits: (inner heights, inner surface, apron heights, apron surface).
@@ -135,7 +135,7 @@ fn chunking_is_invisible() {
     let spec = spec_at(dir(-40.0, 100.0), 150.0, 33, 17);
     let whole = bits(&generate(spec, &field));
     for chunk in [1, 7, 64] {
-        let mut g = RegionGenerator::new(spec, &field);
+        let mut g = RegionGenerator::new(spec, &field, None);
         assert_eq!(g.rows_remaining(), 33 + 17);
         let mut calls = 0;
         while g.rows_remaining() > 0 {
@@ -146,7 +146,7 @@ fn chunking_is_invisible() {
         assert_eq!(bits(&g.finish()), whole, "chunks of {chunk}");
     }
     // Blocks produced out of order (as parallel tasks would) and assembled in order.
-    let g = RegionGenerator::new(spec, &field);
+    let g = RegionGenerator::new(spec, &field, None);
     let late = g.rows(FieldKind::Inner, 20..33);
     let early = g.rows(FieldKind::Inner, 0..20);
     let apron = vec![
@@ -178,8 +178,8 @@ fn overlap_agreement() {
     tiles.set_overview(flat_overview(340.0, 26)).unwrap();
     let (era, present) = (ice_frame(380.0, 0.2), ice_frame(350.0, 0.0));
     let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
-    let ga = RegionGenerator::new(spec_at(a, 0.021, 33, 17), &recent);
-    let gb = RegionGenerator::new(spec_at(b, 0.021, 33, 17), &recent);
+    let ga = RegionGenerator::new(spec_at(a, 0.021, 33, 17), &recent, None);
+    let gb = RegionGenerator::new(spec_at(b, 0.021, 33, 17), &recent, None);
     assert_eq!(ga.sample_point(probe), gb.sample_point(probe));
     // Apron texels too (from the overview), even far apart and with different tiles loaded.
     let only_a = {
@@ -188,7 +188,7 @@ fn overlap_agreement() {
         t
     };
     let recent_a = RecentField::new(&only_a, [&era, &era], 0.0, &present, false).unwrap();
-    let ga = RegionGenerator::new(spec_at(a, 0.021, 33, 17), &recent_a);
+    let ga = RegionGenerator::new(spec_at(a, 0.021, 33, 17), &recent_a, None);
     let far = RegionFrame { center: a }.local_to_dir(900_000.0, 300_000.0);
     assert_eq!(
         ga.sample_point_in(FieldKind::Apron, far),
@@ -201,8 +201,8 @@ fn overlap_agreement() {
         spacing_m: 111_000.0,
         koppen: None,
     };
-    let ga = RegionGenerator::new(spec_at(a, 100.0, 33, 17), &field);
-    let gb = RegionGenerator::new(spec_at(b, 100.0, 33, 17), &field);
+    let ga = RegionGenerator::new(spec_at(a, 100.0, 33, 17), &field, None);
+    let gb = RegionGenerator::new(spec_at(b, 100.0, 33, 17), &field, None);
     for k in 0..20 {
         let p = RegionFrame { center: a }.local_to_dir(f64::from(k) * 6_000.0, -30_000.0);
         let (ha, sa) = ga.sample_point(p);
@@ -236,8 +236,8 @@ fn overlap_agreement() {
         let field = rift_deep(&crust, &frames, &tiles, 1.0);
         let c = dir(0.0, -88.0);
         let d = RegionFrame { center: c }.local_to_dir(100_000.0, 0.0);
-        let ga = RegionGenerator::new(spec_at(c, 1.0, 33, 17), &field);
-        let gb = RegionGenerator::new(spec_at(d, 1.0, 33, 17), &field);
+        let ga = RegionGenerator::new(spec_at(c, 1.0, 33, 17), &field, None);
+        let gb = RegionGenerator::new(spec_at(d, 1.0, 33, 17), &field, None);
         for k in 0..20 {
             let p = RegionFrame { center: c }.local_to_dir(f64::from(k) * 6_000.0, 30_000.0);
             for kind in [FieldKind::Inner, FieldKind::Apron] {
@@ -317,7 +317,7 @@ fn deep_matches_globe() {
     };
     // Straddling plate 202's western edge (render z ~ 0.3).
     let spec = spec_at(dir(0.0, 72.0), 100.0, 33, 33);
-    let g = RegionGenerator::new(spec, &field);
+    let g = RegionGenerator::new(spec, &field, None);
     // Coarse truth: every precomputed node has the globe's land/sea sign.
     let mut nodes = 0;
     for lattice in &g.lattices {
@@ -338,7 +338,7 @@ fn deep_matches_globe() {
     // Texels: wherever the four corners agree, the generated sign is the globe's.
     let grid = g.finish();
     let frame = spec.frame();
-    let g = RegionGenerator::new(spec, &field);
+    let g = RegionGenerator::new(spec, &field, None);
     let (mut agreed, mut land, mut sea) = (0, 0, 0);
     for (kind, f) in [
         (FieldKind::Inner, &grid.inner),
@@ -402,7 +402,7 @@ fn thin_era_fixed_cracks_stay_land() {
         );
         let grid = generate(spec_at(mid, 100.0, 65, 33), &field);
         let lowest = |f: &Field| f.elevation_m.iter().copied().fold(f32::MAX, f32::min);
-        let g = RegionGenerator::new(spec_at(mid, 100.0, 65, 33), &field);
+        let g = RegionGenerator::new(spec_at(mid, 100.0, 65, 33), &field, None);
         if label == "thin" {
             // 44 km wide: every crack point is within 50 km of plate land.
             assert_eq!(deep.sliver_land_m(mid), Some(400.0));
@@ -635,7 +635,7 @@ fn octaves_stop_at_the_source_spacing() {
         spacing_m: 1852.0,
         koppen: Some(26),
     };
-    let g = RegionGenerator::new(spec_at(dir(45.0, 7.0), 0.0, 1025, 513), &field);
+    let g = RegionGenerator::new(spec_at(dir(45.0, 7.0), 0.0, 1025, 513), &field, None);
     assert_eq!(
         g.layers[0].octaves, 2,
         "1852 m down to 586 m: cells 1852 and 926 m"
@@ -656,7 +656,7 @@ fn coast_distance_grows_inland() {
         spacing_m: 111_000.0,
         koppen: None,
     };
-    let g = RegionGenerator::new(spec_at(centre, 100.0, 33, 129), &field);
+    let g = RegionGenerator::new(spec_at(centre, 100.0, 33, 129), &field, None);
     let frame = RegionFrame { center: centre };
     for km in [200.0, 500.0, 900.0] {
         let d = g.coast_km_at(frame.local_to_dir(km * 1000.0, 0.0));
@@ -671,12 +671,12 @@ fn coast_distance_grows_inland() {
 
 #[test]
 fn height_at_is_bilinear() {
-    let field = Field {
-        res: 3,
-        size_m: 200.0,
-        elevation_m: vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
-        surface: vec![[0; 4]; 9],
-    };
+    let field = Field::dry(
+        3,
+        200.0,
+        vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+        vec![[0; 4]; 9],
+    );
     assert_eq!(field.height_at(-100.0, -100.0), Some(0.0));
     assert_eq!(field.height_at(100.0, 100.0), Some(80.0));
     assert_eq!(field.height_at(-50.0, 0.0), Some(35.0));
@@ -706,9 +706,9 @@ fn prep_in_steps_matches_new() {
             koppen: None,
         };
         let spec = spec_at(dir(-33.0, 151.0), 100.0, 33, 17);
-        let whole = bits(&RegionGenerator::new(spec, &field).finish());
+        let whole = bits(&RegionGenerator::new(spec, &field, None).finish());
         for max_nodes in [1, 97, u32::MAX] {
-            let mut prep = RegionPrep::new(spec, &field);
+            let mut prep = RegionPrep::new(spec, &field, None);
             let mut steps = 0u64;
             loop {
                 let before = prep.units_done();
@@ -731,7 +731,7 @@ fn prep_in_steps_matches_new() {
             );
         }
         // finish() completes a part-built prep.
-        let mut prep = RegionPrep::new(spec, &field);
+        let mut prep = RegionPrep::new(spec, &field, None);
         prep.step(500);
         assert_eq!(bits(&prep.finish().finish()), whole);
     }
@@ -819,7 +819,7 @@ fn deep_tiles_needed_cover_every_inner_read() {
             field.tiles_needed(&frame) == needed,
             "independent of the loaded tiles"
         );
-        bits(&RegionGenerator::new(spec, &field).finish())
+        bits(&RegionGenerator::new(spec, &field, None).finish())
     };
     let (g_exact, g_all, g_era) = (grid(&exact), grid(&all), grid(&era_only));
     assert_eq!(
@@ -945,7 +945,7 @@ fn tiles_needed_covers_every_river_read() {
 /// Steps a prep through with `max_nodes` per step; returns (slowest step before the last,
 /// the last step (the coast-distance transform), number of steps), in seconds.
 fn prep_profile<F: CoarseField>(spec: RegionSpec, field: &F, max_nodes: u32) -> (f64, f64, u64) {
-    let mut prep = RegionPrep::new(spec, field);
+    let mut prep = RegionPrep::new(spec, field, None);
     let (mut worst, mut steps) = (0.0f64, 0u64);
     loop {
         let t = std::time::Instant::now();
@@ -963,7 +963,7 @@ fn prep_profile<F: CoarseField>(spec: RegionSpec, field: &F, max_nodes: u32) -> 
 fn print_profile<F: CoarseField>(label: &str, spec: RegionSpec, make: impl Fn() -> F) {
     let field = make();
     let t = std::time::Instant::now();
-    let _ = RegionPrep::new(spec, &field);
+    let _ = RegionPrep::new(spec, &field, None);
     println!(
         "  {label}: RegionPrep::new {:.3} ms",
         t.elapsed().as_secs_f64() * 1e3
@@ -990,7 +990,7 @@ fn generation_timing() {
     let field = rift_deep(&crust, &frames, &tiles, 100.0);
     let spec = RegionSpec::new(dir(10.0, 60.0), YearsBp::from_myr(100.0), 1);
     let t0 = std::time::Instant::now();
-    let g = RegionGenerator::new(spec, &field);
+    let g = RegionGenerator::new(spec, &field, None);
     let t_new = t0.elapsed();
     let grid = g.finish();
     let t_all = t0.elapsed();
@@ -1019,7 +1019,7 @@ fn generation_timing() {
         assert_eq!(field.source_spacing_m(), 1852.0);
         let spec = RegionSpec::new(centre, YearsBp::from_myr(1.0), 1);
         let t0 = std::time::Instant::now();
-        let g = RegionGenerator::new(spec, &field);
+        let g = RegionGenerator::new(spec, &field, None);
         let t_new = t0.elapsed();
         let grid = g.finish();
         println!(
@@ -1046,7 +1046,7 @@ fn generation_timing() {
             .unwrap();
         let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
         let t0 = std::time::Instant::now();
-        let g = RegionGenerator::new(RegionSpec::new(centre, YearsBp(21_000.0), 1), &recent);
+        let g = RegionGenerator::new(RegionSpec::new(centre, YearsBp(21_000.0), 1), &recent, None);
         let t_new = t0.elapsed();
         let nodes: usize = g
             .lattices
@@ -1111,7 +1111,7 @@ fn lattice_nodes_live_in_allocations_of_one_size() {
             spacing_m,
             koppen: None,
         };
-        let g = RegionGenerator::new(spec_at(dir(10.0, 30.0), 0.0, 33, 17), &field);
+        let g = RegionGenerator::new(spec_at(dir(10.0, 30.0), 0.0, 33, 17), &field, None);
         let sizes = g.node_allocation_bytes();
         assert!(!sizes.is_empty());
         assert!(
@@ -1132,4 +1132,1401 @@ fn lattice_nodes_live_in_allocations_of_one_size() {
         assert_eq!(store[i].elevation_m, i as f32);
     }
     assert!(store.get(n).is_none());
+}
+
+// ---- Rivers and lakes (Task 6): carved terrain, water fields and boulders. ----
+
+mod water {
+    use super::*;
+    use crate::hydrology::climate::ZonalClimate;
+    use crate::hydrology::climate::tests::shipped_table;
+    use crate::hydrology::params::{NO_WATER_DROP_M, RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M};
+    use crate::hydrology::{CubeLattice, Down, EraHydrology, HydroPrep, NodeSample, NodeSource};
+    use crate::terrain::blended_water;
+    use crate::worldgen::frame::EARTH_RADIUS_M;
+    use crate::worldgen::generate::rivers::{RegionRivers, chord_point};
+    use crate::worldgen::generate::water::decode_river;
+
+    /// FNV-1a (64-bit) over the M3 fields' bytes: each field's heights (f32, little-endian)
+    /// then its surface bytes, inner field first.
+    fn m3_hash(grid: &RegionGrid) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |b: u8| {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for f in [&grid.inner, &grid.apron] {
+            for x in &f.elevation_m {
+                x.to_le_bytes().into_iter().for_each(&mut eat);
+            }
+            for s in &f.surface {
+                s.iter().copied().for_each(&mut eat);
+            }
+        }
+        h
+    }
+
+    /// [`m3_hash`] of each fixture of `overlap_agreement` and `prep_in_steps_matches_new`, from
+    /// the generator at 273e20b (before any rivers code; 65259b5 gave the same values).
+    const M3_GOLDEN: [(&str, u64); 8] = [
+        ("prep deep", 0xcf7a_d1e5_75c8_6cc5),
+        ("prep recent", 0x466a_35e7_a875_f082),
+        ("overlap recent a", 0xeef6_b23a_3b2e_c482),
+        ("overlap recent b", 0xeef6_b23a_3b2e_c482),
+        ("overlap deep a", 0x3fac_4f39_6d56_a2f9),
+        ("overlap deep b", 0xaf69_2e55_0455_ce33),
+        ("overlap 1 Ma", 0x484c_04de_cc0b_1670),
+        ("1 Ma 129/65", 0x3622_e244_e4c5_8987),
+    ];
+
+    /// A region without a pass, and per texel (inner, then apron) whether a coastline corner is
+    /// below sea level.
+    fn m3_region<F: CoarseField>(spec: RegionSpec, field: &F) -> (RegionGrid, Vec<bool>) {
+        let g = RegionGenerator::new(spec, field, None);
+        let frame = spec.frame();
+        let mut below = Vec::new();
+        for kind in [FieldKind::Inner, FieldKind::Apron] {
+            let res = g.rows_in(kind);
+            let size = if kind == FieldKind::Inner {
+                REGION_SIZE_M
+            } else {
+                APRON_SIZE_M
+            };
+            for row in 0..res {
+                for col in 0..res {
+                    let (x, z) = local_of(res, size, row, col);
+                    let (_, c) = g.coarse_and_corners(kind, frame.local_to_dir(x, z));
+                    below.push(c.iter().any(|&v| v < 0.0));
+                }
+            }
+        }
+        (g.finish(), below)
+    }
+
+    /// The fixtures of `overlap_agreement` and `prep_in_steps_matches_new`.
+    fn m3_golden_regions() -> Vec<(&'static str, RegionGrid, Vec<bool>)> {
+        let mut out = Vec::new();
+        for (label, spacing_m) in [("prep deep", 111_000.0), ("prep recent", 1852.0)] {
+            let field = FnField {
+                f: hilly,
+                spacing_m,
+                koppen: None,
+            };
+            let (g, b) = m3_region(spec_at(dir(-33.0, 151.0), 100.0, 33, 17), &field);
+            out.push((label, g, b));
+        }
+        let a = dir(30.0, 10.0);
+        let b = RegionFrame { center: a }.local_to_dir(100_000.0, 0.0);
+        let mut tiles = flat_tiles_around(&[a, b], 350.0, 26);
+        tiles.set_overview(flat_overview(340.0, 26)).unwrap();
+        let (era, present) = (ice_frame(380.0, 0.2), ice_frame(350.0, 0.0));
+        let recent = RecentField::new(&tiles, [&era, &era], 0.0, &present, false).unwrap();
+        for (label, c) in [("overlap recent a", a), ("overlap recent b", b)] {
+            let (g, bl) = m3_region(spec_at(c, 0.021, 33, 17), &recent);
+            out.push((label, g, bl));
+        }
+        let field = FnField {
+            f: hilly,
+            spacing_m: 111_000.0,
+            koppen: None,
+        };
+        for (label, c) in [("overlap deep a", a), ("overlap deep b", b)] {
+            let (g, bl) = m3_region(spec_at(c, 100.0, 33, 17), &field);
+            out.push((label, g, bl));
+        }
+        let crust = rift(0);
+        let frames = rift_frames(|d| (hilly(d) as f32, true));
+        let mut tiles = TileSet::new();
+        for r in 15..21 {
+            for c in 12..24 {
+                tiles
+                    .insert(
+                        r,
+                        c,
+                        crate::worldgen::tiles::tests::tile_from(r, c, |lat, lon| {
+                            (
+                                (200.0 + 150.0 * (lat * 3.0).sin() * (lon * 2.0).cos()) as f32,
+                                3,
+                            )
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        tiles.set_overview(flat_overview(250.0, 3)).unwrap();
+        let field = rift_deep(&crust, &frames, &tiles, 1.0);
+        let c = dir(0.0, -88.0);
+        let (g, bl) = m3_region(spec_at(c, 1.0, 33, 17), &field);
+        out.push(("overlap 1 Ma", g, bl));
+        let (g, bl) = m3_region(spec_at(c, 1.0, 129, 65), &field);
+        out.push(("1 Ma 129/65", g, bl));
+        out
+    }
+
+    #[test]
+    fn without_a_pass_the_terrain_is_m3s() {
+        let (mut sea, mut dry) = (0, 0);
+        for ((label, grid, below), (golden_label, golden)) in
+            m3_golden_regions().into_iter().zip(M3_GOLDEN)
+        {
+            assert_eq!(label, golden_label);
+            assert_eq!(
+                m3_hash(&grid),
+                golden,
+                "{label}: the heights or surface moved"
+            );
+            assert!(grid.boulders.is_empty());
+            let texels = grid.inner.elevation_m.iter().chain(&grid.apron.elevation_m);
+            let levels = grid
+                .inner
+                .water_level_m
+                .iter()
+                .chain(&grid.apron.water_level_m);
+            let rivers = grid.inner.river.iter().chain(&grid.apron.river);
+            for (((&h, &level), river), below) in texels.zip(levels).zip(rivers).zip(below) {
+                assert_eq!(*river, RIVER_NONE, "{label}");
+                if below {
+                    assert_eq!(level.to_bits(), 0f32.to_bits(), "{label}: sea level");
+                    sea += 1;
+                } else {
+                    assert_eq!(level, h - NO_WATER_DROP_M as f32, "{label}: dry");
+                    dry += 1;
+                }
+            }
+        }
+        assert!(sea > 1000 && dry > 1000, "both cases: {sea} sea, {dry} dry");
+    }
+
+    // ---- Synthetic eras. ----
+
+    /// A pass's elevation from a function of the direction.
+    struct PassTerrain<G: Fn(RenderDir) -> f64 + Sync>(G);
+
+    impl<G: Fn(RenderDir) -> f64 + Sync> NodeSource for PassTerrain<G> {
+        fn node(&self, dir: RenderDir) -> NodeSample {
+            NodeSample {
+                elevation_m: (self.0)(dir) as f32,
+                ice: 0.0,
+            }
+        }
+
+        fn data_lakes(&self) -> bool {
+            false
+        }
+    }
+
+    /// The continental pass at present-day climate over `f` on a lattice of size `n`.
+    fn pass_over(n: u32, f: impl Fn(RenderDir) -> f64 + Sync) -> EraHydrology {
+        let table = shipped_table();
+        let climate = ZonalClimate {
+            table: &table,
+            sea_level_anomaly_m: 0.0,
+        };
+        let mut prep = HydroPrep::with_lake_levels(CubeLattice { n }, YearsBp(0.0), &[]);
+        let source = PassTerrain(f);
+        while !prep.step(&source, &climate, &table, 1 << 20) {}
+        prep.finish()
+    }
+
+    /// A wet continent around `centre` (Task 5's fixture, on any axis): a 1,800 m cone 0.45 rad
+    /// in radius with ridges, ocean beyond.
+    fn continent(centre: DVec3, d: RenderDir) -> f64 {
+        let p = d.0.normalize();
+        let r = p.dot(centre).clamp(-1.0, 1.0).acos();
+        let (north, east) = RegionFrame {
+            center: RenderDir(centre),
+        }
+        .north_east();
+        let theta = p.dot(north).atan2(p.dot(east));
+        1800.0 * (1.0 - r / 0.45)
+            + 250.0 * (7.0 * theta).sin() * (r * 30.0).cos()
+            + 120.0 * (p.dot(north) * 40.0).sin()
+    }
+
+    /// The river node direction with the most rivers of at least `min_q` within 150 km.
+    fn densest_rivers(hydro: &EraHydrology, min_q: f32) -> RenderDir {
+        let mut near = Vec::new();
+        let nodes = hydro.rivers.nodes();
+        let best = nodes
+            .iter()
+            .step_by(7)
+            .filter(|n| n.discharge_m3s >= min_q)
+            .map(|n| {
+                hydro.rivers.near(
+                    &hydro.lattice,
+                    hydro.lattice.dir(n.node),
+                    150_000.0,
+                    &mut near,
+                );
+                let count = near
+                    .iter()
+                    .filter(|&&i| nodes[i as usize].discharge_m3s >= min_q)
+                    .count();
+                (count, n.node)
+            })
+            .max()
+            .expect("rivers");
+        hydro.lattice.dir(best.1)
+    }
+
+    fn texel_bits(t: &Texel) -> (u32, u32, [u16; 4]) {
+        (t.h.to_bits(), t.water_level_m.to_bits(), t.river)
+    }
+
+    /// Asserts two regions give the same texels at `probes`; returns how many show a river
+    /// and how many were carved (differ from the same region without a pass).
+    fn assert_texels_agree<F: CoarseField>(
+        ga: &RegionGenerator<F>,
+        gb: &RegionGenerator<F>,
+        bare: &RegionGenerator<F>,
+        probes: &[(FieldKind, RenderDir)],
+    ) -> (usize, usize) {
+        let (mut rivers, mut carved) = (0, 0);
+        for (i, &(kind, p)) in probes.iter().enumerate() {
+            let (a, b) = (ga.sample_texel_in(kind, p), gb.sample_texel_in(kind, p));
+            assert_eq!(texel_bits(&a), texel_bits(&b), "{kind:?} probe {i}");
+            assert_same_surface_but_dryness(a.surface, b.surface);
+            rivers += usize::from(a.river != RIVER_NONE);
+            carved += usize::from(bare.sample_texel_in(kind, p).h != a.h);
+        }
+        (rivers, carved)
+    }
+
+    /// Probes in both regions' squares (of `kind`): every refined sub-point of `ga`'s rivers
+    /// that lies in both, nudged off the centreline, then a grid; `count` in all.
+    fn overlap_probes<F: CoarseField>(
+        ga: &RegionGenerator<F>,
+        gb: &RegionGenerator<F>,
+        kind: FieldKind,
+        count: usize,
+    ) -> Vec<(FieldKind, RenderDir)> {
+        let half = if kind == FieldKind::Inner {
+            REGION_SIZE_M / 2.0
+        } else {
+            APRON_SIZE_M / 2.0
+        } * 0.98;
+        let (fa, fb) = (ga.spec().frame(), gb.spec().frame());
+        let inside = |d: RenderDir| {
+            [fa, fb].iter().all(|f| {
+                f.dir_to_local(d)
+                    .is_some_and(|(x, z)| x.abs() < half && z.abs() < half)
+            })
+        };
+        let mut out: Vec<(FieldKind, RenderDir)> = Vec::new();
+        let rivers = ga.rivers(kind).expect("a pass");
+        let subs: Vec<DVec3> = rivers
+            .subpoints()
+            .iter()
+            .map(|s| s.dir)
+            .filter(|&d| inside(RenderDir(d)))
+            .collect();
+        let step = (subs.len() / (count / 2)).max(1);
+        for (k, d) in subs.iter().step_by(step).enumerate() {
+            let (north, east) = RegionFrame {
+                center: RenderDir(*d),
+            }
+            .north_east();
+            let off = (k % 7) as f64 * 3.0 / EARTH_RADIUS_M;
+            out.push((kind, RenderDir((*d + (east + north) * off).normalize())));
+        }
+        let mut k = 0u32;
+        while out.len() < count && k < 100_000 {
+            // A Weyl sequence over A's square.
+            let (u, v) = (
+                (f64::from(k) * 0.618_033_988_75).fract(),
+                (f64::from(k) * 0.754_877_666_25).fract(),
+            );
+            let d = fa.local_to_dir((2.0 * u - 1.0) * half, (2.0 * v - 1.0) * half);
+            if inside(d) {
+                out.push((kind, d));
+            }
+            k += 1;
+        }
+        out
+    }
+
+    /// Two regions `dist_m` apart either side of `mid`, at the standard resolutions, with the
+    /// pass: 200 inner and 200 apron probes agree by bits, rivers included.
+    fn assert_regions_agree<F: CoarseField>(
+        hydro: &EraHydrology,
+        field: &F,
+        a: RenderDir,
+        b: RenderDir,
+    ) -> (usize, usize, usize) {
+        let spec = |c| spec_at(c, 0.0, 1025, 513);
+        let ga = RegionGenerator::new(spec(a), field, Some(hydro));
+        let gb = RegionGenerator::new(spec(b), field, Some(hydro));
+        let bare = RegionGenerator::new(spec(a), field, None);
+        let mut probes = overlap_probes(&ga, &gb, FieldKind::Inner, 200);
+        let inner_probes = probes.len();
+        probes.extend(overlap_probes(&ga, &gb, FieldKind::Apron, 200));
+        assert_eq!(probes.len(), 400);
+        let (inner_rivers, inner_carved) =
+            assert_texels_agree(&ga, &gb, &bare, &probes[..inner_probes]);
+        let (apron_rivers, _) = assert_texels_agree(&ga, &gb, &bare, &probes[inner_probes..]);
+        // The two regions refine different sets: the agreement is not a shared cache.
+        assert_ne!(
+            ga.rivers(FieldKind::Inner).unwrap().subpoints().len(),
+            gb.rivers(FieldKind::Inner).unwrap().subpoints().len()
+        );
+        (inner_rivers, inner_carved, apron_rivers)
+    }
+
+    #[test]
+    fn rivers_agree_bit_for_bit_where_regions_overlap() {
+        let c0 = DVec3::X;
+        let hydro = pass_over(419, move |d| continent(c0, d));
+        let field = FnField {
+            f: move |d: RenderDir| continent(c0, d),
+            spacing_m: 1852.0,
+            koppen: None,
+        };
+        let a = densest_rivers(&hydro, RIVER_MIN_DISCHARGE_M3S as f32);
+        let b = RegionFrame { center: a }.local_to_dir(100_000.0, 0.0);
+        let (inner_rivers, carved, apron_rivers) = assert_regions_agree(&hydro, &field, a, b);
+        // The hazard: rivers in the overlap, inner and apron, and the terrain carved by them.
+        assert!(inner_rivers > 60, "{inner_rivers} inner river probes");
+        assert!(carved > 60, "{carved} carved probes");
+        assert!(apron_rivers > 20, "{apron_rivers} apron river probes");
+    }
+
+    /// Rivers along great circles `local z = z_i` of `frame`, west to east over ±150 km: chains
+    /// of the lattice's nearest nodes (consecutive nodes are lattice steps), discharge `q`, on a
+    /// gentle bed, each in a V valley. Returns the pass and the terrain.
+    fn rivers_along(
+        lattice: CubeLattice,
+        frame: RegionFrame,
+        lines_z: &[f64],
+        q: f32,
+    ) -> (EraHydrology, impl Fn(RenderDir) -> f64 + Sync + Copy) {
+        let basis = frame.basis();
+        let bed = |x: f64| 500.0 - 1e-4 * x;
+        let chains: Vec<RiverChain> = lines_z
+            .iter()
+            .map(|&z| {
+                let mut nodes: Vec<u32> = Vec::new();
+                for k in 0..=300 {
+                    let v =
+                        lattice.nearest(basis.local_to_dir(-150_000.0 + 1000.0 * f64::from(k), z));
+                    if nodes.last() != Some(&v) {
+                        nodes.push(v);
+                    }
+                }
+                let mouth = nodes.pop().expect("nodes");
+                RiverChain {
+                    q: vec![q; nodes.len()],
+                    bed: nodes
+                        .iter()
+                        .map(|&v| {
+                            let (x, _) = basis.dir_to_local(lattice.dir(v)).expect("near");
+                            bed(x) as f32
+                        })
+                        .collect(),
+                    nodes,
+                    end: Down::Ocean(mouth),
+                }
+            })
+            .collect();
+        let hydro = river_hydro(lattice, &chains, vec![]);
+        let (zs, n) = ([lines_z[0], *lines_z.last().expect("lines")], lines_z.len());
+        let floor = move |d: RenderDir| {
+            let (x, z) = basis.dir_to_local(d).unwrap_or((0.0, 0.0));
+            let dist = if n == 1 {
+                (z - zs[0]).abs()
+            } else {
+                (z - zs[0]).abs().min((z - zs[1]).abs())
+            };
+            bed(x) + 5.0 + 0.05 * dist
+        };
+        (hydro, floor)
+    }
+
+    /// Review Focus 3: two regions straddling the cube corner at 35.26° N, 45° E agree, rivers
+    /// included, and the rivers in the overlap cross the face seams.
+    #[test]
+    fn rivers_agree_bit_for_bit_at_a_cube_corner() {
+        let corner = dir(35.26439, 45.0);
+        assert!(corner.0.abs_diff_eq(DVec3::ONE.normalize(), 1e-6));
+        let frame = RegionFrame { center: corner };
+        // Two meandering rivers (w = 274 m) on the recent lattice: one 8 km south of the corner,
+        // crossing the PosZ/PosX edge; one 20 km north, crossing into PosY and out.
+        let (hydro, floor) =
+            rivers_along(CubeLattice { n: 900 }, frame, &[8_000.0, -20_000.0], 3000.0);
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        // South-west and south-east of the corner: either side of the PosX/PosZ edge, which
+        // runs due south from it.
+        let (a, b) = (
+            frame.local_to_dir(-50_000.0, 30_000.0),
+            frame.local_to_dir(50_000.0, 30_000.0),
+        );
+        // The cube face: the axis and sign of the largest component.
+        let face = |d: RenderDir| {
+            let v = d.0.to_array();
+            let k = (0..3)
+                .max_by(|&i, &j| v[i].abs().total_cmp(&v[j].abs()))
+                .expect("three axes");
+            (k, v[k] > 0.0)
+        };
+        assert_ne!(face(a), face(b), "the centres lie on different faces");
+        let (inner_rivers, carved, apron_rivers) = assert_regions_agree(&hydro, &field, a, b);
+        assert!(inner_rivers > 60, "{inner_rivers} inner river probes");
+        assert!(carved > 60, "{carved} carved probes");
+        assert!(apron_rivers > 20, "{apron_rivers} apron river probes");
+        // The refined rivers near the corner lie on all three faces, and meander.
+        let ga = RegionGenerator::new(spec_at(a, 0.0, 1025, 513), &field, Some(&hydro));
+        let near: Vec<DVec3> = ga
+            .rivers(FieldKind::Inner)
+            .unwrap()
+            .subpoints()
+            .iter()
+            .map(|s| s.dir)
+            .filter(|d| d.angle_between(corner.0) * EARTH_RADIUS_M < 100_000.0)
+            .collect();
+        let faces: std::collections::BTreeSet<(usize, bool)> =
+            near.iter().map(|&d| face(RenderDir(d))).collect();
+        assert_eq!(faces.len(), 3, "faces {faces:?}");
+        let off_line = near
+            .iter()
+            .filter_map(|&d| frame.dir_to_local(RenderDir(d)))
+            .filter(|&(_, z)| (z - 8_000.0).abs().min((z + 20_000.0).abs()) > 100.0)
+            .count();
+        assert!(
+            off_line > 50,
+            "{off_line} sub-points meander off the valley axes"
+        );
+    }
+
+    /// The continent's pass and a dense region at `inner`/`apron` resolution.
+    fn continent_region(
+        inner: u32,
+        apron: u32,
+    ) -> (
+        EraHydrology,
+        RegionSpec,
+        impl Fn(RenderDir) -> f64 + Sync + Copy,
+    ) {
+        let c0 = DVec3::X;
+        let f = move |d: RenderDir| continent(c0, d);
+        let hydro = pass_over(419, f);
+        let centre = densest_rivers(&hydro, RIVER_MIN_DISCHARGE_M3S as f32);
+        (hydro, spec_at(centre, 0.0, inner, apron), f)
+    }
+
+    #[test]
+    fn grid_texels_equal_sample_texel_at_their_directions() {
+        let (hydro, spec, f) = continent_region(129, 65);
+        let field = FnField {
+            f,
+            spacing_m: 1852.0,
+            koppen: None,
+        };
+        let g = RegionGenerator::new(spec, &field, Some(&hydro));
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let frame = spec.frame();
+        let mut rivers = 0;
+        for (kind, f) in [
+            (FieldKind::Inner, &grid.inner),
+            (FieldKind::Apron, &grid.apron),
+        ] {
+            for row in 0..f.res {
+                for col in 0..f.res {
+                    let (x, z) = f.local_of(row, col);
+                    let i = (row * f.res + col) as usize;
+                    let t = g.sample_texel_in(kind, frame.local_to_dir(x, z));
+                    assert_eq!(f.elevation_m[i].to_bits(), t.h.to_bits());
+                    assert_eq!(f.surface[i], t.surface);
+                    assert_eq!(f.water_level_m[i].to_bits(), t.water_level_m.to_bits());
+                    assert_eq!(f.river[i], t.river);
+                    rivers += usize::from(t.river != RIVER_NONE);
+                }
+            }
+        }
+        assert!(rivers > 100, "{rivers} river texels");
+        assert_eq!(grid.boulders, g.boulders());
+    }
+
+    /// Walks every refined centreline in the inner field (away from the apron blend)
+    /// downstream at 50 m steps. The water rule evaluated at the centreline
+    /// (`sample_texel_in`) never rises. The grid's bilinear read (`blended_water`) never rises
+    /// by more than 1e-3 m on straight reaches; within two texels of a vertex where the
+    /// centreline turns by more than 5°, it can, by up to the level's fall over a few texels:
+    /// texels on either side of the bend take the level of different legs. The bound there is
+    /// `1e-3 + 4 × texel × slope`, `slope` the steeper of the two sub-segments' level slopes.
+    #[test]
+    fn water_never_flows_uphill_along_a_refined_centreline() {
+        let (hydro, f) = valley_tree();
+        let field = FnField {
+            f,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let spec = spec_at(LAT.dir(eq(410)), 0.0, 1025, 513);
+        let g = RegionGenerator::new(spec, &field, Some(&hydro));
+        let rivers: &RegionRivers = g.rivers(FieldKind::Inner).unwrap();
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let basis = spec.frame().basis();
+        let texel = grid.inner.spacing_m();
+        let inner_only = REGION_SIZE_M / 2.0 - 4.0 * grid.apron.spacing_m() - texel;
+        // Sub-segments by segment, in flow order.
+        let mut segments: Vec<Vec<(DVec3, DVec3, f32, f32)>> = Vec::new();
+        let mut last_river = None;
+        for (a, b) in rivers.sub_segments() {
+            if last_river != Some(a.river) {
+                segments.push(Vec::new());
+                last_river = Some(a.river);
+            }
+            segments
+                .last_mut()
+                .expect("pushed")
+                .push((a.dir, b.dir, a.level_m, b.level_m));
+        }
+        let metres = |p: DVec3, q: DVec3| p.angle_between(q) * EARTH_RADIUS_M;
+        let turn = |p: DVec3, q: DVec3, r: DVec3| {
+            let t0 = (q - p) - q * q.dot(q - p);
+            let t1 = (r - q) - q * q.dot(r - q);
+            t0.angle_between(t1).to_degrees()
+        };
+        let slope = |s: &(DVec3, DVec3, f32, f32)| f64::from(s.2 - s.3) / metres(s.0, s.1).max(1.0);
+        let (mut point_steps, mut straight, mut bends) = (0usize, 0usize, 0usize);
+        let (mut worst_straight, mut worst_bend) = (f32::NEG_INFINITY, f64::NEG_INFINITY);
+        for seg in &segments {
+            let mut last: Option<(f32, f32)> = None;
+            for (j, sub) in seg.iter().enumerate() {
+                let (a, b) = (sub.0, sub.1);
+                let n = (metres(a, b) / 50.0).ceil().max(1.0) as u32;
+                // A bend at either end: its turn, and the steeper slope beside it. A segment's
+                // ends are bends (the next segment is not at hand).
+                let start =
+                    (j > 0).then(|| (turn(seg[j - 1].0, a, b), slope(&seg[j - 1]).max(slope(sub))));
+                let end = seg
+                    .get(j + 1)
+                    .map(|nx| (turn(a, b, nx.1), slope(sub).max(slope(nx))));
+                for i in 0..n {
+                    let p = chord_point(a, b, f64::from(i) / f64::from(n));
+                    let Some((x, z)) = basis.dir_to_local(RenderDir(p)) else {
+                        continue;
+                    };
+                    if x.abs() > inner_only || z.abs() > inner_only {
+                        last = None;
+                        continue;
+                    }
+                    let point = g
+                        .sample_texel_in(FieldKind::Inner, RenderDir(p))
+                        .water_level_m;
+                    let read = blended_water(&grid, x, z).level_m;
+                    let near = |v: DVec3, bend: Option<(f64, f64)>| {
+                        let s =
+                            bend.map_or(f64::INFINITY, |(deg, s)| if deg > 5.0 { s } else { -1.0 });
+                        (metres(p, v) < 2.0 * texel).then_some(s)
+                    };
+                    let bend_slope = [near(a, start), near(b, end)]
+                        .into_iter()
+                        .flatten()
+                        .fold(-1.0f64, f64::max);
+                    if let Some((point_before, read_before)) = last {
+                        assert!(
+                            point <= point_before,
+                            "the rule rises: {point_before} -> {point} at ({x:.0}, {z:.0})"
+                        );
+                        point_steps += 1;
+                        let rise = read - read_before;
+                        if bend_slope < 0.0 {
+                            worst_straight = worst_straight.max(rise);
+                            assert!(rise <= 1e-3, "{read_before} -> {read} at ({x:.0}, {z:.0})");
+                            straight += 1;
+                        } else {
+                            let bound = 1e-3 + 4.0 * texel * bend_slope.min(1.0);
+                            worst_bend = worst_bend.max(f64::from(rise) / bound);
+                            assert!(
+                                f64::from(rise) <= bound,
+                                "{read_before} -> {read} at ({x:.0}, {z:.0}), bound {bound}"
+                            );
+                            bends += 1;
+                        }
+                    }
+                    last = Some((point, read));
+                }
+            }
+        }
+        println!(
+            "{point_steps} steps: {straight} straight (worst rise {worst_straight} m), {bends} near \
+             bends (worst {worst_bend:.2} of the bound)"
+        );
+        assert!(
+            straight > 2000 && bends > 2000,
+            "{straight} straight, {bends} bends"
+        );
+    }
+
+    // ---- A sub-texel river: a hand-made chain on Task 5's n = 819 equator row. ----
+
+    const N: u32 = 819;
+    const ROW: u32 = 409;
+    const LAT: CubeLattice = CubeLattice { n: N };
+
+    fn eq(col: u32) -> u32 {
+        LAT.node(CubeFace::PosX, col, ROW)
+    }
+
+    /// Metres east along the equator from the PosX face centre (east is render −Z there).
+    fn along_m(d: DVec3) -> f64 {
+        (-d.z).atan2(d.x) * EARTH_RADIUS_M
+    }
+
+    fn north_m(d: DVec3) -> f64 {
+        d.y.clamp(-1.0, 1.0).asin() * EARTH_RADIUS_M
+    }
+
+    /// A river east along the equator row from column 380 to 440, of discharge `q`, on a bed
+    /// `bed(along)`, in a V valley `wall` steep around it.
+    fn equator_river(
+        q: f32,
+        bed: fn(f64) -> f64,
+        wall: f64,
+    ) -> (EraHydrology, impl Fn(RenderDir) -> f64 + Sync + Copy) {
+        let cols: Vec<u32> = (380..=440).collect();
+        let hydro = river_hydro(
+            LAT,
+            &[RiverChain {
+                nodes: cols.iter().map(|&c| eq(c)).collect(),
+                q: vec![q; cols.len()],
+                bed: cols
+                    .iter()
+                    .map(|&c| bed(along_m(LAT.dir(eq(c)).0)) as f32)
+                    .collect(),
+                end: Down::Ocean(eq(441)),
+            }],
+            vec![],
+        );
+        let floor = move |d: RenderDir| bed(along_m(d.0)) + 5.0 + wall * north_m(d.0).abs();
+        (hydro, floor)
+    }
+
+    fn gentle_bed(a: f64) -> f64 {
+        800.0 - 1e-3 * a
+    }
+
+    /// Task 5's tree in valleys of its own: a meandering main river east along the equator
+    /// row (columns 380-440, Q 2,000-3,300, slope 1e-4), a tributary joining at column 400
+    /// from row 395 and one at column 420 from row 424 (40 m per node), each in a V valley,
+    /// so the relaxation keeps every river on its valley axis.
+    fn valley_tree() -> (EraHydrology, impl Fn(RenderDir) -> f64 + Sync + Copy) {
+        let main_bed = |a: f64| 2000.0 - 1e-4 * (a - along_m(LAT.dir(eq(380)).0));
+        let cols: Vec<u32> = (380..=440).collect();
+        let main = RiverChain {
+            nodes: cols.iter().map(|&c| eq(c)).collect(),
+            q: cols
+                .iter()
+                .map(|&c| {
+                    2000.0 + if c >= 400 { 900.0 } else { 0.0 } + if c >= 420 { 400.0 } else { 0.0 }
+                })
+                .collect(),
+            bed: cols
+                .iter()
+                .map(|&c| main_bed(along_m(LAT.dir(eq(c)).0)) as f32)
+                .collect(),
+            end: Down::Ocean(eq(441)),
+        };
+        let per_m = 40.0 / LAT.mean_spacing_m();
+        let trib = |col: u32, from_row: u32, step: usize, count: u32, q: f32| {
+            let nodes = lattice_walk(&LAT, LAT.node(CubeFace::PosX, col, from_row), step, count);
+            let at = main_bed(along_m(LAT.dir(eq(col)).0));
+            RiverChain {
+                q: vec![q; nodes.len()],
+                bed: nodes
+                    .iter()
+                    .map(|&v| (at + per_m * north_m(LAT.dir(v).0).abs()) as f32)
+                    .collect(),
+                nodes,
+                end: Down::River(eq(col)),
+            }
+        };
+        let (ta, tb) = (trib(400, 395, 6, 13, 900.0), trib(420, 424, 2, 14, 400.0));
+        let side = |c: &RiverChain| north_m(LAT.dir(c.nodes[0]).0).signum();
+        let tribs = [
+            (along_m(LAT.dir(eq(400)).0), side(&ta)),
+            (along_m(LAT.dir(eq(420)).0), side(&tb)),
+        ];
+        let hydro = river_hydro(LAT, &[main, ta, tb], vec![]);
+        let floor = move |d: RenderDir| {
+            let (a, n) = (along_m(d.0), north_m(d.0));
+            let mut f = main_bed(a) + 5.0 + 0.05 * n.abs();
+            for (ac, s) in tribs {
+                if n * s > 0.0 {
+                    f = f.min(main_bed(ac) + per_m * n.abs() + 5.0 + 0.05 * (a - ac).abs());
+                }
+            }
+            f
+        };
+        (hydro, floor)
+    }
+
+    #[test]
+    fn a_sub_texel_river_is_drawn_by_its_ribbon() {
+        let (hydro, floor) = equator_river(20.0, gentle_bed, 0.05);
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        // 586 m texels; the river runs 200 m north of a texel row, between rows.
+        let centre = RegionFrame {
+            center: LAT.dir(eq(410)),
+        }
+        .local_to_dir(0.0, 200.0);
+        let spec = spec_at(centre, 0.0, 513, 513);
+        let g = RegionGenerator::new(spec, &field, Some(&hydro));
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let rivers = g.rivers(FieldKind::Inner).unwrap();
+        let w = 2.0 * rivers.subpoints()[0].half_width_m;
+        assert!((w - 22.36).abs() < 0.01, "w {w}");
+        let basis = spec.frame().basis();
+        let texel = grid.inner.spacing_m();
+        let (mut inside, mut checked) = (0, 0);
+        for k in 0..40 {
+            // Cross-sections along the river, at sub-point and in-between positions.
+            let x0 = -100_000.0 + 5_123.0 * f64::from(k);
+            for i in -120..=120 {
+                let z = -200.0 + 0.5 * f64::from(i);
+                let p = basis.local_to_dir(x0, z);
+                // The exact distance to the centreline, from the point query.
+                let exact = rivers
+                    .texel(p, 1000.0, texel)
+                    .hit
+                    .expect("in the valley")
+                    .offset_m
+                    .abs();
+                let s = blended_water(&grid, x0, z);
+                checked += 1;
+                if s.ribbon_m > 0.0 {
+                    inside += 1;
+                    assert!(
+                        exact <= w / 2.0 + 0.25,
+                        "ribbon {} at {exact} m from the centre",
+                        s.ribbon_m
+                    );
+                    assert!(s.thickness_m > 0.0, "water over the channel: {s:?}");
+                }
+                if exact < w / 2.0 - 0.25 {
+                    assert!(s.ribbon_m > 0.0, "drawn at {exact} m: {s:?}");
+                }
+            }
+            // The hazard: the texels either side hold negative ribbons, so interpolating the
+            // ribbon itself would draw nothing.
+            let (u, v) = (
+                ((x0 + REGION_SIZE_M / 2.0) / texel).floor() as usize,
+                ((-200.0 + REGION_SIZE_M / 2.0) / texel).floor() as usize,
+            );
+            let n = grid.inner.res as usize;
+            for (r, c) in [(v, u), (v, u + 1), (v + 1, u), (v + 1, u + 1)] {
+                let [ribbon, ..] = decode_river(grid.inner.river[r * n + c]);
+                assert!(ribbon < 0.0, "texel ({r}, {c}) ribbon {ribbon}");
+            }
+        }
+        assert!(
+            inside > 40 * 30 && checked == 40 * 241,
+            "{inside} of {checked}"
+        );
+    }
+
+    #[test]
+    fn an_inland_basin_below_sea_level_is_not_sea() {
+        // A -28 m bowl 40 km across in the dry subtropics (22° N) on a 500 m dome 1,900 km in
+        // radius, over 1,100 km from the ocean: a terminal basin (a wet climate would fill it to
+        // its rim, where the sea's level could not show anyway).
+        let c0 = dir(22.0, 30.0).0;
+        let bowl = RegionFrame {
+            center: RenderDir(c0),
+        }
+        .local_to_dir(600_000.0, 0.0);
+        let land = move |d: RenderDir| {
+            let base = 500.0 * (1.0 - d.0.angle_between(c0) / 0.3);
+            let r = d.0.angle_between(bowl.0) * EARTH_RADIUS_M;
+            let t = ((r - 20_000.0) / 40_000.0).clamp(0.0, 1.0);
+            -28.0 * (1.0 - t) + base * t
+        };
+        let hydro = pass_over(419, land);
+        let field = FnField {
+            f: land,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let spec = spec_at(bowl, 0.0, 129, 513);
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let bare = RegionGenerator::new(spec, &field, None).finish();
+        let lakes: Vec<f32> = hydro.lakes.iter().map(|l| l.level_m).collect();
+        let (mut below, mut lake, mut dry) = (0, 0, 0);
+        for i in 0..grid.inner.elevation_m.len() {
+            let level = grid.inner.water_level_m[i];
+            let h = grid.inner.elevation_m[i];
+            assert_ne!(level, 0.0, "texel {i} is sea at h {h}");
+            assert!(
+                lakes.contains(&level)
+                    || level == h - NO_WATER_DROP_M as f32
+                    || grid.inner.river[i] != RIVER_NONE,
+                "texel {i}: level {level} at h {h}"
+            );
+            // The hazard: without the pass, these texels are sea.
+            if bare.inner.water_level_m[i] == 0.0 {
+                below += 1;
+                lake += usize::from(lakes.contains(&level));
+                dry += usize::from(level == h - NO_WATER_DROP_M as f32);
+            }
+        }
+        println!("{below} texels under the bowl's corners: {lake} lake, {dry} dry");
+        assert!(below > 50, "{below} texels under the bowl's corners");
+        // The bowl is not filled to its rim, where the sea's level could not show anyway.
+        assert!(
+            lakes.iter().all(|&l| l < 0.0) || dry > 0,
+            "the basin must be dry or below sea level: lakes {lakes:?}"
+        );
+    }
+
+    #[test]
+    fn the_sea_band_covers_every_shoreline() {
+        // An east-west coast along the equator at the PosX face centre (land north), with
+        // bays and headlands 10-20 km across reaching 25 km in, on a 66 km lattice: much of
+        // the shoreline is water in cells whose four lattice taps are land.
+        let coast = RenderDir(DVec3::X);
+        let lattice = CubeLattice { n: 150 };
+        // The mean coast 8 km south of a row of lattice nodes, so bays reach past that row
+        // into cells whose four taps are land.
+        let row_m = north_m(lattice.dir(lattice.nearest(coast)).0);
+        let shore = move |d: RenderDir| {
+            let east = along_m(d.0);
+            let wobble = 16_000.0 * (east / 4_000.0).sin() + 9_000.0 * (east / 1_700.0 + 1.0).sin();
+            // Metres north of the coastline, lightly sloped.
+            let north = north_m(d.0) - (row_m - 8_000.0) - wobble;
+            if north > 0.0 {
+                0.004 * north + 2.0
+            } else {
+                0.01 * north - 2.0
+            }
+        };
+        let hydro = pass_over(lattice.n, shore);
+        let field = FnField {
+            f: shore,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let spec = spec_at(coast, 0.0, 257, 33);
+        let g = RegionGenerator::new(spec, &field, Some(&hydro));
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let frame = spec.frame();
+        let f = &grid.inner;
+        let (mut mixed, mut sub_cell) = (0, 0);
+        for row in 0..f.res {
+            for col in 0..f.res {
+                let (x, z) = f.local_of(row, col);
+                let d = frame.local_to_dir(x, z);
+                let (_, c) = g.coarse_and_corners(FieldKind::Inner, d);
+                if c.iter().all(|&v| v < 0.0) || c.iter().all(|&v| v > 0.0) {
+                    continue;
+                }
+                let i = (row * f.res + col) as usize;
+                let (h, level) = (f.elevation_m[i], f.water_level_m[i]);
+                mixed += 1;
+                // Under sea level, water stands over the ground; above it, only a river or a
+                // lake may (sign(level − h) == sign(−h) for the sea and dry land).
+                if h < 0.0 {
+                    assert!(level > h, "({row}, {col}): h {h}, level {level}");
+                } else if f.river[i] == RIVER_NONE && level != 0.0 {
+                    assert!(level < h, "({row}, {col}): h {h}, level {level}");
+                } else if f.river[i] == RIVER_NONE {
+                    assert_eq!(
+                        (level - h).signum(),
+                        (-h).signum(),
+                        "({row}, {col}): h {h}, sea"
+                    );
+                }
+                if h < 0.0 && !hydro.ocean_tap(d) {
+                    sub_cell += 1;
+                }
+            }
+        }
+        // The hazard: shoreline water the lattice's four taps call land.
+        assert!(
+            mixed > 500 && sub_cell >= 10,
+            "{mixed} mixed, {sub_cell} sub-cell"
+        );
+    }
+
+    /// 2% beds: rapids along the whole river.
+    fn steep_bed(a: f64) -> f64 {
+        3000.0 - 0.02 * a
+    }
+
+    #[test]
+    fn boulders_lie_in_rapids_and_agree_across_regions() {
+        let (hydro, floor) = equator_river(150.0, steep_bed, 0.05);
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let a = LAT.dir(eq(405));
+        let b = RegionFrame { center: a }.local_to_dir(100_000.0, 0.0);
+        let ga = RegionGenerator::new(spec_at(a, 0.0, 1025, 33), &field, Some(&hydro));
+        let gb = RegionGenerator::new(spec_at(b, 0.0, 1025, 33), &field, Some(&hydro));
+        let half = REGION_SIZE_M / 2.0;
+        for g in [&ga, &gb] {
+            let rivers = g.rivers(FieldKind::Inner).unwrap();
+            let texel = REGION_SIZE_M / 1024.0;
+            assert!(g.boulders().len() > 500, "{} boulders", g.boulders().len());
+            for bo in g.boulders() {
+                let hit = rivers
+                    .texel(RenderDir(bo.dir), 5000.0, texel)
+                    .hit
+                    .expect("in a valley");
+                assert!(
+                    hit.ribbon_m >= bo.radius_m - 1e-3,
+                    "in the channel: {hit:?} {bo:?}"
+                );
+                let rapid = rivers.subpoints().iter().any(|s| {
+                    s.rapid > 0.0
+                        && s.dir.angle_between(bo.dir) * EARTH_RADIUS_M
+                            <= SUBPOINT_M + f64::from(s.half_width_m)
+                });
+                assert!(rapid, "{bo:?} near a rapid");
+                let t = g.sample_texel_in(FieldKind::Inner, RenderDir(bo.dir));
+                assert_eq!(bo.base_m.to_bits(), t.h.to_bits(), "on the channel bed");
+                assert!((0.0..=1.0).contains(&bo.wet));
+                assert!(bo.base_m < t.water_level_m, "under the river: {bo:?} {t:?}");
+            }
+        }
+        let in_square = |g: &RegionGenerator<_>, d: DVec3| {
+            g.spec()
+                .frame()
+                .dir_to_local(RenderDir(d))
+                .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
+        };
+        let key = |bo: &Boulder| (bo.seed, bo.dir.to_array().map(f64::to_bits));
+        let shared = |g: &RegionGenerator<_>, other: &RegionGenerator<_>| {
+            let mut v: Vec<Boulder> = g
+                .boulders()
+                .iter()
+                .copied()
+                .filter(|bo| in_square(other, bo.dir))
+                .collect();
+            v.sort_by_key(key);
+            v
+        };
+        let (sa, sb) = (shared(&ga, &gb), shared(&gb, &ga));
+        assert!(sa.len() > 300, "{} shared boulders", sa.len());
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(&sb) {
+            assert_eq!(
+                x.dir.to_array().map(f64::to_bits),
+                y.dir.to_array().map(f64::to_bits)
+            );
+            assert_eq!(
+                (
+                    x.base_m.to_bits(),
+                    x.radius_m.to_bits(),
+                    x.seed,
+                    x.wet.to_bits()
+                ),
+                (
+                    y.base_m.to_bits(),
+                    y.radius_m.to_bits(),
+                    y.seed,
+                    y.wet.to_bits()
+                )
+            );
+        }
+        assert!(
+            ga.boulders().len() > sa.len(),
+            "the sets differ outside the overlap"
+        );
+    }
+
+    /// Every stored quantity's bits, boulders included.
+    type AllBits = (GridBits, Vec<u32>, Vec<[u16; 4]>, Vec<u32>, Vec<Boulder>);
+
+    fn all_bits(grid: &RegionGrid) -> AllBits {
+        let levels = grid
+            .inner
+            .water_level_m
+            .iter()
+            .chain(&grid.apron.water_level_m)
+            .map(|x| x.to_bits())
+            .collect();
+        let rivers = grid
+            .inner
+            .river
+            .iter()
+            .chain(&grid.apron.river)
+            .copied()
+            .collect();
+        let boulder_bits = grid
+            .boulders
+            .iter()
+            .flat_map(|b| {
+                [
+                    b.base_m.to_bits(),
+                    b.radius_m.to_bits(),
+                    b.seed,
+                    b.wet.to_bits(),
+                ]
+            })
+            .collect();
+        (
+            bits(grid),
+            levels,
+            rivers,
+            boulder_bits,
+            grid.boulders.clone(),
+        )
+    }
+
+    #[test]
+    fn prep_in_steps_matches_new_with_a_pass() {
+        let (hydro, floor) = equator_river(150.0, steep_bed, 0.05);
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let spec = spec_at(LAT.dir(eq(405)), 0.0, 65, 17);
+        let whole = all_bits(&RegionGenerator::new(spec, &field, Some(&hydro)).finish());
+        assert!(!whole.4.is_empty(), "boulders");
+        assert!(whole.2.iter().any(|&r| r != RIVER_NONE), "river texels");
+        for max_nodes in [1, 97, 4096, u32::MAX] {
+            let mut prep = RegionPrep::new(spec, &field, Some(&hydro));
+            let mut steps = 0u64;
+            loop {
+                let before = prep.units_done();
+                let done = prep.step(max_nodes);
+                steps += 1;
+                assert!(prep.units_done() - before <= u64::from(max_nodes));
+                if done {
+                    break;
+                }
+            }
+            assert!(prep.step(max_nodes), "stays done");
+            assert_eq!(
+                all_bits(&prep.finish().finish()),
+                whole,
+                "steps of {max_nodes} ({steps} steps)"
+            );
+        }
+        let mut prep = RegionPrep::new(spec, &field, Some(&hydro));
+        prep.step(5000);
+        assert_eq!(all_bits(&prep.finish().finish()), whole);
+    }
+
+    #[test]
+    fn rows_carry_the_water_fields_in_any_order() {
+        let (hydro, floor) = equator_river(150.0, steep_bed, 0.05);
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let spec = spec_at(LAT.dir(eq(405)), 0.0, 65, 17);
+        let g = RegionGenerator::new(spec, &field, Some(&hydro));
+        let whole = all_bits(&RegionGenerator::new(spec, &field, Some(&hydro)).finish());
+        let late = g.rows(FieldKind::Inner, 40..65);
+        let early = g.rows(FieldKind::Inner, 0..40);
+        let apron = vec![
+            g.rows(FieldKind::Apron, 0..9),
+            g.rows(FieldKind::Apron, 9..17),
+        ];
+        assert_eq!(all_bits(&g.assemble(vec![early, late], apron)), whole);
+    }
+
+    /// Counts the field's samples, delegating everything.
+    struct Counting<'f, F: CoarseField> {
+        inner: &'f F,
+        tiles: std::sync::atomic::AtomicU64,
+        overview: std::sync::atomic::AtomicU64,
+    }
+
+    impl<'f, F: CoarseField> Counting<'f, F> {
+        fn new(inner: &'f F) -> Self {
+            Counting {
+                inner,
+                tiles: Default::default(),
+                overview: Default::default(),
+            }
+        }
+
+        fn counts(&self) -> (u64, u64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.tiles.load(Relaxed), self.overview.load(Relaxed))
+        }
+    }
+
+    impl<F: CoarseField> CoarseField for Counting<'_, F> {
+        fn sample(&self, d: RenderDir) -> crate::worldgen::coarse::CoarseSample {
+            self.tiles
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.sample(d)
+        }
+
+        fn sample_overview(&self, d: RenderDir) -> crate::worldgen::coarse::CoarseSample {
+            self.overview
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.sample_overview(d)
+        }
+
+        fn source_spacing_m(&self) -> f64 {
+            self.inner.source_spacing_m()
+        }
+
+        fn paleolat(&self, d: RenderDir) -> f64 {
+            self.inner.paleolat(d)
+        }
+
+        fn lattice_key(
+            &self,
+            d: RenderDir,
+            nearest: crate::worldgen::coarse::KeyKind,
+        ) -> crate::worldgen::coarse::LatticeKey {
+            self.inner.lattice_key(d, nearest)
+        }
+    }
+
+    /// Rows of both fields across `threads` scoped threads in 16-row blocks (as
+    /// `generate_parallel` does on the task pool); seconds.
+    fn rows_parallel<F: CoarseField>(g: &RegionGenerator<F>, threads: usize) -> f64 {
+        let t = std::time::Instant::now();
+        let mut blocks: Vec<(FieldKind, std::ops::Range<u32>)> = Vec::new();
+        for kind in [FieldKind::Inner, FieldKind::Apron] {
+            let rows = g.rows_in(kind);
+            for b in 0..rows.div_ceil(16) {
+                blocks.push((kind, b * 16..((b + 1) * 16).min(rows)));
+            }
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((kind, range)) = blocks.get(i).cloned() else {
+                            break;
+                        };
+                        std::hint::black_box(g.rows(kind, range));
+                    }
+                });
+            }
+        });
+        t.elapsed().as_secs_f64()
+    }
+
+    /// The generation time and memory rivers add on Task 5's river-dense region (the wet
+    /// continent at n = 900, the densest 300 km square). Run with
+    /// `cargo test --release -p timefly_core --lib water_generation_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing; run in release"]
+    fn water_generation_timing() {
+        use crate::hydrology::params::HYDRO_RECENT_N;
+        use crate::worldgen::generate::rivers::river_read_reach_m;
+        use std::time::Instant;
+        let c0 = DVec3::X;
+        let f = move |d: RenderDir| {
+            continent(c0, d) + 40.0 * (d.0.y * 3000.0).sin() * (d.0.z * 2100.0).cos()
+        };
+        let t = Instant::now();
+        let hydro = pass_over(HYDRO_RECENT_N, f);
+        println!(
+            "pass {:.2} s, {} river nodes",
+            t.elapsed().as_secs_f64(),
+            hydro.rivers.nodes().len()
+        );
+        let centre = densest_rivers(&hydro, RIVER_MIN_DISCHARGE_M3S as f32);
+        let base = FnField {
+            f,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let spec = spec_at(centre, 0.0, 1025, 513);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for run in 0..2 {
+            println!("--- run {run}");
+            let mut rows_single = [0.0; 2];
+            let mut rows_par = [0.0; 2];
+            let mut prep_s = [0.0; 2];
+            let mut samples = [(0u64, 0u64); 2];
+            let mut bytes = [0usize; 2];
+            for (k, hydro) in [None, Some(&hydro)].into_iter().enumerate() {
+                let field = Counting::new(&base);
+                let t = Instant::now();
+                let g = RegionGenerator::new(spec, &field, hydro);
+                prep_s[k] = t.elapsed().as_secs_f64();
+                samples[k] = field.counts();
+                let t = Instant::now();
+                let inner = g.rows(FieldKind::Inner, 0..1025);
+                let apron = g.rows(FieldKind::Apron, 0..513);
+                rows_single[k] = t.elapsed().as_secs_f64();
+                rows_par[k] = rows_parallel(&g, threads);
+                let grid = g.assemble(vec![inner], vec![apron]);
+                bytes[k] = grid.bytes();
+                if let Some(h) = hydro {
+                    let (ri, ra) = (
+                        g.rivers(FieldKind::Inner).unwrap(),
+                        g.rivers(FieldKind::Apron).unwrap(),
+                    );
+                    let river_texels = grid
+                        .inner
+                        .river
+                        .iter()
+                        .filter(|&&r| r != RIVER_NONE)
+                        .count();
+                    let apron_river = grid
+                        .apron
+                        .river
+                        .iter()
+                        .filter(|&&r| r != RIVER_NONE)
+                        .count();
+                    println!(
+                        "rivers: inner {} sub-points ({:.1} MiB), apron {} sub-points ({:.1} MiB); \
+                         {} boulders ({} dropped); river texels inner {river_texels}, apron {apron_river}; \
+                         working bytes {:.1} MiB; pass {:.1} MiB",
+                        ri.subpoints().len(),
+                        ri.bytes() as f64 / 1048576.0,
+                        ra.subpoints().len(),
+                        ra.bytes() as f64 / 1048576.0,
+                        grid.boulders.len(),
+                        g.boulders_dropped(),
+                        g.working_bytes() as f64 / 1048576.0,
+                        h.bytes() as f64 / 1048576.0,
+                    );
+                }
+            }
+            println!(
+                "prep: {:.1} ms -> {:.1} ms (+{:.1}); rows single-threaded {:.1} -> {:.1} ms (+{:.1}); \
+                 rows on {threads} threads {:.1} -> {:.1} ms (+{:.1})",
+                prep_s[0] * 1e3,
+                prep_s[1] * 1e3,
+                (prep_s[1] - prep_s[0]) * 1e3,
+                rows_single[0] * 1e3,
+                rows_single[1] * 1e3,
+                (rows_single[1] - rows_single[0]) * 1e3,
+                rows_par[0] * 1e3,
+                rows_par[1] * 1e3,
+                (rows_par[1] - rows_par[0]) * 1e3,
+            );
+            println!(
+                "field samples (tiles, overview): {:?} -> {:?}: on demand +{} tile-level, +{} overview-level",
+                samples[0],
+                samples[1],
+                samples[1].0 - samples[0].0,
+                samples[1].1 - samples[0].1
+            );
+            println!(
+                "RegionGrid::bytes {} -> {} ({:.2} -> {:.2} MiB)",
+                bytes[0],
+                bytes[1],
+                bytes[0] as f64 / 1048576.0,
+                bytes[1] as f64 / 1048576.0
+            );
+        }
+        // The web: RegionPrep stepped at WEB_PREP_STEP (256) units; the slowest step with rivers.
+        for budget in [64u32, 256, 1024] {
+            for (label, h) in [("no pass", None), ("pass", Some(&hydro))] {
+                let mut prep = RegionPrep::new(spec, &base, h);
+                let (mut worst, mut steps, mut total) = (0.0f64, 0u32, 0.0f64);
+                loop {
+                    let t = Instant::now();
+                    let done = prep.step(budget);
+                    let dt = t.elapsed().as_secs_f64();
+                    total += dt;
+                    steps += 1;
+                    if done {
+                        break;
+                    }
+                    worst = worst.max(dt);
+                }
+                println!(
+                    "step({budget}) {label}: {steps} steps, total {:.1} ms, slowest {:.2} ms (before the final transform)",
+                    total * 1e3,
+                    worst * 1e3
+                );
+            }
+        }
+        // Task 5's centreline geometry here: long sub-segments and sharp turns.
+        {
+            let g = RegionGenerator::new(spec, &base, Some(&hydro));
+            let subs: Vec<(DVec3, DVec3, u32)> = g
+                .rivers(FieldKind::Inner)
+                .unwrap()
+                .sub_segments()
+                .map(|(a, b)| (a.dir, b.dir, a.river))
+                .collect();
+            let len = |a: DVec3, b: DVec3| a.angle_between(b) * EARTH_RADIUS_M;
+            let long = subs
+                .iter()
+                .filter(|s| len(s.0, s.1) > 2.0 * SUBPOINT_M)
+                .count();
+            let longest = subs.iter().map(|s| len(s.0, s.1)).fold(0.0, f64::max);
+            let mut hairpins = 0;
+            for w in subs.windows(2) {
+                if w[0].1 == w[1].0 {
+                    let q = w[0].1;
+                    let t0 = (q - w[0].0) - q * q.dot(q - w[0].0);
+                    let t1 = (w[1].1 - q) - q * q.dot(w[1].1 - q);
+                    hairpins += usize::from(t0.angle_between(t1).to_degrees() > 150.0);
+                }
+            }
+            println!(
+                "centrelines: {} sub-segments, {long} longer than 2 sub-points (longest {longest:.0} m), \
+                 {hairpins} turns over 150 degrees within a segment",
+                subs.len()
+            );
+        }
+        // The gathers (one unit each, no terrain reads).
+        for (label, half, sub, q) in [
+            (
+                "inner",
+                REGION_SIZE_M / 2.0,
+                SUBPOINT_M,
+                RIVER_MIN_DISCHARGE_M3S,
+            ),
+            (
+                "apron",
+                APRON_SIZE_M / 2.0,
+                SUBPOINT_M.max(APRON_SIZE_M / 1024.0),
+                crate::hydrology::params::APRON_RIVER_MIN_DISCHARGE_M3S,
+            ),
+        ] {
+            let t = Instant::now();
+            let b =
+                super::super::rivers::RiverBuilder::new(&hydro, &spec.frame(), half, sub, q as f32);
+            println!("{label} gather {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+            drop(b);
+        }
+        // Widening the inner lattice's precomputed square by the river reads' reach.
+        let g = RegionGenerator::new(spec, &base, None);
+        let inner = &g.lattices[g.layers[0].lattice];
+        let reach = river_read_reach_m(&hydro.lattice, SUBPOINT_M);
+        let nodes_of = |half: f64| {
+            let mut l =
+                lattice::Lattice::new(inner.n, crate::worldgen::tiles::SourceLevel::Tiles, half);
+            while !l.planned() {
+                l.plan(&spec.frame().basis(), u32::MAX);
+            }
+            l.blocks
+                .iter()
+                .flatten()
+                .map(|b| u64::from(b.w) * u64::from(b.h))
+                .sum::<u64>()
+        };
+        let half = REGION_SIZE_M / 2.0
+            + 1852.0 / 2.0
+            + 2.0 * (1852.0f64 / 4.0).max(REGION_SIZE_M / 1024.0);
+        let (now, wide) = (nodes_of(half), nodes_of(half + reach));
+        println!(
+            "inner lattice: half {:.0} m, {now} nodes ({:.1} MiB); widened by {reach:.0} m: {wide} nodes ({:.1} MiB), +{} nodes",
+            half,
+            now as f64 * 8.0 / 1048576.0,
+            wide as f64 * 8.0 / 1048576.0,
+            wide - now
+        );
+    }
 }

@@ -678,12 +678,7 @@ fn shaped_grid(f: impl Fn(f64, f64) -> f32) -> (RegionGrid, RegionFrame) {
                 )
             })
             .collect();
-        Field {
-            res,
-            size_m,
-            elevation_m,
-            surface: vec![[0; 4]; (res * res) as usize],
-        }
+        Field::dry(res, size_m, elevation_m, vec![[0; 4]; (res * res) as usize])
     };
     let centre = RenderDir(dir(36.1, -112.1));
     let grid = RegionGrid {
@@ -694,6 +689,7 @@ fn shaped_grid(f: impl Fn(f64, f64) -> f32) -> (RegionGrid, RegionFrame) {
         },
         inner: field(601, REGION_SIZE_M),
         apron: field(65, APRON_SIZE_M),
+        boulders: Vec::new(),
     };
     (grid, RegionFrame { center: centre })
 }

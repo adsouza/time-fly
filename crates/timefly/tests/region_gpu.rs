@@ -257,12 +257,7 @@ fn rough_field(res: u32, size_m: f64, seed: u64) -> Field {
             elevation_m.push(h);
         }
     }
-    Field {
-        res,
-        size_m,
-        surface: vec![[0; 4]; (res * res) as usize],
-        elevation_m,
-    }
+    Field::dry(res, size_m, elevation_m, vec![[0; 4]; (res * res) as usize])
 }
 
 fn r32_texture(device: &wgpu::Device, queue: &wgpu::Queue, field: &Field) -> wgpu::TextureView {
@@ -315,6 +310,7 @@ fn wesl_morph_matches_rust() {
         spec: RegionSpec::new(center, YearsBp(0.0), 1),
         inner: rough_field(REGION_RES, REGION_SIZE_M, 1),
         apron: rough_field(APRON_RES, APRON_SIZE_M, 2),
+        boulders: Vec::new(),
     };
     let settings = LodSettings::region();
 
@@ -542,6 +538,7 @@ fn wesl_normal_matches_rust() {
         spec: RegionSpec::new(center, YearsBp(0.0), 1),
         inner: rough_field(REGION_RES, REGION_SIZE_M, 3),
         apron: rough_field(APRON_RES, APRON_SIZE_M, 4),
+        boulders: Vec::new(),
     };
     let settings = LodSettings::region();
     let camera = Vec3::new(-20_000.0, 3_000.0, 35_000.0);

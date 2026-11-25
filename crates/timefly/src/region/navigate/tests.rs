@@ -1752,12 +1752,12 @@ fn globe_data() -> GlobeData {
 }
 
 fn flat(res: u32, size_m: f64, h: f32) -> Field {
-    Field {
+    Field::dry(
         res,
         size_m,
-        surface: vec![[0, 0, 0, 0]; (res * res) as usize],
-        elevation_m: vec![h; (res * res) as usize],
-    }
+        vec![h; (res * res) as usize],
+        vec![[0, 0, 0, 0]; (res * res) as usize],
+    )
 }
 
 fn grid(center: RenderDir, snapshot: YearsBp, ground_m: f32) -> Arc<RegionGrid> {
@@ -1769,6 +1769,7 @@ fn grid(center: RenderDir, snapshot: YearsBp, ground_m: f32) -> Arc<RegionGrid> 
         },
         inner: flat(9, REGION_SIZE_M, ground_m),
         apron: flat(9, APRON_SIZE_M, ground_m),
+        boulders: Vec::new(),
     })
 }
 

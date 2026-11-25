@@ -128,7 +128,7 @@ fn ten_ma_channels() {
         seed: 0x7F1E_0002,
         ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
     };
-    let grid = RegionGenerator::new(spec, &field).finish();
+    let grid = RegionGenerator::new(spec, &field, None).finish();
     // The globe's reference at the same directions, with the same frames.
     let deep = match b.timeline.select_frames(age) {
         FrameSelection::Deep(d) => d,
@@ -388,7 +388,7 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
             ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
         };
         let t0 = std::time::Instant::now();
-        let grid = RegionGenerator::new(spec, &field).finish();
+        let grid = RegionGenerator::new(spec, &field, None).finish();
         let secs = t0.elapsed().as_secs_f64();
         let sample = |e: usize, d: RenderDir| {
             let mut s = cube_rg(grids[sampling.endpoints[e].frame].as_ref().unwrap(), d);
@@ -578,7 +578,7 @@ fn candidate_stats(
             ..RegionSpec::new(centre, YearsBp(years), 0)
         };
         let t0 = std::time::Instant::now();
-        let grid = RegionGenerator::new(spec, &field).finish();
+        let grid = RegionGenerator::new(spec, &field, None).finish();
         s.gen_secs = Some(t0.elapsed().as_secs_f64());
         s.grid_max_m = grid.inner.elevation_m.iter().copied().reduce(f32::max);
         let mut counts = std::collections::BTreeMap::new();
@@ -703,7 +703,7 @@ fn dry_snowline_on_the_real_bake() {
             seed: 0x7F1E_0002,
             ..RegionSpec::new(centre, YearsBp(0.0), 0)
         };
-        (RegionGenerator::new(spec, &field).finish(), frame)
+        (RegionGenerator::new(spec, &field, None).finish(), frame)
     };
     let snowy = |s: &[u8; 4]| {
         s[2] >= 128 || s[0] == BiomeClass::IceCap as u8 || s[0] == BiomeClass::Alpine as u8
@@ -843,7 +843,7 @@ fn inner_field_at(lat: f64, lon: f64) -> timefly_core::worldgen::generate::Field
         seed: 0x7F1E_0002,
         ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
     };
-    RegionGenerator::new(spec, &field).finish().inner
+    RegionGenerator::new(spec, &field, None).finish().inner
 }
 
 /// The shader's band ramp on dry bare ground (`terrain.wesl`: smoothstep from `BAND_MIN_SLOPE`

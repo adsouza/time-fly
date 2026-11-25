@@ -786,11 +786,13 @@ mod tests {
         use timefly_core::geo::{geo_to_render, latlon_to_geo};
         use timefly_core::worldgen::generate::{Field, RegionSpec};
         use timefly_core::worldgen::wind::wind_axis;
-        let field = |res: u32, size_m: f64| Field {
-            res,
-            size_m,
-            elevation_m: vec![-10.0; (res * res) as usize],
-            surface: vec![[0; 4]; (res * res) as usize],
+        let field = |res: u32, size_m: f64| {
+            Field::dry(
+                res,
+                size_m,
+                vec![-10.0; (res * res) as usize],
+                vec![[0; 4]; (res * res) as usize],
+            )
         };
         let grid = RegionGrid {
             spec: RegionSpec {
@@ -800,6 +802,7 @@ mod tests {
             },
             inner: field(3, 300_000.0),
             apron: field(3, 2_400_000.0),
+            boulders: Vec::new(),
         };
         let look = water_look(&grid);
         let wind = wind_axis(&grid.spec.frame()).0.as_vec2();

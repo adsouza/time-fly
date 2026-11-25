@@ -187,7 +187,7 @@ fn angle(a: DVec3, b: DVec3) -> f64 {
 }
 
 /// `p` moved `dist_m` along the unit tangent `dir`, on the sphere. Exactly `p` for 0.
-fn offset_point(p: DVec3, dir: DVec3, dist_m: f64) -> DVec3 {
+pub(super) fn offset_point(p: DVec3, dir: DVec3, dist_m: f64) -> DVec3 {
     if dist_m == 0.0 {
         return p;
     }
@@ -216,7 +216,7 @@ fn sub_count(len_m: f64, subpoint_m: f64) -> u32 {
 }
 
 /// The point at `t` on the great circle from `p0` to `p1` (the ends exactly).
-fn chord_point(p0: DVec3, p1: DVec3, t: f64) -> DVec3 {
+pub(super) fn chord_point(p0: DVec3, p1: DVec3, t: f64) -> DVec3 {
     if t == 0.0 {
         p0
     } else if t == 1.0 {
@@ -238,7 +238,7 @@ fn chord_normal(p0: DVec3, p1: DVec3, c0: DVec3, c1: DVec3) -> DVec3 {
 }
 
 /// The unit tangent at `c` across the chord, toward its left bank.
-fn across(c: DVec3, normal: DVec3) -> DVec3 {
+pub(super) fn across(c: DVec3, normal: DVec3) -> DVec3 {
     (normal - c * c.dot(normal)).normalize()
 }
 
@@ -565,6 +565,8 @@ pub struct RiverBuilder<'a> {
     phase: Phase,
     subpoints: Vec<SubPoint>,
     out: Vec<RiverSeg>,
+    /// Work units done so far.
+    units: u64,
 }
 
 impl<'a> RiverBuilder<'a> {
@@ -748,7 +750,14 @@ impl<'a> RiverBuilder<'a> {
             phase: Phase::Relax(0),
             subpoints: Vec::new(),
             out: Vec::new(),
+            units: 0,
         }
+    }
+
+    /// Work units done so far by [`step`](Self::step): a progress measure, and what a caller
+    /// time-boxing the steps charges for them.
+    pub fn units_done(&self) -> u64 {
+        self.units
     }
 
     /// Does about `budget` units of work (at least one) and returns `true` once the rivers are
@@ -803,9 +812,13 @@ impl<'a> RiverBuilder<'a> {
                         Phase::Points(r, k + 1)
                     };
                 }
-                Phase::Done => return true,
+                Phase::Done => {
+                    self.units += u64::from(used);
+                    return true;
+                }
             }
         }
+        self.units += u64::from(used);
         self.phase == Phase::Done
     }
 
@@ -1175,6 +1188,13 @@ pub struct RiverHit {
     pub flow_north_mps: f32,
     /// 1 in the inner half of the valley, falling to 0 at its edge.
     pub fade: f32,
+    /// The channel's half-width `w/2` (Task 6).
+    pub half_width_m: f32,
+    /// The signed distance to the centreline: positive on the left bank (looking downstream).
+    /// `half_width_m − |offset_m| = ribbon_m`. Unlike the ribbon it is linear across the
+    /// centreline, so it interpolates between texels on either side of a sub-texel river
+    /// (Task 6).
+    pub offset_m: f32,
 }
 
 /// A sub-segment in the index: its segment, its start's index along it, its reach and its
@@ -1362,6 +1382,15 @@ impl RegionRivers {
             + 4 * (self.start.capacity() + self.items.capacity())
     }
 
+    /// Every sub-segment's ends, by segment then `k`: consecutive sub-points, and each
+    /// non-terminal segment's last sub-point with the down segment's first.
+    pub fn sub_segments(&self) -> impl Iterator<Item = (&SubPoint, &SubPoint)> + '_ {
+        self.segs.iter().enumerate().flat_map(move |(si, seg)| {
+            let pairs = seg.count - 1 + u32::from(seg.next.is_some());
+            (0..pairs).map(move |j| self.pair(si, j))
+        })
+    }
+
     /// The ends of sub-segment `j` of segment `seg`.
     fn pair(&self, seg: usize, j: u32) -> (&SubPoint, &SubPoint) {
         let s = &self.segs[seg];
@@ -1413,6 +1442,8 @@ impl RegionRivers {
             speed: f64,
             tangent: DVec3,
             end_level: f32,
+            half_width: f64,
+            offset: f64,
         }
         let mut carved = h_m;
         let mut in_channel = false;
@@ -1443,6 +1474,7 @@ impl RegionRivers {
             };
             carved = carved.min(cut);
             let ribbon = w / 2.0 - d;
+            let left = a.dir.cross(b.dir).dot(p) >= 0.0;
             let better = best.as_ref().is_none_or(|b| {
                 ribbon > b.ribbon || (ribbon == b.ribbon && (a.river, a.k) < (b.river, b.k))
             });
@@ -1457,6 +1489,8 @@ impl RegionRivers {
                     speed: sa + (sb - sa) * u,
                     tangent: flow_tangent(p, a.tangent, b.tangent, u, travel),
                     end_level: self.segs[ss.seg as usize].end_level_m,
+                    half_width: w / 2.0,
+                    offset: if left { d } else { -d },
                 });
             }
         }
@@ -1476,6 +1510,8 @@ impl RegionRivers {
                 flow_east_mps: (b.speed * b.tangent.dot(east)) as f32,
                 flow_north_mps: (b.speed * b.tangent.dot(north)) as f32,
                 fade,
+                half_width_m: b.half_width as f32,
+                offset_m: b.offset as f32,
             });
         }
         out.h_m = carved;

@@ -847,12 +847,12 @@ mod tests {
 
     fn field(res: u32, size_m: f64) -> Field {
         let n = (res * res) as usize;
-        Field {
+        Field::dry(
             res,
             size_m,
-            elevation_m: (0..n).map(|i| i as f32 * 0.5 - 100.0).collect(),
-            surface: (0..n).map(|i| [i as u8, 1, 2, 3]).collect(),
-        }
+            (0..n).map(|i| i as f32 * 0.5 - 100.0).collect(),
+            (0..n).map(|i| [i as u8, 1, 2, 3]).collect(),
+        )
     }
 
     fn grid(inner_res: u32, apron_res: u32) -> RegionGrid {
@@ -868,6 +868,7 @@ mod tests {
             },
             inner: field(inner_res, REGION_SIZE_M),
             apron: field(apron_res, APRON_SIZE_M),
+            boulders: Vec::new(),
         }
     }
 

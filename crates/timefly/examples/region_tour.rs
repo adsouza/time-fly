@@ -1255,12 +1255,7 @@ mod tests {
     fn timing_app(agl_m: f32, ground: f32) -> App {
         let request = launch_request(&parse_region("0,0,0").unwrap());
         let spec = RegionSpec::new(request.era_dir, request.snapshot, 0);
-        let field = Field {
-            res: 2,
-            size_m: 1000.0,
-            elevation_m: vec![ground; 4],
-            surface: vec![[0; 4]; 4],
-        };
+        let field = Field::dry(2, 1000.0, vec![ground; 4], vec![[0; 4]; 4]);
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_message::<RegionEntered>()
@@ -1278,6 +1273,7 @@ mod tests {
                     spec,
                     inner: field.clone(),
                     apron: field,
+                    boulders: Vec::new(),
                 }
                 .into(),
             })

@@ -164,13 +164,15 @@ impl Plugin for RegionWarmupPlugin {
 
 /// A stand-in region: a 3 × 3 field rising from sea to land, so its look is an ordinary one.
 pub fn warmup_grid() -> RegionGrid {
-    let field = |size_m: f64| Field {
-        res: 3,
-        size_m,
-        elevation_m: vec![
-            -200.0, -50.0, 100.0, -50.0, 100.0, 400.0, 100.0, 400.0, 900.0,
-        ],
-        surface: vec![[0, 0, 0, 0]; 9],
+    let field = |size_m: f64| {
+        Field::dry(
+            3,
+            size_m,
+            vec![
+                -200.0, -50.0, 100.0, -50.0, 100.0, 400.0, 100.0, 400.0, 900.0,
+            ],
+            vec![[0, 0, 0, 0]; 9],
+        )
     };
     RegionGrid {
         spec: RegionSpec {
@@ -180,6 +182,7 @@ pub fn warmup_grid() -> RegionGrid {
         },
         inner: field(REGION_SIZE_M),
         apron: field(APRON_SIZE_M),
+        boulders: Vec::new(),
     }
 }
 

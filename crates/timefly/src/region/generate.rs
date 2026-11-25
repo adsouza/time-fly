@@ -18,13 +18,16 @@ use bevy::platform::time::Instant;
 use timefly_core::formats::Grid;
 use timefly_core::geodynamics::CrustModel;
 use timefly_core::hydrology::EraHydrology;
+use timefly_core::hydrology::params::MAX_BOULDERS;
 use timefly_core::surface::Timeline;
 use timefly_core::worldgen::coarse::{
     CoarseField, FieldError, SnapshotField, frames_needed, snapshot_field,
 };
-use timefly_core::worldgen::generate::{FieldKind, FieldRows, RegionGrid, RegionPrep, RegionSpec};
+use timefly_core::worldgen::generate::{
+    FieldKind, FieldRows, RegionGenerator, RegionGrid, RegionPrep, RegionSpec,
+};
 use timefly_core::worldgen::tiles::TileSet;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 /// Rows per parallel task on native: small enough to balance the pool's threads.
 pub const NATIVE_BLOCK_ROWS: u32 = 16;
@@ -65,7 +68,8 @@ pub struct GenInputs {
     /// Some needed tile is missing (`tiles.missing(&needed)` is not empty).
     pub fallback: bool,
     /// The era's continental pass ([`crate::hydro`]), or `None` when it is disabled or failed.
-    /// Task 7 hands it to the generator; for now it only travels with the inputs.
+    /// The generator can refine it (Task 6, `RegionPrep::new`'s `hydro`); Task 7 hands it over
+    /// with the water upload. For now it only travels with the inputs.
     pub hydro: Option<Arc<EraHydrology>>,
 }
 
@@ -116,6 +120,18 @@ impl GenInputs {
     }
 }
 
+/// Warns once when the region had more boulders than [`MAX_BOULDERS`] (core does not log).
+fn warn_dropped_boulders<F: CoarseField>(generator: &RegionGenerator<'_, F>) {
+    let dropped = generator.boulders_dropped();
+    if dropped > 0 {
+        warn!(
+            dropped,
+            kept = MAX_BOULDERS,
+            "region has more boulders than the cap; dropped the rest"
+        );
+    }
+}
+
 /// Consecutive row ranges of at most `block` rows covering `0..rows`, in order.
 pub fn row_blocks(rows: u32, block: u32) -> Vec<Range<u32>> {
     let block = block.max(1);
@@ -139,8 +155,9 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
 
     let started = Instant::now();
     let field = inputs.field()?;
-    let owned = RegionPrep::new(inputs.spec, &field).finish();
+    let owned = RegionPrep::new(inputs.spec, &field, None).finish();
     let prep_ms = started.elapsed().as_secs_f64() * 1e3;
+    warn_dropped_boulders(&owned);
     trace_generation("prep done: lattice and coast field", || {
         owned.working_bytes()
     });
@@ -156,10 +173,7 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
         }
     });
     trace_generation("rows done: row blocks", || {
-        blocks
-            .iter()
-            .map(|b| b.elevation_m.capacity() * 4 + b.surface.capacity() * 4)
-            .sum()
+        blocks.iter().map(FieldRows::bytes).sum()
     });
     let apron_blocks = blocks.split_off(inner_blocks);
     let grid = generator.assemble(blocks, apron_blocks);
@@ -269,13 +283,14 @@ async fn run_budgeted(
     slice.longest = earlier;
     let field = inputs.field()?;
     slice.yield_if_spent().await;
-    let mut prep = RegionPrep::new(inputs.spec, &field);
+    let mut prep = RegionPrep::new(inputs.spec, &field, None);
     while !prep.step(WEB_PREP_STEP) {
         slice.yield_if_spent().await;
     }
     slice.yield_if_spent().await;
     // Done stepping, so this does no lattice work; timed like everything else.
     let generator = prep.finish();
+    warn_dropped_boulders(&generator);
     slice.yield_if_spent().await;
     let mut done: [Vec<FieldRows>; 2] = [Vec::new(), Vec::new()];
     for (k, kind) in [FieldKind::Inner, FieldKind::Apron].into_iter().enumerate() {
