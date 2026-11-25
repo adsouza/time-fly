@@ -7,7 +7,8 @@
 //!   the bytes it can attribute (the neighbour's grid, the job's stage, the terrain's image data
 //!   on the CPU, the field textures in the render world);
 //! - a `generation` line at each step of a native region generation, from its worker thread,
-//!   with the bytes the step holds ([`trace_generation`]);
+//!   with the bytes the step holds (`crate::diagnostics::hop_memory::trace_generation`, which
+//!   product code calls);
 //! - a `render world` line whenever the render world's field textures change.
 //!
 //! It is how `docs/testing/m3/performance.md` explains the hop's memory peak. With the target
@@ -20,30 +21,17 @@ use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::texture::GpuImage;
 use bevy::render::{Render, RenderApp, RenderSystems};
-use tracing::{Level, trace};
+use tracing::trace;
 
 use crate::bench::memory;
+pub use crate::diagnostics::hop_memory::{TARGET, enabled};
 use crate::region::navigate::{NavPhase, Navigation};
 use crate::region::{ActiveRegion, PendingRegion, RegionJob};
 use crate::terrain::{TerrainScene, TerrainSceneSystems};
 
-/// The trace's target.
-pub const TARGET: &str = "timefly::hop_memory";
 /// A texture or image this large or larger counts as one of the terrain's fields (the apron's
 /// are 513² × 4 B, about 1.05 MB; nothing else in a region is as large).
 const FIELD_BYTES: u64 = 1_000_000;
-
-/// Whether the trace is on.
-pub fn enabled() -> bool {
-    tracing::enabled!(target: TARGET, Level::TRACE)
-}
-
-/// One step of a region's generation, from the thread that runs it, with the bytes it holds.
-pub fn trace_generation(step: &'static str, bytes: usize) {
-    if enabled() {
-        trace!(target: TARGET, step, bytes, memory = ?memory::split(), "generation");
-    }
-}
 
 /// The render world's textures, written in the render world, read in the main world.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

@@ -6,6 +6,8 @@
 //! (the one global subscriber) and logs what `start` found.
 
 pub mod aspects;
+pub mod hop_memory;
+pub mod memory;
 pub mod notice;
 pub mod probe;
 pub mod recorder;
