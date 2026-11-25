@@ -230,6 +230,9 @@ pub struct FlyInput {
     pub turn: f32,
     pub boost: bool,
     pub dt_s: f32,
+    /// Keep the fly inside the inner field ([`timefly_core::flight::hop::confine`]), before the
+    /// substeps, so their floors follow only the path it takes.
+    pub confined: bool,
 }
 
 /// Cruise speed (m/s) at `agl_m` above `max(ground, 0)`, before the boost.
@@ -271,7 +274,13 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
     }
 
     // Substeps, each ending on or above the floor and under the ceiling.
-    let delta = velocity * dt;
+    let mut delta = velocity * dt;
+    if input.confined {
+        let from = Vec2::new(p.x, p.z);
+        let to = timefly_core::flight::hop::confine(from, from + Vec2::new(delta.x, delta.z));
+        delta.x = to.x - from.x;
+        delta.z = to.y - from.y;
+    }
     let substeps = (Vec2::new(delta.x, delta.z).length() / MAX_SUBSTEP_M)
         .ceil()
         .clamp(1.0, 1_024.0);
@@ -411,20 +420,12 @@ fn step_fly(
         turn: held.turn,
         boost: held.boost,
         dt_s: time.delta_secs(),
+        confined: controls.confined,
     };
     let grid = &region.grid;
     let ground = |x: f32, z: f32| blended_height_m(grid, f64::from(x), f64::from(z));
-    let mut next = fly_step(*fly, input, ground);
-    if controls.confined {
-        // Inside the inner field: past its edge only under a hop's opaque cloud.
-        let from = Vec2::new(fly.pos_m.x, fly.pos_m.z);
-        let to = Vec2::new(next.pos_m.x, next.pos_m.z);
-        let kept = timefly_core::flight::hop::confine(from, to);
-        if kept != to {
-            let floor = ground(kept.x, kept.y).max(0.0) + CAMERA_CLEARANCE_M;
-            next.pos_m = Vec3::new(kept.x, next.pos_m.y.max(floor), kept.y);
-        }
-    }
+    // Inside the inner field (`input.confined`): past its edge only under a hop's opaque cloud.
+    let next = fly_step(*fly, input, ground);
     if next != *fly {
         *fly = next;
     }
@@ -635,6 +636,7 @@ mod tests {
             turn: 0.0,
             boost,
             dt_s,
+            confined: false,
         }
     }
 
@@ -699,6 +701,7 @@ mod tests {
                     // Most steps boost: the brief's worst case.
                     boost: boost || dt_s > 0.1,
                     dt_s,
+                    confined: false,
                 };
                 state = fly_step(state, step, &ground);
                 let p = state.pos_m;
@@ -746,6 +749,33 @@ mod tests {
         // The limits.
         assert_eq!(fly_speed(0.0), MIN_SPEED_MPS);
         assert_eq!(fly_speed(1.0e6), MAX_SPEED_MPS);
+    }
+
+    #[test]
+    fn a_confined_step_stops_at_the_edge_and_climbs_nothing_beyond_it() {
+        // Flat inside; a 20 km wall just past the east edge, which a confined fly never reaches.
+        let ground = |x: f32, _z: f32| if x > EDGE_M + 100.0 { 20_000.0 } else { 100.0 };
+        let s = FlyState {
+            pos_m: Vec3::new(EDGE_M - 100.0, 5_000.0, 0.0),
+            yaw: -std::f32::consts::FRAC_PI_2, // facing east
+            pitch: 0.0,
+        };
+        let step = FlyInput {
+            confined: true,
+            ..input(Vec3::new(0.0, 0.0, -1.0), true, 0.1)
+        };
+        let next = fly_step(s, step, ground);
+        assert_eq!(next.pos_m.x, EDGE_M, "{next:?}");
+        assert_eq!(
+            next.pos_m.y, 5_000.0,
+            "lifted over ground it never reached: {next:?}"
+        );
+        // Unconfined, the same step flies out over the wall.
+        let free = fly_step(s, input(Vec3::new(0.0, 0.0, -1.0), true, 0.1), ground);
+        assert!(
+            free.pos_m.x > EDGE_M + 1_000.0 && free.pos_m.y > 20_000.0,
+            "{free:?}"
+        );
     }
 
     #[test]

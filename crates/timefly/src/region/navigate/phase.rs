@@ -268,8 +268,10 @@ pub struct FlyControls {
     pub vertical: bool,
     /// Whether the fly is kept inside the inner field ([`timefly_core::flight::hop::confine`]):
     /// everywhere but a hop's hold at full cover, so the fly is past the edge only under an
-    /// opaque cloud (fix round 1: a hop ending, a failed one's retries and a flight a hop cannot
-    /// start from never carry it out into the apron in clear air).
+    /// opaque cloud: it gets out only from the hold, and a hop keeps its cloud opaque while the
+    /// fly is out (fix rounds 1 and 2: a hop ending, a failed one's retries, a flight a hop
+    /// cannot start from, and a turn or retarget out of the hold never leave it out in clear
+    /// air).
     pub confined: bool,
 }
 
@@ -960,7 +962,13 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             }
             let out_m = edge.out(i.region_pos_m);
             let outward = edge.out(i.region_vel_mps);
-            let target = if outward < 0.0 {
+            // Past an edge (the hold drifts out, and turning back or retargeting starts there),
+            // the cloud stays opaque until the fly is back inside: it is outside the field only
+            // under full cover (fix round 2).
+            let outside = i.region_pos_m.abs().max_element() > EDGE_M;
+            let target = if outside {
+                1.0
+            } else if outward < 0.0 {
                 0.0
             } else {
                 lift_target(EDGE_M - out_m)

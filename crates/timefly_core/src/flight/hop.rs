@@ -94,6 +94,22 @@ pub fn confine(prev_m: Vec2, next_m: Vec2) -> Vec2 {
     next_m.clamp(-limit, limit)
 }
 
+/// The fly's velocity for [`should_preload`]: as `measured_mps` (its motion over the last
+/// frame), except on an axis where it is at or past the edge (held there by [`confine`]) and the
+/// player's `wish_mps` points out of it, where the wish's component counts. Held at an edge
+/// while pushing out at an angle, it slides along it, so its motion alone shows no way out.
+pub fn velocity_at_edges(pos_m: Vec2, measured_mps: Vec2, wish_mps: Vec2) -> Vec2 {
+    /// Within this of the edge counts as held at it (the clamp puts it exactly there).
+    const AT_EDGE_M: f32 = 1.0;
+    let mut v = measured_mps;
+    for a in 0..2 {
+        if pos_m[a].abs() >= EDGE_M - AT_EDGE_M && pos_m[a] * wish_mps[a] > 0.0 {
+            v[a] = wish_mps[a];
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +275,33 @@ mod tests {
         assert_eq!(
             confine(out, out - Vec2::new(500.0, 0.0)),
             out - Vec2::new(500.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn at_an_edge_the_wish_out_of_it_is_the_velocity_on_its_axis() {
+        let e = EDGE_M;
+        // Pinned at the east edge, pushing out 20° off straight, sliding along it: the push out
+        // counts on x, the slide on z, so the edge it is held at is the one it flies out of.
+        let (s, c) = 20f32.to_radians().sin_cos();
+        let wish = Vec2::new(c, s) * 10_000.0;
+        let slide = Vec2::new(0.0, wish.y);
+        let v = velocity_at_edges(Vec2::new(e, 3_000.0), slide, wish);
+        assert_eq!(v, Vec2::new(wish.x, wish.y));
+        assert!(should_preload(Vec2::new(e, 3_000.0), v, v.length(), 3.0));
+        // At a corner, held on both axes.
+        let wish = Vec2::new(1.0, -1.0) * 5_000.0;
+        assert_eq!(velocity_at_edges(Vec2::new(e, -e), Vec2::ZERO, wish), wish);
+        // Inside the field, or wishing back in, or along the edge: the motion as measured.
+        let m = Vec2::new(700.0, -20.0);
+        assert_eq!(velocity_at_edges(Vec2::new(e - 5_000.0, 0.0), m, wish), m);
+        assert_eq!(
+            velocity_at_edges(Vec2::new(e, 0.0), m, Vec2::new(-3_000.0, 0.0)),
+            m
+        );
+        assert_eq!(
+            velocity_at_edges(Vec2::new(-e, 0.0), Vec2::ZERO, Vec2::X * 100.0),
+            Vec2::ZERO
         );
     }
 

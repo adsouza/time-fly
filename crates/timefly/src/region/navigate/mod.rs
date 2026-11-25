@@ -42,7 +42,7 @@ use bevy::prelude::*;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::GLOBE_MAX_ALTITUDE_KM;
 use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, GlobeFlight};
-use timefly_core::flight::hop::carry_pose;
+use timefly_core::flight::hop::{carry_pose, velocity_at_edges};
 use timefly_core::formats::Grid;
 use timefly_core::geo::RenderDir;
 use timefly_core::geodynamics::{Candidate, CrustModel, PlateIndex, ResolvedPosition};
@@ -531,15 +531,13 @@ fn navigate(
     }
     .filter(|v| v.length() <= PLACEMENT_MPS)
     .unwrap_or(Vec2::ZERO);
-    // Held at the field's edge (`FlyControls::confined`), the fly does not move: what the player
-    // asks for is its velocity there, so pressing out of the edge still starts a hop.
-    let velocity = if measured.length() < 1.0 {
-        world.keys.as_deref().map_or(Vec2::ZERO, |k| {
-            wish_mps(&keys_to_input(k), flies.fly.yaw, p.y - ground_m)
-        })
-    } else {
-        measured
-    };
+    // Held at the field's edge (`FlyControls::confined`), the fly does not move out of it: what
+    // the player asks for counts there on that axis, so pressing out of the edge, straight or at
+    // an angle (sliding along it), still starts a hop.
+    let wish = world.keys.as_deref().map_or(Vec2::ZERO, |k| {
+        wish_mps(&keys_to_input(k), flies.fly.yaw, p.y - ground_m)
+    });
+    let velocity = velocity_at_edges(xz, measured, wish);
     let inputs = NavInputs {
         now_s,
         load_s: clock.elapsed_s,

@@ -85,11 +85,8 @@ fn hop_frame(
         _ => to,
     };
     let moved = (i.region_pos_m - from) / i.dt_s;
-    i.region_vel_mps = if moved.length() < 1.0 {
-        *wish * share
-    } else {
-        moved
-    };
+    i.region_vel_mps =
+        timefly_core::flight::hop::velocity_at_edges(i.region_pos_m, moved, *wish * share);
     out
 }
 
@@ -292,9 +289,16 @@ fn turning_back_cancels_the_preload_and_keeps_the_region() {
             back.windows(2).all(|w| w[1].density <= w[0].density),
             "{start}"
         );
-        // A frame to see the turn, then the clear.
+        // Opaque until back inside the field (fix round 2: the hold drifts past the edge), then a
+        // frame to see the turn, then the clear.
+        let inside = back.iter().position(|f| f.x_m <= EDGE_M).unwrap_or(0);
+        assert!(back[..inside].iter().all(|f| f.density == 1.0), "{start}");
         let clear_frames = (CLOUD_CLEAR_S / 0.1).ceil() as usize + 3;
-        assert!(back.len() <= clear_frames, "{start}: {} frames", back.len());
+        assert!(
+            back.len() - inside <= clear_frames,
+            "{start}: {} frames after back inside",
+            back.len() - inside
+        );
         assert_eq!(end.density, 0.0);
         // The fly is back at its height above the ground.
         assert!(
@@ -1312,4 +1316,233 @@ fn a_failing_hop_never_lets_the_fly_out_in_clear_air() {
     assert_eq!(turns, 3);
     assert!(frames.iter().all(|f| f.scene_centre == Some(alps())));
     assert_pose_follows_the_camera(&frames);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 2: angled approaches, and the cloud up until the fly is back inside
+
+/// Out of the east edge `deg` off straight, sliding south along it once held: `(x, z)`.
+fn angled_out(deg: f32, speed: f32) -> Vec2 {
+    let (s, c) = deg.to_radians().sin_cos();
+    Vec2::new(c, s) * speed
+}
+
+/// Runs `phase` with `wish`, every neighbour ready once asked for (none while `failing`), for
+/// at most `frames` frames or until a swap; returns the frames and the fly's `z` after each.
+fn run_hops(
+    mut phase: NavPhase,
+    i: &mut NavInputs,
+    wish: &mut Vec2,
+    frames: usize,
+    failing: bool,
+) -> (Vec<HopFrame>, Vec<f32>) {
+    let (mut out, mut z) = (Vec::new(), Vec::new());
+    for _ in 0..frames {
+        if let NavPhase::Hopping {
+            centre,
+            swapped: false,
+            turned_back: false,
+            ..
+        } = phase
+        {
+            i.neighbour = (!failing).then_some((centre, YearsBp(0.0)));
+            i.preload_failed = failing;
+        } else {
+            i.preload_failed = false;
+        }
+        let (next, actions, _, density) = hop_frame(phase, i, wish);
+        z.push(i.region_pos_m.y);
+        let swap = has(&actions, |a| matches!(a, NavAction::SwapToNeighbour));
+        out.push(HopFrame {
+            phase: next,
+            actions,
+            density,
+            height_m: i.region_height_m,
+            x_m: i.region_pos_m.x,
+        });
+        phase = next;
+        if swap {
+            break;
+        }
+    }
+    (out, z)
+}
+
+/// The re-review's Important: held at the field's edge, a fly pushing out at an angle slides
+/// along it; that must still start a hop, from plain flying and after a turn-back.
+#[test]
+fn angled_approaches_to_a_held_edge_still_hop() {
+    for deg in [10.0f32, 20.0, 30.0] {
+        // Flying, held at the east edge (the end of a hop's end phase leaves it there).
+        let mut wish = angled_out(deg, 1_000.0);
+        // What the shell measures there is the slide along the edge; what it hands navigation
+        // counts the push out of it.
+        let at = Vec2::new(EDGE_M, 0.0);
+        let slide = Vec2::new(0.0, wish.y);
+        let mut i = NavInputs {
+            region_pos_m: at,
+            region_vel_mps: timefly_core::flight::hop::velocity_at_edges(at, slide, wish),
+            ..in_alps(0.0, HOP_AGL_M)
+        };
+        let (frames, z) = run_hops(NavPhase::Flying, &mut i, &mut wish, 600, false);
+        let first = frames
+            .iter()
+            .position(|f| has(&f.actions, |a| matches!(a, NavAction::Preload(_))));
+        assert_eq!(first, Some(0), "{deg}°: no hop from the edge");
+        assert!(
+            frames.last().is_some_and(|f| swapped(&f.phase)),
+            "{deg}°: never swapped: {:?}",
+            frames.last().map(|f| f.phase)
+        );
+        let bad = outside_in_clear_air(&frames, &z);
+        assert!(bad.is_empty(), "{deg}°: {:?}", &bad[..bad.len().min(3)]);
+
+        // After a failed neighbour turned it round, straight back out at the angle.
+        let (mut i, mut wish) = flying_east(EDGE_M - 10_000.0);
+        let (frames, mut z) = run_hops(NavPhase::Flying, &mut i, &mut wish, 600, true);
+        let mut frames = frames;
+        let turn = frames
+            .iter()
+            .position(|f| has(&f.actions, |a| matches!(a, NavAction::TurnBack { .. })))
+            .expect("turned back");
+        frames.truncate(turn + 1);
+        z.truncate(turn + 1);
+        let mut phase = frames[turn].phase;
+        wish = angled_out(deg, 1_000.0);
+        let (after, after_z) = run_hops(phase, &mut i, &mut wish, 3_000, false);
+        phase = after.last().unwrap().phase;
+        assert!(
+            after
+                .iter()
+                .any(|f| has(&f.actions, |a| matches!(a, NavAction::Preload(_)))),
+            "{deg}°: no hop after the turn-back, ending {phase:?}"
+        );
+        assert!(swapped(&phase), "{deg}°: never swapped: {phase:?}");
+        frames.extend(after);
+        z.extend(after_z);
+        let bad = outside_in_clear_air(&frames, &z);
+        assert!(bad.is_empty(), "{deg}°: {:?}", &bad[..bad.len().min(3)]);
+    }
+}
+
+/// Holds past the east edge for `hold` frames at 10 km/s, no neighbour ready; returns the
+/// phase and inputs there, the fly some km out.
+fn held_past_the_edge(start_z: f32, hold: usize) -> (NavPhase, NavInputs) {
+    let (mut i, _) = flying_east(EDGE_M - 15_000.0);
+    i.region_pos_m.y = start_z;
+    let mut wish = Vec2::X * 10_000.0;
+    i.region_vel_mps = wish;
+    let mut phase = NavPhase::Flying;
+    let mut held = 0;
+    for _ in 0..2_000 {
+        let (next, _, _, density) = hop_frame(phase, &mut i, &mut wish);
+        phase = next;
+        if density == 1.0 && i.region_pos_m.x > EDGE_M {
+            held += 1;
+            if held >= hold {
+                break;
+            }
+        }
+    }
+    assert!(i.region_pos_m.x > EDGE_M + 2_000.0, "{}", i.region_pos_m.x);
+    (phase, i)
+}
+
+/// Minor 1: turning back out of the hold, or retargeting from it, keeps the cloud opaque
+/// until the fly is back inside the field.
+#[test]
+fn the_cloud_stays_up_until_the_fly_is_back_inside() {
+    // Straight back in (west), and back in toward the north edge, retargeting there.
+    for (start_z, back) in [
+        (0.0, Vec2::NEG_X),
+        (-(EDGE_M - 30_000.0), Vec2::new(-0.3, -1.0).normalize()),
+    ] {
+        let (phase, mut i) = held_past_the_edge(start_z, 100);
+        let mut wish = back * 10_000.0;
+        let (mut frames, mut z) = (Vec::new(), Vec::new());
+        let mut p = phase;
+        for _ in 0..6_000 {
+            let (next, actions, _, density) = hop_frame(p, &mut i, &mut wish);
+            z.push(i.region_pos_m.y);
+            frames.push(HopFrame {
+                phase: next,
+                actions,
+                density,
+                height_m: i.region_height_m,
+                x_m: i.region_pos_m.x,
+            });
+            p = next;
+            if i.region_pos_m.x < EDGE_M - 5_000.0 {
+                break;
+            }
+        }
+        assert!(i.region_pos_m.x < EDGE_M - 5_000.0, "{back}: never back in");
+        let bad = outside_in_clear_air(&frames, &z);
+        assert!(
+            bad.is_empty(),
+            "{back}: {} frames: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(3)]
+        );
+        if back.y < 0.0 {
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| has(&f.actions, |a| matches!(a, NavAction::Preload(_)))),
+                "no retarget north"
+            );
+        }
+        assert_eq!(i.region_centre, Some(alps()));
+    }
+}
+
+/// The re-review's Important, in the shell: with the real fly camera sliding the fly along the
+/// edge it pushes out of at 10°, 20° and 30° off straight, a hop starts and swaps, from plain
+/// flying held at the edge and after a turn-back; never out in clear air.
+#[test]
+fn angled_approaches_hop_in_the_shell() {
+    let clear_air = |frames: &[Drawn]| -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f.fly.pos_m.x.abs().max(f.fly.pos_m.z.abs()) > EDGE_M && f.density < 1.0)
+            .map(|f| format!("{:?} at {}", f.fly.pos_m, f.density))
+            .collect()
+    };
+    let turned_back = |a: &App| {
+        matches!(
+            phase(a),
+            NavPhase::Hopping {
+                turned_back: true,
+                ..
+            }
+        )
+    };
+    for deg in [10.0f32, 20.0, 30.0] {
+        let yaw = -std::f32::consts::FRAC_PI_2 - deg.to_radians();
+        // Flying, held at the east edge.
+        let (mut app, _) = hop_app(3, false, EDGE_M);
+        app.world_mut().resource_mut::<FlyState>().yaw = yaw;
+        run_until(&mut app, 600, |a| swapped(&phase(a)));
+        let bad = clear_air(&drawn(&app));
+        assert!(
+            bad.is_empty(),
+            "{deg}° from the edge: {:?}",
+            &bad[..bad.len().min(3)]
+        );
+
+        // After a turn-back, straight back out at the angle.
+        let (mut app, _) = hop_app(3, true, EDGE_M - 10_000.0);
+        run_until(&mut app, 2_000, turned_back);
+        app.world_mut().resource_mut::<FakeNeighbours>().fail = false;
+        app.world_mut().resource_mut::<FlyState>().yaw = yaw;
+        run_until(&mut app, 3_000, |a| swapped(&phase(a)));
+        let frames = drawn(&app);
+        let bad = clear_air(&frames);
+        assert!(
+            bad.is_empty(),
+            "{deg}° after the turn-back: {:?}",
+            &bad[..bad.len().min(3)]
+        );
+        assert_pose_follows_the_camera(&frames);
+    }
 }
