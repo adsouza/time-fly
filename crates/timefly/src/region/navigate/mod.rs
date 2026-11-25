@@ -24,7 +24,8 @@
 //!   navigation, before the terrain scene and the fly camera, so that frame draws the new
 //!   region with the fly in it, under the opaque cloud.
 //! - **"Descending..."** shows only after a region has been generating for
-//!   [`CAPTION_DELAY_S`].
+//!   [`CAPTION_DELAY_S`], or a hop has held at full cover for its neighbour that long
+//!   ([`NavPhase::hop_hold_s`]).
 //! - **"terrain detail unavailable here"** ([`FALLBACK_NOTICE_TEXT`]) shows for
 //!   [`FALLBACK_NOTICE_S`] after a region appears (`RegionEntered` or `RegionSnapshotChanged`)
 //!   whose `RegionGenerated` says it fell back (a tile it needs is missing or corrupt, so part of
@@ -141,9 +142,12 @@ pub fn carry_crust_position(
     }
 }
 
-/// Whether "Descending..." shows, `generating_for_s` after the region started generating.
-pub fn caption_shown(generating_for_s: Option<f64>) -> bool {
-    generating_for_s.is_some_and(|s| s > CAPTION_DELAY_S)
+/// Whether "Descending..." shows, `generating_for_s` after the region started generating, or
+/// with a hop held at full cover for `hop_hold_s` ([`NavPhase::hop_hold_s`]): either longer
+/// than [`CAPTION_DELAY_S`].
+pub fn caption_shown(generating_for_s: Option<f64>, hop_hold_s: Option<f32>) -> bool {
+    let waited = |s: Option<f64>| s.is_some_and(|s| s > CAPTION_DELAY_S);
+    waited(generating_for_s) || waited(hop_hold_s.map(f64::from))
 }
 
 /// When the fallback notice started, after a frame in which a region appeared
@@ -657,7 +661,13 @@ fn navigate(
         budget.0 = large;
     }
     let climbing = matches!(phase, NavPhase::Climbing { .. });
-    let show_caption = !climbing && caption_shown(nav.generating_since.map(|since| now_s - since));
+    // A region generating, or a hop held at full cover for its neighbour (design §6 "Holding":
+    // a neighbour's job never enters `RegionState::Generating`).
+    let show_caption = !climbing
+        && caption_shown(
+            nav.generating_since.map(|since| now_s - since),
+            phase.hop_hold_s(),
+        );
     for mut node in &mut ui.caption {
         show_node(&mut node, show_caption);
     }

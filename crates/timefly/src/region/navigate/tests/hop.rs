@@ -885,6 +885,68 @@ fn the_hop_swaps_worlds_under_the_cloud() {
     assert_eq!(frames[flying].density, 0.0);
 }
 
+/// The time a hop has held at full cover, for the caption: only in the hold, before its end.
+#[test]
+fn only_a_hops_hold_counts_toward_the_caption() {
+    let at = |lift: f32, swapped: bool, turned_back: bool| NavPhase::Hopping {
+        centre: east_of_alps(),
+        edge: HopEdge { axis: 0, side: 1.0 },
+        lift_from_agl_m: HOP_AGL_M,
+        swapped,
+        elapsed_s: 2.5,
+        lift,
+        failed: turned_back,
+        turned_back,
+    };
+    assert_eq!(at(1.0, false, false).hop_hold_s(), Some(2.5));
+    // Lifting, or ended (the end's `elapsed_s` is the clear's), or not a hop: none.
+    assert_eq!(at(0.6, false, false).hop_hold_s(), None);
+    assert_eq!(at(1.0, true, false).hop_hold_s(), None);
+    assert_eq!(at(1.0, false, true).hop_hold_s(), None);
+    assert_eq!(NavPhase::Flying.hop_hold_s(), None);
+}
+
+/// Spec §6 "Holding", in the shell: a hold longer than `CAPTION_DELAY_S` at full cover shows
+/// "Descending..." (a web hold can last up to 40 s at full white-out), which a neighbour job,
+/// never entering `RegionState::Generating`, did not (the final review). The swap hides it.
+#[test]
+fn a_long_hop_hold_shows_the_caption() {
+    // 1 km short of the edge, so the hold starts within a second; the neighbour is ready 4 s
+    // (40 updates) after it is asked for.
+    let (mut app, _) = hop_app(40, false, EDGE_M - 1_000.0);
+    let shown = |app: &mut App| {
+        let world = app.world_mut();
+        let mut q = world.query_filtered::<&Node, With<DescendingCaption>>();
+        q.single(world).unwrap().display == Display::Flex
+    };
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        app.update();
+        let p = phase(&app);
+        seen.push((p.hop_hold_s(), swapped(&p), shown(&mut app)));
+        if p == NavPhase::Flying && seen.iter().any(|(_, sw, _)| *sw) {
+            break;
+        }
+    }
+    let held: Vec<_> = seen.iter().filter_map(|&(h, _, s)| Some((h?, s))).collect();
+    assert!(
+        held.iter().any(|&(h, _)| h > 2.0),
+        "the hold never lasted: {seen:?}"
+    );
+    for &(h, s) in &held {
+        // Exactly at the delay it may go either way (the frame's step lands there).
+        if (f64::from(h) - CAPTION_DELAY_S).abs() > 1e-3 {
+            assert_eq!(s, f64::from(h) > CAPTION_DELAY_S, "held {h} s: {seen:?}");
+        }
+    }
+    // Hidden again once the hop has swapped.
+    assert!(
+        seen.iter().filter(|(_, sw, _)| *sw).all(|(_, _, s)| !s),
+        "{seen:?}"
+    );
+    assert_eq!(phase(&app), NavPhase::Flying);
+}
+
 /// Point 6: from the preload to the swap at most two grids live, with the terrain scene drawing;
 /// the old one is released on the swap frame.
 #[test]

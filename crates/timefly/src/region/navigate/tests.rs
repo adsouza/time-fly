@@ -221,10 +221,15 @@ fn fade_progress() {
 
 #[test]
 fn caption_waits_a_second() {
-    assert!(!caption_shown(None));
-    assert!(!caption_shown(Some(0.0)));
-    assert!(!caption_shown(Some(0.99)));
-    assert!(caption_shown(Some(1.01)));
+    assert!(!caption_shown(None, None));
+    assert!(!caption_shown(Some(0.0), None));
+    assert!(!caption_shown(Some(0.99), None));
+    assert!(caption_shown(Some(1.01), None));
+    // A hop's hold at full cover shows it too (spec §6 "Holding"; the final review): a
+    // neighbour's job never enters `RegionState::Generating`.
+    assert!(!caption_shown(None, Some(0.99)));
+    assert!(caption_shown(None, Some(1.01)));
+    assert!(caption_shown(Some(0.2), Some(1.01)));
 }
 
 #[test]

@@ -450,6 +450,23 @@ impl NavPhase {
         )
     }
 
+    /// How long a hop has held at full cover waiting for its neighbour (its `elapsed_s` while
+    /// lifted fully, before its end), or `None` outside a hop's hold: the shell shows
+    /// "Descending..." for it as for a region generating (design §6 "Holding"), since a
+    /// neighbour's job never enters `RegionState::Generating`.
+    pub fn hop_hold_s(&self) -> Option<f32> {
+        match *self {
+            NavPhase::Hopping {
+                lift,
+                swapped: false,
+                turned_back: false,
+                elapsed_s,
+                ..
+            } if lift >= 1.0 => Some(elapsed_s),
+            _ => None,
+        }
+    }
+
     /// Whether the player is flying the region with no transition on screen: flying, or on a hop
     /// whose neighbour is still only preloading (its lift has not begun), which leaves the region
     /// and the view as they are.
