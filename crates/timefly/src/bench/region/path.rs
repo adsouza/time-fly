@@ -24,9 +24,9 @@
 //! The path never leaves [`FIELD_LIMIT_M`] on either axis and never comes within [`MIN_AGL_M`]
 //! of the ground under it, well above the fly camera's clearance. The limit keeps it out of the
 //! hop's preload reach (M3 Task 9, ruling P5: the path is a test driver, so it was pulled in
-//! from 0.92 of the half field, and the edge segments are not strictly comparable with M2's
-//! numbers): it never flies out within `PRELOAD_MIN_M` of the edge, nor within a generation's
-//! flight at its speed, so the bench never hops.
+//! from 0.92 of the half field to 0.5, and the edge segments are not strictly comparable with
+//! M2's numbers): it never flies out within `PRELOAD_MIN_M` of the edge, nor within a
+//! generation's flight at its speed on either platform, so the bench never hops.
 
 use std::f32::consts::{PI, TAU};
 
@@ -57,12 +57,14 @@ pub const SWEEP_AGL_M: f32 = 6_000.0;
 pub const HIGH_PASS_TOP_M: f32 = 280_000.0;
 /// The path's floor above the ground (the fly camera's own clearance is 150 m).
 pub const MIN_AGL_M: f32 = 300.0;
-/// The path stays within this of the centre on either axis: 60 km inside the edge, 10 km more
-/// than the hop's least preload distance (`PRELOAD_MIN_M`).
-pub const FIELD_LIMIT_M: f32 = 0.6 * EDGE_M;
+/// The path stays within this of the centre on either axis: 75 km inside the edge. A fly within
+/// `PRELOAD_MIN_M` of the edge, or a generation's flight at its speed, preloads a neighbour, and
+/// on the web a generation is expected to take `EXPECTED_GEN_S_WEB` (8 s): at 0.6 of the half
+/// field the coast run's transit (about 13 km/s) came within that reach (fix round 1).
+pub const FIELD_LIMIT_M: f32 = 0.5 * EDGE_M;
 /// A coast within this of the centre on both axes is run along; farther out it is viewed from
 /// the field's edge.
-pub const COAST_IN_FIELD_M: f32 = 0.55 * EDGE_M;
+pub const COAST_IN_FIELD_M: f32 = 0.45 * EDGE_M;
 /// The low pass's speed.
 const LOW_SPEED_MPS: f32 = 600.0;
 /// The climb ends at this speed.

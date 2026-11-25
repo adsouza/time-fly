@@ -85,6 +85,15 @@ pub fn carry_pose(old: &RegionFrame, new: &RegionFrame, pos_m: DVec3, yaw: f32) 
     (DVec3::new(x, pos_m.y, z), yaw)
 }
 
+/// Where the fly moving from `prev_m` toward `next_m` may be, kept inside the inner field: on
+/// each axis no farther out than [`EDGE_M`], or than it already was (a hop's hold drifts past
+/// the edge under the opaque cloud, and turning back from there is never held), so it slides
+/// along an edge it meets and always gets back in.
+pub fn confine(prev_m: Vec2, next_m: Vec2) -> Vec2 {
+    let limit = prev_m.abs().max(Vec2::splat(EDGE_M));
+    next_m.clamp(-limit, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +236,30 @@ mod tests {
             "{q}"
         );
         assert!((yaw + std::f32::consts::FRAC_PI_2).abs() < 0.1, "{yaw}");
+    }
+
+    #[test]
+    fn confining_keeps_the_fly_in_the_field_and_lets_it_back() {
+        let e = EDGE_M;
+        // Inside, nothing changes.
+        let p = Vec2::new(100_000.0, -20_000.0);
+        assert_eq!(
+            confine(p, p + Vec2::new(30_000.0, 5_000.0)),
+            Vec2::new(130_000.0, -15_000.0)
+        );
+        // Out over an edge on either side and axis: held at it, sliding along it.
+        assert_eq!(
+            confine(p, Vec2::new(e + 5_000.0, -10_000.0)),
+            Vec2::new(e, -10_000.0)
+        );
+        assert_eq!(confine(p, Vec2::new(-e - 1.0, -e - 7.0)), Vec2::new(-e, -e));
+        // Already out (a hold drifted past the edge): never farther out, always back in.
+        let out = Vec2::new(e + 3_000.0, 0.0);
+        assert_eq!(confine(out, out + Vec2::new(500.0, 0.0)), out);
+        assert_eq!(
+            confine(out, out - Vec2::new(500.0, 0.0)),
+            out - Vec2::new(500.0, 0.0)
+        );
     }
 
     /// The horizontal `(x, z)` of a local position.

@@ -1579,3 +1579,122 @@ fn an_ignored_neighbour_reports_failure() {
         .collect();
     assert!(reasons.iter().all(|r| !r.is_empty()), "{reasons:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 9, fix round 1: hops through the real region job
+
+mod hops {
+    use super::*;
+    use timefly::fly_camera::FlyState;
+    use timefly::region::navigate::{NavPhase, Navigation, RegionNavigationPlugin};
+    use timefly::time::{GlobeTime, TimePlugin};
+    use timefly_core::flight::hop::EDGE_M;
+
+    fn phase(app: &App) -> NavPhase {
+        app.world().resource::<Navigation>().phase
+    }
+
+    /// Navigation over the tiny bake, in the region at (0°, 0°) at `years`, flying (the fly's
+    /// pose is scripted, as the bench writes it), `step` a frame.
+    fn hop_app(stalls: Option<Stalls>, years: f64, step: Duration) -> App {
+        let mut app = region_app_with(&tiny_root(), SMALL, stalls, |app| {
+            app.init_resource::<ButtonInput<KeyCode>>()
+                .add_plugins((TimePlugin, RegionNavigationPlugin));
+        });
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(step));
+        app.world_mut().resource_mut::<GlobeTime>().years = YearsBp(years);
+        request(&mut app, 0.0, 0.0, years);
+        let deadline = Instant::now() + REGION_TIMEOUT * 2;
+        while phase(&app) != NavPhase::Flying {
+            app.update();
+            assert!(Instant::now() < deadline, "never flying: {:?}", phase(&app));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        app
+    }
+
+    /// Flies the fly east from 25 km short of the edge at `speed` (at its controls' share of
+    /// it, as the fly camera would), until `done`.
+    fn fly_east(app: &mut App, speed: f32, step: Duration, done: impl Fn(&App) -> bool) {
+        {
+            let mut fly = app.world_mut().resource_mut::<FlyState>();
+            fly.pos_m = Vec3::new(EDGE_M - 25_000.0, 3_000.0, 0.0);
+            fly.yaw = -std::f32::consts::FRAC_PI_2;
+        }
+        app.update();
+        let deadline = Instant::now() + REGION_TIMEOUT * 2;
+        while !done(app) {
+            let share = phase(app).fly_controls().map_or(0.0, |c| c.horizontal);
+            let dx = speed * share * step.as_secs_f32();
+            app.world_mut().resource_mut::<FlyState>().pos_m.x += dx;
+            app.update();
+            assert!(Instant::now() < deadline, "still {:?}", phase(app));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// At a deep era the neighbour is an era-frame direction like the region's own: no crust
+    /// position is resolved for it, so it generates and the hop swaps there as at the present
+    /// (missing crust cannot fail a hop; spec §5.2, era-fixed points stay explorable).
+    #[test]
+    fn a_deep_era_hop_swaps_without_resolving_crust() {
+        let step = Duration::from_millis(50);
+        let mut app = hop_app(None, 100.0e6, step);
+        let before = active(&app);
+        fly_east(&mut app, 10_000.0, step, |a| {
+            matches!(phase(a), NavPhase::Hopping { swapped: true, .. })
+        });
+        assert_eq!(
+            app.world().resource::<timefly::cloud::CloudDensity>().0,
+            1.0
+        );
+        let after = active(&app);
+        assert_eq!(after.grid.spec.snapshot, YearsBp(100.0e6));
+        let (x, z) = before.frame.dir_to_local(after.frame.center).unwrap();
+        assert!(
+            (x - 250_000.0).abs() < 5_000.0 && z.abs() < 5_000.0,
+            "({x}, {z})"
+        );
+        assert!(app.world().resource::<Seen>().failed.is_empty());
+    }
+
+    /// A neighbour the real job fails (its tile load stalls past the timeout) turns the fly round
+    /// 10 km inside the edge under the opaque cloud; the region stays.
+    #[test]
+    fn a_hop_whose_neighbour_times_out_turns_back() {
+        let stalls = Stalls::default();
+        stalls.lock().unwrap().push(tile_path(18, 36).into());
+        let step = Duration::from_secs(1);
+        let mut app = hop_app(Some(stalls), 0.0, step);
+        let before = active(&app);
+        fly_east(&mut app, 10_000.0, step, |a| {
+            matches!(
+                phase(a),
+                NavPhase::Hopping {
+                    turned_back: true,
+                    ..
+                }
+            )
+        });
+        assert_eq!(
+            app.world().resource::<timefly::cloud::CloudDensity>().0,
+            1.0
+        );
+        let seen = app.world().resource::<Seen>();
+        assert_eq!(seen.failed.len(), 1, "{:?}", seen.failed);
+        assert!(
+            seen.failed[0].reason.contains("timed out"),
+            "{:?}",
+            seen.failed
+        );
+        assert!(Arc::ptr_eq(&active(&app).grid, &before.grid));
+        let fly = *app.world().resource::<FlyState>();
+        assert_eq!(fly.pos_m.x, EDGE_M - 10_000.0);
+        assert!(
+            (fly.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "{}",
+            fly.yaw
+        );
+        assert_eq!(state(&app), RegionState::InRegion);
+    }
+}

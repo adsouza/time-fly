@@ -413,9 +413,18 @@ fn step_fly(
         dt_s: time.delta_secs(),
     };
     let grid = &region.grid;
-    let next = fly_step(*fly, input, |x, z| {
-        blended_height_m(grid, f64::from(x), f64::from(z))
-    });
+    let ground = |x: f32, z: f32| blended_height_m(grid, f64::from(x), f64::from(z));
+    let mut next = fly_step(*fly, input, ground);
+    if controls.confined {
+        // Inside the inner field: past its edge only under a hop's opaque cloud.
+        let from = Vec2::new(fly.pos_m.x, fly.pos_m.z);
+        let to = Vec2::new(next.pos_m.x, next.pos_m.z);
+        let kept = timefly_core::flight::hop::confine(from, to);
+        if kept != to {
+            let floor = ground(kept.x, kept.y).max(0.0) + CAMERA_CLEARANCE_M;
+            next.pos_m = Vec3::new(kept.x, next.pos_m.y.max(floor), kept.y);
+        }
+    }
     if next != *fly {
         *fly = next;
     }
@@ -740,8 +749,9 @@ mod tests {
     }
 
     #[test]
-    fn the_field_edge_holds_no_one_back() {
-        // The hop crosses the edge (M3 Task 9): flying out past it, nothing pushes back.
+    fn fly_step_has_no_edge() {
+        // The step itself neither pushes back nor stops at the field's edge (M3 Task 9): the
+        // shell keeps the fly inside it (`FlyControls::confined`) except under a hop's cloud.
         let ground = flat(100.0);
         let out = FlyState {
             pos_m: Vec3::new(EDGE_M + 10_000.0, 5_000.0, -EDGE_M - 4_000.0),

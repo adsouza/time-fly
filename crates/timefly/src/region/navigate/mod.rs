@@ -75,10 +75,11 @@ use crate::ui::TEXT_COLOR;
 mod phase;
 
 pub use phase::{
-    CLIMB_OUT_M, DIVE_DRIFT_S, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT, NavAction, NavInputs,
-    NavPhase, SNAPSHOT_FADE_S, START_TIMEOUT_S, SliderHold, TURN_BACK_INSIDE_M, TimeChange, World,
-    dive_drift_mps, emerge_altitude_km, emerge_density, emerge_height_m, fade_alpha, fly_on_globe,
-    gather_density, gather_elapsed_for, hold_slider, region_yaw, same_region, step_nav,
+    CLIMB_OUT_M, DIVE_DRIFT_S, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT, HopEdge, NavAction,
+    NavInputs, NavPhase, SNAPSHOT_FADE_S, START_TIMEOUT_S, SliderHold, TURN_BACK_INSIDE_M,
+    TimeChange, World, dive_drift_mps, emerge_altitude_km, emerge_density, emerge_height_m,
+    fade_alpha, fly_on_globe, gather_density, gather_elapsed_for, hold_slider, region_yaw,
+    same_region, step_nav,
 };
 
 /// "Descending..." shows only once a region has been generating this long (design §6.1).
@@ -524,12 +525,21 @@ fn navigate(
     let flight = flies.flight.0;
     let pending = world.pending.as_deref().and_then(|p| p.0.as_ref());
     let xz = Vec2::new(p.x, p.z);
-    let velocity = match nav.last_fly_m {
+    let measured = match nav.last_fly_m {
         Some(last) if dt_s > 0.0 => Some((xz - last) / dt_s),
         _ => None,
     }
     .filter(|v| v.length() <= PLACEMENT_MPS)
     .unwrap_or(Vec2::ZERO);
+    // Held at the field's edge (`FlyControls::confined`), the fly does not move: what the player
+    // asks for is its velocity there, so pressing out of the edge still starts a hop.
+    let velocity = if measured.length() < 1.0 {
+        world.keys.as_deref().map_or(Vec2::ZERO, |k| {
+            wish_mps(&keys_to_input(k), flies.fly.yaw, p.y - ground_m)
+        })
+    } else {
+        measured
+    };
     let inputs = NavInputs {
         now_s,
         load_s: clock.elapsed_s,
@@ -811,7 +821,10 @@ fn apply_action(
             let fly = &mut flies.fly;
             fly.pos_m.x = pos_m.x;
             fly.pos_m.z = pos_m.y;
-            fly.yaw = (fly.yaw + 2.0 * std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+            // Turned round: `yaw + π`, wrapped into [−π, π) (adding another π before the
+            // `rem_euclid` and taking it off after maps any yaw there).
+            let turned = fly.yaw + std::f32::consts::PI;
+            fly.yaw = (turned + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                 - std::f32::consts::PI;
             if let Some(region) = region {
                 let ground =
@@ -826,6 +839,21 @@ fn apply_action(
             );
         }
     }
+}
+
+/// The horizontal velocity (m/s, `(x, z)`) the held keys ask of the region's fly heading `yaw`,
+/// `agl_m` above the ground: as [`crate::fly_camera::fly_step`] would move it, unheld.
+fn wish_mps(keys: &crate::fly_camera::KeyInput, yaw: f32, agl_m: f32) -> Vec2 {
+    let m = keys.move_local;
+    let world = Quat::from_rotation_y(yaw) * Vec3::new(m.x, 0.0, m.z);
+    let dir = Vec2::new(world.x, world.z);
+    let dir = if dir.length_squared() > 1.0 {
+        dir.normalize()
+    } else {
+        dir
+    };
+    let boost = if keys.boost { BOOST } else { 1.0 };
+    dir * fly_speed(agl_m) * boost
 }
 
 /// Resets the region chase camera's smoothing, so it starts at the new pose.

@@ -246,9 +246,10 @@ pub enum NavPhase {
     /// neighbour failed: at full cover the fly turns back instead of swapping. The hop ends
     /// under the opaque cloud, `swapped` into the neighbour or `turned_back` inside the edge;
     /// then for `elapsed_s` of [`CLOUD_CLEAR_S`] the cloud clears while the fly returns to its
-    /// height.
+    /// height. `edge` is the edge of the region it crosses, worked out once per neighbour.
     Hopping {
         centre: RenderDir,
+        edge: HopEdge,
         lift_from_agl_m: f32,
         swapped: bool,
         elapsed_s: f32,
@@ -265,6 +266,11 @@ pub struct FlyControls {
     pub horizontal: f32,
     /// Whether climbing and descending are the player's.
     pub vertical: bool,
+    /// Whether the fly is kept inside the inner field ([`timefly_core::flight::hop::confine`]):
+    /// everywhere but a hop's hold at full cover, so the fly is past the edge only under an
+    /// opaque cloud (fix round 1: a hop ending, a failed one's retries and a flight a hop cannot
+    /// start from never carry it out into the apron in clear air).
+    pub confined: bool,
 }
 
 /// The expected generation time (s) of a neighbour on this platform, for
@@ -275,6 +281,35 @@ pub const EXPECTED_GEN_S: f32 = timefly_core::flight::altitudes::EXPECTED_GEN_S_
 /// [`preload_distance_m`](timefly_core::flight::hop::preload_distance_m).
 #[cfg(not(target_arch = "wasm32"))]
 pub const EXPECTED_GEN_S: f32 = timefly_core::flight::altitudes::EXPECTED_GEN_S_NATIVE as f32;
+/// The edge of the region a hop crosses: `axis` 0 for `x`, 1 for `z`, and `side` ±1.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct HopEdge {
+    pub axis: usize,
+    pub side: f32,
+}
+
+impl HopEdge {
+    /// The edge a hop to the neighbour centred on `centre` crosses, from the region centred on
+    /// `region`: the axis the neighbour lies farthest along, on its side.
+    pub fn toward(region: RenderDir, centre: RenderDir) -> HopEdge {
+        let (x, z) = RegionFrame { center: region }
+            .dir_to_local(centre)
+            .unwrap_or((0.0, 0.0));
+        let axis = usize::from(z.abs() > x.abs());
+        let c = if axis == 0 { x } else { z };
+        HopEdge {
+            axis,
+            side: if c < 0.0 { -1.0 } else { 1.0 },
+        }
+    }
+
+    /// How far out along this edge's axis `v` points (a position: how far out; a velocity: how
+    /// fast out of the edge).
+    pub fn out(self, v: Vec2) -> f32 {
+        self.side * v[self.axis]
+    }
+}
+
 /// A failed neighbour turns the fly back this far inside the edge (Review Focus 4).
 pub const TURN_BACK_INSIDE_M: f32 = 10_000.0;
 /// While a hop holds in the cloud, the fly's horizontal speed is this share of its own *(call:
@@ -381,6 +416,7 @@ impl NavPhase {
         let full = FlyControls {
             horizontal: 1.0,
             vertical: true,
+            confined: true,
         };
         match *self {
             NavPhase::Flying => Some(full),
@@ -389,10 +425,14 @@ impl NavPhase {
                 swapped: false,
                 turned_back: false,
                 ..
-            } if lift > 0.0 => Some(FlyControls {
-                horizontal: if lift >= 1.0 { HOLD_DRIFT } else { 1.0 },
-                vertical: false,
-            }),
+            } if lift > 0.0 => {
+                let held = lift >= 1.0;
+                Some(FlyControls {
+                    horizontal: if held { HOLD_DRIFT } else { 1.0 },
+                    vertical: false,
+                    confined: !held,
+                })
+            }
             NavPhase::Hopping { .. } => Some(full),
             _ => None,
         }
@@ -547,17 +587,6 @@ pub fn fly_on_globe(frame: &RegionFrame, x_m: f64, z_m: f64, yaw: f32) -> (Rende
     (dir, tangent.normalize())
 }
 
-/// The edge a hop to the neighbour centred on `centre` crosses, in the frame of the region
-/// centred on `region`: the axis (0 for `x`, 1 for `z`) and the side (±1).
-fn hop_edge(region: RenderDir, centre: RenderDir) -> (usize, f32) {
-    let (x, z) = RegionFrame { center: region }
-        .dir_to_local(centre)
-        .unwrap_or((0.0, 0.0));
-    let axis = usize::from(z.abs() > x.abs());
-    let c = if axis == 0 { x } else { z };
-    (axis, if c < 0.0 { -1.0 } else { 1.0 })
-}
-
 /// The neighbour to request for the fly in the region, if it should be preloading: never the
 /// region itself (Task 8 note b; the region job does not check).
 fn neighbour_to_preload(i: &NavInputs) -> Option<RenderDir> {
@@ -573,10 +602,11 @@ fn neighbour_to_preload(i: &NavInputs) -> Option<RenderDir> {
     (!same_region(centre, snapshot, region, snapshot)).then_some(centre)
 }
 
-/// A hop starting now, to `centre`.
-fn hop_to(centre: RenderDir, i: &NavInputs) -> NavPhase {
+/// A hop starting now, to `centre` past `edge`.
+fn hop_to(centre: RenderDir, edge: HopEdge, i: &NavInputs) -> NavPhase {
     NavPhase::Hopping {
         centre,
+        edge,
         lift_from_agl_m: i.region_height_m - i.region_ground_m,
         swapped: false,
         elapsed_s: 0.0,
@@ -775,9 +805,11 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                     }
                     None => climb(i),
                 }
-            } else if let Some(centre) = neighbour_to_preload(i) {
+            } else if let Some(centre) = neighbour_to_preload(i)
+                && let Some(region) = i.region_centre
+            {
                 actions.push(NavAction::Preload(centre));
-                hop_to(centre, i)
+                hop_to(centre, HopEdge::toward(region, centre), i)
             } else {
                 NavPhase::Flying
             }
@@ -880,6 +912,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
         }
         NavPhase::Hopping {
             centre,
+            edge,
             lift_from_agl_m,
             swapped,
             elapsed_s,
@@ -891,23 +924,16 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 return (out_over_globe, actions);
             }
             if i.climb_key || i.region_height_m >= CLIMB_OUT_M {
-                // Leaving drops the neighbour too.
+                // Out to the globe, from the cloud already there. Leaving drops the neighbour
+                // too, but only at the climb's swap: stop its job now (minor 6).
+                if !(swapped || turned_back) {
+                    actions.push(NavAction::CancelPreload);
+                }
                 return (climb(i), actions);
             }
             let agl = i.region_height_m - i.region_ground_m;
             if swapped || turned_back {
-                return (
-                    step_hop_end(
-                        centre,
-                        lift_from_agl_m,
-                        swapped,
-                        elapsed_s,
-                        agl,
-                        i,
-                        &mut actions,
-                    ),
-                    actions,
-                );
+                return (step_hop_end(phase, agl, i, &mut actions), actions);
             }
             let Some(region) = i.region_centre else {
                 return (out_over_globe, actions);
@@ -921,19 +947,19 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             let mut centre = centre;
             // A job taking over for an enter or snapshot change drops the neighbour.
             let mut failed = failed || i.preload_failed || i.region_state != RegionState::InRegion;
-            let (mut axis, mut side) = hop_edge(region, centre);
+            let mut edge = edge;
             // Flying no longer out of the hop's edge, near another: retarget.
-            if side * i.region_vel_mps[axis] <= 0.0
+            if edge.out(i.region_vel_mps) <= 0.0
                 && let Some(c) = neighbour_to_preload(i)
-                && hop_edge(region, c) != (axis, side)
+                && HopEdge::toward(region, c) != edge
             {
                 actions.push(NavAction::Preload(c));
                 centre = c;
                 failed = false;
-                (axis, side) = hop_edge(region, c);
+                edge = HopEdge::toward(region, c);
             }
-            let out_m = side * i.region_pos_m[axis];
-            let outward = side * i.region_vel_mps[axis];
+            let out_m = edge.out(i.region_pos_m);
+            let outward = edge.out(i.region_vel_mps);
             let target = if outward < 0.0 {
                 0.0
             } else {
@@ -969,6 +995,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 });
             let ended = |swapped: bool, turned_back: bool| NavPhase::Hopping {
                 centre,
+                edge,
                 lift_from_agl_m,
                 swapped,
                 elapsed_s: 0.0,
@@ -979,7 +1006,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             if opaque && failed {
                 // Review Focus 4: round, inside the edge, under the opaque cloud.
                 let mut pos_m = i.region_pos_m;
-                pos_m[axis] = side * (EDGE_M - TURN_BACK_INSIDE_M);
+                pos_m[edge.axis] = edge.side * (EDGE_M - TURN_BACK_INSIDE_M);
                 actions.push(NavAction::CancelPreload);
                 actions.push(NavAction::TurnBack { pos_m });
                 ended(false, true)
@@ -990,6 +1017,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             } else {
                 NavPhase::Hopping {
                     centre,
+                    edge,
                     lift_from_agl_m,
                     swapped,
                     elapsed_s,
@@ -1007,14 +1035,22 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
 /// [`CLOUD_CLEAR_S`] while the fly, `agl_m` above the ground, returns to `lift_from_agl_m`
 /// (climbing or descending makes the player's height the one to keep); then flying.
 fn step_hop_end(
-    centre: RenderDir,
-    lift_from_agl_m: f32,
-    swapped: bool,
-    elapsed_s: f32,
+    hop: NavPhase,
     agl_m: f32,
     i: &NavInputs,
     actions: &mut Vec<NavAction>,
 ) -> NavPhase {
+    let NavPhase::Hopping {
+        centre,
+        edge,
+        lift_from_agl_m,
+        swapped,
+        elapsed_s,
+        ..
+    } = hop
+    else {
+        return hop;
+    };
     let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32);
     let lift_from_agl_m = if i.vertical_held {
         agl_m
@@ -1032,6 +1068,7 @@ fn step_hop_end(
     } else {
         NavPhase::Hopping {
             centre,
+            edge,
             lift_from_agl_m,
             swapped,
             elapsed_s,
