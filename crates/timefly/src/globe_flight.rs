@@ -40,13 +40,14 @@ use timefly_core::flight::chase::{
 use timefly_core::flight::cloud::globe_exaggeration;
 use timefly_core::flight::globe::{
     BOOST, GLOBE_MIN_ALTITUDE_KM, GlobeFlight, GlobeInput, SPEED_PER_ALTITUDE, globe_fly_step,
+    globe_speed_km_s,
 };
 
 use crate::creature::FlyPose;
 use crate::diagnostics::DiagnosticsContext;
 use crate::fly_camera::{
-    ChaseGlide, FlyFlourish, KeyInput, LOOK_RADIANS_PER_PX, MAX_STEP_S, TURN_DEG_PER_S, fly_speed,
-    keys_to_input,
+    ChaseGlide, FlyFlourish, FlyTurn, KeyInput, LOOK_RADIANS_PER_PX, MAX_STEP_S, TURN_DEG_PER_S,
+    fly_speed, keys_to_input,
 };
 use crate::globe::{
     EARTH_RADIUS_KM, GlobeCamera, GlobeCameraSync, GlobeExaggeration, GlobeExaggerationSync,
@@ -356,20 +357,33 @@ fn apply_globe_flight(
     }
 
     // The fly: held at its share of the view, banked by its turn rate (the signed turn of the
-    // heading about up, the previous heading carried into this frame) and bobbing while idle.
+    // heading about up, the previous heading carried into this frame), pitched by its climb
+    // (against the climb keys' speed at last frame's altitude) and bobbing while idle.
     let dt_s = time.delta_secs();
-    let (yaw_rate, idle) = match chase.last {
+    let turn = match chase.last {
         Some(last) => {
             let before = carry * last.heading;
             let turned = up.dot(before.cross(f.heading)).atan2(before.dot(f.heading));
-            let rate = if dt_s > 0.0 {
-                (turned / f64::from(dt_s)) as f32
+            let (yaw_rate, climb) = if dt_s > 0.0 {
+                let dt = f64::from(dt_s);
+                let full = globe_speed_km_s(last.altitude_km, false).max(1e-9);
+                (
+                    (turned / dt) as f32,
+                    ((f.altitude_km - last.altitude_km) / dt / full) as f32,
+                )
             } else {
-                0.0
+                (0.0, 0.0)
             };
-            (rate, last == f)
+            FlyTurn {
+                yaw_rate,
+                climb,
+                idle: last == f,
+            }
         }
-        None => (0.0, true),
+        None => FlyTurn {
+            idle: true,
+            ..default()
+        },
     };
     chase.last = Some(f);
     let vfov = match projection {
@@ -377,14 +391,13 @@ fn apply_globe_flight(
         _ => PerspectiveProjection::default().fov,
     };
     let scale = fly_scale((eye - fly).length(), f64::from(vfov)) as f32;
-    let (bank_rad, bob) = chase
-        .flourish
-        .step(yaw_rate, idle, dt_s, time.elapsed_secs(), scale);
+    let (bank_rad, pitch_rad, bob) = chase.flourish.step(turn, dt_s, time.elapsed_secs(), scale);
     let next = FlyPose {
         translation: (fly + up * f64::from(bob)).as_vec3(),
         rotation: heading_rotation(f.heading, up),
         scale,
         bank_rad,
+        pitch_rad,
     };
     // Only the world on screen writes the fly and the overlay's altitude.
     if settings.is_active && *pose != next {
@@ -963,6 +976,33 @@ mod tests {
         let amplitude =
             f64::from(crate::creature::HOVER_AMPLITUDE * app.world().resource::<FlyPose>().scale);
         assert!(furthest > 0.5 * amplitude, "{furthest} vs {amplitude}");
+    }
+
+    #[test]
+    fn the_fly_pitches_with_climbs_on_the_globe() {
+        // Spec §5.1, the final review: nose up climbing, down descending, at the climb keys'
+        // full speed the limit.
+        let (mut app, _) = app(16.0 / 9.0);
+        set_flight(&mut app, at(3_000.0));
+        run(&mut app, 3);
+        let limit = crate::creature::MAX_PITCH_DEG.to_radians();
+        for (key, sign) in [(KeyCode::Space, 1.0), (KeyCode::ControlLeft, -1.0)] {
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(key);
+            run(&mut app, 60);
+            let pitch = app.world().resource::<FlyPose>().pitch_rad;
+            assert!(
+                (pitch - sign * limit).abs() < 0.05 * limit,
+                "{key:?}: {pitch}"
+            );
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .release(key);
+        }
+        run(&mut app, 120);
+        let level = app.world().resource::<FlyPose>().pitch_rad;
+        assert!(level.abs() < 0.01, "{level}");
     }
 
     #[test]

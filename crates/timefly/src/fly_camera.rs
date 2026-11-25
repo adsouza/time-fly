@@ -53,7 +53,7 @@ use timefly_core::flight::altitudes::{
 pub use timefly_core::flight::chase::CHASE_START_LOOK_DEG;
 use timefly_core::flight::chase::{ChasePose, chase_pose, fly_scale, lift_above_ground};
 
-use crate::creature::{FlyPose, HOVER_EASE_S, bank_step, hover_offset};
+use crate::creature::{FlyPose, HOVER_EASE_S, bank_step, hover_offset, pitch_step};
 use crate::region::navigate::{Navigation, NavigationSystems};
 use crate::region::{ActiveRegion, CAMERA_START_ALTITUDE_M};
 use crate::terrain::view::REGION_FOV_DEG;
@@ -484,31 +484,49 @@ impl ChaseGlide {
 }
 
 /// The fly's drawn-only motion, shared by the region and the globe: the bank into turns
-/// ([`bank_step`]) and the idle bob ([`hover_offset`]), which fades in while the fly is left
-/// alone. Neither moves the flight state.
+/// ([`bank_step`]), the pitch with climbs ([`pitch_step`]) and the idle bob ([`hover_offset`]),
+/// which fades in while the fly is left alone. None of them moves the flight state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FlyFlourish {
     bank_rad: f32,
+    pitch_rad: f32,
     /// How much of the idle bob shows, 0 to 1.
     hover: f32,
 }
 
 impl FlyFlourish {
-    /// Steps the bank toward `yaw_rate` (rad/s, positive to the left) and the bob toward
-    /// `idle`; returns the bank and the bob's height (along up) for a fly drawn at `scale`.
+    /// Steps the bank toward `yaw_rate` (rad/s, positive to the left), the pitch toward
+    /// `climb` (the vertical speed over the climb keys' speed, [`pitch_step`]) and the bob toward
+    /// `idle`; returns the bank, the pitch and the bob's height (along up) for a fly drawn at
+    /// `scale`.
     pub(crate) fn step(
         &mut self,
-        yaw_rate: f32,
-        idle: bool,
+        turn: FlyTurn,
         dt_s: f32,
         t_s: f32,
         scale: f32,
-    ) -> (f32, f32) {
-        self.bank_rad = bank_step(self.bank_rad, yaw_rate, dt_s);
+    ) -> (f32, f32, f32) {
+        self.bank_rad = bank_step(self.bank_rad, turn.yaw_rate, dt_s);
+        self.pitch_rad = pitch_step(self.pitch_rad, turn.climb, dt_s);
         let ease = 1.0 - (-dt_s / HOVER_EASE_S).exp();
-        self.hover += (f32::from(u8::from(idle)) - self.hover) * ease;
-        (self.bank_rad, self.hover * hover_offset(t_s, scale))
+        self.hover += (f32::from(u8::from(turn.idle)) - self.hover) * ease;
+        (
+            self.bank_rad,
+            self.pitch_rad,
+            self.hover * hover_offset(t_s, scale),
+        )
     }
+}
+
+/// How the fly moved over the last frame, for [`FlyFlourish::step`].
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub(crate) struct FlyTurn {
+    /// The heading's turn rate (rad/s, positive to the left).
+    pub(crate) yaw_rate: f32,
+    /// The vertical speed over the speed the climb keys fly at (1 climbing at full speed).
+    pub(crate) climb: f32,
+    /// Whether the fly did not move at all.
+    pub(crate) idle: bool,
 }
 
 /// The chase camera's smoothed pose and the fly's visual state between frames.
@@ -578,27 +596,43 @@ fn apply_fly(
         *camera = want_camera;
     }
 
-    // The fly: its size on screen held by the camera's distance; banked by its turn rate and
-    // bobbing while left alone (both drawn only, never moving `FlyState`).
+    // The fly: its size on screen held by the camera's distance; banked by its turn rate,
+    // pitched by its climb and bobbing while left alone (all drawn only, never moving
+    // `FlyState`).
     let dt_s = time.delta_secs();
-    let (yaw_rate, idle) = match chase.last {
-        Some(last) if dt_s > 0.0 => ((fly.yaw - last.yaw) / dt_s, last == *fly),
-        Some(last) => (0.0, last == *fly),
-        None => (0.0, true),
+    let turn = match chase.last {
+        Some(last) if dt_s > 0.0 => {
+            // Against the speed the climb keys flew at from last frame's height.
+            let full = fly_speed(
+                last.pos_m.y - ground(f64::from(last.pos_m.x), f64::from(last.pos_m.z)) as f32,
+            );
+            FlyTurn {
+                yaw_rate: (fly.yaw - last.yaw) / dt_s,
+                climb: (fly.pos_m.y - last.pos_m.y) / dt_s / full,
+                idle: last == *fly,
+            }
+        }
+        Some(last) => FlyTurn {
+            idle: last == *fly,
+            ..default()
+        },
+        None => FlyTurn {
+            idle: true,
+            ..default()
+        },
     };
     chase.last = Some(*fly);
     let scale = fly_scale(
         (shown.eye - fly_m).length(),
         f64::from(REGION_FOV_DEG.to_radians()),
     ) as f32;
-    let (bank_rad, bob) = chase
-        .flourish
-        .step(yaw_rate, idle, dt_s, time.elapsed_secs(), scale);
+    let (bank_rad, pitch_rad, bob) = chase.flourish.step(turn, dt_s, time.elapsed_secs(), scale);
     let next = FlyPose {
         translation: fly.pos_m + Vec3::Y * bob,
         rotation: Quat::from_rotation_y(fly.yaw),
         scale,
         bank_rad,
+        pitch_rad,
     };
     // Only the world on screen writes the pose: a region held while the globe draws (a
     // preload, a swap) leaves it to the globe.
@@ -1486,6 +1520,39 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// Spec §5.1: the body "banks into turns and pitches with climbs" (the final review).
+        #[test]
+        fn the_fly_pitches_with_climbs() {
+            let grid = grid(|_, _| 0.0);
+            let fly = FlyState::start(&grid);
+            let mut app = app(&grid, fly);
+            app.update();
+            let dt = STEP.as_secs_f32();
+            let pitch_after = |app: &mut App, sign: f32| {
+                for _ in 0..90 {
+                    let mut f = app.world_mut().resource_mut::<FlyState>();
+                    // Straight up or down at the climb keys' full speed.
+                    f.pos_m.y += sign * fly_speed(f.pos_m.y) * dt;
+                    app.update();
+                }
+                app.world().resource::<FlyPose>().pitch_rad
+            };
+            let full = crate::creature::MAX_PITCH_DEG.to_radians();
+            let up = pitch_after(&mut app, 1.0);
+            assert!((up - full).abs() < 0.02, "{up} vs {full}");
+            // The nose rises: the drawn forward points up.
+            let pose = *app.world().resource::<FlyPose>();
+            assert!(
+                (pose.transform().rotation * Vec3::NEG_Z).y > 0.3,
+                "{pose:?}"
+            );
+            let down = pitch_after(&mut app, -1.0);
+            assert!((down + full).abs() < 0.02, "{down} vs {full}");
+            // Level flight settles level.
+            let level = pitch_after(&mut app, 0.0);
+            assert!(level.abs() < 0.01, "{level}");
         }
 
         #[test]

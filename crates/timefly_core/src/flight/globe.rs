@@ -71,6 +71,14 @@ fn rotate(v: DVec3, axis: DVec3, angle: f64) -> DVec3 {
 
 /// Advances the fly one frame: turn about up, then travel along the great circle toward the
 /// input direction, carrying the heading with it and re-orthonormalising it.
+/// The globe's flight speed (km/s) at `altitude_km`, along the ground and climbing alike:
+/// [`SPEED_PER_ALTITUDE`] × the altitude (× [`BOOST`] when boosted), with the ground track's
+/// angular speed capped at `GLOBE_MAX_TURN_DEG_PER_S`.
+pub fn globe_speed_km_s(altitude_km: f64, boost: bool) -> f64 {
+    let speed = SPEED_PER_ALTITUDE * altitude_km * if boost { BOOST } else { 1.0 };
+    speed.min(GLOBE_MAX_TURN_DEG_PER_S.to_radians() * (EARTH_RADIUS_KM + altitude_km))
+}
+
 pub fn globe_fly_step(state: GlobeFlight, input: GlobeInput) -> GlobeFlight {
     let dir = state.dir.normalize();
     let up = dir;
@@ -78,9 +86,8 @@ pub fn globe_fly_step(state: GlobeFlight, input: GlobeInput) -> GlobeFlight {
     let heading = (turned - up * up.dot(turned)).normalize();
     let right = heading.cross(up);
 
-    let mut speed = SPEED_PER_ALTITUDE * state.altitude_km * if input.boost { BOOST } else { 1.0 };
+    let speed = globe_speed_km_s(state.altitude_km, input.boost);
     let radius = EARTH_RADIUS_KM + state.altitude_km;
-    speed = speed.min(GLOBE_MAX_TURN_DEG_PER_S.to_radians() * radius);
 
     let mut wish = heading * input.forward + right * input.strafe;
     if wish.length() > 1.0 {

@@ -10,8 +10,9 @@
 //!   [`RIM_POWER`]) so it reads over dark ground.
 //! - **Pose** ([`FlyPose`]): whichever world is active writes it (the region's
 //!   `crate::fly_camera::apply_fly`, the globe's `crate::globe_flight`); [`follow_fly_pose`]
-//!   copies it to the root's transform, adding the bank. The bank ([`bank_step`]) and the idle
-//!   bob ([`hover_offset`]) are visual only: they never move the flight state.
+//!   copies it to the root's transform, adding the pitch and the bank. The bank into turns
+//!   ([`bank_step`]), the pitch with climbs ([`pitch_step`]) and the idle bob ([`hover_offset`])
+//!   are visual only: they never move the flight state.
 //! - **Shown** while the region camera is active, or while the globe camera is and the globe
 //!   is interactive (not over the loading screen).
 //! - **Lit** by exactly one sun in each world: the region's sun shares the region camera's
@@ -68,6 +69,12 @@ pub const BANK_PER_YAW_RATE: f32 = 0.5;
 pub const BANK_SMOOTHING_S: f32 = 0.25;
 /// The steepest bank *(call)*.
 pub const MAX_BANK_DEG: f32 = 40.0;
+/// The steepest pitch, nose up climbing or down diving at the climb keys' full speed *(call)*:
+/// a climb fraction of 1 (the vertical speed over the speed the climb keys fly at) pitches
+/// this far; a boost or a lift's faster climb is clamped to it.
+pub const MAX_PITCH_DEG: f32 = 20.0;
+/// The pitch's smoothing time constant (s), the bank's.
+pub const PITCH_SMOOTHING_S: f32 = BANK_SMOOTHING_S;
 /// The idle bob's frequency (Hz).
 pub const HOVER_HZ: f32 = 0.3;
 /// The idle bob's amplitude, as a fraction of the fly's drawn scale.
@@ -81,14 +88,15 @@ pub struct Dragonfly;
 
 /// Where the dragonfly is drawn, written by whichever world is active: its position (the idle
 /// bob included), its heading frame (`−z` forward, `+y` up, no bank), its uniform scale (the
-/// body length, from `fly_scale`) and its bank about the body axis. The drawn rotation is
-/// `rotation × Rz(bank_rad)`.
+/// body length, from `fly_scale`), its pitch (nose up positive) about its right axis and its
+/// bank about the body axis. The drawn rotation is `rotation × Rx(pitch_rad) × Rz(bank_rad)`.
 #[derive(Resource, Copy, Clone, Debug, PartialEq)]
 pub struct FlyPose {
     pub translation: Vec3,
     pub rotation: Quat,
     pub scale: f32,
     pub bank_rad: f32,
+    pub pitch_rad: f32,
 }
 
 impl Default for FlyPose {
@@ -98,16 +106,19 @@ impl Default for FlyPose {
             rotation: Quat::IDENTITY,
             scale: 1.0,
             bank_rad: 0.0,
+            pitch_rad: 0.0,
         }
     }
 }
 
 impl FlyPose {
-    /// The dragonfly root's transform: the pose with the bank applied.
+    /// The dragonfly root's transform: the pose with the pitch and the bank applied.
     pub fn transform(&self) -> Transform {
         Transform {
             translation: self.translation,
-            rotation: self.rotation * Quat::from_rotation_z(self.bank_rad),
+            rotation: self.rotation
+                * Quat::from_rotation_x(self.pitch_rad)
+                * Quat::from_rotation_z(self.bank_rad),
             scale: Vec3::splat(self.scale),
         }
     }
@@ -125,6 +136,21 @@ pub fn bank_step(bank_rad: f32, yaw_rate: f32, dt_s: f32) -> f32 {
     };
     let dt = if dt_s.is_finite() { dt_s.max(0.0) } else { 0.0 };
     bank_rad + (want - bank_rad) * (1.0 - (-dt / BANK_SMOOTHING_S).exp())
+}
+
+/// The next pitch (radians, nose up positive) after `dt_s` seconds climbing at `climb` (the
+/// vertical speed over the speed the climb keys fly at: 1 climbing at full speed, −1 descending):
+/// toward `climb` × [`MAX_PITCH_DEG`], clamped to it, smoothed with [`PITCH_SMOOTHING_S`], as
+/// [`bank_step`] is.
+pub fn pitch_step(pitch_rad: f32, climb: f32, dt_s: f32) -> f32 {
+    let limit = MAX_PITCH_DEG.to_radians();
+    let want = if climb.is_finite() {
+        climb.clamp(-1.0, 1.0) * limit
+    } else {
+        0.0
+    };
+    let dt = if dt_s.is_finite() { dt_s.max(0.0) } else { 0.0 };
+    pitch_rad + (want - pitch_rad) * (1.0 - (-dt / PITCH_SMOOTHING_S).exp())
 }
 
 /// The idle bob's height at `t_s` for a fly drawn at `scale`: [`HOVER_AMPLITUDE`] × `scale` at
@@ -345,6 +371,50 @@ mod tests {
     const TURN_RATE: f32 = 1.0;
 
     #[test]
+    fn the_pitch_follows_climbs_and_settles() {
+        // Climbing at the climb keys' full speed (a climb fraction of 1) pitches the nose up to
+        // the limit; diving, down to it.
+        let limit = MAX_PITCH_DEG.to_radians();
+        let settle = |climb: f32| {
+            let mut p = 0.0;
+            for _ in 0..240 {
+                p = pitch_step(p, climb, 1.0 / 60.0);
+            }
+            p
+        };
+        assert!((settle(1.0) - limit).abs() < 1e-3);
+        assert!((settle(-1.0) + limit).abs() < 1e-3);
+        assert!((settle(0.5) - 0.5 * limit).abs() < 1e-3);
+        // Boosted (4x) or a placement's jump: never past the limit.
+        assert!((settle(4.0) - limit).abs() < 1e-3);
+        assert!(pitch_step(0.0, 1.0e6, 10.0) <= limit + 1e-6);
+        assert_eq!(pitch_step(0.1, f32::NAN, 1.0 / 60.0).is_finite(), true);
+        // Smoothed like the bank: one time constant is 1 − 1/e of the way.
+        let one_tau = pitch_step(0.0, 1.0, PITCH_SMOOTHING_S);
+        assert!((one_tau / limit - (1.0 - (-1.0f32).exp())).abs() < 1e-3);
+        // Level flight decays back to level.
+        let mut p = limit;
+        for _ in 0..240 {
+            p = pitch_step(p, 0.0, 1.0 / 60.0);
+        }
+        assert!(p.abs() < 1e-3, "{p}");
+        // Drawn: a positive pitch lifts the nose (−z) about the fly's own right axis, before
+        // the bank about the body axis.
+        let pose = FlyPose {
+            rotation: Quat::from_rotation_y(0.7),
+            pitch_rad: 0.3,
+            bank_rad: 0.2,
+            ..default()
+        };
+        let nose = pose.transform().rotation * Vec3::NEG_Z;
+        assert!((nose.y - 0.3f32.sin()).abs() < 1e-5, "{nose}");
+        let flat = Quat::from_rotation_y(0.7) * Vec3::NEG_Z;
+        assert!(
+            (Vec2::new(nose.x, nose.z).normalize() - Vec2::new(flat.x, flat.z)).length() < 1e-5
+        );
+    }
+
+    #[test]
     fn the_dragonfly_follows_the_pose_in_either_world() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
@@ -368,6 +438,7 @@ mod tests {
             rotation: Quat::from_rotation_y(0.4),
             scale: 120.0,
             bank_rad: 0.3,
+            pitch_rad: 0.0,
         };
         app.insert_resource(pose);
         app.update();
