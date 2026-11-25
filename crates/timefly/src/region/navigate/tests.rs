@@ -26,7 +26,7 @@ use crate::data::BakeRevision;
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, fly_speed};
 use crate::globe::EARTH_RADIUS_KM;
-use crate::region::{RegionGenerated, RegionPlugin, RegionSnapshotChanged};
+use crate::region::{RegionGenerated, RegionPlugin, RegionSnapshotChanged, RequestPurpose};
 use crate::time::TimePlugin;
 use timefly_core::terrain::blended_height_m;
 
@@ -494,6 +494,7 @@ fn descending_below_the_dive_altitude_commits_once() {
             NavAction::Request(RegionRequested {
                 era_dir: target,
                 snapshot,
+                purpose: RequestPurpose::Enter,
             }),
         ]
     );
@@ -1382,6 +1383,7 @@ fn snapshot_change_holds_until_the_region_is_ready() {
         vec![NavAction::Request(RegionRequested {
             era_dir: carried,
             snapshot: YearsBp(100e6),
+            purpose: RequestPurpose::Snapshot,
         })]
     );
     let generating = NavInputs {

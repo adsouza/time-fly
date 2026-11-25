@@ -27,9 +27,10 @@ use timefly::region::frames::{CpuGrid, FRAME_CACHE_SLOTS, FrameCache};
 use timefly::region::generate::{BudgetedRun, GenInputs, generate_parallel, tiles_needed};
 use timefly::region::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, tile_path};
 use timefly::region::{
-    ActiveRegion, GenMode, LOAD_TIMEOUT_S, LargeGenBudget, LoadClock, RegionEntered,
-    RegionGenerated, RegionLeft, RegionPlugin, RegionRequested, RegionSettings,
-    RegionSnapshotChanged, RegionState,
+    ActiveRegion, GenMode, LOAD_TIMEOUT_S, LargeGenBudget, LoadClock, PendingRegion, RegionEntered,
+    RegionGenerated, RegionLeft, RegionPlugin, RegionPreloadCancelled, RegionPreloadFailed,
+    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState, RegionSwapRequested,
+    RequestPurpose,
 };
 use timefly_core::deep_time::YearsBp;
 use timefly_core::formats::{Grid, read_tfgrid};
@@ -248,6 +249,7 @@ struct Seen {
     generated: Vec<RegionGenerated>,
     entered: Vec<RegionEntered>,
     changed: Vec<RegionSnapshotChanged>,
+    failed: Vec<RegionPreloadFailed>,
     states: Vec<RegionState>,
 }
 
@@ -256,8 +258,10 @@ fn record(
     mut generated: MessageReader<RegionGenerated>,
     mut entered: MessageReader<RegionEntered>,
     mut changed: MessageReader<RegionSnapshotChanged>,
+    mut failed: MessageReader<RegionPreloadFailed>,
     state: Res<State<RegionState>>,
 ) {
+    seen.failed.extend(failed.read().cloned());
     seen.generated.extend(generated.read().copied());
     seen.entered.extend(entered.read().copied());
     seen.changed.extend(changed.read().copied());
@@ -366,10 +370,56 @@ fn region_app_with(
 }
 
 fn request(app: &mut App, lat: f64, lon: f64, years: f64) {
+    request_for(app, RequestPurpose::Enter, lat, lon, years);
+}
+
+fn request_for(app: &mut App, purpose: RequestPurpose, lat: f64, lon: f64, years: f64) {
     app.world_mut().write_message(RegionRequested {
         era_dir: dir(lat, lon),
         snapshot: YearsBp(years),
+        purpose,
     });
+}
+
+/// Whether the region is centred on (`lat`, `lon`): the spec normalises its centre.
+fn centred(region: &ActiveRegion, lat: f64, lon: f64) -> bool {
+    region.grid.spec.center.0.dot(dir(lat, lon).0) > 1.0 - 1e-12
+}
+
+fn neighbour(app: &mut App, lat: f64, lon: f64) {
+    request_for(app, RequestPurpose::Neighbour, lat, lon, 0.0);
+}
+
+fn pending(app: &App) -> Option<ActiveRegion> {
+    app.world().resource::<PendingRegion>().0.clone()
+}
+
+/// Updates until the neighbour is ready in [`PendingRegion`].
+fn run_until_pending(app: &mut App) {
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    while pending(app).is_none() {
+        app.update();
+        assert!(Instant::now() < deadline, "no neighbour after the timeout");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Updates for `ms` of wall time, long enough for anything wrongly in flight to land.
+fn settle(app: &mut App, ms: u64) {
+    let until = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < until {
+        app.update();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// An app in a region at (0°, 0°), present day, with the state history cleared.
+fn app_in_region(settings: RegionSettings) -> App {
+    let mut app = region_app(&tiny_root(), settings);
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    app.world_mut().resource_mut::<Seen>().states.clear();
+    app
 }
 
 fn state(app: &App) -> RegionState {
@@ -1264,4 +1314,217 @@ fn aegean_time_boxed_slices() {
         counts[0] as f64 * 16.7e-3,
         counts[1] as f64 * 16.7e-3
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 8: preloading a neighbour
+
+#[test]
+fn a_neighbour_generates_without_replacing_the_active_region() {
+    let mut app = app_in_region(SMALL);
+    let before = active(&app);
+    neighbour(&mut app, 0.0, 0.3);
+    run_until_pending(&mut app);
+    // The region is untouched: same grid, same state, never `Generating`, no `RegionEntered`.
+    assert!(Arc::ptr_eq(&active(&app).grid, &before.grid));
+    assert_eq!(state(&app), RegionState::InRegion);
+    assert_eq!(
+        app.world().resource::<Seen>().states,
+        vec![RegionState::InRegion]
+    );
+    assert_eq!(app.world().resource::<Seen>().entered.len(), 1);
+    let ready = pending(&app).unwrap();
+    assert!(centred(&ready, 0.0, 0.3));
+    assert!(!centred(&before, 0.0, 0.3));
+
+    app.world_mut().write_message(RegionSwapRequested);
+    app.update();
+    // The promote happens in the frame the message is read.
+    assert!(centred(&active(&app), 0.0, 0.3));
+    assert!(pending(&app).is_none());
+    assert_eq!(state(&app), RegionState::InRegion);
+    let seen = app.world().resource::<Seen>();
+    assert_eq!(seen.entered.len(), 2);
+    assert_eq!(seen.entered[1].spec, ready.grid.spec);
+    assert!(seen.changed.is_empty());
+}
+
+#[test]
+fn cancelling_a_preload_keeps_the_region() {
+    let mut app = app_in_region(SMALL);
+    let before = active(&app);
+    neighbour(&mut app, 0.0, 0.3);
+    app.update();
+    app.update();
+    app.world_mut().write_message(RegionPreloadCancelled);
+    settle(&mut app, 500);
+    assert!(pending(&app).is_none(), "a cancelled job must not land");
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 1);
+    assert!(Arc::ptr_eq(&active(&app).grid, &before.grid));
+    assert_eq!(state(&app), RegionState::InRegion);
+
+    // A cancel after the neighbour is ready drops it too: it is never promoted later.
+    neighbour(&mut app, 0.0, 0.3);
+    run_until_pending(&mut app);
+    let weak = Arc::downgrade(&pending(&app).unwrap().grid);
+    app.world_mut().write_message(RegionPreloadCancelled);
+    app.update();
+    assert!(pending(&app).is_none());
+    assert!(weak.upgrade().is_none(), "the cancelled grid leaked");
+    app.world_mut().write_message(RegionSwapRequested);
+    app.update();
+    assert!(Arc::ptr_eq(&active(&app).grid, &before.grid));
+}
+
+#[test]
+fn a_preload_that_times_out_reports_failure() {
+    let (mut app, stalls) = stalling_region_app(&tiny_root(), SMALL);
+    stalls.lock().unwrap().push(tile_path(18, 36).into());
+    one_second_per_update(&mut app);
+    // The active region itself falls back on the stalled tile, after its own timeout.
+    request(&mut app, 0.0, 0.0, 0.0);
+    run_until(&mut app, RegionState::InRegion);
+    let before = active(&app);
+    app.world_mut().resource_mut::<Seen>().states.clear();
+
+    neighbour(&mut app, 0.0, 0.3);
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    while app.world().resource::<Seen>().failed.is_empty() {
+        app.update();
+        assert!(Instant::now() < deadline, "no failure reported");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let seen = app.world().resource::<Seen>();
+    assert_eq!(seen.failed.len(), 1);
+    assert!(
+        seen.failed[0].reason.contains("timed out"),
+        "{:?}",
+        seen.failed
+    );
+    assert_eq!(seen.generated.len(), 1, "only the active region");
+    assert!(pending(&app).is_none());
+    assert!(Arc::ptr_eq(&active(&app).grid, &before.grid));
+    assert_eq!(state(&app), RegionState::InRegion);
+    assert_eq!(
+        app.world().resource::<Seen>().states,
+        vec![RegionState::InRegion]
+    );
+    let warnings = warnings_naming("preload");
+    assert!(
+        warnings.iter().any(|w| w.contains("timed out")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_hop_holds_two_grids_at_most() {
+    let mut app = app_in_region(SMALL);
+    let old = Arc::downgrade(&active(&app).grid);
+    neighbour(&mut app, 0.0, 0.3);
+    run_until_pending(&mut app);
+    let new = Arc::downgrade(&pending(&app).unwrap().grid);
+    // Two grids live: the active one and the neighbour.
+    assert_eq!(old.strong_count(), 1);
+    assert_eq!(new.strong_count(), 1);
+    app.world_mut().write_message(RegionSwapRequested);
+    app.update();
+    app.update();
+    assert!(pending(&app).is_none());
+    assert!(old.upgrade().is_none(), "the old grid is still held");
+    assert_eq!(new.strong_count(), 1, "the new grid is the active region's");
+    assert_eq!(Arc::as_ptr(&active(&app).grid), new.as_ptr());
+}
+
+#[test]
+fn leaving_drops_a_neighbour_in_flight_and_a_ready_one() {
+    // In flight.
+    let mut app = app_in_region(SMALL);
+    neighbour(&mut app, 0.0, 0.3);
+    app.update();
+    app.world_mut().write_message(RegionLeft);
+    settle(&mut app, 500);
+    assert_eq!(state(&app), RegionState::Globe);
+    assert!(pending(&app).is_none(), "a stale neighbour landed");
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 1);
+
+    // Ready.
+    let mut app = app_in_region(SMALL);
+    neighbour(&mut app, 0.0, 0.3);
+    run_until_pending(&mut app);
+    let weak = Arc::downgrade(&pending(&app).unwrap().grid);
+    app.world_mut().write_message(RegionLeft);
+    app.update();
+    app.update();
+    assert!(pending(&app).is_none());
+    assert!(weak.upgrade().is_none(), "the neighbour's grid leaked");
+    // A swap after leaving has nothing to promote.
+    app.world_mut().write_message(RegionSwapRequested);
+    app.update();
+    assert!(app.world().get_resource::<ActiveRegion>().is_none());
+    assert_eq!(state(&app), RegionState::Globe);
+}
+
+/// The concurrency rule: a neighbour request is ignored while an enter or snapshot job runs.
+#[test]
+fn a_neighbour_is_ignored_while_an_enter_job_runs() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    request(&mut app, 0.0, 0.0, 0.0);
+    app.update();
+    app.update();
+    assert_eq!(state(&app), RegionState::Generating);
+    neighbour(&mut app, 0.0, 0.3);
+    run_until(&mut app, RegionState::InRegion);
+    settle(&mut app, 500);
+    assert!(pending(&app).is_none());
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 1);
+    assert!(centred(&active(&app), 0.0, 0.0));
+
+    // And while a snapshot change runs.
+    app.world_mut().resource_mut::<Seen>().states.clear();
+    request_for(&mut app, RequestPurpose::Snapshot, 0.0, 0.0, 100.0e6);
+    app.update();
+    app.update();
+    assert_eq!(state(&app), RegionState::Generating);
+    neighbour(&mut app, 0.0, 0.3);
+    run_until(&mut app, RegionState::InRegion);
+    settle(&mut app, 500);
+    assert!(pending(&app).is_none());
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 2);
+}
+
+/// The concurrency rule: a newer neighbour request cancels an older one.
+#[test]
+fn a_newer_neighbour_cancels_an_older_one() {
+    let slow = RegionSettings {
+        mode: GenMode::Budgeted {
+            budget: Duration::from_micros(200),
+        },
+        ..SMALL
+    };
+    let mut app = app_in_region(slow);
+    neighbour(&mut app, 0.0, 0.3);
+    app.update();
+    neighbour(&mut app, 0.3, 0.0);
+    run_until_pending(&mut app);
+    settle(&mut app, 300);
+    assert!(centred(&pending(&app).unwrap(), 0.3, 0.0));
+    // The active region and the newer neighbour only: the older one never landed.
+    assert_eq!(app.world().resource::<Seen>().generated.len(), 2);
+}
+
+/// A new enter or snapshot request invalidates a ready neighbour (it may be at another
+/// snapshot), so a later swap cannot promote it.
+#[test]
+fn a_snapshot_request_drops_the_ready_neighbour() {
+    let mut app = app_in_region(SMALL);
+    neighbour(&mut app, 0.0, 0.3);
+    run_until_pending(&mut app);
+    request_for(&mut app, RequestPurpose::Snapshot, 0.0, 0.0, 100.0e6);
+    app.update();
+    assert!(pending(&app).is_none());
+    run_until(&mut app, RegionState::InRegion);
+    app.world_mut().write_message(RegionSwapRequested);
+    app.update();
+    assert_eq!(active(&app).grid.spec.snapshot, YearsBp(100.0e6));
+    assert!(centred(&active(&app), 0.0, 0.0));
 }

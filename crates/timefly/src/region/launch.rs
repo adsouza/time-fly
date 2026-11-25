@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
 
-use super::RegionRequested;
+use super::{RegionRequested, RequestPurpose};
 use crate::args::RegionArg;
 use crate::globe::GlobeRenderStatus;
 use crate::time::GlobeTime;
@@ -22,6 +22,7 @@ pub fn launch_request(arg: &RegionArg) -> RegionRequested {
     RegionRequested {
         era_dir: geo_to_render(latlon_to_geo(arg.lat_deg, arg.lon_deg)),
         snapshot: YearsBp(arg.years),
+        purpose: RequestPurpose::Enter,
     }
 }
 

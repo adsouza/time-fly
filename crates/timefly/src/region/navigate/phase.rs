@@ -36,7 +36,7 @@ use timefly_core::geo::RenderDir;
 use timefly_core::worldgen::frame::RegionFrame;
 
 use crate::fly_camera::fly_speed;
-use crate::region::{RegionRequested, RegionState};
+use crate::region::{RegionRequested, RegionState, RequestPurpose};
 use crate::time::nearest_snapshot;
 
 /// The fade across a snapshot change inside a region (design §6.2: about a second).
@@ -455,6 +455,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 actions.push(NavAction::Request(RegionRequested {
                     era_dir: target,
                     snapshot,
+                    purpose: RequestPurpose::Enter,
                 }));
                 NavPhase::Diving {
                     target,
@@ -541,6 +542,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                         actions.push(NavAction::Request(RegionRequested {
                             era_dir,
                             snapshot: change.to,
+                            purpose: RequestPurpose::Snapshot,
                         }));
                         NavPhase::ChangingSnapshot {
                             fade: Fade::new(SNAPSHOT_FADE_S),
@@ -591,6 +593,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                         actions.push(NavAction::Request(RegionRequested {
                             era_dir,
                             snapshot: to,
+                            purpose: RequestPurpose::Snapshot,
                         }));
                     }
                     None => return (climb(i), actions),
