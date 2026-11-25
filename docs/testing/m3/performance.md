@@ -541,7 +541,12 @@ both. Nothing in the wave adds GPU work in flight (the warm-up's fly is gone bef
 region; the pitch is a transform). An uncapped A/B wasn't possible, since the display decides
 the pacing. **The owner accepted it (2026-11-25)**, as with Pangaea: it is the terrain's cost at
 2560 × 1440 when the display doesn't pace the run. The region bench's Red Sea and Pangaea
-flights at 2560 × 1440 uncapped are known failures, not M3 regressions.
+flights at 2560 × 1440 uncapped are known failures, not M3 regressions. **The region bench now
+reports the Red Sea's and Pangaea's flight only** (owner, 2026-11-25; `BenchRegion::flight_gated`
+is false for both): their verdicts are still printed, marked "(reported only)", and can't fail
+the run, the same as Pangaea's in the journey bench. Every other region's flight still gates, as
+does a `--region`-picked single-region run's, and the other region gates (R11, warm generation,
+web first entries, memory cycles) are unchanged.
 
 **Journey bench, run 2.** Holds: dives 404–723 ms, hops 32–36 ms, climbs 32–34 ms (run 1: 405–720,
 33–34, 33–34). Flight per route, display-paced, all PASS (Pangaea's reported only): medians

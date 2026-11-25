@@ -75,6 +75,9 @@ pub struct BenchRegion {
     pub name: &'static str,
     pub arg: RegionArg,
     pub pan_from_previous: bool,
+    /// Whether the region's flight frames gate the run. An ungated region's flight verdict is
+    /// still computed and printed, marked reported only.
+    pub flight_gated: bool,
 }
 
 /// Seconds the globe pan between two bench regions takes (eased at both ends).
@@ -132,6 +135,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 250.0e6,
         },
         pan_from_previous: false,
+        flight_gated: false,
     },
     BenchRegion {
         name: "Red Sea",
@@ -141,6 +145,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 0.0,
         },
         pan_from_previous: false,
+        flight_gated: false,
     },
     BenchRegion {
         name: "Himalayas",
@@ -150,6 +155,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 0.0,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Sundaland",
@@ -159,6 +165,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 21_000.0,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Japan",
@@ -168,6 +175,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 1.0e6,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Beringia",
@@ -177,6 +185,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 21_000.0,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Rockies ice margin",
@@ -186,6 +195,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 21_000.0,
         },
         pan_from_previous: true,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Panama",
@@ -195,6 +205,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 3.0e6,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
 ];
 
@@ -266,6 +277,7 @@ impl RegionBenchConfig {
                 name: CHOSEN_REGION,
                 arg,
                 pan_from_previous: false,
+                flight_gated: true,
             }],
             ..RegionBenchConfig::new(target_fps, exit_when_done)
         }
@@ -409,6 +421,8 @@ struct RegionRun {
     memory_before: Option<u64>,
     memory_peak: Option<u64>,
     failure: Option<String>,
+    /// The flight's own verdict (whether or not it gates the region).
+    flight_pass: Option<bool>,
     pass: bool,
 }
 
@@ -1009,6 +1023,51 @@ pub(crate) fn gate_word(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }
 
+/// A flight's verdict word: an ungated region's is marked reported only.
+fn flight_verdict_word(pass: bool, gated: bool) -> String {
+    if gated {
+        gate_word(pass).to_string()
+    } else {
+        format!("{} (reported only)", gate_word(pass))
+    }
+}
+
+/// Whether a region passes: no failure, its flight (unless ungated), its pan and the first-entry
+/// gate.
+fn region_passes(
+    failed: bool,
+    flight_pass: bool,
+    flight_gated: bool,
+    pan_pass: bool,
+    gen_gate: Option<bool>,
+) -> bool {
+    !failed && (flight_pass || !flight_gated) && pan_pass && gen_gate.unwrap_or(true)
+}
+
+/// A region's entry in the summary's `regions (R14 frame rate)` line.
+fn region_summary_entry(
+    name: &str,
+    measured: bool,
+    pass: bool,
+    flight_gated: bool,
+    flight_pass: Option<bool>,
+) -> String {
+    let word = match (measured, pass) {
+        (false, _) => return format!("{name} not run"),
+        (true, true) => "PASS",
+        (true, false) => "FAIL",
+    };
+    match (flight_gated, flight_pass) {
+        (false, Some(flight)) => {
+            format!(
+                "{name} {word} (flight {}, reported only)",
+                gate_word(flight)
+            )
+        }
+        _ => format!("{name} {word}"),
+    }
+}
+
 /// The first-region worst frame against the R11 limit.
 fn first_region_gate(bench: &RegionBench) -> Option<(f32, bool)> {
     let first = &bench.runs[0];
@@ -1198,7 +1257,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         s.worst_ms,
         STALL_BUDGETS * interval,
         stall_count(&r.flight_ms, fps),
-        if flight_pass { "PASS" } else { "FAIL" }
+        flight_verdict_word(flight_pass, spec.flight_gated)
     ));
     out.push(format!(
         "  missed frames (>{:.1} ms = {MISSED_INTERVALS}x interval): {missed} ({share:.2}%)",
@@ -1208,15 +1267,24 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
         out.push(format!("  {}", stat_line(segment.label(), frames)));
     }
-    let pass = r.failure.is_none() && flight_pass && pan_pass && gen_gate.unwrap_or(true);
+    let pass = region_passes(
+        r.failure.is_some(),
+        flight_pass,
+        spec.flight_gated,
+        pan_pass,
+        gen_gate,
+    );
     out.push(match &r.failure {
         Some(reason) => format!("result: FAIL ({reason})"),
         None => format!(
-            "result: {} (decided by the {} rule{})",
+            "result: {} ({}{})",
             if pass { "PASS" } else { "FAIL" },
-            match pacing {
-                Pacing::DisplayPaced => "display-paced missed-frame",
-                Pacing::Uncapped => "uncapped p95",
+            match (spec.flight_gated, pacing) {
+                (false, _) => "decided without the flight, which is reported only".to_string(),
+                (true, Pacing::DisplayPaced) => {
+                    "decided by the display-paced missed-frame rule".to_string()
+                }
+                (true, Pacing::Uncapped) => "decided by the uncapped p95 rule".to_string(),
             },
             if gen_gate.is_some() {
                 " and the first-entry generation gate"
@@ -1227,6 +1295,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     });
     out.push("===== end region bench =====".to_string());
     bench.runs[region].pass = pass;
+    bench.runs[region].flight_pass = Some(flight_pass);
     out.join("\n")
 }
 
@@ -1255,14 +1324,12 @@ fn finish(
         .zip(&bench.runs)
         .map(|(spec, run)| {
             let measured = run.failure.is_some() || !run.flight_ms.is_empty();
-            format!(
-                "{} {}",
+            region_summary_entry(
                 spec.name,
-                match (measured, run.pass) {
-                    (false, _) => "not run",
-                    (true, true) => "PASS",
-                    (true, false) => "FAIL",
-                }
+                measured,
+                run.pass,
+                spec.flight_gated,
+                run.flight_pass,
             )
         })
         .collect();
@@ -1537,6 +1604,75 @@ mod tests {
         assert_eq!(after_region(7, 8, 0), Next::Summary);
         // A single-region run goes from its one region straight to the summary.
         assert_eq!(after_region(0, 1, 0), Next::Summary);
+    }
+
+    #[test]
+    fn only_the_red_sea_and_pangaea_have_an_ungated_flight() {
+        // Owner, 2026-11-25: their uncapped p95 is the terrain's cost (Red Sea 18.15 ms,
+        // Pangaea 20.06 ms at 2560 x 1440); every other region's flight gates.
+        let gated: Vec<(&str, bool)> = BENCH_REGIONS
+            .iter()
+            .map(|r| (r.name, r.flight_gated))
+            .collect();
+        assert_eq!(
+            gated,
+            [
+                ("Pangaea interior", false),
+                ("Red Sea", false),
+                ("Himalayas", true),
+                ("Sundaland", true),
+                ("Japan", true),
+                ("Beringia", true),
+                ("Rockies ice margin", true),
+                ("Panama", true),
+            ]
+        );
+        // A region picked with --region keeps its flight gated, even at the Red Sea's place.
+        let red_sea = BENCH_REGIONS[1].arg;
+        let single = RegionBenchConfig::single(60, true, red_sea);
+        assert_eq!(single.regions.len(), 1);
+        assert!(single.regions[0].flight_gated);
+    }
+
+    #[test]
+    fn an_ungated_regions_flight_failure_does_not_fail_it() {
+        // Ungated: a failing flight passes the region; the other gates still count.
+        assert!(region_passes(false, false, false, true, None));
+        assert!(!region_passes(false, false, false, false, None), "pan");
+        assert!(
+            !region_passes(false, false, false, true, Some(false)),
+            "first entry on the web"
+        );
+        assert!(!region_passes(true, true, false, true, None), "failure");
+        // Gated: a failing flight fails the region.
+        assert!(!region_passes(false, false, true, true, None));
+        assert!(region_passes(false, true, true, true, Some(true)));
+        // The flight line says so.
+        assert_eq!(flight_verdict_word(false, false), "FAIL (reported only)");
+        assert_eq!(flight_verdict_word(true, false), "PASS (reported only)");
+        assert_eq!(flight_verdict_word(false, true), "FAIL");
+        assert_eq!(flight_verdict_word(true, true), "PASS");
+    }
+
+    #[test]
+    fn the_summary_marks_an_ungated_flight_reported_only() {
+        let entry = |measured, pass, gated, flight| {
+            region_summary_entry("Red Sea", measured, pass, gated, flight)
+        };
+        // The region passes, its flight failed: the summary shows both.
+        assert_eq!(
+            entry(true, true, false, Some(false)),
+            "Red Sea PASS (flight FAIL, reported only)"
+        );
+        assert_eq!(
+            entry(true, true, false, Some(true)),
+            "Red Sea PASS (flight PASS, reported only)"
+        );
+        // A gated region reads as before.
+        assert_eq!(entry(true, true, true, Some(true)), "Red Sea PASS");
+        assert_eq!(entry(true, false, true, Some(false)), "Red Sea FAIL");
+        // Not run: nothing to mark.
+        assert_eq!(entry(false, false, false, None), "Red Sea not run");
     }
 
     #[test]
