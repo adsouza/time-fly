@@ -1,0 +1,48 @@
+{
+  "description": "Golden routing grid for the continental water pass (rivers and lakes, Task 2). A 4 x 5 GridGraph, row 0 north, at 1,000 m spacing; column 0 is ocean at -10 m. Cells are [row, col]. receiver is null for ocean. q holds discharge per case; null for ocean. Task 3 adds the lake cases B and C; the Python reference (Task 11) reads the same file.",
+  "rows": 4,
+  "cols": 5,
+  "spacing_m": 1000.0,
+  "elevation_m": [
+    [-10.0, 5.0, 5.0, 9.0, 9.0],
+    [-10.0, 3.0, 1.0, 2.0, 9.0],
+    [-10.0, 4.0, 2.0, 2.0, 9.0],
+    [-10.0, 6.0, 6.0, 9.0, 9.0]
+  ],
+  "ocean": [
+    [true, false, false, false, false],
+    [true, false, false, false, false],
+    [true, false, false, false, false],
+    [true, false, false, false, false]
+  ],
+  "filled_m": [
+    [-10.0, 5.0, 5.0, 9.0, 9.0],
+    [-10.0, 3.0, 3.0, 3.0, 9.0],
+    [-10.0, 4.0, 3.0, 3.0, 9.0],
+    [-10.0, 6.0, 6.0, 9.0, 9.0]
+  ],
+  "order": [
+    [1, 1], [1, 2], [2, 2], [1, 3], [2, 3], [2, 1], [0, 1], [0, 2],
+    [3, 1], [3, 2], [0, 3], [3, 3], [1, 4], [0, 4], [2, 4], [3, 4]
+  ],
+  "receiver": [
+    [null, [0, 0], [1, 2], [1, 3], [1, 3]],
+    [null, [1, 0], [1, 1], [1, 2], [1, 3]],
+    [null, [2, 0], [1, 2], [1, 2], [2, 3]],
+    [null, [3, 0], [2, 2], [2, 3], [2, 3]]
+  ],
+  "basins": [
+    { "nodes": [[1, 2], [1, 3], [2, 2], [2, 3]], "spill_m": 3.0, "exit": [1, 2], "rim": [1, 1] }
+  ],
+  "q": {
+    "A": {
+      "description": "unit runoff on every land node, no evaporation",
+      "q": [
+        [null, 1.0, 1.0, 1.0, 1.0],
+        [null, 13.0, 12.0, 4.0, 1.0],
+        [null, 1.0, 2.0, 4.0, 1.0],
+        [null, 1.0, 1.0, 1.0, 1.0]
+      ]
+    }
+  }
+}
