@@ -20,7 +20,7 @@ owner has to judge are also in `manual-checks.md`.
 - `GLOBE_MIN_ALTITUDE_KM` lives in `globe.rs`, not `altitudes.rs`.
 
 ## Task 3 (the dragonfly and the chase camera in regions)
-- The dragonfly pipelines aren't in the region warm-up (a first-show compile hitch); carried through Task 4, where the globe shows the fly from startup.
+- ~~The dragonfly pipelines aren't in the region warm-up (a first-show compile hitch); carried through Task 4, where the globe shows the fly from startup.~~ Fixed in the final review's wave (`af07e7c`).
 - With the eye straight above the target on very steep ground, the camera heading falls back to the fly's yaw (arbitrary).
 - The line of sight between the eye and the fly isn't checked against a crest.
 - `fly_camera.rs` grew to about 1,327 lines: move the chase tests to `fly_camera/tests.rs`.
@@ -42,7 +42,7 @@ owner has to judge are also in `manual-checks.md`.
 
 ## Task 5 (the cloud effect)
 - `update_cloud` uses `density.0` unclamped (`cloud.rs:351`; `pin_cloud` writes it directly).
-- The warm-up `CloudParams` has `state.y = 0`, a divide by zero in the clip depth (`warmup.rs:295`, harmless).
+- ~~The warm-up `CloudParams` has `state.y = 0`, a divide by zero in the clip depth (`warmup.rs:295`, harmless).~~ Fixed in the final review's wave (`691cf00`).
 - The cloud material is rewritten every frame while visible (`cloud.rs:419`).
 - The "no overlay" test counts a name string (`navigate/tests.rs:1013`).
 - The globe tint uses `REGION_SUN_COLOR` (`cloud.rs:415`).
@@ -65,13 +65,49 @@ owner has to judge are also in `manual-checks.md`.
 - No tests for: a neighbour sent the same frame as an enter or snapshot request; a neighbour with no active region; a neighbour replacing a ready neighbour; a swap with nothing pending.
 
 ## Task 9 (the region hop)
-- `velocity_at_edges` treats about 1e-8 of float noise as intent (`hop.rs:108`: add a ±1 m/s deadband).
+- ~~`velocity_at_edges` treats about 1e-8 of float noise as intent (`hop.rs:108`: add a ±1 m/s deadband).~~ Fixed in the final review's wave (`98fef80`).
 - The landing gate accepts a carry exactly on the neighbour's side edge (`phase.rs:1110`: add a margin against back-to-back hops).
 - The hop property test never presses `Backspace`, moves the slider or changes `region_state` (covered by named tests).
-- The fallback notice can't show for a neighbour that fell back.
+- ~~The fallback notice can't show for a neighbour that fell back.~~ Fixed in the final review's wave (`e9f9ec3`).
 - The region bench's `flying()` counts a preloading hop.
 
 ## Task 10 (the journey bench)
 - The flight summary lines are duplicated in the journey bench, the region bench and `bench/mod.rs`: extract a shared helper.
 - `ChosenBench` and `chosen_bench` are `pub` but only `lib.rs` uses them (`pub(crate)`).
 - The `hop lift` line compares the height above the ground ("from") with the height above sea level ("peak").
+
+## Task 11 (verification and documentation)
+- Both of Task 11's minors (the `!wesl.contains("band")` string test in `cloud.rs`, and a padding
+  note for the dead `state.z` slot) went with the tilt-shift's restoration (`7c15064`): the test
+  is gone and `state.z` carries the tilt-shift again. Nothing remains.
+
+## Hop memory and the journey route set
+- The last lattice chunk is always 512 KiB, and wasm linear memory never shrinks: size the final
+  chunk exactly.
+- **Accepted (ruling, not a defect):** the chunked lattice's double indirection makes region
+  generation about 3–5% slower (the rows read nodes through a chunk index); the plan's Task 11
+  ruling on hop memory accepts it for the reuse it buys. See `performance.md`, "Hop memory".
+- `the_memory_split_reads_the_kernels_footprint` (now in `diagnostics/memory.rs`) may flake under
+  parallel tests, or if the 64 MiB block's allocation is elided (`black_box`, wider tolerances).
+- **Loosened, with its reason:** `tests/journey_bench.rs`, the lift-from-cruise tolerance went from
+  +100 m to +1,000 m over `CRUISE_AGL_M` (`d3b38ff`). Once down to the cruise the scripted fly
+  holds its height (`region_keys` stops descending once cruising, so a valley never stalls the
+  leg), so ground falling away along the leg out adds to its height above the ground before the
+  lift. The same commit steered the scripted dive in to within 0.25° (it had stopped 2° short),
+  so the test's Alps leg starts elsewhere, over ground that falls away by more than 100 m (the
+  test's own comment; the reading itself was not recorded). The lift is still checked to reach
+  `HOP_ALTITUDE_M` and to start under it.
+- No headless test of the age change between journeys, of the route checks' aggregation, or of
+  an empty `JourneyBenchConfig::journeys` (which panics).
+- `bench/journey/mod.rs` is about 1,890 lines: split the routes into `journey/routes.rs`.
+
+## Final review
+- The final review's minors (its ten, the warm-up's `state.y` and the docs) were all fixed in its
+  fix wave (`5f2f9f2` onward; see the SDD report). Its one minor deferred to it from Task 10, the
+  duplicated flight summary lines, stays open above.
+- **New in the fix wave, for the owner:** the web hop-memory gate lets every hop of a route's
+  first visit grow the linear memory (not only its first hop), since Mt Fuji's corner hop (hop 2)
+  needs a larger lattice than its first; only repeat visits must stay flat. And a dive is called
+  off once the fly, climbed back above the opaque cloud, flies more than `DIVE_LEAVE_KM` (10 km)
+  from its target, so that freeing its horizontal flight there can't swap it into a region far
+  from where it is. Both are recorded in the plan's rulings.
