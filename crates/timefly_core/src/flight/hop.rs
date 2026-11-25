@@ -101,9 +101,16 @@ pub fn into_field(pos_m: Vec2) -> Vec2 {
     pos_m.clamp(Vec2::splat(-EDGE_M), Vec2::splat(EDGE_M))
 }
 
+/// A wish smaller than this on an axis (m/s) is no push on it: flying along an edge the fly
+/// sits exactly on ([`into_field`], [`confine`]), the wish's other axis is float noise (about
+/// 1e-8 from the yaw's sine), which must not start a hop. A real push clears it: the fly's
+/// slowest speed is 60 m/s (`fly_speed`'s floor), so pushing even 1° out of the edge's line
+/// gives 1.05 m/s.
+pub const WISH_DEADBAND_MPS: f32 = 1.0;
+
 /// The fly's velocity for [`should_preload`] and the hop: as `measured_mps` (its motion over the
 /// last frame), except on an axis where it is at or past the edge and the player's `wish_mps`
-/// has a component on it, which counts instead. Held at an edge ([`confine`]) while pushing out
+/// has a component on it of at least [`WISH_DEADBAND_MPS`], which counts instead. Held at an edge ([`confine`]) while pushing out
 /// at an angle, the fly slides along it, so its motion alone shows no way out (fix round 2);
 /// and past it, in a hop's hold, the player turning back in is seen in the frame they turn, not
 /// a frame later from the drift (fix round 3). A wish back in never starts a hop.
@@ -112,7 +119,7 @@ pub fn velocity_at_edges(pos_m: Vec2, measured_mps: Vec2, wish_mps: Vec2) -> Vec
     const AT_EDGE_M: f32 = 1.0;
     let mut v = measured_mps;
     for a in 0..2 {
-        if pos_m[a].abs() >= EDGE_M - AT_EDGE_M && wish_mps[a] != 0.0 {
+        if pos_m[a].abs() >= EDGE_M - AT_EDGE_M && wish_mps[a].abs() >= WISH_DEADBAND_MPS {
             v[a] = wish_mps[a];
         }
     }
@@ -328,6 +335,27 @@ mod tests {
         let v = velocity_at_edges(Vec2::new(-e, 0.0), Vec2::ZERO, Vec2::X * 100.0);
         assert_eq!(v, Vec2::X * 100.0);
         assert!(!should_preload(Vec2::new(-e, 0.0), v, v.length(), 3.0));
+    }
+
+    #[test]
+    fn float_noise_in_the_wish_is_no_push_out_of_the_edge() {
+        let e = EDGE_M;
+        // `into_field` parks the fly exactly on the east edge; flying north along it, the
+        // wish's x is float noise from the yaw's sine, not a push out (final review).
+        let at = into_field(Vec2::new(e + 3_000.0, 1_000.0));
+        assert_eq!(at.x, e);
+        let along = Vec2::new(0.0, -10_000.0);
+        for noise in [1e-8, 1e-3, 0.5, WISH_DEADBAND_MPS * 0.99] {
+            let wish = Vec2::new(noise, -10_000.0);
+            let v = velocity_at_edges(at, along, wish);
+            assert_eq!(v.x, 0.0, "{noise}");
+            assert!(!should_preload(at, v, v.length(), 3.0), "{noise}");
+        }
+        // A real push out, from the deadband up, still counts.
+        let wish = Vec2::new(WISH_DEADBAND_MPS, -10_000.0);
+        let v = velocity_at_edges(at, along, wish);
+        assert_eq!(v.x, WISH_DEADBAND_MPS);
+        assert!(should_preload(at, v, v.length(), 3.0));
     }
 
     /// The horizontal `(x, z)` of a local position.
