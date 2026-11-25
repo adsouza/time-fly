@@ -30,6 +30,8 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 | `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only** |
 | `--journey-bench` after the hop-memory work (`ec9293e`, gate +64 MiB; the Alps; 2560 × 1440 uncapped) | PASS (exit 0): hop memory worst +34.1 MiB | PASS (exit 0): hop memory worst +29.5 MiB |
 | `--journey-bench`, the owner's route set (`d3b38ff`; 2560 × 1440) | FAIL (exit 3) as run: Pangaea's flight, uncapped p95 18.40 ms; hop memory worst **+48.0 MiB**. Re-judged under the fix-round rules (one pacing per run; Pangaea's flight reported only, owner 2026-11-25): **PASS** | **PASS** (exit 0, display-paced): hop memory worst +30.2 MiB; every gate passes; unchanged when re-judged |
+| **At HEAD (final, `ed78ff8`; 2560 × 1440)**: `--region-bench` | FAIL: Pangaea and Red Sea, uncapped | **FAIL: Red Sea alone** (uncapped p95 18.15 ms); see "Native at HEAD (final)" |
+| **At HEAD (final)**: `--journey-bench` | PASS (display-paced) | **PASS** (display-paced): hop memory worst +22.0 MiB |
 | Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: over the 1 ms budget, **accepted by the owner** (2026-11-25) |
 
 **Hop memory: fixed in part, gate raised.** A per-frame memory trace found that most of the hop
@@ -511,17 +513,60 @@ in 65536 of 65536 pixels". The shader was restored from a copy, and the test pas
 The Chrome WebGPU side of this check (the same shader through Tint) is the controller's, with the
 Chrome runs below.
 
+## Native at HEAD (final)
+
+The final review's fix wave (`5f2f9f2..ed78ff8`), `release` build of `ed78ff8` (proved by
+`grep -a -c 'Warm-up dragonfly body'` = 1; the binary's label reads a stale `1225832`), on the 4K
+monitor: every run rendered the full **2560 × 1440**. Each bench twice, a fresh `TIMEFLY_LOG_DIR`
+each; run 1 was the binary's first launch. Run 2 is judged.
+
+| Bench | Run 1 | Run 2 (judged) | Paced? |
+|---|---|---|---|
+| `--region-bench` | FAIL (exit 3): Pangaea interior p95 20.06 ms, Red Sea p95 16.88 ms (uncapped rule) | **FAIL** (exit 3): **Red Sea alone**, p95 18.15 ms (uncapped; median 10.07 ms) | Run 1: no region paced. Run 2: Pangaea display-paced (median 16.04 ms, PASS), the other seven uncapped |
+| `--journey-bench` (route set) | PASS (exit 0) | **PASS** (exit 0) | Both display-paced (pooled median 16.68 ms) |
+
+**Region bench, run 2.** Seven regions pass; R11 36.40 ms; warm generation median 333 ms, max
+348 ms; memory cycles +0.1%. Per region (median / p95 / worst ms): Pangaea 16.04 / 21.01 /
+43.82 (display-paced, PASS), **Red Sea 10.07 / 18.15 / 37.04 (FAIL)**, Himalayas 10.51 / 15.69
+/ 35.66, Sundaland 10.62 / 13.95 / 34.51, Japan 9.72 / 16.61 / 39.32, Beringia 10.06 / 14.23 /
+35.62, Rockies 10.71 / 15.18 / 33.56, Panama 8.79 / 12.46 / 34.73. Red Sea's segments: apron
+sweep median 12.21 ms and high pass 13.79 ms, the heaviest.
+
+**Is the Red Sea failure this wave's?** Probably not, though not proved. Red Sea had never been
+benched *uncapped* at 2560 × 1440 before (Task 11 rendered 1920 × 951, and `r1` was
+display-paced there: p95 17.59 ms, PASS). An A/B of Red Sea alone (`--region-bench
+--region=20,37.5,0`), alternating the base `0ce253d` and HEAD, ran display-paced every time and
+passed every time: base p95 18.12 / 18.19 / 18.27 ms, HEAD 18.45 / 18.53 ms, medians 16.67–16.71 ms
+both. Nothing in the wave adds GPU work in flight (the warm-up's fly is gone before the first
+region; the pitch is a transform). An uncapped A/B wasn't possible, since the display decides
+the pacing. **The owner's call**: as Pangaea's was, this is the terrain's cost at 2560 × 1440
+when the display doesn't pace the run.
+
+**Journey bench, run 2.** Holds: dives 404–723 ms, hops 32–36 ms, climbs 32–34 ms (run 1: 405–720,
+33–34, 33–34). Flight per route, display-paced, all PASS (Pangaea's reported only): medians
+16.68–16.69 ms, missed frames 0–2 per route (one 105.71 ms frame on Fuji's route, under the 1%
+rule). Swap worst 35.17 ms (run 1: 34.35). Hop memory worst +22.0 MiB (run 1: +35.1, Andes hop
+1, the run's first). Route checks PASS: Fuji hop 1 coast, land 66%; hop 2 at 100 km from the
+cube corner (run 1: 98 km). Sites: the canyon 1,097 m deep, Fuji 3,025 m. Journey memory cycles:
+Andes +0.6% (run 1: +5.3%).
+
 ## Chrome WebGPU — pending (controller runs this)
 
 **Not yet run.** The controller runs both benches in the owner's Chrome (an Incognito window, in
 front, hands off; not the Claude app's browser pane, which throttles `requestAnimationFrame`, R23)
 and fills this section in.
 
-**The build.** `web-release` of `e3bd6e9` (Task 11's code commit), built 2026-11-25.
-- `timefly.wasm`: 70,819,154 bytes, sha256 `9ddc20270b9e746b…`; wasm-bindgen output 62.16 MB.
-- `grep -a -c 'journey bench summary'` finds 1. The journey bench is this branch's, so the build
-  is too.
-- The shaders are served from the tree, and the served `cloud.wesl` has no tilt-shift.
+**The build.** `web-release` of `ed78ff8` (the final review's fix wave, HEAD), built
+2026-11-25, `timefly-final.wasm` in the SDD scratch folder.
+- `timefly.wasm`: 70,913,241 bytes, sha256
+  `5c9946d65023068e5f1fd43cca22ef96beddb150abdbd08da8b4e9351c68ce62`.
+- `grep -a -c 'Warm-up dragonfly body'` finds 1 (new in the fix wave; the `e3bd6e9` build finds
+  0), and so does the web hop-memory gate's new text ("no growth in any hop of a route's repeat
+  visit"). So the build is HEAD's. (The label in a binary built in this worktree reads a stale
+  SHA, so the string is the proof.)
+- The shaders are served from the tree, which has the tilt-shift (restored in `7c15064`).
+- The web journey bench judges hop memory per route (a route's first visit may grow the linear
+  memory, repeat visits may not), and its memory cycles by what a repeat visit added (spec §10).
 
 **To serve it** (from a folder whose `assets/` holds `data` from the main checkout and this
 branch's `shaders` and `credits.txt`; `wasm-server-runner` serves `./assets`):
