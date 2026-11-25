@@ -10,6 +10,7 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Global sea level (0–798 ka) | Spratt & Lisiecki (2016) via NOAA NCEI; see [Sea level](#sea-level) | NOAA NCEI public data; cite publication and dataset DOI | Task 7 (`timefly_bake.sealevel`) |
 | Terrain and bathymetry (region worlds) | ETOPO 2022 60″ surface, NOAA NCEI; see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | NOAA NCEI public data; cite doi:10.25921/fd45-gt74 | M2 Task 1 (`timefly_bake.etopo`, `tiles`) |
 | Climate classes (region worlds) | Köppen-Geiger 1991–2020, Beck et al. (2023); see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | CC BY 4.0 | M2 Task 1 (`timefly_bake.koppen`) |
+| Past climate, 0–120 ka (rivers) | Beyer, Krapp & Manica (2020), figshare 12293345; see [Past climate](#past-climate-beyer-et-al-2020) | CC BY 4.0 | Rivers and lakes Task 1 (`timefly_bake.beyer`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
 ## Pinned downloads (`data/sources.json`)
@@ -304,6 +305,49 @@ Each tile is a 5° × 5° `latlon` grid of 301 × 301 samples
 antimeridian), 2 channels, float16: elevation in metres, then the Köppen code. The manifest lists
 every tile with its byte size and SHA-256 and the two source checksums. Sizes:
 [`docs/testing/region-m2/performance.md`](../docs/testing/region-m2/performance.md).
+
+## Past climate: Beyer et al. 2020
+
+Beyer, R.M., Krapp, M. & Manica, A. (2020). An empirical evaluation of bioclimatic and
+vegetation reconstructions for the last 120,000 years. *Scientific Data* 7, 236,
+doi:10.1038/s41597-020-0552-1. Data: figshare doi:10.6084/m9.figshare.12293345 (article
+12293345), CC BY 4.0. Changes: BIO1 and BIO12 regridded to 1°.
+
+The data is one 1,333,236,636-byte file, `LateQuaternary_Environment.nc` (figshare file 22659026,
+`https://ndownloader.figshare.com/files/22659026`, md5 `d23abb7ce8671433ea36a2cae814ebab` per the
+figshare files API), HDF5 inside. It is **not** downloaded whole and is not in the `files` list
+of `data/sources.json`, so `timefly-fetch` never touches it. It has its own top-level
+`range_read` list, and `timefly-bake climate` reads from it with HTTP range requests through
+h5py (`timefly_bake.beyer.RangeFile`), holding 64 blocks in memory and writing nothing to
+disk. The ndownloader redirects every ranged GET to a signed URL that lives about ten seconds, so
+each request starts from the public URL and follows one redirect, which must go to https. The
+reader refuses to fetch more than `MAX_FETCH_BYTES` (100 MB). The API's size and md5 must match
+the pins before any block is read, and SHA-256 pins on the two extracted arrays
+(`range_read[].variables`) catch a changed file.
+
+What the file holds (read from this run's log and header): 72 time steps (`time`, int32, "years
+since present", -120000 to 0 in steps of 2000 up to 22 ka and 1000 below, i.e. ages 0 to 21 ka
+by 1, then 22 to 120 ka by 2), `latitude` 300 rows from -59.75 to 89.75 (south first, 0.5°) and
+`longitude` 720 columns from -179.75 to 179.75. Land only: sea and Antarctica are NaN or absent.
+Each bioclimatic variable is `(72, 300, 720)` float32, chunks `(24, 100, 240)`, gzip, about 19 MB
+stored. The variables carry only a `long_name` (no `units` attribute); the values are °C for
+`BIO1` and mm/yr for `BIO12` (Amazon about 27 °C and 1,850 mm, Sahara about 23 °C and 20-45 mm),
+and the coordinate variables' `units` attributes are mislabeled (latitude says `degrees_east`),
+so the bake places values by the numbers, not the labels.
+
+Baked ages (ka): 0 to 21 in steps of 1, then 22, 24, 26, then 30, 40, ..., 120 (35 grids).
+
+`cd tools/bake && uv run timefly-bake climate --sources ../../data/sources.json --out ../../crates/timefly/assets/data/climate`
+(`--record-pins` prints the two array digests instead of checking them) writes, flat in that
+folder: `manifest.json` (version 1, replaced last) and one `bio_<age>ka.<sha256>.tfgrid` per age.
+Each is a `latlon` F16 grid of shape (180, 360, 2): row 0 is centred on 89.5° N, column 0 on
+179.5° W, channel 0 is BIO1 (°C) and channel 1 is BIO12 (mm/yr), NaN where Beyer has no land
+value. The 1° value is the mean of the 2 × 2 half-degree cells that have one. The manifest lists
+every file's age, byte size and SHA-256, the figshare file id, the SHA-256 of each extracted
+0.5° array (`source.variables_sha256`) and the attribution. The first run fetched 39,621,532
+bytes in 66 requests (about 40 s); the 35 grids total 2,486,321 bytes. The tiny test fixture
+`crates/timefly/tests/assets/data/climate/` is written by
+`tools/bake/scripts/write_climate_fixture.py` through the same code on a synthetic file.
 
 ## Performance and memory (Task 10)
 

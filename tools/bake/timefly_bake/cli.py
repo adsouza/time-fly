@@ -39,7 +39,7 @@ from pathlib import Path, PurePosixPath
 
 import numpy as np
 
-from timefly_bake import ages, cube, etopo, formats, ice6g, koppen, log, paleodem, plates
+from timefly_bake import ages, beyer, cube, etopo, formats, ice6g, koppen, log, paleodem, plates
 from timefly_bake import sealevel, tiles
 from timefly_bake.log import traced
 
@@ -528,13 +528,53 @@ def _tiles_main(argv) -> int:
         log.configure(None, args.log_level)
 
 
+BEYER_ENTRY = "beyer2020"
+
+
+def _climate_main(argv) -> int:
+    p = argparse.ArgumentParser(
+        prog="timefly-bake climate",
+        description="Bake past climate (Beyer et al. 2020 BIO1 and BIO12) by HTTP range requests.",
+    )
+    p.add_argument("--sources", type=Path, required=True, help="data/sources.json")
+    p.add_argument("--out", type=Path, required=True, help="output directory")
+    p.add_argument(
+        "--record-pins",
+        action="store_true",
+        help="print the extracted arrays' SHA-256 pins as JSON instead of checking them",
+    )
+    p.add_argument("--log-level", default="INFO", help="stderr log level (bake.log is DEBUG)")
+    args = p.parse_args(argv)
+    log.configure(args.out, args.log_level)
+    try:
+        try:
+            doc = json.loads(args.sources.read_text(encoding="utf-8"))
+            entry = next(e for e in doc.get("range_read", []) if e.get("name") == BEYER_ENTRY)
+        except (OSError, ValueError, StopIteration):
+            _log.error("%s has no range_read entry named %s", args.sources, BEYER_ENTRY)
+            return 1
+        try:
+            manifest = beyer.bake_climate(entry, args.out, record_pins=args.record_pins)
+        except Exception as exc:  # already logged with its traceback by @traced
+            _log.error("climate bake failed: %s", exc)
+            return 1
+        if args.record_pins:
+            print(json.dumps(manifest["source"]["variables_sha256"], indent=1))
+        return 0
+    finally:
+        log.configure(None, args.log_level)
+
+
 @traced
 def main(argv=None) -> int:
     """Entry point of ``timefly-bake``; returns the process exit code. ``timefly-bake tiles ...``
-    bakes the region-world tiles; anything else bakes the globe set."""
+    bakes the region-world tiles, ``timefly-bake climate ...`` the past-climate grids; anything
+    else bakes the globe set."""
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "tiles":
         return _tiles_main(argv[1:])
+    if argv and argv[0] == "climate":
+        return _climate_main(argv[1:])
     parser = _parser()
     args = parser.parse_args(argv)
     log.configure(args.out, args.log_level)
