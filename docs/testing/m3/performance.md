@@ -27,7 +27,8 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 |---|---|---|
 | `--region-bench` | PASS (exit 0) | **PASS** (exit 0) |
 | `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only** |
-| `--journey-bench` after the hop-memory work (`ec9293e`, gate +64 MiB; 2560 × 1440 uncapped) | PASS (exit 0): hop memory worst +34.1 MiB | **PASS** (exit 0): hop memory worst +29.5 MiB; every gate passes |
+| `--journey-bench` after the hop-memory work (`ec9293e`, gate +64 MiB; the Alps; 2560 × 1440 uncapped) | PASS (exit 0): hop memory worst +34.1 MiB | PASS (exit 0): hop memory worst +29.5 MiB |
+| `--journey-bench`, the owner's route set (`d3b38ff`; 2560 × 1440) | FAIL (exit 3): Pangaea's flight, uncapped p95 18.40 ms; hop memory worst **+48.0 MiB** | **PASS** (exit 0, display-paced): hop memory worst +30.2 MiB; every gate passes |
 | Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: over the 1 ms budget, **accepted by the owner** (2026-11-25) |
 
 **Hop memory: fixed in part, gate raised.** A per-frame memory trace found that most of the hop
@@ -139,6 +140,10 @@ the edge than in M2, looking at much the same view.
   first region.
 
 ## Journey bench
+
+*(Task 11's runs below flew the bench's first route, the Alps. Since 2026-11-25 the bench flies
+the owner's route set instead; see "Journey route set" below. The Alps numbers are the
+"before".)*
 
 `--journey-bench`: from the globe, dive into the Alps (46.5° N, 10.0° E, present), descend to
 about 20 km above the ground, fly east over the edge and hop twice, then climb back out with
@@ -356,6 +361,69 @@ regions and not others) passed every gate: warm generation median 333 ms, max 34
 memory cycles −0.0%; all eight regions PASS. Part of that is the larger, uncapped render
 competing with the generator's threads; the journey comparison above, at the same render size,
 puts the lattice's share at about 5% of the rows.
+
+### Journey route set (owner, 2026-11-25)
+
+The Alps route flew near-repeat hops, none at a cube corner (where the generator's lattice is
+largest) or over a coast. The owner asked for geographic diversity, a cube corner, a coastline,
+the Grand Canyon, then "Andes and Fuji". A run (`d3b38ff`, about 7 minutes natively, 5 journeys)
+flies:
+
+| Route | Start, heading | What its hops reach (checked against the code and the 1′ data) |
+|---|---|---|
+| Andes | Aconcagua (32.65° S, 70.01° W; 6,040 m in the data), north | both hops over the range: 35% and 43% of their inner fields above 3,000 m (11% and 1% flying south) |
+| Pangaea interior | the bench region (22° S, 18° W era frame, 250 Ma), north | deep time; its lattice is 1.5 MiB (the deep generator) |
+| Grand Canyon | 33.85° N, 112.1° W, north | hop 1's neighbour centred on the canyon (36.1° N, 112.1° W). The grid reads a floor of 1,044–1,047 m and rims of 2,508 m (north) and 2,145 m (south) within 15 km: **about 1,100 m deep** (the 1′ data smooths the inner gorge; the river is at about 730 m) |
+| Mt Fuji | 35.36° N, 141.48° E (the Pacific east of the Bōsō peninsula), west | hop 1 crosses the Kantō coast onto Fuji: the neighbour's inner field is 67% land (gated: 5–95%). **Fuji reads as a peak**: 3,024 m at 35.36° N, 138.73° E, 3,101–3,117 m within 10 km, a 20 km ring averaging 710 m (the 1′ data tops out at 3,164 m; the real summit is 3,776 m). Hop 2's neighbour is 104–106 km from the **cube corner** at 35.26° N, 135° E (gated: ≤ 150 km) |
+| Andes again | as the first | so memory compares the Andes with itself |
+
+The corner: the cube's faces are planes of the render frame (`crates/timefly_core/src/cube.rs`),
+so the corners are the directions `(±1, ±1, ±1) / √3`; render `(x, y, z)` is geo `(y, z, x)`
+(`geo.rs`), so they lie at ±35.26° latitude and ±45°, ±135° longitude. The lattices measured by
+the trace (`n1`): Fuji's dive 31.0 MiB, hop 1 32.0, hop 2 (the corner hop) **35.0 MiB**; the
+Andes 14.0–16.5, the Grand Canyon 17.5–20.0.
+
+The scripted dive used to stop descending 2° short of a route's start (it dove at 44.6° N,
+9.1° E for the Alps' 46.5° N, 10° E); it now steers in to within 0.25° while descending
+(`SETTLE_DEG`), so the hops land where they are aimed: the dives measured within 0.3° of each
+start.
+
+Per hop, MiB over the baseline (`n1` traced; all four runs on `d3b38ff`'s code):
+
+| Run | Andes h1, h2 | Pangaea h1, h2 | Grand Canyon h1, h2 | Mt Fuji h1, h2 (corner) | Andes again h1, h2 | Worst |
+|---|---|---|---|---|---|---|
+| `n1` (trace) | +30.1, +37.8 | +21.9, +22.2 | +22.0, +22.3 | +24.6, +25.4 | +24.5, +22.2 | +37.8 |
+| `n2` | +32.5, +23.0 | +22.3, +22.2 | +27.1, +25.3 | +25.6, +24.9 | +21.8, +21.9 | +32.5 |
+| `o1` (run 1) | +37.3, +26.4 | +23.0, +22.1 | +30.8, +23.0 | +23.9, +27.4 | +21.9, **+48.0** | **+48.0** |
+| **`o2` (run 2, judged)** | +30.2, +16.4 | +14.9, +16.9 | +21.0, +26.5 | +27.1, +8.8 | +1.9, +2.4 | **+30.2** |
+
+**The gate decision on the route set: +64 MiB stands.** `o1`'s second Andes visit read +48.0
+MiB on its second hop, 8 MiB over +40. Between the two Andes visits the globe's footprint fell
+110 MiB (1,043.7 to 933.3 MiB): the OS took back retained pages, so that hop paid for its pages
+anew, the no-reuse case estimated above at about +44 MiB. The corner hop itself read +8.8 to
++27.4: its 35 MiB lattice reused the chunks of Fuji's dive (31 MiB) and first hop (32 MiB), as
+neighbouring regions' lattices are close in size; the dive pays the jump, not the hop. With no
+reuse at all at the corner the parts would add up to about +77 MiB (lattice 35, grid 10, image
+data 10, staging 10, textures net 12), over even +64; that needs the OS to reclaim the pages
+between the corner region's dive and its hop, which no run showed.
+
+**Flight is judged per route** (each route's frames under its own pacing rule, as the region
+bench judges each region, R14). Pooled, the route set's frames failed the uncapped p95 rule in
+`n1` and `n2` (16.96 and 16.87 ms) though the routes render very differently: from `n1`'s
+trace, Pangaea's median was 16.56 ms (p95 18.00), the Andes' 13.4–13.8, the Grand Canyon's 12.5,
+Fuji's 8.4. Per route, `o2` passed everywhere (display-paced, medians 16.67–16.68 ms); `o1`,
+uncapped, failed on **Pangaea alone: p95 18.40 ms** (median 14.16), the other routes 12.41–16.43.
+Pangaea's sand seas (the dunes) are the heaviest terrain at 2560 × 1440; the region bench passes
+it display-paced (p95 20.64 ms in `r1`), and Task 11's 1920 × 951 runs passed it. Whether the
+display paced a run changed between runs on this 4K monitor, so an uncapped run can fail on
+Pangaea. Not changed here: it's the terrain's cost, not the transitions'.
+
+Other gates, `o1` / `o2`: holds (dives 404–724 ms, hops 20–35 ms, climbs 27–40 ms) and swap
+frames (worst 31.98 / 36.61 ms) pass; route checks pass in all four runs; memory cycles: the
+Andes against itself −10.6% (the reclaim) / +4.0%.
+
+On the web the run becomes about 10 minutes (5 journeys at about 2 minutes each, against about
+5 minutes for Task 11's 3 Alps cycles); not run here.
 
 ## Cloud pass cost (Task 5's ≤ 1 ms, Task 7's early-Z loss)
 

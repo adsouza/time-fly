@@ -375,6 +375,11 @@ packages on Vulkan. Record the adapter and backend.
   instead of the free camera, and it gains a high-altitude segment near the cloud base.
 - A new **journey bench** (`--journey-bench` / `?journey-bench`): from the globe, dive into one
   of the bench regions, fly to the edge and hop twice, then climb back out, several times.
+  *(Owner, 2026-11-25: a set of routes instead, for geographic diversity: the Andes flown north
+  along the range from Aconcagua, a deep-time bench region (Pangaea), the Grand Canyon, and Mt
+  Fuji, whose hops cross a coastline and reach a cube-face corner of the terrain's cube sphere,
+  where the generator's lattice is largest; then the Andes again, so memory compares a route
+  with itself. `--region` still flies one place.)*
   Gates *(call; the owner sets final numbers in the plan)*:
   - time spent holding in the cloud per transition: native ≤ 3 s (gated); web ≤ 8 s (reported
     only, §8)

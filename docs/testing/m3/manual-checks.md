@@ -176,11 +176,13 @@ below. The region is framed from 230 km when you emerge, and the globe from the 
       hop's cloud gathers, then the hop runs.
 - [ ] Acceptable, or does the hold feel like an invisible wall? Choose: acceptable / needs work.
 
-### 15. The journey bench flies the Alps, not one of the bench regions (Task 10)
+### 15. The journey bench's routes (Task 10; answered by the owner, 2026-11-25)
 
-Design §10 says the journey bench dives into "one of the bench regions". It dives into the Alps
-(46.5° N, 10.0° E, present), which isn't one of the region bench's eight (`JOURNEY_REGION`). Any
-place can be flown with `--journey-bench --region=LAT,LON,AGE_YEARS`.
+Design §10 said the journey bench dives into "one of the bench regions"; Task 10 flew only the
+Alps. The owner asked for geographic diversity, a cube corner, a coastline, the Grand Canyon, the
+Andes in place of the Alps and Mt Fuji. A run now flies the Andes north from Aconcagua, Pangaea
+at 250 Ma, the Grand Canyon north, Mt Fuji west over the Kantō coast to the cube corner at
+35.26° N, 135° E, then the Andes again (`JOURNEY_ROUTES`, `JOURNEY_ORDER`). Any single place can
+still be flown with `--journey-bench --region=LAT,LON,AGE_YEARS` (east, three times).
 
-- [ ] Keep the Alps, or switch the default to one of the eight (for example the Himalayas):
-      keep / switch to ______
+- [x] Answered: the route set above.
