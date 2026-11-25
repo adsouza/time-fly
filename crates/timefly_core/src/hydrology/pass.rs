@@ -495,7 +495,9 @@ impl HydroPrep {
                     (self.lattice.nearest(dir), l.level_m)
                 })
                 .collect();
-            let (placed, unplaced) = place_levels(&routed, self.first_flat, &points);
+            let ice = &self.ice;
+            let (placed, unplaced) =
+                place_levels(&routed, self.first_flat, &|i| bit(ice, i), &points);
             self.placed_levels = placed;
             self.unplaced_levels = unplaced
                 .into_iter()
@@ -1566,12 +1568,14 @@ mod tests {
                 })
                 .collect();
             if data_lakes {
-                // The arid bowl's balance makes no lake; the table makes one at its level.
+                // The arid bowl's balance makes no lake; the table makes a terminal one at its
+                // level, since it evaporates more than it receives.
                 assert_eq!(on_arid.len(), 1, "{on_arid:?}");
                 assert_eq!(
                     (on_arid[0].kind, on_arid[0].level_m),
-                    (LakeKind::Data, 300.0)
+                    (LakeKind::Terminal, 300.0)
                 );
+                assert_eq!(on_arid[0].outflow_m3s, 0.0);
                 assert_eq!(h.unplaced_lake_levels, vec!["Nowhere".to_string()]);
             } else {
                 assert!(on_arid.is_empty(), "{on_arid:?}");

@@ -20,17 +20,22 @@
 //!     routing's, in scan order: its nodes, spill_m = its minimum e, exit = its outlet first in
 //!     pop order, rim = the exit's receiver. Its other outlets are redirected to the exit.
 //! Lake level table (only if data_lakes), after the flats: each table point's nearest lattice
-//!   node; if that node is in a depression basin, the basin takes the point's level (the first
-//!   point in table order wins). A point in no depression is unplaced (the shell warns). The
-//!   level is the present one; the era's elevation change is not added.
+//!   node; if that node is in a depression basin with a non-ice node below the point's level,
+//!   the basin takes the level (the first point in table order wins; a later point within tol
+//!   of it is silent). Unplaced, for the shell to warn: a point in no depression, one whose
+//!   basin has no non-ice node below its level, or one more than tol from the basin's level.
+//!   The level is the present one; the era's elevation change is not added.
 //! Discharge: own runoff per land node, then nodes in reverse pop order. A node outside every
 //!   basin adds its q to its receiver (none into the ocean). A basin node other than the exit
 //!   keeps its q (own runoff + inflow from outside the basin). At the exit the basin resolves:
 //!   Q_in = Σ q over its nodes, ascending node id, in f64. Lakes are numbered in the order their
 //!   exits resolve (reverse pop order), which lake_tap's tie-break uses.
-//! A depression basin with a table level L, if some non-ice node has e < L: Data lake at L,
-//!   footprint = non-ice nodes with e < L, outflow = max(0, Q_in − Σ_footprint c) if L ≥ spill,
-//!   else 0; evaporation = Q_in − outflow. It overrides every rule below.
+//! A depression basin with a table level L: a lake at L, kept even above the spill (the table
+//!   is trusted over the data's 10 km spill); footprint = non-ice nodes with e < L. It drains
+//!   by its surplus, whatever L is against the spill: Open if Q_in > Σc over the nodes below L
+//!   (outflow = Q_in − Σc, evaporation = Σc, and the exit then joins the footprint as its
+//!   outlet unless ice), else Terminal (outflow 0, evaporation = Q_in). It overrides every rule
+//!   below.
 //! A flat basin: if Q_in ≥ DATA_LAKE_MIN_BALANCE × Σc: Data lake at level = spill = min e,
 //!   footprint = all its nodes, outflow = max(0, Q_in − Σc), evaporation = Q_in − outflow.
 //!   Otherwise no lake (it passes Q_in on). Either way it routes as a spilling basin (below).
@@ -49,10 +54,10 @@
 //!       ice; no lake if the footprint is empty, or if level − min e < MIN_LAKE_DEPTH_M and
 //!       Q_in < RIVER_MIN_DISCHARGE_M3S (a playa).
 //! Routing inside a basin, always local: sources are, for a basin that passes water on (Open,
-//!   Data or table lake with outflow, a flat, no lake), its footprint plus its exit (a lake
-//!   with outflow adds the exit to its footprint unless ice); for any other basin (Terminal, a
-//!   playa, Data or table lake without outflow), its sinks (Data and table lakes: the nodes in
-//!   the footprint or with e below the level, ice included). BFS from the sources over the
+//!   Data lake with outflow, an Open table lake, a flat, no lake), its footprint plus its exit (a
+//!   lake with outflow adds the exit to its footprint unless ice); for any other basin
+//!   (Terminal, a playa, Data lake without outflow, a Terminal table lake), its sinks (Data and
+//!   table lakes: the nodes in the footprint or with e below the level, ice included). BFS from the sources over the
 //!   basin's nodes. Every other node routes to the neighbour one step closer with the lowest e
 //!   (ties: neighbour order); re-accumulate q and area in descending distance, ties ascending id.
 //!   A basin that passes water on then adds each other source's q and area to the exit
@@ -194,11 +199,14 @@ pub(crate) struct Accumulation {
 }
 
 /// Places lake level table points `(nearest node, level)`: each point whose node lies in a
-/// depression basin gives that basin its level (the first point wins). Returns the
-/// `(basin, level)` pairs, sorted, and the indices of the points that are in no depression.
+/// depression basin with a non-ice node below the level gives that basin its level (the first
+/// point wins). Returns the `(basin, level)` pairs, sorted, and the indices of the points that
+/// are unplaced: in no depression, with no non-ice basin node below the level, or giving a
+/// basin that already has a level another one more than `DATA_LAKE_FLAT_TOL_M` apart.
 pub(crate) fn place_levels(
     routed: &Routed,
     first_flat: u32,
+    ice: &impl Fn(u32) -> bool,
     points: &[(u32, f32)],
 ) -> (Vec<(u32, f32)>, Vec<usize>) {
     let mut placed: Vec<(u32, f32)> = Vec::new();
@@ -207,8 +215,21 @@ pub(crate) fn place_levels(
         let b = routed.basin_of[node as usize];
         if b == NO_BASIN || b >= first_flat {
             unplaced.push(k);
-        } else if !placed.iter().any(|&(p, _)| p == b) {
-            placed.push((b, level));
+            continue;
+        }
+        let wet = routed.basins[b as usize]
+            .nodes
+            .iter()
+            .any(|&v| !ice(v) && routed.elevation_m[v as usize] < level);
+        match placed.iter().find(|&&(p, _)| p == b) {
+            _ if !wet => unplaced.push(k),
+            Some(&(_, other)) => {
+                // One water body at one level (Michigan and Huron) is silent; another level is not.
+                if f64::from((other - level).abs()) > DATA_LAKE_FLAT_TOL_M {
+                    unplaced.push(k);
+                }
+            }
+            None => placed.push((b, level)),
         }
     }
     placed.sort_by_key(|&(b, _)| b);
@@ -697,20 +718,18 @@ impl Accumulation {
             if !footprint.contains(&true) {
                 return None;
             }
+            // It drains by its surplus, whatever its level against the data's spill: the
+            // table's levels are low-water datums, and the data's outlet can stand above them.
             let capacity: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
-            let outflow = if level >= f64::from(spill) {
-                (q_in - capacity).max(0.0)
-            } else {
-                0.0
-            };
-            Some(if outflow > 0.0 {
+            Some(if q_in > capacity {
                 footprint[exit_k] |= !iced[exit_k];
-                let lake = make_lake(LakeKind::Data, level, q_in - outflow, outflow, &footprint);
+                let outflow = q_in - capacity;
+                let lake = make_lake(LakeKind::Open, level, capacity, outflow, &footprint);
                 Outcome::Spill {
                     lake: Some((lake, footprint)),
                 }
             } else {
-                let lake = make_lake(LakeKind::Data, level, q_in, 0.0, &footprint);
+                let lake = make_lake(LakeKind::Terminal, level, q_in, 0.0, &footprint);
                 Outcome::Sink {
                     lake: Some((lake, footprint)),
                     sinks,
@@ -939,6 +958,22 @@ mod tests {
         data_lakes: bool,
         budget: u32,
     ) -> Accumulation {
+        accumulate_with(g, routed, own, capacity, ice, data_lakes, budget, &[]).0
+    }
+
+    /// [`accumulate`] with lake level table points `(node, level)`, placed only with data
+    /// lakes. Also returns the placed `(basin, level)` pairs and the unplaced point indices.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_with(
+        g: &impl HydroGraph,
+        routed: &mut Routed,
+        own: impl Fn(u32) -> f32,
+        capacity: impl Fn(u32) -> f64,
+        ice: impl Fn(u32) -> bool,
+        data_lakes: bool,
+        budget: u32,
+        points: &[(u32, f32)],
+    ) -> (Accumulation, Vec<(u32, f32)>, Vec<usize>) {
         let first_flat = if data_lakes {
             let mut flats = Flats::new(g.len());
             while !flats.step(g, routed, &ice, budget).0 {}
@@ -946,13 +981,19 @@ mod tests {
         } else {
             routed.basins.len() as u32
         };
+        let (placed, unplaced) = if data_lakes {
+            place_levels(routed, first_flat, &ice, points)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut acc = Accumulation::new(g.len(), first_flat);
+        acc.set_levels(placed.clone());
         while !acc.init_step(g, routed, |i, _| own(i), budget).0 {}
         while !acc
             .walk_step(g, routed, &ice, |i, _, _| capacity(i), data_lakes, budget)
             .0
         {}
-        acc
+        (acc, placed, unplaced)
     }
 
     fn golden_grid(fx: &Value) -> (GridGraph, Vec<f32>) {
@@ -1123,14 +1164,20 @@ mod tests {
             evap in prop::collection::vec(0.0f64..3.0, 132),
             ice in prop::collection::vec(0u8..10, 132),
             data_lakes in any::<bool>(),
+            table in prop::collection::vec((0u32..132, -3i32..14), 0..4),
         ) {
             // An 11 x 12 grid at 10 km: flats, pits, ice and several outlets.
             let g = GridGraph { rows: 11, cols: 12, spacing_m: 10_000.0 };
             let elevation: Vec<f32> = levels.iter().map(|&l| l as f32 * 3.0).collect();
             let iced = |i: u32| ice[i as usize] == 0;
             let mut r = route(&g, elevation.clone());
-            let acc = accumulate(&g, &mut r, |i| 1.0 + (i % 3) as f32,
-                |i| evap[i as usize], iced, data_lakes, 5);
+            // Lake level table points, off the 3 m grid of elevations.
+            let points: Vec<(u32, f32)> =
+                table.iter().map(|&(n, l)| (n, l as f32 * 3.0 + 0.7)).collect();
+            let (acc, placed, _) = accumulate_with(&g, &mut r, |i| 1.0 + (i % 3) as f32,
+                |i| evap[i as usize], iced, data_lakes, 5, &points);
+            let table_exits: Vec<u32> =
+                placed.iter().map(|&(b, _)| r.basins[b as usize].exit).collect();
             let mut own = 0.0;
             let mut out = 0.0;
             for i in 0..g.len() {
@@ -1165,7 +1212,10 @@ mod tests {
             for lake in &acc.lakes {
                 let sum = lake.evaporation_m3s + lake.outflow_m3s;
                 prop_assert!((sum - lake.inflow_m3s).abs() <= 1e-9 * lake.inflow_m3s.max(1.0));
-                prop_assert!(lake.level_m <= lake.spill_m);
+                // A table lake keeps the table's level, which may stand above the spill.
+                if !table_exits.contains(&lake.exit) {
+                    prop_assert!(lake.level_m <= lake.spill_m);
+                }
             }
             // Every node outside a lake drains to a neighbour.
             for i in 0..g.len() {
@@ -1270,59 +1320,106 @@ mod tests {
     }
 
     #[test]
-    fn a_table_level_sets_its_basins_lake() {
+    fn a_table_lake_drains_by_its_surplus() {
         let (g, elevation) = deep_bowl();
         let centre = g.node(4, 6);
-        let wall = g.node(0, 5);
-        // Humid: by water balance alone the bowl fills to its 50 m spill.
-        let run = |points: &[(u32, f32)]| {
+        let (rim, sea) = (g.node(4, 1), g.node(4, 0));
+        let run = |capacity: f64, points: &[(u32, f32)]| {
             let mut r = route(&g, elevation.clone());
-            let first_flat = r.basins.len() as u32;
-            let (placed, unplaced) = place_levels(&r, first_flat, points);
-            let mut acc = Accumulation::new(g.len(), first_flat);
-            acc.set_levels(placed);
-            while !acc.init_step(&g, &r, |_, _| 5.0, 7).0 {}
-            while !acc
-                .walk_step(&g, &mut r, &|_| false, |_, _, _| 0.1, true, 7)
-                .0
-            {}
+            let (acc, _, unplaced) = accumulate_with(
+                &g,
+                &mut r,
+                |_| 5.0,
+                |_| capacity,
+                |_| false,
+                true,
+                7,
+                points,
+            );
             (r, acc, unplaced)
         };
-        let (r, balance, unplaced) = run(&[]);
-        assert!(unplaced.is_empty());
+        // Humid: the balance alone fills the bowl to its 50 m spill.
+        let (r, balance, _) = run(0.1, &[]);
         assert_eq!(r.basins.len(), 1);
-        assert_eq!(balance.lakes.len(), 1);
+        assert_eq!(r.basins[0].spill_m, 50.0);
         let open = &balance.lakes[0];
-        assert_eq!(
-            (open.kind, open.level_m, open.spill_m),
-            (LakeKind::Open, 50.0, 50.0)
-        );
-        // A table level below the spill: a data lake at it, holding all its inflow.
-        let (r, acc, unplaced) = run(&[(centre, 15.0), (wall, 12.0)]);
-        assert_eq!(unplaced, vec![1], "the wall point is in no basin");
+        assert_eq!((open.kind, open.level_m), (LakeKind::Open, 50.0));
+        // The hazard: the table's level sits 1 m under the data's spill.
+        for level in [49.0, 15.0, 52.0] {
+            let (r, acc, unplaced) = run(0.1, &[(centre, level)]);
+            assert!(unplaced.is_empty());
+            let lake = &acc.lakes[0];
+            // Open by its surplus, at the table's level, even above the spill.
+            assert_eq!(
+                (lake.kind, lake.level_m),
+                (LakeKind::Open, level),
+                "{lake:?}"
+            );
+            // Evaporation over the nodes below the level (the exit is the outlet, not surface).
+            let wet = r.basins[0]
+                .nodes
+                .iter()
+                .filter(|&&v| elevation[v as usize] < level)
+                .count();
+            let capacity = 0.1 * wet as f64;
+            assert!((lake.evaporation_m3s - capacity).abs() < 1e-9, "{lake:?}");
+            assert_eq!(lake.outflow_m3s, lake.inflow_m3s - lake.evaporation_m3s);
+            // The outflow leaves over the rim and reaches the sea.
+            assert_eq!(receiver_of(&g, &r, lake.exit), Some(rim));
+            assert_eq!(receiver_of(&g, &r, rim), Some(sea));
+            assert_eq!(acc.q[rim as usize], 5.0 + lake.outflow_m3s as f32);
+            let below: Vec<u32> = r.basins[0]
+                .nodes
+                .iter()
+                .copied()
+                .filter(|&v| elevation[v as usize] < level || v == lake.exit)
+                .collect();
+            let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+            assert_eq!(footprint, below, "{level}");
+        }
+        // Arid (a Caspian): terminal at the table's level under the spill.
+        let (_, acc, _) = run(1e3, &[(centre, 15.0)]);
         let lake = &acc.lakes[0];
-        assert_eq!((lake.kind, lake.level_m), (LakeKind::Data, 15.0));
+        assert_eq!((lake.kind, lake.level_m), (LakeKind::Terminal, 15.0));
         assert_eq!(lake.outflow_m3s, 0.0);
         assert_eq!(lake.evaporation_m3s, lake.inflow_m3s);
+        assert_eq!(acc.q[rim as usize], 5.0);
         let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
-        let below: Vec<u32> = r.basins[0]
-            .nodes
-            .iter()
-            .copied()
-            .filter(|&v| elevation[v as usize] < 15.0)
-            .collect();
-        assert_eq!(footprint, below);
-        assert!(below.len() > 5 && below.len() < r.basins[0].nodes.len());
-        // A table level at or above the spill: the lake spills its inflow less evaporation.
-        let (_, acc, _) = run(&[(centre, 52.0)]);
-        let lake = &acc.lakes[0];
-        assert_eq!((lake.kind, lake.level_m), (LakeKind::Data, 52.0));
-        let capacity = 0.1 * acc.lake_nodes.len() as f64;
-        assert!(
-            (lake.outflow_m3s - (lake.inflow_m3s - capacity)).abs() < 1e-9,
-            "{lake:?}"
-        );
-        assert!(lake.outflow_m3s > 0.0);
+        assert!(footprint.iter().all(|&v| elevation[v as usize] < 15.0));
+    }
+
+    #[test]
+    fn conflicting_table_points_are_unplaced() {
+        let (g, elevation) = deep_bowl();
+        let (centre, near) = (g.node(4, 6), g.node(3, 6));
+        let wall = g.node(0, 5);
+        let mut r = route(&g, elevation);
+        let points = [
+            (centre, 15.0),
+            // The same water body at the same level (Michigan and Huron): silent.
+            (near, 15.3),
+            // Another level for the same basin.
+            (near, 30.0),
+            // Below the whole bed (the bed's lowest node is 5 m).
+            (centre, 2.0),
+            (wall, 12.0),
+        ];
+        let (placed, unplaced) = place_levels(&r, r.basins.len() as u32, &|_| false, &points);
+        assert_eq!(placed, vec![(0, 15.0)]);
+        assert_eq!(unplaced, vec![2, 3, 4]);
+        // A level whose basin's nodes below it are all ice is unplaced too.
+        let iced = |v: u32| elevation_below(&g, v);
+        let (placed, unplaced) = place_levels(&r, r.basins.len() as u32, &iced, &[(centre, 9.0)]);
+        assert!(placed.is_empty());
+        assert_eq!(unplaced, vec![0]);
+        let _ = &mut r;
+    }
+
+    /// Ice on the deep bowl's nodes below 9 m.
+    fn elevation_below(g: &GridGraph, v: u32) -> bool {
+        let (_, elevation) = deep_bowl();
+        let _ = g;
+        elevation[v as usize] < 9.0
     }
 
     /// A 9 x 17 grid at 10 km, ocean all round, a 70 m plateau, and a shelf at exactly 50 m
