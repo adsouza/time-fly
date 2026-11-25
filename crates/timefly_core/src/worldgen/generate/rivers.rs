@@ -46,9 +46,16 @@
 //!   level = bed − LEVEL_BELOW_BED × d(Q of the segment).
 //!   slope = (bed(x ⊖ 500 m) − bed(x ⊕ 500 m)) / span, along the main branch upstream, clamped
 //!   at a source or a terminal end; speed and rapid by river_speed_mps.
+//! Tangent (unit flow direction at a sub-point): a central difference of the meandered
+//!   centreline between nodes; at a node, the node's own meander (its A, λ and normal held)
+//!   evaluated one sub-point spacing either side along its travel bisector, so every segment
+//!   meeting there gives the same bits; one-sided at a terminal end.
 //! Texel: candidates are the sub-segments within their valley half-width V = max(4w,
 //!   w_eff/2 + 3·texel), w_eff = max(w, CHANNEL_MIN_TEXELS × texel), at great-circle distance
 //!   d; level and speed lerp along the sub-segment, w and depth are its start's.
+//!   flow = speed × the ends' tangents lerped along the sub-segment, projected at the texel
+//!   and normalised: continuous along a river, across the switch between sub-segments and
+//!   through nodes (the shader can flow-map it without tearing).
 //!   cut(d) = level − depth·(1 − (2d / w_eff)²) in the channel (d ≤ w_eff / 2), else
 //!     bank = level + BANK_FREEBOARD_M + VALLEY_WALL_SLOPE·(d − w_eff / 2), blended to h by
 //!     smoothstep(V / 2, V, d); fade = 1 − that blend.
@@ -453,7 +460,8 @@ pub struct SubPoint {
     pub depth_m: f32,
     pub speed_mps: f32,
     pub rapid: f32,
-    /// The unit flow direction, tangent at `dir`.
+    /// The unit flow direction, tangent at `dir` (see the module's tangent rule). Texel flow
+    /// lerps it along each sub-segment.
     pub tangent: DVec3,
     /// The river node whose segment this is.
     pub river: u32,
@@ -936,9 +944,9 @@ impl<'a> RiverBuilder<'a> {
         (MEANDER_AMPLITUDE_PER_WIDTH * w * flat, lambda)
     }
 
-    /// The meander normal at segment `s`'s start node: left of the bisector of its outgoing
-    /// chord and its main incoming one.
-    fn node_normal(&self, s: usize) -> DVec3 {
+    /// The travel direction at segment `s`'s start node, before meanders: the bisector of its
+    /// outgoing chord and its main incoming one (unit, tangent at the relaxed node).
+    fn node_travel(&self, s: usize) -> DVec3 {
         let seg = &self.segs[s];
         let p = seg.points[0];
         let k_max = seg.k_max as usize;
@@ -948,8 +956,40 @@ impl<'a> RiverBuilder<'a> {
             .and_then(|u| tangent_toward(p, self.segs[u].points[0]))
             .map_or(DVec3::ZERO, |t| -t);
         let b = out + into;
-        let b = if b.length() > 1e-9 { b } else { out };
-        p.cross(b).normalize()
+        if b.length() > 1e-9 {
+            b.normalize()
+        } else {
+            out
+        }
+    }
+
+    /// The meander normal at segment `s`'s start node: left of its travel direction.
+    fn node_normal(&self, s: usize) -> DVec3 {
+        let p = self.segs[s].points[0];
+        p.cross(self.node_travel(s)).normalize()
+    }
+
+    /// The flow direction at segment `s`'s start node, after meanders: the node's own meander
+    /// (its amplitude, wavelength and normal held) evaluated one sub-point spacing either side
+    /// of the node along its travel direction, as a central difference. It depends only on the
+    /// node, so every segment meeting there gives the same bits.
+    fn node_tangent(&self, s: usize, key_at: &impl Fn(RenderDir) -> (DVec3, u32)) -> DVec3 {
+        let seg = &self.segs[s];
+        let p = seg.points[0];
+        let travel = self.node_travel(s);
+        let (a, lambda) = self.node_values(seg.river);
+        let normal = self.node_normal(s);
+        let here = meander_point(p, a, lambda, normal, key_at);
+        let h = seg.len / f64::from(seg.k_max);
+        let side =
+            |sign: f64| meander_point(offset_point(p, travel, sign * h), a, lambda, normal, key_at);
+        let t = side(1.0) - side(-1.0);
+        let t = t - here * here.dot(t);
+        if t.length() > 1e-15 {
+            t.normalize()
+        } else {
+            travel
+        }
     }
 
     /// The meander normal at a terminal segment's end: left of its own chord.
@@ -982,17 +1022,7 @@ impl<'a> RiverBuilder<'a> {
                 n0 * (1.0 - t) + n1 * t,
             )
         };
-        if a == 0.0 {
-            return p;
-        }
-        let n = n - p * p.dot(n);
-        let l = n.length();
-        if !l.is_finite() || l <= 1e-12 {
-            return p;
-        }
-        let (pos, seed) = key_at(RenderDir(p));
-        let f = f64::from(fbm(pos, lambda, 2, 2.0, 0.5, seed ^ MEANDER_SALT));
-        offset_point(p, n.normalize(), a * f)
+        meander_point(p, a, lambda, n, key_at)
     }
 
     /// Sub-point `k` of segment `s`, its tangent left for [`close_segment`](Self::close_segment).
@@ -1041,6 +1071,8 @@ impl<'a> RiverBuilder<'a> {
         }
         let fallback =
             tangent_toward(seg.points[0], seg.points[seg.k_max as usize]).unwrap_or(DVec3::ZERO);
+        // Central differences between nodes; at a node, the node's own rule (shared by every
+        // segment meeting there); one-sided at a terminal end.
         let tangent = |k: usize| {
             let prev = dirs[k.saturating_sub(1)];
             let after = dirs[(k + 1).min(dirs.len() - 1)];
@@ -1053,11 +1085,12 @@ impl<'a> RiverBuilder<'a> {
                 fallback
             }
         };
+        let start = self.node_tangent(s, key_at);
         for k in 0..count as usize {
-            self.subpoints[first as usize + k].tangent = tangent(k);
+            self.subpoints[first as usize + k].tangent = if k == 0 { start } else { tangent(k) };
         }
         if let Some(n) = &mut next {
-            n.tangent = tangent(dirs.len() - 1);
+            n.tangent = self.node_tangent(seg.down_seg.expect("next has a segment"), key_at);
         }
         self.out.push(RiverSeg {
             river: seg.river,
@@ -1073,6 +1106,40 @@ impl<'a> RiverBuilder<'a> {
     pub fn finish(self) -> RegionRivers {
         debug_assert!(self.phase == Phase::Done, "the rivers are not finished");
         RegionRivers::new(self.basis, self.subpoint_m, self.subpoints, self.out)
+    }
+}
+
+/// `p` meandered by amplitude `a` and wavelength `lambda` along `normal` (projected at `p`):
+/// `a × fbm(key_at(p), λ, 2 octaves)`. Exactly `p` when `a` is 0.
+fn meander_point(
+    p: DVec3,
+    a: f64,
+    lambda: f64,
+    normal: DVec3,
+    key_at: &impl Fn(RenderDir) -> (DVec3, u32),
+) -> DVec3 {
+    if a == 0.0 {
+        return p;
+    }
+    let n = normal - p * p.dot(normal);
+    let l = n.length();
+    if !l.is_finite() || l <= 1e-12 {
+        return p;
+    }
+    let (pos, seed) = key_at(RenderDir(p));
+    let f = f64::from(fbm(pos, lambda, 2, 2.0, 0.5, seed ^ MEANDER_SALT));
+    offset_point(p, n.normalize(), a * f)
+}
+
+/// The flow direction at texel `p` on a sub-segment: its ends' tangents lerped by `u`,
+/// projected onto the tangent plane at `p`; the chord's direction if that vanishes.
+fn flow_tangent(p: DVec3, ta: DVec3, tb: DVec3, u: f64, chord: Option<DVec3>) -> DVec3 {
+    let t = ta * (1.0 - u) + tb * u;
+    let t = t - p * p.dot(t);
+    if t.length() > 1e-12 {
+        t.normalize()
+    } else {
+        chord.unwrap_or(ta)
     }
 }
 
@@ -1310,10 +1377,19 @@ impl RegionRivers {
     }
 
     /// The carved height and the river at a texel at `dir` whose height is `h_m`, for texels
-    /// `texel_m` wide (at most twice the sub-point spacing). A pure function of `dir`, `h_m`,
-    /// `texel_m` and the era's rivers inside the region's square.
+    /// `texel_m` wide. A pure function of `dir`, `h_m`, `texel_m` and the era's rivers inside
+    /// the region's square. Flow follows the sub-points' tangents, lerped.
+    ///
+    /// Panics if `texel_m` exceeds twice the sub-point spacing: the gather and the index bound
+    /// valleys by that texel, and a coarser one would silently drop candidates near the reach.
     pub fn texel(&self, dir: RenderDir, h_m: f64, texel_m: f64) -> RiverTexel {
-        debug_assert!(texel_m <= 2.0 * self.subpoint_m * (1.0 + 1e-9));
+        assert!(
+            texel_m <= 2.0 * self.subpoint_m * (1.0 + 1e-9),
+            "texel {texel_m} m is coarser than twice the sub-point spacing ({} m, so at most {} m): \
+             the gather and the index would drop candidates near their reach",
+            self.subpoint_m,
+            2.0 * self.subpoint_m
+        );
         let mut out = RiverTexel { h_m, hit: None };
         if self.subsegs.is_empty() {
             return out;
@@ -1335,7 +1411,7 @@ impl RegionRivers {
             level: f64,
             fade: f64,
             speed: f64,
-            travel: DVec3,
+            tangent: DVec3,
             end_level: f32,
         }
         let mut carved = h_m;
@@ -1379,7 +1455,7 @@ impl RegionRivers {
                     level,
                     fade: 1.0 - blend,
                     speed: sa + (sb - sa) * u,
-                    travel: travel.unwrap_or(a.tangent),
+                    tangent: flow_tangent(p, a.tangent, b.tangent, u, travel),
                     end_level: self.segs[ss.seg as usize].end_level_m,
                 });
             }
@@ -1397,8 +1473,8 @@ impl RegionRivers {
             out.hit = Some(RiverHit {
                 level_m: b.level as f32,
                 ribbon_m: b.ribbon as f32,
-                flow_east_mps: (b.speed * b.travel.dot(east)) as f32,
-                flow_north_mps: (b.speed * b.travel.dot(north)) as f32,
+                flow_east_mps: (b.speed * b.tangent.dot(east)) as f32,
+                flow_north_mps: (b.speed * b.tangent.dot(north)) as f32,
                 fade,
             });
         }
@@ -1916,6 +1992,124 @@ mod tests {
             n += 1;
         }
         assert!(n > 300);
+    }
+
+    /// The texel's flow as a vector in the era frame.
+    fn flow_vector(d: DVec3, hit: &RiverHit) -> DVec3 {
+        let (north, east) = RegionFrame {
+            center: RenderDir(d),
+        }
+        .north_east();
+        east * f64::from(hit.flow_east_mps) + north * f64::from(hit.flow_north_mps)
+    }
+
+    #[test]
+    fn flow_turns_smoothly_along_a_meandering_river() {
+        // w = 200 m on flat ground: λ = 2.2 km, A = 300 m, a bend every few sub-points.
+        let (hydro, floor) = meander_case(1600.0, 1e-4);
+        let rr = build(&hydro, &floor);
+        // The centreline in flow order (one river: rivers ascend along the row), each
+        // segment's start shared with the previous one's closing point.
+        let line: Vec<DVec3> = by_river(&rr).values().flatten().map(|s| s.dir).collect();
+        // Its sharpest discrete curvature: the turn at a vertex over the mean of its chords.
+        let mut kappa = 0.0f64;
+        for w in line.windows(3) {
+            let (c0, c1) = (w[1] - w[0], w[2] - w[1]);
+            let turn = c0.cross(c1).length().atan2(c0.dot(c1));
+            let mean = 0.5 * (metres_between(w[0], w[1]) + metres_between(w[1], w[2]));
+            kappa = kappa.max(turn / mean);
+        }
+        let step = INNER_TEXEL_M;
+        let bound = 1.3 * kappa * step + 0.002;
+        // The hazard: a chord switch turns by a whole vertex angle, about κ × 500 m.
+        assert!(kappa * SUBPOINT_M > bound, "{kappa}");
+        assert!(
+            kappa * step > 5f64.to_radians(),
+            "a meandering river: {kappa}"
+        );
+        // Texels every `step` metres of arc along the centreline.
+        let (mut prev, mut worst, mut samples) = (None::<DVec3>, 0.0f64, 0);
+        let mut carry = 0.0;
+        for w in line.windows(2) {
+            let len = metres_between(w[0], w[1]);
+            let mut s = carry;
+            while s < len {
+                let d = chord_point(w[0], w[1], s / len);
+                let hit = rr
+                    .texel(RenderDir(d), 1000.0, step)
+                    .hit
+                    .expect("on the river");
+                let f = flow_vector(d, &hit);
+                if let Some(p) = prev {
+                    let turn = p.cross(f).length().atan2(p.dot(f));
+                    worst = worst.max(turn);
+                    assert!(
+                        turn <= bound,
+                        "{}° > {}°",
+                        turn.to_degrees(),
+                        bound.to_degrees()
+                    );
+                }
+                prev = Some(f);
+                samples += 1;
+                s += step;
+            }
+            carry = s - len;
+        }
+        assert!(samples > 500, "{samples}");
+        println!(
+            "worst turn {:.2}° per texel; bound {:.2}°; κ max {kappa:.2e} /m",
+            worst.to_degrees(),
+            bound.to_degrees()
+        );
+    }
+
+    #[test]
+    fn flow_is_continuous_at_nodes() {
+        // Joins along the main river and at a confluence, on meandering flat ground.
+        let hydro = tree(1e-4);
+        let floor = valley_field(vec![(col_along(400), 2000.0, -30.0, 6000.0)], (0.0, 0.0));
+        let rr = build(&hydro, &floor);
+        let first: BTreeMap<u32, SubPoint> = by_river(&rr)
+            .into_iter()
+            .map(|(r, sps)| (r, sps[0]))
+            .collect();
+        let bits = |v: DVec3| v.to_array().map(f64::to_bits);
+        let (mut joins, mut confluences) = (0, 0);
+        for seg in &rr.segs {
+            let Some(next) = seg.next else { continue };
+            let Down::River(v) = hydro.rivers.nodes()[seg.river as usize].down else {
+                panic!()
+            };
+            let Some(start) = first.get(&v) else { continue };
+            // Both sides of the node give its tangent.
+            assert_eq!(
+                bits(next.tangent),
+                bits(start.tangent),
+                "river {} -> {v}",
+                seg.river
+            );
+            let hit = rr
+                .texel(RenderDir(start.dir), 1000.0, INNER_TEXEL_M)
+                .hit
+                .unwrap();
+            let f = flow_vector(start.dir, &hit).normalize();
+            assert!(
+                f.dot(start.tangent) > 1.0 - 1e-9,
+                "the node's flow is its tangent"
+            );
+            joins += 1;
+            confluences += u32::from(hydro.rivers.upstream(v).len() > 1);
+        }
+        assert!(joins > 20 && confluences >= 2, "{joins} {confluences}");
+    }
+
+    #[test]
+    #[should_panic(expected = "twice the sub-point spacing")]
+    fn a_texel_coarser_than_twice_the_subpoint_panics() {
+        let (hydro, floor) = meander_case(1600.0, 1e-4);
+        let rr = build(&hydro, &floor);
+        rr.texel(centre(), 1000.0, 2.0 * SUBPOINT_M * 1.01);
     }
 
     #[test]
