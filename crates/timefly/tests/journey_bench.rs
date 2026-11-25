@@ -241,9 +241,14 @@ fn a_route_set_flies_each_route_its_own_way_and_compares_like_with_like() {
             .unwrap_or_else(|| panic!("{route} in\n{summary}"));
         assert!(line.ends_with(" rule -> PASS"), "{line}");
     }
+    // One pacing for the run, every route judged under it.
+    let rule = summary
+        .lines()
+        .find(|l| l.starts_with("flight by route (the run's "))
+        .unwrap_or_else(|| panic!("{summary}"));
     assert!(
-        summary.contains("\nflight by route (each route's own pacing rule) -> PASS\n"),
-        "{summary}"
+        rule.ends_with(" rule for every route; ungated routes reported only) -> PASS"),
+        "{rule}"
     );
     // Memory is compared route by route: the Alps against itself; the west route once.
     let cycles = summary

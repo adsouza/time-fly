@@ -639,3 +639,95 @@ fn sites_read_a_canyon_and_a_peak_from_the_grid() {
     };
     assert_eq!(read_site(&far, &grid, &frame), None);
 }
+
+/// A run's flight frames by journey: `(journey, frame ms)` runs of `n` frames.
+fn flight_of(parts: &[(u32, f32, usize)]) -> (Vec<f32>, Vec<u32>) {
+    let mut ms = Vec::new();
+    let mut cycles = Vec::new();
+    for &(cycle, frame, n) in parts {
+        ms.extend(std::iter::repeat_n(frame, n));
+        cycles.extend(std::iter::repeat_n(cycle, n));
+    }
+    (ms, cycles)
+}
+
+/// How the shell classifies frames requested `AutoNoVsync` on a 60 Hz display.
+fn native_60hz(frames: &[f32]) -> Pacing {
+    crate::bench::pacing(false, true, Some(60.0), frame_time_stats(frames).median_ms)
+}
+
+#[test]
+fn flight_pacing_is_decided_once_per_run() {
+    // An uncapped run (pooled median about 10 ms): the Andes and Fuji light, Pangaea heavy with
+    // its median near the 16.67 ms interval. Pangaea must be judged by the run's uncapped rule
+    // (p95 <= 16.67 ms, which it fails), not flip itself into the lenient display-paced rule.
+    let config = JourneyBenchConfig::new(60, true);
+    let (ms, cycles) = flight_of(&[
+        (0, 9.0, 4_000),
+        (1, 16.5, 1_500),
+        (1, 18.0, 500),
+        (2, 10.0, 3_000),
+        (3, 8.0, 3_000),
+        (4, 9.0, 4_000),
+    ]);
+    assert_eq!(native_60hz(&ms), Pacing::Uncapped);
+    let verdicts = judge_flight_by_route(&config, &ms, &cycles, 60, native_60hz);
+    let pangaea = &verdicts[1];
+    assert_eq!(config.routes[pangaea.route].region.name, "Pangaea interior");
+    assert_eq!(pangaea.pacing, Pacing::Uncapped, "pass {}", pangaea.pass);
+    assert!(!pangaea.pass);
+    for v in &verdicts {
+        assert_eq!(v.pacing, Pacing::Uncapped);
+    }
+    assert!(verdicts.iter().enumerate().all(|(i, v)| i == 1 || v.pass));
+    // A display-paced run judges every route by the paced rule.
+    let (paced, cycles) = flight_of(&[(0, 16.67, 3_000), (1, 16.7, 2_000), (2, 16.6, 2_000)]);
+    let config3 = JourneyBenchConfig {
+        journeys: vec![0, 1, 2],
+        ..JourneyBenchConfig::new(60, true)
+    };
+    let verdicts = judge_flight_by_route(&config3, &paced, &cycles, 60, native_60hz);
+    assert!(
+        verdicts[..3]
+            .iter()
+            .all(|v| v.pacing == Pacing::DisplayPaced && v.pass)
+    );
+}
+
+#[test]
+fn an_ungated_routes_flight_never_fails_the_run() {
+    // Pangaea's flight is reported only (owner, 2026-11-25); every other route's gates.
+    let gated: Vec<bool> = JOURNEY_ROUTES.iter().map(|r| r.flight_gated).collect();
+    assert_eq!(gated, [true, false, true, true]);
+    const { assert!(ALPS_ROUTE.flight_gated) };
+    let verdict = |route, pass, gated| RouteFlight {
+        route,
+        frames: vec![10.0],
+        pacing: Pacing::Uncapped,
+        pass,
+        gated,
+    };
+    // An ungated route's failure: the run passes.
+    assert!(flight_by_route_passes(&[
+        verdict(0, true, true),
+        verdict(1, false, false),
+        verdict(2, true, true),
+    ]));
+    // A gated route's failure: the run fails.
+    assert!(!flight_by_route_passes(&[
+        verdict(0, false, true),
+        verdict(1, true, false),
+    ]));
+    // From the frames: a failing Pangaea is reported, the run still passes.
+    let config = JourneyBenchConfig::new(60, true);
+    let (ms, cycles) = flight_of(&[
+        (0, 9.0, 4_000),
+        (1, 18.0, 2_000),
+        (2, 10.0, 3_000),
+        (3, 8.0, 3_000),
+        (4, 9.0, 4_000),
+    ]);
+    let verdicts = judge_flight_by_route(&config, &ms, &cycles, 60, native_60hz);
+    assert!(!verdicts[1].pass && !verdicts[1].gated);
+    assert!(flight_by_route_passes(&verdicts));
+}

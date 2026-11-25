@@ -159,6 +159,10 @@ pub struct JourneyRoute {
     /// `(hop from 1, what it crosses)`, checked at run time (gated).
     pub crosses: &'static [(u32, Crossing)],
     pub site: Option<Site>,
+    /// Whether its flight frames gate the run. Pangaea's are reported only (owner,
+    /// 2026-11-25): its sand seas run near the interval at 2560 x 1440 and fail the uncapped
+    /// rule whenever the display doesn't pace the run.
+    pub flight_gated: bool,
 }
 
 /// The Alps east: M3's first journey route, now only the headless tests' (the tiny fixture).
@@ -168,6 +172,7 @@ pub const ALPS_ROUTE: JourneyRoute = JourneyRoute {
     heading: "east",
     crosses: &[],
     site: None,
+    flight_gated: true,
 };
 
 /// The routes, in the order a run flies them ([`JOURNEY_ORDER`]):
@@ -198,6 +203,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
         heading: "north",
         crosses: &[],
         site: None,
+        flight_gated: true,
     },
     JourneyRoute {
         region: BENCH_REGIONS[0],
@@ -205,6 +211,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
         heading: "north",
         crosses: &[],
         site: None,
+        flight_gated: false,
     },
     JourneyRoute {
         region: BenchRegion {
@@ -226,6 +233,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
             lon_deg: -112.1,
             kind: SiteKind::Canyon,
         }),
+        flight_gated: true,
     },
     JourneyRoute {
         region: BenchRegion {
@@ -247,6 +255,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
             lon_deg: 138.73,
             kind: SiteKind::Peak,
         }),
+        flight_gated: true,
     },
 ];
 /// The journeys of a run, by route: every route once, then the Andes again, so the memory
@@ -551,6 +560,7 @@ impl JourneyBenchConfig {
                 heading: "east",
                 crosses: &[],
                 site: None,
+                flight_gated: true,
             },
         )
     }
@@ -632,6 +642,57 @@ pub fn crossing_check(c: Crossing, hop: &HopRecord) -> (bool, String) {
             None => (false, "coast: not measured".to_string()),
         },
     }
+}
+
+/// One route's flight outside the cloud, judged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteFlight {
+    pub route: usize,
+    pub frames: Vec<f32>,
+    pub pacing: Pacing,
+    pub pass: bool,
+    /// Whether the verdict gates the run ([`JourneyRoute::flight_gated`]).
+    pub gated: bool,
+}
+
+/// Judges each route's flight frames (`flight_ms`, the journey of each in `flight_cycle`) at
+/// `fps`, all under one pacing for the run: the one `classify` finds for every flight frame
+/// pooled. A heavy route whose own median sits near the interval in an uncapped run is judged
+/// by the uncapped rule; classified alone, it would flip itself into the lenient paced rule.
+pub fn judge_flight_by_route(
+    config: &JourneyBenchConfig,
+    flight_ms: &[f32],
+    flight_cycle: &[u32],
+    fps: u32,
+    classify: impl Fn(&[f32]) -> Pacing,
+) -> Vec<RouteFlight> {
+    let pacing = classify(flight_ms);
+    config
+        .routes
+        .iter()
+        .enumerate()
+        .map(|(r, route)| {
+            let frames: Vec<f32> = flight_ms
+                .iter()
+                .zip(flight_cycle)
+                .filter(|&(_, &c)| config.journeys[c as usize] == r)
+                .map(|(&ms, _)| ms)
+                .collect();
+            RouteFlight {
+                route: r,
+                pass: passes(&frames, fps, pacing),
+                frames,
+                pacing,
+                gated: route.flight_gated,
+            }
+        })
+        .collect()
+}
+
+/// The flight gate over the routes' verdicts: every gated route passes (an ungated route's
+/// verdict is reported only).
+pub fn flight_by_route_passes(verdicts: &[RouteFlight]) -> bool {
+    verdicts.iter().all(|v| v.pass || !v.gated)
 }
 
 /// A site read from the grid it lies in (`None` outside the inner field): the text of the
@@ -1402,37 +1463,41 @@ fn finish(
         ),
         Pacing::Uncapped => format!("pass rule (uncapped): p95 <= {interval:.2} ms"),
     });
-    // With several routes each is judged on its own frames, with its own pacing (as the region
-    // bench judges each region, R14): routes render very differently (Pangaea's dunes run near
-    // the interval at 2560 x 1440, Fuji's sea far under it), so a pooled rule mixes them.
+    // With several routes each is judged on its own frames (as the region bench judges each
+    // region, R14), all under the run's one pacing (the pooled frames'): routes render very
+    // differently (Pangaea's dunes run near the interval at 2560 x 1440, Fuji's sea far under
+    // it), so pooled frames would mix them. Pangaea's verdict is reported only (owner,
+    // 2026-11-25).
     let several = config.routes.len() > 1;
     let pooled_pass = passes(flight, fps, pacing);
     let mut route_lines = Vec::new();
-    let mut flight_pass = true;
+    let flight_pass;
     if several {
-        for (r, route) in config.routes.iter().enumerate() {
-            let frames: Vec<f32> = bench
-                .flight_ms
-                .iter()
-                .zip(&bench.flight_cycle)
-                .filter(|&(_, &c)| config.journeys[c as usize] == r)
-                .map(|(&ms, _)| ms)
-                .collect();
-            let p = pacing_for(&info, &frames);
-            let ok = passes(&frames, fps, p);
-            flight_pass &= ok;
-            let rs = frame_time_stats(&frames);
+        let verdicts = judge_flight_by_route(
+            config,
+            &bench.flight_ms,
+            &bench.flight_cycle,
+            fps,
+            |frames| pacing_for(&info, frames),
+        );
+        flight_pass = flight_by_route_passes(&verdicts);
+        for v in &verdicts {
+            let rs = frame_time_stats(&v.frames);
             route_lines.push(format!(
                 "  flight, {}: frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms, missed (>{:.1} ms) {} -> {} rule -> {}",
-                route.region.name,
+                config.routes[v.route].region.name,
                 rs.frames,
                 rs.median_ms,
                 rs.p95_ms,
                 rs.worst_ms,
                 MISSED_INTERVALS * interval,
-                missed_frames(&frames, fps),
-                pacing_name(p),
-                gate_word(ok)
+                missed_frames(&v.frames, fps),
+                pacing_name(v.pacing),
+                if v.gated {
+                    gate_word(v.pass).to_string()
+                } else {
+                    format!("{} (reported only)", gate_word(v.pass))
+                }
             ));
         }
     } else {
@@ -1470,7 +1535,8 @@ fn finish(
     if several {
         out.extend(route_lines);
         out.push(format!(
-            "flight by route (each route's own pacing rule) -> {}",
+            "flight by route (the run's {} rule for every route; ungated routes reported only) -> {}",
+            pacing_name(pacing),
             gate_word(flight_pass)
         ));
     }
