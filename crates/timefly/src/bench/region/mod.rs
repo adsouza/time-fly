@@ -481,7 +481,7 @@ impl RegionBench {
 
 /// The memory the cycles compare: the process footprint natively, the wasm linear memory on the
 /// web.
-fn cycle_memory() -> Option<u64> {
+pub(crate) fn cycle_memory() -> Option<u64> {
     #[cfg(target_arch = "wasm32")]
     return memory::web_memory().1;
     #[cfg(not(target_arch = "wasm32"))]
@@ -489,7 +489,7 @@ fn cycle_memory() -> Option<u64> {
 }
 
 /// What [`cycle_memory`] measures.
-fn cycle_memory_kind() -> &'static str {
+pub(crate) fn cycle_memory_kind() -> &'static str {
     if cfg!(target_arch = "wasm32") {
         "wasm linear memory, which grows but never shrinks"
     } else {
@@ -498,7 +498,7 @@ fn cycle_memory_kind() -> &'static str {
 }
 
 /// Logs a block as one message (the browser console shows it whole) and prints it on native.
-fn emit(report: &str) {
+pub(crate) fn emit(report: &str) {
     info!("{report}");
     #[cfg(not(target_arch = "wasm32"))]
     println!("{report}");
@@ -516,14 +516,14 @@ pub fn memory_cycles_pass(on_globe: &[Option<u64>]) -> Option<(bool, f64)> {
 
 /// The display the run is measured on.
 #[derive(SystemParam)]
-struct Screen<'w, 's> {
-    adapter: Option<Res<'w, RenderAdapterInfo>>,
+pub(crate) struct Screen<'w, 's> {
+    pub(crate) adapter: Option<Res<'w, RenderAdapterInfo>>,
     windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     monitors: Query<'w, 's, &'static Monitor, With<PrimaryMonitor>>,
 }
 
 impl Screen<'_, '_> {
-    fn info(&self) -> DisplayInfo {
+    pub(crate) fn info(&self) -> DisplayInfo {
         let window = self.windows.single().ok();
         DisplayInfo {
             size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
@@ -538,10 +538,10 @@ impl Screen<'_, '_> {
     }
 }
 
-struct DisplayInfo {
-    size: Option<UVec2>,
-    present_mode: Option<PresentMode>,
-    refresh_hz: Option<f32>,
+pub(crate) struct DisplayInfo {
+    pub(crate) size: Option<UVec2>,
+    pub(crate) present_mode: Option<PresentMode>,
+    pub(crate) refresh_hz: Option<f32>,
 }
 
 /// What the bench reads about the game.
@@ -941,7 +941,7 @@ fn secs(v: Option<f64>) -> String {
     v.map_or("unknown".to_string(), |s| format!("{s:.2} s"))
 }
 
-fn show_mib(v: Option<u64>) -> String {
+pub(crate) fn show_mib(v: Option<u64>) -> String {
     v.map_or("n/a".to_string(), mib)
 }
 
@@ -954,7 +954,7 @@ fn stat_line(name: &str, frames: &[f32]) -> String {
 }
 
 /// The pacing in effect for a series of frames on this display.
-fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
+pub(crate) fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
     let uncapped_requested = matches!(
         display.present_mode,
         Some(PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox)
@@ -967,7 +967,7 @@ fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
     )
 }
 
-fn pacing_name(pacing: Pacing) -> &'static str {
+pub(crate) fn pacing_name(pacing: Pacing) -> &'static str {
     match pacing {
         Pacing::DisplayPaced => "display-paced",
         Pacing::Uncapped => "uncapped",
@@ -987,7 +987,7 @@ pub fn host_stalls(frames: &[f32]) -> (usize, f32) {
         .fold((0, 0.0), |(n, longest), &ms| (n + 1, f32::max(longest, ms)))
 }
 
-fn host_stall_line(window: &str, frames: &[f32]) -> String {
+pub(crate) fn host_stall_line(window: &str, frames: &[f32]) -> String {
     let (count, longest) = host_stalls(frames);
     format!(
         "  host stalls in the {window} (frames > {HOST_STALL_MS:.0} ms; page paused or throttled?): {count}{}",
@@ -1005,7 +1005,7 @@ pub fn first_entry_gate(millis: Option<u32>, web: bool) -> Option<bool> {
     web.then(|| millis.is_some_and(|m| m <= WEB_GEN_TARGET_MS))
 }
 
-fn gate_word(pass: bool) -> &'static str {
+pub(crate) fn gate_word(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }
 

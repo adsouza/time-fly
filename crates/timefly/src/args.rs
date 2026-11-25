@@ -1,7 +1,7 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--region-bench`, `--no-dunes`, `--target-fps N`, `--window WxH` and
+//! `--region-bench`, `--journey-bench`, `--no-dunes`, `--target-fps N`, `--window WxH` and
 //! `--region LAT,LON,AGE_YEARS`. A value
 //! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
 //! with `--` is the next flag, never a value.
@@ -22,6 +22,10 @@ pub struct LaunchArgs {
     /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`.
     /// With `--region` it benches only that region: one flight, no globe pan or memory cycles.
     pub region_bench: bool,
+    /// `--journey-bench` (web: `?journey-bench`): from the globe, dive into a region, hop twice
+    /// to its neighbours and climb back out, several times, and report. A bare flag. It takes
+    /// precedence over the scrub bench, and the region bench over it.
+    pub journey_bench: bool,
     /// `--no-dunes` (web: `?no-dunes`): skip the terrain's dune shading, for slower machines.
     /// A bare flag: `--no-dunes=VALUE` is not it and goes to `unknown`.
     pub no_dunes: bool,
@@ -51,6 +55,7 @@ const CHECK_DATA_FLAG: &str = "--check-data";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const REGION_BENCH_FLAG: &str = "--region-bench";
+const JOURNEY_BENCH_FLAG: &str = "--journey-bench";
 const NO_DUNES_FLAG: &str = "--no-dunes";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
@@ -114,6 +119,10 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
         }
         if arg == REGION_BENCH_FLAG {
             parsed.region_bench = true;
+            continue;
+        }
+        if arg == JOURNEY_BENCH_FLAG {
+            parsed.journey_bench = true;
             continue;
         }
         if arg == NO_DUNES_FLAG {
@@ -232,6 +241,42 @@ mod tests {
             assert!(parsed.no_dunes && parsed.region_bench, "{q}");
         }
         assert!(!parse_query_args("?no-dunes=true").no_dunes);
+    }
+
+    #[test]
+    fn journey_bench_is_a_bare_flag() {
+        let parsed = parse_launch_args(args(&["--journey-bench"]));
+        assert!(parsed.journey_bench);
+        assert!(!parsed.region_bench && !parsed.scrub_bench);
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        assert!(!parse_launch_args(args(&[])).journey_bench);
+        let valued = parse_launch_args(args(&["--journey-bench=1"]));
+        assert!(!valued.journey_bench);
+        assert_eq!(valued.unknown, args(&["--journey-bench=1"]));
+        // Not a prefix match.
+        let longer = parse_launch_args(args(&["--journey-benchmark"]));
+        assert!(!longer.journey_bench);
+        assert_eq!(longer.unknown, args(&["--journey-benchmark"]));
+        // Vsync off on native, as the other benches, so frame times show the real cost.
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(
+            crate::primary_window(&parsed).present_mode,
+            bevy::window::PresentMode::AutoNoVsync
+        );
+    }
+
+    #[test]
+    fn journey_bench_on_the_web_in_any_order() {
+        for q in [
+            "?journey-bench&target-fps=30",
+            "?target-fps=30&journey-bench",
+        ] {
+            let parsed = parse_query_args(q);
+            assert!(parsed.journey_bench, "{q}");
+            assert_eq!(parsed.target_fps, Some(30), "{q}");
+            assert!(parsed.unknown.is_empty(), "{q}: {:?}", parsed.unknown);
+        }
+        assert!(!parse_query_args("?journey-bench=true").journey_bench);
     }
 
     #[test]

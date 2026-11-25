@@ -46,6 +46,7 @@ pub fn remembers_window(args: &LaunchArgs) -> bool {
     args.window.is_none()
         && !args.scrub_bench
         && !args.region_bench
+        && !args.journey_bench
         && args.diagnostics_probe.is_none()
         && args.check_data.is_none()
 }
@@ -347,6 +348,10 @@ mod tests {
             },
             LaunchArgs {
                 region_bench: true,
+                ..default()
+            },
+            LaunchArgs {
+                journey_bench: true,
                 ..default()
             },
             LaunchArgs {

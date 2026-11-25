@@ -20,8 +20,10 @@
 //! not a crash, so the next launch shows no crash notice).
 //!
 //! The region bench (`--region-bench`, web `?region-bench`) lives in [`region`] and shares the
-//! statistics, the pass rule, the block's header and the exit codes.
+//! statistics, the pass rule, the block's header and the exit codes; so does the journey bench
+//! (`--journey-bench`, web `?journey-bench`), in [`journey`].
 
+pub mod journey;
 pub mod region;
 
 use bevy::platform::time::Instant;
@@ -202,7 +204,7 @@ pub fn bridge_target_bytes(size: UVec2) -> (u64, u64) {
     (2 * pixels * 4, 2 * pixels * 40)
 }
 
-fn mib(bytes: u64) -> String {
+pub(crate) fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
@@ -287,7 +289,7 @@ struct MemoryTrack {
     peak_scrub_bridge: Option<u64>,
 }
 
-fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+pub(crate) fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -468,7 +470,7 @@ fn header_lines(session: Option<&SessionInfo>, adapter: Option<&RenderAdapterInf
 }
 
 /// [`header_lines`] under another title line.
-fn header_lines_titled(
+pub(crate) fn header_lines_titled(
     title: &str,
     session: Option<&SessionInfo>,
     adapter: Option<&RenderAdapterInfo>,
@@ -652,7 +654,7 @@ fn report_block(
 }
 
 /// Process memory and OS description, per platform.
-mod memory {
+pub(crate) mod memory {
     #[cfg(target_os = "macos")]
     pub const FOOTPRINT_KIND: &str = "phys_footprint, includes GPU allocations on Apple silicon";
     #[cfg(all(unix, not(target_os = "macos")))]

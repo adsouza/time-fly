@@ -30,6 +30,7 @@ pub mod window_memory;
 
 use args::LaunchArgs;
 use bench::ScrubBenchPlugin;
+use bench::journey::{JourneyBenchConfig, JourneyBenchPlugin};
 use bench::region::{RegionBenchConfig, RegionBenchPlugin};
 use creature::CreaturePlugin;
 use data::GlobeDataPlugin;
@@ -69,7 +70,7 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
         if let Some((w, h)) = args.window {
             window.resolution = WindowResolution::new(w, h);
         }
-        if args.scrub_bench || args.region_bench {
+        if args.scrub_bench || args.region_bench || args.journey_bench {
             window.present_mode = PresentMode::AutoNoVsync;
         }
     }
@@ -156,6 +157,13 @@ pub fn app(session: &Session) -> App {
             None => RegionBenchConfig::new(target_fps, exit_when_done),
         };
         app.add_plugins(RegionBenchPlugin(config));
+    } else if args.journey_bench {
+        // The journey bench flies the player's keys from the globe; it takes precedence over the
+        // scrub bench, and a `--region` launch region would only stand in its way.
+        app.add_plugins(JourneyBenchPlugin(JourneyBenchConfig::new(
+            target_fps,
+            exit_when_done,
+        )));
     } else {
         if let Some(region) = args.region {
             app.insert_resource(LaunchRegion(region));
