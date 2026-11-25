@@ -9,7 +9,9 @@
 //!   exactly opaque, the views swap: the fly appears at the region's cloud base over the dive
 //!   point with its heading carried ([`NavAction::PlaceInRegion`]), then
 //!   [`NavPhase::Emerging`] eases it down to [`REGION_EMERGE_TO_M`] over [`EMERGE_S`] as the
-//!   cloud thins. Climbing back above the cloud top before the swap cancels the dive.
+//!   cloud thins. Climbing back above the cloud top before the swap cancels the dive, as does
+//!   flying off the dive point above the opaque cloud ([`DIVE_LEAVE_KM`]); inside it the fly's
+//!   horizontal flight is damped to a drift ([`NavPhase::damps_dive_drift`]).
 //! - **The climb** (§7.2). Climbing to the cloud base ([`CLIMB_OUT_M`], ruling P3) or pressing
 //!   `Backspace` gathers the cloud over [`CLOUD_GATHER_S`] ([`NavPhase::Climbing`]). After a
 //!   frame at exactly full density the views swap: `RegionLeft`, and the fly over the globe at the dive altitude
@@ -76,6 +78,13 @@ pub const CLIMB_OUT_M: f32 = (REGION_CLOUD_BASE_M - 1_000.0) as f32;
 /// ([`dive_drift_mps`]) *(call)*: it eases toward [`GLOBE_MIN_ALTITUDE_KM`], so the fly keeps
 /// descending and slows to a drift.
 pub const DIVE_DRIFT_S: f64 = 1.5;
+
+/// A dive is called off once the fly, out of the opaque cloud (above [`DIVE_ALTITUDE_KM`]), is
+/// this far from its target along the ground (km) *(call)*: the swap puts the fly over the
+/// target, so a fly that flew off it would land in a region far from where it was; a descent
+/// then commits a new dive where it is. Out of the opaque cloud any flight covers this within
+/// a frame (the globe's speed there is about 1,000 km/s), and a climb straight up none of it.
+pub const DIVE_LEAVE_KM: f64 = 10.0;
 
 /// Progress within this of the end counts as reaching it (frame times add up in `f32`).
 const FADE_EPSILON: f32 = 1e-4;
@@ -459,6 +468,15 @@ impl NavPhase {
                 | NavPhase::Climbing { .. }
                 | NavPhase::Hopping { .. }
         )
+    }
+
+    /// Whether the globe's horizontal flight is damped to a drift
+    /// (`crate::globe_flight::dive_horizontal_scale`) at `altitude_km`: while a dive waits in
+    /// the opaque cloud (at or below [`DIVE_ALTITUDE_KM`]), where the swap can come, so the fly
+    /// holds over the dive point (Task 7). Climbed back above it the fly flies freely, and
+    /// flying off the point calls the dive off ([`DIVE_LEAVE_KM`]).
+    pub fn damps_dive_drift(&self, altitude_km: f64) -> bool {
+        matches!(self, NavPhase::Diving { .. }) && globe_density(altitude_km) == 1.0
     }
 
     /// How long a hop has held at full cover waiting for its neighbour (its `elapsed_s` while
@@ -866,6 +884,18 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 out_over_globe
             } else if i.globe_altitude_km > CLOUD_TOP_KM {
                 // Climbed back out of the cloud before the swap: the dive is off.
+                actions.push(NavAction::CancelRequest);
+                NavPhase::Globe
+            } else if globe_density(i.globe_altitude_km) < 1.0
+                && i.globe_dir
+                    .0
+                    .normalize()
+                    .angle_between(target.0.normalize())
+                    * crate::globe::EARTH_RADIUS_KM
+                    > DIVE_LEAVE_KM
+            {
+                // Flown off the dive point out of the opaque cloud: the dive is off too, so a
+                // descent dives where the fly is, not into the old target.
                 actions.push(NavAction::CancelRequest);
                 NavPhase::Globe
             } else if ready && i.shown_density == 1.0 && globe_density(i.globe_altitude_km) == 1.0 {

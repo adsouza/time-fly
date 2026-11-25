@@ -838,10 +838,12 @@ fn entering_places_the_fly_below_the_cloud_base_with_its_heading() {
 fn climbing_out_of_the_cloud_cancels_the_dive() {
     let target = everest();
     // The region is even ready, but the player climbs before the cloud is opaque again.
+    // Over the dive point: the dive targets the ground under the fly.
     let mut i = ready(
         target,
         NavInputs {
             globe_altitude_km: DIVE_ALTITUDE_KM + 10.0,
+            globe_dir: target,
             ..inputs()
         },
     );
@@ -873,6 +875,41 @@ fn climbing_out_of_the_cloud_cancels_the_dive() {
     }
     assert_eq!(phase, NavPhase::Globe);
     assert_eq!(density, 0.0);
+}
+
+/// The final review: the dive's horizontal damping is for a fly waiting in the opaque cloud,
+/// where the swap can come; it held a fly that had climbed back above the dive altitude at 5%
+/// speed all the way to the cloud top. There it flies freely, and flying off the dive point
+/// calls the dive off, so a later descent dives where the fly is, never into the old target.
+#[test]
+fn a_dive_damps_the_drift_only_in_the_opaque_cloud() {
+    let target = everest();
+    let d = diving(target);
+    assert!(d.damps_dive_drift(DIVE_ALTITUDE_KM));
+    assert!(d.damps_dive_drift(DIVE_ALTITUDE_KM - 300.0));
+    assert!(!d.damps_dive_drift(DIVE_ALTITUDE_KM + 1.0));
+    assert!(!d.damps_dive_drift(2_000.0));
+    assert!(!NavPhase::Globe.damps_dive_drift(DIVE_ALTITUDE_KM - 300.0));
+    // `off` km from the target along the ground, at `alt` km.
+    let east = DVec3::Y.cross(target.0).normalize();
+    let away = |off_km: f64, alt: f64| {
+        let a = off_km / EARTH_RADIUS_KM;
+        NavInputs {
+            globe_altitude_km: alt,
+            globe_dir: RenderDir(target.0 * a.cos() + east * a.sin()),
+            region_state: RegionState::Generating,
+            ..inputs()
+        }
+    };
+    // Above the opaque cloud, flown off the dive point: the dive is off.
+    let (next, actions) = step_nav(d, &away(DIVE_LEAVE_KM + 1.0, 1_600.0));
+    assert_eq!(next, NavPhase::Globe);
+    assert_eq!(actions, [NavAction::CancelRequest]);
+    // Still over it (a climb straight up), or waiting in the opaque cloud: the dive goes on.
+    let (next, _) = step_nav(d, &away(DIVE_LEAVE_KM - 1.0, 1_600.0));
+    assert!(matches!(next, NavPhase::Diving { .. }), "{next:?}");
+    let (next, _) = step_nav(d, &away(DIVE_LEAVE_KM + 1.0, DIVE_ALTITUDE_KM - 100.0));
+    assert!(matches!(next, NavPhase::Diving { .. }), "{next:?}");
 }
 
 /// Climbs out from `phase` (already `Climbing`) and returns the swap frame's actions, after
@@ -1290,6 +1327,7 @@ fn no_swap_before_the_cloud_is_opaque() {
             dt_s: dt,
             region_state: RegionState::Generating,
             globe_altitude_km: DIVE_ALTITUDE_KM - 1.0,
+            globe_dir: target,
             time: YearsBp(21_000.0),
             ..inputs()
         };

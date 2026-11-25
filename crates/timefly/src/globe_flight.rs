@@ -271,10 +271,11 @@ fn step_globe_flight(
     if input.climb < 0.0 {
         input.climb *= descent_ease(flight.0.altitude_km);
     }
-    // Waiting in the cloud, the fly drifts over the dive point rather than flying off it.
+    // Waiting in the opaque cloud, the fly drifts over the dive point rather than flying off
+    // it; climbed back above it, it flies freely (flying off calls the dive off).
     if nav
         .as_ref()
-        .is_some_and(|n| matches!(n.phase, NavPhase::Diving { .. }))
+        .is_some_and(|n| n.phase.damps_dive_drift(flight.0.altitude_km))
     {
         let scale = dive_horizontal_scale(flight.0.altitude_km, input.boost);
         input.forward *= scale;
@@ -1159,6 +1160,35 @@ mod tests {
         }
         let km = start.dir.angle_between(last.dir) * (EARTH_RADIUS_KM + 1_100.0);
         assert!(km < 2.0, "drifted {km} km");
+    }
+
+    /// The final review: the drift damping holds only in the opaque cloud. Climbed back above
+    /// the dive altitude (still `Diving` up to the cloud top), the fly flies at full speed.
+    #[test]
+    fn above_the_dive_altitude_a_diving_fly_flies_freely() {
+        use bevy::state::app::StatesPlugin;
+        let (mut app, _) = app(16.0 / 9.0);
+        app.add_plugins(StatesPlugin)
+            .init_state::<RegionState>()
+            .init_resource::<Navigation>();
+        app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Diving {
+            target: timefly_core::geo::RenderDir(DVec3::Z),
+            snapshot: timefly_core::deep_time::YearsBp(0.0),
+            since_s: 0.0,
+            started: true,
+        };
+        let alt = 2_000.0;
+        set_flight(&mut app, at(alt));
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyW);
+        let before = flight(&app);
+        app.update();
+        let after = flight(&app);
+        let km = before.dir.angle_between(after.dir) * (EARTH_RADIUS_KM + alt);
+        let full = globe_speed_km_s(alt, false) * STEP.as_secs_f64();
+        assert!((km - full).abs() < 1e-3 * full, "{km} km against {full}");
     }
 
     #[test]

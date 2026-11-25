@@ -76,11 +76,11 @@ use crate::ui::TEXT_COLOR;
 mod phase;
 
 pub use phase::{
-    CLIMB_OUT_M, DIVE_DRIFT_S, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT, HOLD_MAX_S,
-    HOP_END_MAX_S, HopEdge, NavAction, NavInputs, NavPhase, SNAPSHOT_FADE_S, START_TIMEOUT_S,
-    SliderHold, TURN_BACK_INSIDE_M, TimeChange, World, dive_drift_mps, emerge_altitude_km,
-    emerge_density, emerge_height_m, fade_alpha, fly_on_globe, gather_density, gather_elapsed_for,
-    hold_slider, region_yaw, same_region, step_nav,
+    CLIMB_OUT_M, DIVE_DRIFT_S, DIVE_LEAVE_KM, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT,
+    HOLD_MAX_S, HOP_END_MAX_S, HopEdge, NavAction, NavInputs, NavPhase, SNAPSHOT_FADE_S,
+    START_TIMEOUT_S, SliderHold, TURN_BACK_INSIDE_M, TimeChange, World, dive_drift_mps,
+    emerge_altitude_km, emerge_density, emerge_height_m, fade_alpha, fly_on_globe, gather_density,
+    gather_elapsed_for, hold_slider, region_yaw, same_region, step_nav,
 };
 
 /// "Descending..." shows only once a region has been generating this long (design §6.1).
