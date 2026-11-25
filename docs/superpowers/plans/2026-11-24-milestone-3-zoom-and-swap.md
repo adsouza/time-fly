@@ -544,7 +544,7 @@ left out on purpose: they belong to that branch, not to this plan.
 - The region bench's globe pan runs at `GLOBE_MAX_ALTITUDE_KM`. Why: closest to M1's whole-disc pan. Cost: pan numbers still not strictly M2-comparable.
 
 **Task 5**
-- Keep the cloud's tilt-shift until a native measurement at 2560 × 1440; drop it (`band` in `cloud.wesl`, `tilt_shift` in `cloud.rs`) if the pass exceeds 1 ms. Why: the brief's gate couldn't be measured without a clean native run (xctrace filled the disk). Cost: up to about 1 ms of GPU in short transitions, then a small deletion. Outcome (Task 11): the pass measured about 1.8 ms (ioreg, offscreen at 2560 × 1440), so the tilt-shift was dropped; without it the pass still costs about 2.0–2.2 ms, since the cost is the noise itself. See `docs/testing/m3/performance.md`, "Cloud pass cost".
+- Keep the cloud's tilt-shift until a native measurement at 2560 × 1440; drop it (`band` in `cloud.wesl`, `tilt_shift` in `cloud.rs`) if the pass exceeds 1 ms. Why: the brief's gate couldn't be measured without a clean native run (xctrace filled the disk). Cost: up to about 1 ms of GPU in short transitions, then a small deletion. Outcome (Task 11): the pass measured about 1.8 ms (ioreg, offscreen at 2560 × 1440), so the tilt-shift was dropped; without it the pass still costs about 2.0–2.2 ms, since the cost is the noise itself. The owner accepted about 2 ms on 2026-11-25. See `docs/testing/m3/performance.md`, "Cloud pass cost".
 - Pale UI text over the full white-out goes to the owner's manual checks. Why: taste, not correctness. Cost: a small HUD tweak later.
 
 **Task 6**

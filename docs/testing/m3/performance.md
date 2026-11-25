@@ -27,10 +27,11 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 |---|---|---|
 | `--region-bench` | PASS (exit 0) | **PASS** (exit 0) |
 | `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only**: open, owner decision pending |
-| Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: **over budget, open, owner decision pending** |
+| Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: over the 1 ms budget, **accepted by the owner** (2026-11-25) |
 
-**Cloud pass: the owner's options.** Dropping the tilt-shift (Task 5's ruling) saved nothing,
-because the cost is the noise itself: six evaluations a pixel. Ways to make it cheaper, each a
+**Cloud pass: accepted.** On 2026-11-25 the owner accepted the pass at about 2 ms, so the
+noise stays as it is. Dropping the tilt-shift (Task 5's ruling) saved nothing, because the cost
+is the noise itself: six evaluations a pixel. If it ever needs to be cheaper, each of these is a
 look change:
 - drop to three octaves (`CLOUD_OCTAVES` allows 3–4);
 - skip the two sun taps (the lighting's `shape(toward)`);
@@ -43,7 +44,7 @@ journey memory cycles.
 
 - **Cloud pass:** about 1.8 ms a frame at 2560 × 1440, over Task 5's 1 ms budget. So Task 11
   dropped the tilt-shift, as Task 5's ruling said. Without it the pass costs about 2.0–2.2 ms:
-  the noise is the cost (see "Cloud pass cost"). Open: the owner's options are listed above.
+  the noise is the cost (see "Cloud pass cost"). The owner accepted that cost on 2026-11-25.
   - The benches ran on `4b79f08`, before that change. It touches only the cloud, which is
     hidden outside transitions, and it doesn't make the pass cheaper, so they weren't re-run.
 - **Near geometry under the cloud** (Task 7's rule), observed on Metal: PASS (a new GPU test).
@@ -310,7 +311,8 @@ used the GPU during the runs.
   transitions: the gather, the hold and the clear. Every flight and swap frame in the benches
   above stayed on 60 Hz natively. Chrome renders at a larger size (3200 × 1800 in M2's gated
   runs), where it would cost proportionally more: the Chrome journey run will tell.
-- **If it needs to be cheaper:** see the owner's options under "Summary".
+- **Owner's decision (2026-11-25):** about 2 ms is acceptable. The cheaper options under
+  "Summary" stay on file in case a later milestone needs the time.
 
 ## The cloud over near geometry, observed on Metal
 
