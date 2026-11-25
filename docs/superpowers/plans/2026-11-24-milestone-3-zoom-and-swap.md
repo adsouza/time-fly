@@ -513,3 +513,54 @@ git commit -m "feat(core): flight altitudes, cloud density and chase camera"
 - **No lattice snapping of neighbour centres.** Every centre agrees on the shared planet lattice (M2), so snapping buys nothing. Cost if wrong: none for heights; biome colours differ anyway and are hidden by the cloud.
 - **The terrain is uploaded at the swap frame, not before.** It is hidden by the opaque cloud and gated by the swap-frame worst frame (Task 10). Cost if wrong: add a pre-built second terrain scene if the gate fails.
 - **`FlyState` keeps its name**, now meaning the fly's pose. This avoids churn in the benches, tests and examples. Cost if wrong: a rename later.
+
+### Rulings made while building (copied from the SDD ledger)
+
+Each is *what*; *why*; *cost if wrong*.
+
+**Pre-flight (before Task 1)**
+- **P1.** `chase_pose` takes a trailing `min_distance: f64` (regions pass `CHASE_MIN_DISTANCE_M`, the globe `CHASE_MIN_DISTANCE_M / 1000.0`). Why: one constant can't be in both metres and kilometres. Cost: a one-argument signature change.
+- **P2.** Task 3 builds its own minimal test grid in `fly_camera.rs` tests (or lifts the navigate helpers into a `#[cfg(test)] pub(crate)` module). Why: the navigate helpers are private. Cost: duplicated test scaffolding.
+- **P3.** The climb out triggers at `height >= REGION_CLOUD_BASE_M - 1_000.0`; Task 6's ceiling eases over the band but caps at the base, never short of base − 1 km. Why: a ceiling that eases to zero speed at the base never reaches it, so the trigger must sit below it. Cost: retune one threshold.
+- **P4.** The climb trigger is live only in `Flying`, not `Emerging`. Why: the fly placed at the base on entry must emerge downward first, not climb straight back out. Cost: none expected.
+- **P5.** If the M2 bench path comes within the preload distance of the edge, Task 9 pulls the path inward and records it. Why: the path is a test driver, not product, and it must never preload. Cost: the edge segments' numbers aren't strictly comparable with M2's (applied: `FIELD_LIMIT` 0.5 and `COAST_IN_FIELD` 0.45 × `EDGE_M`).
+
+**Task 1**
+- A pure rustfmt fix commit (`86f1a79`) was verified mechanically (no non-whitespace change) instead of by a reviewer. Why: a formatting-only diff has nothing to judge. Cost: none.
+
+**Task 3**
+- Drag keeps M2's sense (dragging down looks further down): look pitch = (`CHASE_ELEVATION_DEG` − 5°) − (pitch − start pitch), and `FlyState.pitch` is clamped to the range the look allows. Why: the brief's literal `CHASE_ELEVATION_DEG + pitch` reversed M2's drag and started level; this starts with the fly a little below centre (design §5.3). Cost: one formula.
+- W/S/strafe move the fly level; Space/E and Ctrl/Q change height. Why: the design says drag tilts the view, not the flight path. Cost: players who liked diving with W use Ctrl/Q.
+- A light rim (fresnel) brightening on the dragonfly. Why: anti-goal "the fly lost" over dark forest. Cost: a slightly glowier fly.
+
+**Task 4**
+- On the globe the eye's elevation rises with altitude too: elevation = `globe_look_pitch_deg(alt)` + 5°, through `chase_pose_with_elevation`. Why: the plan's fixed 20° eye with a 70° look put the fly about 50° above centre, off screen. Cost: retune two curves.
+- Framing targets replace the 15°-at-dive end: at `DIVE_ALTITUDE_KM` land fills at least the lower two-thirds under the fly (look 50°); at `GLOBE_MAX_ALTITUDE_KM` the disc centre is within about 10% of view height of centre (look 85°). Why: the approach must show the place you dive into. Cost: retune two constants.
+- The top target is accepted at 10.6%. Why: it is the geometric floor with the fly 5° below centre. Cost: none.
+- Globe drag keeps the region's sense, as an offset on both curves, clamped so the fly stays in frame and the eye within `GLOBE_MAX_CAMERA_DISTANCE_KM`. Why: one control feel in both worlds. Cost: a feel tweak.
+- On the globe the fly is lit by the globe's sun, never the region sun (which reaches the globe view via `FLY_LAYER`). Why: wrong shading otherwise. Cost: wrong fly shading on the globe.
+- The scroll wheel climbs and descends on the globe at the keys' speed rule. Why: M1 users' zoom habit. Cost: remove one input.
+- The region bench's globe pan runs at `GLOBE_MAX_ALTITUDE_KM`. Why: closest to M1's whole-disc pan. Cost: pan numbers still not strictly M2-comparable.
+
+**Task 5**
+- Keep the cloud's tilt-shift until a native measurement at 2560 × 1440; drop it (`band` in `cloud.wesl`, `tilt_shift` in `cloud.rs`) if the pass exceeds 1 ms. Why: the brief's gate couldn't be measured without a clean native run (xctrace filled the disk). Cost: up to about 1 ms of GPU in short transitions, then a small deletion. Outcome (Task 11): the pass measured about 1.8 ms (ioreg, offscreen at 2560 × 1440), so the tilt-shift was dropped; without it the pass still costs about 2.0–2.2 ms, since the cost is the noise itself. See `docs/testing/m3/performance.md`, "Cloud pass cost".
+- Pale UI text over the full white-out goes to the owner's manual checks. Why: taste, not correctness. Cost: a small HUD tweak later.
+
+**Task 6**
+- No third region-bench run for run 2's single-frame stalls (Red Sea sweep 65 ms, Japan run 59 ms); Panama judged on run 1 (run 2's was occluded and uncapped). Why: one-offs the owner doesn't weigh; medians and p95 pass everywhere; Task 11 re-runs natively. Cost: a sweep regression from the pitch retune would surface later.
+
+**Task 7**
+- While Diving, horizontal globe motion gets the same drift damping as vertical (|v| ≤ 0.05 × M2 speed). Why: "waiting holds in the cloud" means holding position; a 2,400–6,400 km drift breaks "the same place above and below". Cost: no steering inside the cloud during a slow generation.
+- Keep the cloud's `frag_depth` write (near-plane depth outside the fly's hole at every density above clear) despite losing early-Z for the pass. Why: coverage is the milestone's core promise, and the pass shades nearly every pixel anyway. Cost: the pass may exceed budget and need a cheaper coverage scheme (measured in Task 11).
+
+**Task 9**
+- Fix round 3 was committed before clippy and the wasm check ran (fmt and tests green). Why: the disk was held by another process and the re-review needed only the diff; both ran clean in round 4. Cost: one extra small commit.
+- `HOLD_MAX_S` = 40 s (2 × `LOAD_TIMEOUT_S`) on the clamped load clock caps time at full cover; past it the hold fails and turns the fly back. Why: a bounded exit from white-out even if a job never answers or a player zig-zags retargets. Cost: a neighbour needing more than 40 s turns the fly back once and is re-asked on the next approach.
+- A tap of S in the hold ends the hop (`PlaceInside` at the edge, `CancelPreload`); the next push out starts a fresh hop. Why: the only option that makes invariants I1–I4 hold by construction. Cost: an accidental tap costs about 8–13 s; the owner may prefer keep-alive-while-outside.
+
+**Task 10**
+- The deferred native measurements (cloud pass cost and the tilt-shift, old segments against M2, the near-geometry cloud check on Metal and Chrome) run in Task 11. Why: Task 10 builds the bench and a headless test only; Task 11 already does the native and Chrome runs. Cost: none.
+
+**Task 11**
+- The journey bench's hop-memory FAIL (worst +48.9 MiB against the spec's +40 MiB) is recorded as open, pending the owner; neither the gate nor the bench changes. Why: the gate is the spec's, so changing it is the owner's call; every other gate passes and memory is flat across journeys. Cost: M3 can't be called done until the owner decides (options in `docs/testing/m3/performance.md`).
+- The Chrome WebGPU step is split: the implementer builds `web-release`, proves it by string grep and writes the serve instructions; the controller runs the owner's Chrome (Incognito) and commits the numbers. Why: a subagent can't drive the owner's Chrome. Cost: none.
