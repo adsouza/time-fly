@@ -388,7 +388,7 @@ mod tests {
         // Boosted (4x) or a placement's jump: never past the limit.
         assert!((settle(4.0) - limit).abs() < 1e-3);
         assert!(pitch_step(0.0, 1.0e6, 10.0) <= limit + 1e-6);
-        assert_eq!(pitch_step(0.1, f32::NAN, 1.0 / 60.0).is_finite(), true);
+        assert!(pitch_step(0.1, f32::NAN, 1.0 / 60.0).is_finite());
         // Smoothed like the bank: one time constant is 1 − 1/e of the way.
         let one_tau = pitch_step(0.0, 1.0, PITCH_SMOOTHING_S);
         assert!((one_tau / limit - (1.0 - (-1.0f32).exp())).abs() < 1e-3);
