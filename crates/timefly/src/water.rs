@@ -524,8 +524,8 @@ fn sync_water(
             info!("region sea removed");
         }
         (SkyAction::Keep, Some(scene), Some(water)) => {
-            // A staged replace's heights arrive the frame after its grid
-            // (`TerrainScene::fields_pending`).
+            // A staged replace's heights arrive two frames after its grid
+            // (`TerrainScene::steps_remaining`).
             let stale = materials.get(&water.material).is_some_and(|m| {
                 m.extension.inner_height != scene.inner_height
                     || m.extension.apron_height != scene.apron_height

@@ -271,8 +271,10 @@ pub enum NavPhase {
     /// - **I1.** The fly is outside the inner field only in the hold (at full cover, the one
     ///   place [`FlyControls::confined`] is off), drawn at density exactly 1.
     /// - **I2.** The white-out is bounded whatever the player and the neighbour job do: the hold
-    ///   lasts at most [`HOLD_MAX_S`], and the end starts clearing on its first frame and lasts
-    ///   at most [`HOP_END_MAX_S`], whatever the ground does to the return.
+    ///   lasts at most [`HOLD_MAX_S`], and the end starts clearing once the swap's fields are
+    ///   complete (`crate::terrain::REPLACE_EXTRA_HELD_FRAMES` frames after it; at once after a
+    ///   turn back) and lasts at most [`HOP_END_MAX_S`] more, whatever the ground does to the
+    ///   return.
     /// - **I3.** A swap happens on a frame drawn opaque after one drawn opaque, to the neighbour
     ///   asked for and ready, while the fly still flies out of `edge`; turning back from the
     ///   hold drops the neighbour, so that hop never swaps.
@@ -597,6 +599,11 @@ pub struct NavInputs {
     pub vertical_held: bool,
     /// A slider change waits for the transition to end.
     pub time_queued: bool,
+    /// The terrain scene's fields would still be incomplete or mixed at the end of this frame
+    /// (a staged replace's, `crate::terrain::TerrainScene::holds_cloud`): a hop's end and a
+    /// snapshot change's fade-in hold the cloud at exactly 1 until they are not (the owner's
+    /// ruling of 2026-11-25, one more frame in cloud).
+    pub fields_settling: bool,
 }
 
 /// What [`step_nav`] asks the shell to do.
@@ -1027,7 +1034,8 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             // Held at full cover until the camera moves. It moves once ready, after a frame
             // already drawn exactly opaque, so the cloud is opaque on both sides of the swap.
             let opaque = fade.opaque();
-            let fade = fade.advance(i.dt_s, !placed);
+            // Past the swap, held again while the scene's staged upload finishes.
+            let fade = fade.advance(i.dt_s, !placed || i.fields_settling);
             let placed = placed || {
                 let swap = ready && opaque;
                 if swap {
@@ -1262,8 +1270,14 @@ fn step_hop_end(
         return hop;
     };
     // Every ending put the fly inside the field, where the end's controls keep it: the clear
-    // starts at once and nothing holds it (fix round 4).
-    let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(HOP_END_MAX_S);
+    // starts at once and nothing else holds it (fix round 4), but the swap's staged upload holds
+    // it opaque until the fields are complete (`fields_settling`).
+    let dt_s = if i.fields_settling {
+        0.0
+    } else {
+        i.dt_s.max(0.0)
+    };
+    let elapsed_s = (elapsed_s + dt_s).min(HOP_END_MAX_S);
     let lift_from_agl_m = if i.vertical_held {
         agl_m
     } else {

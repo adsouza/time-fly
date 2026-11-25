@@ -858,4 +858,7 @@ Each ruling is *what*; *why*; *cost if wrong*.
 
 ### Rulings made while building (copied from the SDD ledger)
 
-*(Filled in as tasks land.)*
+- **A hop's swap holds the cloud one frame longer (owner, 2026-11-25: "One more frame in cloud").**
+  - What: a replaced region uploads in three frames. On the swap frame the old water textures are removed and nothing binds water. The next frame makes the new water, once the render world has freed the old. The third frame replaces the heights and surface codes. Navigation holds the cloud at density exactly 1 for the swap frame and `REPLACE_EXTRA_HELD_FRAMES` (1) more, for both hops and snapshot changes. The active grid also frees its river texels after the upload.
+  - Why: with rivers, M3's native hop-memory gate (+64 MiB) failed at +81 MiB. The old and new field data, their staging and both water texture sets peaked together.
+  - Cost if wrong: one more white frame (about 17 ms) per hop and per snapshot change. Task 8's water material must draw nothing while `TerrainScene::inner_water` is not loaded.

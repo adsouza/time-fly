@@ -581,6 +581,10 @@ fn navigate(
             .as_deref()
             .is_some_and(|k| keys_to_input(k).move_local.y != 0.0),
         time_queued: nav.slider.queued.is_some(),
+        fields_settling: world
+            .scene
+            .as_deref()
+            .is_some_and(crate::terrain::TerrainScene::holds_cloud),
         region_fly: shown_frame.map(|frame| {
             fly_on_globe(
                 &frame,

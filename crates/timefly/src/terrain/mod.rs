@@ -5,9 +5,11 @@
 //!   (heights, surface codes and water, inner and apron), builds one grid mesh, one
 //!   [`TerrainMaterial`] and one patch buffer, and spawns the [`RegionCamera`] and the
 //!   [`TerrainSun`], then frees the grid's river texels, which only the GPU reads. A replaced
-//!   region (a snapshot change, a hop) swaps the textures in place over two frames, the water
-//!   on the swap frame and the heights and surface codes on the next
-//!   ([`TerrainScene::fields_pending`]), so the upload's memory peaks twice at half the height.
+//!   region (a snapshot change, a hop) swaps the textures in place over three frames: the old
+//!   water released on the swap frame, the new water on the next, the heights and surface codes
+//!   on the third ([`TerrainScene::steps_remaining`]), so the upload's memory never peaks with
+//!   both water sets; navigation holds the cloud opaque meanwhile
+//!   ([`REPLACE_EXTRA_HELD_FRAMES`]).
 //!   A removed one despawns everything and drops every handle, so the GPU memory goes back to
 //!   where it was.
 //! - **Patches.** Every frame, [`select_patches`] runs for the region camera. Patch `i` goes into
@@ -162,16 +164,57 @@ pub struct TerrainScene {
     pub sun: Entity,
     /// Whether a frame needing more than [`MAX_TERRAIN_PATCHES`] was already reported.
     overflow_reported: bool,
-    /// The heights and surface codes still to replace ([`TerrainScene::fields_pending`]).
-    fields_pending: bool,
+    /// A replace's uploads still to make ([`TerrainScene::steps_remaining`]).
+    staged: Staged,
+}
+
+/// Frames a replace draws incomplete or mixed fields after its swap frame, for which navigation
+/// keeps the cloud at density exactly 1 (`NavInputs::fields_settling`): the owner's ruling of
+/// 2026-11-25, one more frame in cloud than M3. The swap frame itself binds no water (the old
+/// water is freed in the render world the frame after its removal); the next draws the new
+/// water over the old heights; the third is complete.
+pub const REPLACE_EXTRA_HELD_FRAMES: u32 = 1;
+
+/// A replace's uploads still to make ([`begin_replace`], [`advance_replace`]).
+enum Staged {
+    Done,
+    /// The new grid's water, built on the swap frame (when the grid's rivers could be freed),
+    /// added to the assets the frame after.
+    Water(Box<[Image; 2]>),
+    /// The new grid's heights and surface codes.
+    Heights,
+}
+
+impl std::fmt::Debug for Staged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Staged::Done => "Done",
+            Staged::Water(_) => "Water",
+            Staged::Heights => "Heights",
+        })
+    }
 }
 
 impl TerrainScene {
-    /// Whether a replace is half done: the water textures are the new grid's while the heights
-    /// and surface codes are still the old one's. True for exactly one frame, the replace's
-    /// first, which a swap only makes at cloud density 1 (see `sync_terrain_scene`).
+    /// The frames of uploads a replace still has to make: 2 after its swap frame (the water,
+    /// then the heights and surface codes), 1 after the next, 0 once the fields are the grid's.
+    pub fn steps_remaining(&self) -> u32 {
+        match self.staged {
+            Staged::Done => 0,
+            Staged::Heights => 1,
+            Staged::Water(_) => 2,
+        }
+    }
+
+    /// Whether the scene's fields are incomplete or mixed (a replace under way).
     pub fn fields_pending(&self) -> bool {
-        self.fields_pending
+        self.steps_remaining() > 0
+    }
+
+    /// Whether this frame's step (the scene runs after navigation) still leaves the fields
+    /// incomplete, so navigation must draw the frame at cloud density 1.
+    pub fn holds_cloud(&self) -> bool {
+        self.steps_remaining() > 1
     }
 }
 
@@ -431,11 +474,9 @@ fn sync_terrain_scene(
     options: Option<Res<TerrainOptions>>,
 ) {
     let options = options.map_or_else(TerrainOptions::default, |o| *o);
-    // A staged replace's second frame comes first, whatever this frame brings.
-    if let Some(scene) = scene.as_deref_mut()
-        && scene.fields_pending
-    {
-        finish_replace(scene, &mut images, &mut materials, options);
+    // A staged replace's next step comes first, whatever this frame brings.
+    if let Some(scene) = scene.as_deref_mut() {
+        advance_replace(scene, &mut images, &mut materials, options);
     }
     let action = match scene_action(
         region.as_ref().map(|r| &r.grid),
@@ -525,7 +566,7 @@ fn build_scene(
         camera,
         sun,
         overflow_reported: false,
-        fields_pending: false,
+        staged: Staged::Done,
     }
 }
 
@@ -567,31 +608,42 @@ fn terrain_material(
     }
 }
 
-/// A replaced region at the same LOD settings, its uploads spread over two frames so the old
-/// and new image data and their staging never all peak together (the hop's memory, M3's gate).
-/// This frame, the swap's (at cloud density 1): the scene takes the new grid and its water
-/// textures, the old ones released first, and the grid's rivers are freed. The next frame
-/// ([`finish_replace`]): the heights and surface codes, and with them the patches' header, the
-/// bounds and the look. The terrain draws the old heights until then; the same material and
-/// pool throughout.
+/// A replaced region at the same LOD settings, its uploads spread over three frames so the old
+/// and new image data, their staging and the old and new GPU textures never all peak together
+/// (the hop's memory, M3's gate). This frame, the swap's (at cloud density 1): the old water's
+/// images are removed, the scene takes the new grid, and the new water is built while the
+/// region alone holds the grid, so its rivers can be freed; nothing binds water this frame. The
+/// next two ([`advance_replace`]): the new water, once the render world has freed the old; then
+/// the heights and surface codes, with the patches' header, the bounds and the look. The
+/// terrain draws the old heights until then; the same material and pool throughout.
 fn begin_replace(scene: &mut TerrainScene, grid: &mut Arc<RegionGrid>, images: &mut Assets<Image>) {
     release(images, &mut scene.inner_water);
     release(images, &mut scene.apron_water);
-    let [inner_water, apron_water] = upload_water(grid, images);
+    let water = Box::new([water_image(&grid.inner), water_image(&grid.apron)]);
     free_rivers(grid);
-    scene.inner_water = inner_water;
-    scene.apron_water = apron_water;
     scene.grid = grid.clone();
-    scene.fields_pending = true;
-    debug!(
-        mib = format!(
-            "{:.1}",
-            (grid.inner.res.pow(2) + grid.apron.res.pow(2)) as f64
-                * material::WATER_TEXEL_BYTES as f64
-                / 1_048_576.0
-        ),
-        "terrain water replaced; the heights follow next frame"
-    );
+    scene.staged = Staged::Water(water);
+    debug!("terrain water released; the new water follows next frame, then the heights");
+}
+
+/// The next step of a staged replace, if one is under way: the water, then the heights.
+fn advance_replace(
+    scene: &mut TerrainScene,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<TerrainMaterial>,
+    options: TerrainOptions,
+) {
+    match std::mem::replace(&mut scene.staged, Staged::Done) {
+        Staged::Done => {}
+        Staged::Water(water) => {
+            let [inner, apron] = *water;
+            scene.inner_water = images.add(inner);
+            scene.apron_water = images.add(apron);
+            scene.staged = Staged::Heights;
+            debug!("terrain water replaced; the heights follow next frame");
+        }
+        Staged::Heights => finish_replace(scene, images, materials, options),
+    }
 }
 
 /// Takes `handle` and removes its image now, rather than once every handle has gone (a frame
@@ -602,7 +654,7 @@ fn release(images: &mut Assets<Image>, handle: &mut Handle<Image>) {
     images.remove(&old);
 }
 
-/// The second frame of a replace ([`begin_replace`]): the scene grid's heights and surface
+/// The last frame of a replace ([`begin_replace`]): the scene grid's heights and surface
 /// codes, the old ones released first.
 fn finish_replace(
     scene: &mut TerrainScene,
@@ -633,7 +685,6 @@ fn finish_replace(
     scene.apron_surface = apron_surface;
     scene.params = TerrainParams::new(&grid, &scene.settings);
     scene.height_range_m = height_range_m(&grid);
-    scene.fields_pending = false;
     info!("terrain fields replaced");
 }
 

@@ -496,6 +496,7 @@ fn inputs() -> NavInputs {
         preload_failed: false,
         vertical_held: false,
         time_queued: false,
+        fields_settling: false,
     }
 }
 
@@ -505,6 +506,14 @@ fn inputs() -> NavInputs {
 fn frame(phase: NavPhase, i: &mut NavInputs) -> (NavPhase, Vec<NavAction>, f32, f32) {
     let before = phase.cloud_density(i);
     let (next, actions) = step_nav(phase, i);
+    // As the terrain scene: a swap this frame (a hop's, a snapshot change's) leaves the next
+    // frame's fields incomplete (`TerrainScene::holds_cloud`); one frame later they are not.
+    i.fields_settling = actions.iter().any(|a| {
+        matches!(
+            a,
+            NavAction::SwapToNeighbour | NavAction::PlaceAfterChange { .. }
+        )
+    });
     for action in &actions {
         match *action {
             NavAction::SnapTime(t) => i.time = t,
@@ -2358,50 +2367,67 @@ fn record_fields(
     mut frames: ResMut<FieldFrames>,
 ) {
     let Some(scene) = scene else { return };
+    // `None` where no texture is bound (a staged replace's swap frame has no water).
     let first = |h: &Handle<Image>| {
-        let data = images
-            .get(h)
-            .and_then(|i| i.data.as_ref())
-            .expect("image data");
-        f32::from_le_bytes(data[..4].try_into().unwrap())
+        let data = images.get(h).and_then(|i| i.data.as_ref())?;
+        Some(f32::from_le_bytes(data[..4].try_into().unwrap()))
     };
+    let g = &scene.grid;
     frames.0.push(FieldsDrawn {
         density: density.0,
         pending: scene.fields_pending(),
-        heights_current: first(&scene.inner_height) == scene.grid.inner.elevation_m[0]
-            && first(&scene.apron_height) == scene.grid.apron.elevation_m[0],
-        water_current: first(&scene.inner_water) == scene.grid.inner.water_level_m[0]
-            && first(&scene.apron_water) == scene.grid.apron.water_level_m[0],
-        centre: scene.grid.spec.center,
+        heights_current: first(&scene.inner_height) == Some(g.inner.elevation_m[0])
+            && first(&scene.apron_height) == Some(g.apron.elevation_m[0]),
+        water_current: first(&scene.inner_water) == Some(g.inner.water_level_m[0])
+            && first(&scene.apron_water) == Some(g.apron.water_level_m[0]),
+        centre: g.spec.center,
     });
 }
 
-/// The hop's memory (follow-up), for any swap: a frame that draws fields of two grids (the
-/// staged replace's first frame) is drawn at density exactly 1, and there is one such frame
-/// per replace. `replaces` is how many replaces the frames should hold.
+/// The hop's memory (third stage), for any swap: every frame whose fields are incomplete (no
+/// water bound) or mixed (another grid's heights) is drawn at density exactly 1. Per replace
+/// there are `1 + REPLACE_EXTRA_HELD_FRAMES` of them in a row: the swap frame, with no water,
+/// then the new water over the old heights. `replaces` is how many the frames hold.
 fn assert_mixed_fields_only_under_the_cloud(frames: &[FieldsDrawn], replaces: usize) {
+    use crate::terrain::REPLACE_EXTRA_HELD_FRAMES;
+    let held = 1 + REPLACE_EXTRA_HELD_FRAMES as usize;
     let mixed: Vec<usize> = (0..frames.len())
         .filter(|&k| !(frames[k].heights_current && frames[k].water_current))
         .collect();
     for &k in &mixed {
         let f = frames[k];
-        assert_eq!(f.density, 1.0, "frame {k} draws two grids' fields: {f:?}");
-        assert!(
-            f.pending && f.water_current && !f.heights_current,
-            "frame {k}: {f:?}"
-        );
-        assert!(frames[k + 1].heights_current, "frame {k} + 1 still mixed");
+        assert_eq!(f.density, 1.0, "frame {k} draws incomplete fields: {f:?}");
+        assert!(f.pending && !f.heights_current, "frame {k}: {f:?}");
     }
-    assert!(frames.iter().all(|f| f.pending == !f.heights_current));
+    assert!(
+        frames
+            .iter()
+            .all(|f| f.pending == !(f.heights_current && f.water_current))
+    );
     assert_eq!(
         mixed.len(),
-        replaces,
-        "one staged frame per replace: {mixed:?}"
+        replaces * held,
+        "{held} staged frames per replace: {mixed:?}"
     );
+    for run in mixed.chunks(held) {
+        assert!(
+            run.windows(2).all(|w| w[1] == w[0] + 1),
+            "not in a row: {mixed:?}"
+        );
+        assert!(
+            !frames[run[0]].water_current,
+            "the swap frame binds no water"
+        );
+        assert!(frames[run[held - 1]].water_current, "then the new water");
+        assert!(
+            frames[run[held - 1] + 1].heights_current,
+            "complete after {held} frames"
+        );
+    }
 }
 
-/// The hop's memory (follow-up): a snapshot change's staged replace draws mixed fields only on
-/// its first frame, at density exactly 1, whether the region is ready early or late.
+/// The hop's memory (third stage): a snapshot change's staged replace draws incomplete or mixed
+/// fields only at density exactly 1, whether the region is ready early or late.
 #[test]
 fn a_snapshot_change_replaces_the_fields_under_the_opaque_cloud() {
     for after in [0, 1, 3, 12] {
