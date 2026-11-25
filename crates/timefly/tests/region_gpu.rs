@@ -15,6 +15,10 @@
 //!   `timefly_core::worldgen::biome::snowline_with_raise_m`.
 //! - `wesl_planet_position_matches_rust` runs `planet.wesl`'s `planet_position_m` against
 //!   `EARTH_RADIUS_M * FrameBasis::local_to_dir`.
+//! - `the_cloud_veils_geometry_nearer_than_its_plane` draws `cloud.wesl` (its Bevy and package
+//!   imports stood in for) over an opaque quad nearer than 1.2 × the eye-to-fly distance, with
+//!   the game's blend and reverse-Z depth test, and checks the quad comes out veiled exactly as
+//!   far ground does (M3 Task 7's near-plane depth rule).
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -978,4 +982,386 @@ fn wesl_planet_position_matches_rust() {
         );
     }
     println!("{} positions: worst diff {worst:.3} m", queries.len());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The cloud over near geometry (M3 Task 7's frag_depth rule, observed on the GPU)
+
+const CLOUD: &str = include_str!("../assets/shaders/cloud.wesl");
+/// The cloud's imports, stood in for: Bevy's view uniform (only the matrices the cloud reads)
+/// at group 0, and the material at group 1.
+const CLOUD_VIEW: &str = r#"
+struct View {
+    clip_from_view: mat4x4<f32>,
+    view_from_clip: mat4x4<f32>,
+    world_from_view: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> view: View;
+"#;
+/// Near geometry: a full-screen opaque red triangle at a fixed clip depth, writing depth.
+const NEAR_QUAD: &str = r#"
+@group(0) @binding(0) var<uniform> quad: vec4<f32>; // x: clip depth
+
+@vertex
+fn vertex(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], quad.x, 1.0);
+}
+
+@fragment
+fn fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+}
+"#;
+const VEIL_SIZE: u32 = 256;
+/// The eye-to-fly distance (world units) and the cloud's density for the check.
+const VEIL_FLY_DISTANCE: f32 = 10.0;
+const VEIL_DENSITY: f32 = 0.5;
+
+/// `cloud.wesl` as plain WGSL: the imports replaced by `noise.wesl` and [`CLOUD_VIEW`].
+fn cloud_wgsl() -> String {
+    let imports = [
+        "import bevy_pbr::render::mesh_view_bindings::view;",
+        "import package::noise::gradient_noise3;",
+    ];
+    for import in imports {
+        assert_eq!(
+            CLOUD.matches(import).count(),
+            1,
+            "cloud.wesl imports {import}"
+        );
+    }
+    let body: Vec<&str> = CLOUD
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("import "))
+        .collect();
+    let body = body.join("\n");
+    assert_eq!(body.matches("constants::MATERIAL_BIND_GROUP").count(), 1);
+    let body = body.replace("constants::MATERIAL_BIND_GROUP", "1");
+    assert!(
+        !body
+            .lines()
+            .any(|l| !l.trim_start().starts_with("//") && l.contains("::")),
+        "cloud.wesl has an import this test doesn't stand in for"
+    );
+    format!("{NOISE}\n{CLOUD_VIEW}\n{body}")
+}
+
+/// Renders the red quad at `quad_view_depth`, then the cloud at [`VEIL_DENSITY`] for a fly
+/// [`VEIL_FLY_DISTANCE`] ahead, as the game's pipeline draws it (blended, depth-tested with
+/// reverse-Z `GreaterEqual`, never writing depth), and reads the colour back (RGBA8).
+fn render_cloud_over_quad(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    quad_view_depth: f32,
+) -> Vec<[u8; 4]> {
+    use bevy::camera::{CameraProjection, PerspectiveProjection};
+    use bevy::math::{Mat4, Vec4};
+    use timefly::cloud::{CloudParams, DEPTH_PAST_FLY};
+
+    let (w, h) = (VEIL_SIZE, VEIL_SIZE);
+    // Bevy's own projection (infinite reverse-Z), as the game's cameras use it.
+    let clip_from_view = PerspectiveProjection {
+        fov: 45f32.to_radians(),
+        aspect_ratio: w as f32 / h as f32,
+        near: 0.1,
+        ..Default::default()
+    }
+    .get_clip_from_view();
+    let clip_depth = |view_depth: f32| {
+        let c = clip_from_view * Vec4::new(0.0, 0.0, -view_depth, 1.0);
+        c.z / c.w
+    };
+    let mats: Vec<f32> = [clip_from_view, clip_from_view.inverse(), Mat4::IDENTITY]
+        .iter()
+        .flat_map(|m| m.to_cols_array())
+        .collect();
+    let params = CloudParams {
+        state: Vec4::new(
+            VEIL_DENSITY,
+            VEIL_FLY_DISTANCE * DEPTH_PAST_FLY,
+            0.0,
+            w as f32 / h as f32,
+        ),
+        // No hole: the fly isn't drawn here.
+        fly: Vec4::ZERO,
+        motion: Vec4::ZERO,
+        sun: Vec4::new(0.3, 0.6, -0.74, 0.0).normalize(),
+        sun_color: Vec4::new(1.0, 0.95, 0.9, 1.0),
+        zenith: Vec4::new(0.2, 0.35, 0.7, 1.0),
+        horizon: Vec4::new(0.6, 0.7, 0.85, 1.0),
+    };
+    let packed: Vec<f32> = [
+        params.state,
+        params.fly,
+        params.motion,
+        params.sun,
+        params.sun_color,
+        params.zenith,
+        params.horizon,
+    ]
+    .iter()
+    .flat_map(|v| v.to_array())
+    .collect();
+
+    let uniform = |label, data: &[u8]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    };
+    let view_buf = uniform("view", bytemuck::cast_slice(&mats));
+    let cloud_buf = uniform("cloud", bytemuck::cast_slice(&packed));
+    let quad_buf = uniform(
+        "quad",
+        bytemuck::cast_slice(&[clip_depth(quad_view_depth), 0.0, 0.0, 0.0]),
+    );
+    let triangle: [[f32; 3]; 3] = [[-1.0, -1.0, 0.0], [3.0, -1.0, 0.0], [-1.0, 3.0, 0.0]];
+    let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("cloud triangle"),
+        contents: bytemuck::cast_slice(&triangle),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let color_format = wgpu::TextureFormat::Rgba8Unorm;
+    let depth_format = wgpu::TextureFormat::Depth32Float;
+    let target = |format, usage| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
+    };
+    let color = target(
+        color_format,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let depth = target(depth_format, wgpu::TextureUsages::RENDER_ATTACHMENT);
+    let color_view = color.create_view(&Default::default());
+    let depth_view = depth.create_view(&Default::default());
+
+    let quad_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("near quad"),
+        source: wgpu::ShaderSource::Wgsl(NEAR_QUAD.into()),
+    });
+    let cloud_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cloud"),
+        source: wgpu::ShaderSource::Wgsl(cloud_wgsl().into()),
+    });
+    let depth_state = |write: bool, compare| wgpu::DepthStencilState {
+        format: depth_format,
+        depth_write_enabled: Some(write),
+        depth_compare: Some(compare),
+        stencil: Default::default(),
+        bias: Default::default(),
+    };
+    let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("near quad"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &quad_module,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: Some(depth_state(true, wgpu::CompareFunction::GreaterEqual)),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &quad_module,
+            entry_point: Some("fragment"),
+            compilation_options: Default::default(),
+            targets: &[Some(color_format.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    // As `CloudMaterial` specializes Bevy's blended mesh pipeline: no culling, depth-tested,
+    // never writing depth.
+    let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cloud"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &cloud_module,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: 12,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_state(false, wgpu::CompareFunction::GreaterEqual)),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &cloud_module,
+            entry_point: Some("fragment"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let group = |pipeline: &wgpu::RenderPipeline, index: u32, buffer: &wgpu::Buffer| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(index),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffer.as_entire_binding(),
+            }],
+        })
+    };
+    let quad_group = group(&quad_pipeline, 0, &quad_buf);
+    let view_group = group(&cloud_pipeline, 0, &view_buf);
+    let cloud_group = group(&cloud_pipeline, 1, &cloud_buf);
+
+    let row_bytes = w * 4;
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: u64::from(row_bytes * h),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("cloud over near geometry"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                // Reverse-Z: 0 is infinitely far.
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_pipeline(&quad_pipeline);
+        pass.set_bind_group(0, &quad_group, &[]);
+        pass.draw(0..3, 0..1);
+        pass.set_pipeline(&cloud_pipeline);
+        pass.set_bind_group(0, &view_group, &[]);
+        pass.set_bind_group(1, &cloud_group, &[]);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.draw(0..3, 0..1);
+    }
+    encoder.copy_texture_to_buffer(
+        color.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &read_buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row_bytes),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let pixels: Vec<[u8; 4]> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+    pixels
+}
+
+/// Ground nearer than [`DEPTH_PAST_FLY`] × the eye-to-fly distance, under a half-dense cloud, is
+/// veiled exactly as far ground is, never drawn sharp in front of the cloud (M3 Task 7: the
+/// cloud writes the near plane's depth at every density above clear).
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn the_cloud_veils_geometry_nearer_than_its_plane() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    println!("adapter: {:?}", adapter.get_info());
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+
+    // Far ground (well past the cloud's plane) is the reference: the cloud always covered it.
+    let far = render_cloud_over_quad(&device, &queue, VEIL_FLY_DISTANCE * 10.0);
+    let veiled = |p: &[u8; 4]| p[1] >= 4 && p[2] >= 4;
+    let far_veiled = far.iter().filter(|p| veiled(p)).count();
+    assert_eq!(
+        far_veiled,
+        far.len(),
+        "the half-dense cloud leaves far ground bare in {} of {} pixels",
+        far.len() - far_veiled,
+        far.len()
+    );
+    let min_green = far.iter().map(|p| p[1]).min().unwrap_or(0);
+    println!("far ground under the cloud: least green {min_green} (bare ground is 0)");
+
+    // Nearer than the fly, and between the fly and the cloud's old plane at 1.2 x.
+    let plane = VEIL_FLY_DISTANCE * timefly::cloud::DEPTH_PAST_FLY;
+    for factor in [0.5, 1.1] {
+        let depth = VEIL_FLY_DISTANCE * factor;
+        assert!(depth < plane);
+        let near = render_cloud_over_quad(&device, &queue, depth);
+        let sharp = near.iter().filter(|p| **p == [255, 0, 0, 255]).count();
+        let differing = near
+            .iter()
+            .zip(&far)
+            .filter(|(n, f)| n.iter().zip(f.iter()).any(|(a, b)| a.abs_diff(*b) > 1))
+            .count();
+        println!(
+            "ground at {factor} x the fly distance ({depth} of plane {plane}): {sharp} sharp, {differing} differing from far ground, of {} pixels",
+            near.len()
+        );
+        assert_eq!(
+            sharp,
+            0,
+            "ground at {factor} x the fly distance is drawn sharp in front of the cloud in {sharp} of {} pixels",
+            near.len()
+        );
+        assert_eq!(
+            differing,
+            0,
+            "ground at {factor} x the fly distance is veiled differently from far ground in {differing} of {} pixels",
+            near.len()
+        );
+    }
 }

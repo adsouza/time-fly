@@ -18,7 +18,6 @@
 //   lavender shade leaning to the era's zenith, all tinted a little by the era's horizon.
 // - Opacity: the density lowers the field's coverage threshold and adds a veil; at density 1
 //   every pixel is opaque, whatever the noise says.
-// - Tilt-shift: while state.z > 0, the top and bottom bands drop the fine octaves and soften.
 // - Colour: display colour in both worlds, never tone-mapped (the globe camera does not tone
 //   map; the region's materials tone-map themselves), so the cloud looks the same in each.
 
@@ -26,7 +25,7 @@ import bevy_pbr::render::mesh_view_bindings::view;
 import package::noise::gradient_noise3;
 
 struct CloudParams {
-    // x: density (0 clear, 1 opaque); y: the cloud's view depth (world units); z: tilt-shift;
+    // x: density (0 clear, 1 opaque); y: the cloud's view depth (world units); z: unused (0);
     // w: the view's aspect (width over height).
     state: vec4<f32>,
     // The fly's hole in the opaque cloud: xy its centre (NDC); z the radius (NDC height units, 0
@@ -142,14 +141,11 @@ fn cloud_color(in: CloudOut) -> vec4<f32> {
     let v = view.view_from_clip * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize((view.world_from_view * vec4<f32>(v.xyz / v.w, 0.0)).xyz);
 
-    // Tilt-shift: the top and bottom bands soften.
-    let band = cloud.state.z * smoothstep(0.35, 0.95, abs(in.ndc.y));
-
     var field = 0.0;
     let broad = shape(dir);
     field += broad;
     for (var k = SHAPE_OCTAVES; k < OCTAVES; k += 1u) {
-        field += octave(dir, k) * LAYERS[k].z * (1.0 - band);
+        field += octave(dir, k) * LAYERS[k].z;
     }
 
     // Light: lit where the wisps thin toward the sun, and brighter on the sun's side of the view.
@@ -176,7 +172,7 @@ fn cloud_color(in: CloudOut) -> vec4<f32> {
     let edge = smoothstep(0.4, 1.3, length(in.ndc)) * (1.0 - density) * 0.15;
     let w = clamp(0.5 + field * CONTRAST + edge, 0.0, 1.0);
     let threshold = mix(1.15, -0.1, density);
-    let soft = mix(0.16, 0.4, band);
+    let soft = 0.16;
     let wisps = smoothstep(threshold - soft, threshold + soft, w);
     let veil = 0.65 * density * density;
     var alpha = 1.0 - (1.0 - wisps) * (1.0 - veil);

@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|high|fly|cruise|cloud|time|cloudtime] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|high|fly|cruise|cloud|time|cloudtime|cloudtime1] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
 //! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
@@ -46,7 +46,7 @@
 //! then, once the cloud is opaque, holds it at 1.0 as long and saves `<prefix>-cloud-full.png`,
 //! and after the change saves `<prefix>-cloud-after.png`. A fifth argument `cloudtime` is `time`
 //! with the cloud held at density 0.5 throughout, so the two read the cloud pass's cost as a
-//! difference.
+//! difference; `cloudtime1` holds it at 1.0 (opaque) instead.
 //!
 //! `--offscreen`, anywhere among the arguments, makes `time` and `cloudtime` render into the
 //! offscreen image as the other modes do: a window the compositor is not showing (behind
@@ -143,6 +143,8 @@ const FLIGHT_SHOT_SECS: f32 = 2.0;
 const PIN_FRAMES: u32 = 8;
 /// The density `cloudtime` holds the cloud at.
 const TIMED_CLOUD_DENSITY: f32 = 0.5;
+/// The density `cloudtime1` holds the cloud at: opaque.
+const TIMED_OPAQUE_DENSITY: f32 = 1.0;
 /// The `dive` mode's first shot: the fly this far above the cloud top (km).
 const ABOVE_CLOUD_KM: f64 = 300.0;
 /// Frames after a swap before its shot is requested (each shot resolves a few frames later).
@@ -1122,7 +1124,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|cruise|cloud|time|cloudtime|dive|divekey|lowclimb|hop|hop1] [AGL_M] [LATER_S]"
+             [shaded|fly|cruise|cloud|time|cloudtime|cloudtime1|dive|divekey|lowclimb|hop|hop1] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -1135,14 +1137,18 @@ fn main() -> AppExit {
         return AppExit::error();
     };
     let prefix = args.get(3).cloned().unwrap_or_else(|| "cdlod".to_string());
-    let timed_cloud = args.get(4).is_some_and(|m| m == "cloudtime");
+    let timed_cloud = match args.get(4).map(String::as_str) {
+        Some("cloudtime") => Some(TIMED_CLOUD_DENSITY),
+        Some("cloudtime1") => Some(TIMED_OPAQUE_DENSITY),
+        _ => None,
+    };
     let mode = match args.get(4).map(String::as_str) {
         Some("shaded") => Mode::Shaded,
         Some("high") => Mode::High,
         Some("fly") => Mode::Fly,
         Some("cruise") => Mode::Cruise,
         Some("cloud") => Mode::Cloud,
-        Some("time" | "cloudtime") => Mode::Time,
+        Some("time" | "cloudtime" | "cloudtime1") => Mode::Time,
         Some("lowclimb") => Mode::LowClimb,
         Some("dive") => Mode::Dive { backspace: false },
         Some("divekey") => Mode::Dive { backspace: true },
@@ -1231,7 +1237,7 @@ fn main() -> AppExit {
         frames: 0,
         left_generating: false,
         frame_ms: Vec::new(),
-        pin: timed_cloud.then_some(TIMED_CLOUD_DENSITY),
+        pin: timed_cloud,
         offscreen,
     })
     .add_systems(Update, render_offscreen)
