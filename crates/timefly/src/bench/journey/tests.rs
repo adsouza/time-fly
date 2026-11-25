@@ -320,20 +320,21 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
 #[test]
 fn hop_memory_is_gated_on_the_peak_natively_and_on_growth_on_the_web() {
     let mib = |m: u64| Some(m << 20);
-    // Natively: the worst peak over its own in-region baseline, at most +40 MiB.
+    // Natively: the worst peak over its own in-region baseline, at most +64 MiB (the owner's
+    // ruling of 2026-11-25; the measured breakdown is in `docs/testing/m3/performance.md`).
     let hops = [
         (mib(800), mib(830), mib(810)),
-        (mib(810), mib(845), mib(812)),
+        (mib(810), mib(855), mib(812)),
     ];
-    assert_eq!(hop_memory_gate(&hops, false), Some((true, 35 << 20)));
+    assert_eq!(hop_memory_gate(&hops, false), Some((true, 45 << 20)));
     assert_eq!(
-        hop_memory_gate(&[(mib(800), mib(840), None)], false),
-        Some((true, 40 << 20)),
-        "exactly +40 MiB"
+        hop_memory_gate(&[(mib(800), mib(864), None)], false),
+        Some((true, 64 << 20)),
+        "exactly +64 MiB"
     );
     assert_eq!(
-        hop_memory_gate(&[(mib(800), mib(841), mib(800))], false),
-        Some((false, 41 << 20))
+        hop_memory_gate(&[(mib(800), mib(865), mib(800))], false),
+        Some((false, 65 << 20))
     );
     // A peak below the baseline (memory freed) is fine.
     assert_eq!(
