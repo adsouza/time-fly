@@ -232,6 +232,108 @@ fn caption_waits_a_second() {
     assert!(caption_shown(Some(0.2), Some(1.01)));
 }
 
+/// A region lost from under the fly (a snapshot change's generation error, the region gone
+/// while flying, emerging, climbing or hopping) comes out over the globe above the fly's place
+/// in it, as a climb does, not over the dive point a continent of hops away (the final review).
+#[test]
+fn a_lost_region_comes_out_over_the_flys_place() {
+    let centre = RenderDir(geo_to_render(latlon_to_geo(46.5, 10.0)).0.normalize());
+    let place = RenderDir(geo_to_render(latlon_to_geo(47.0, 14.0)).0.normalize());
+    let heading = DVec3::X;
+    let phases = [
+        NavPhase::Flying,
+        NavPhase::Emerging {
+            world: World::Region,
+            elapsed_s: 0.5,
+        },
+        NavPhase::ChangingSnapshot {
+            fade: Fade::new(SNAPSHOT_FADE_S).advance(0.5, true),
+            to: YearsBp(1e6),
+            requested: centre,
+            agl_m: 1_000.0,
+            generated: false,
+            placed: false,
+        },
+        NavPhase::Climbing {
+            elapsed_s: 0.1,
+            centre: Some(centre),
+        },
+        NavPhase::Hopping {
+            centre,
+            edge: HopEdge { axis: 0, side: 1.0 },
+            lift_from_agl_m: 1_000.0,
+            swapped: false,
+            elapsed_s: 3.0,
+            lift: 1.0,
+            failed: false,
+            turned_back: false,
+        },
+    ];
+    let lost = NavInputs {
+        region_state: RegionState::Globe,
+        region_fly: Some((place, heading)),
+        globe_dir: centre,
+        ..inputs()
+    };
+    let over_globe = NavPhase::Emerging {
+        world: World::Globe,
+        elapsed_s: 0.0,
+    };
+    let placed = NavAction::PlaceOnGlobe {
+        dir: place,
+        heading,
+        altitude_km: DIVE_ALTITUDE_KM,
+    };
+    for phase in phases {
+        let (next, actions) = step_nav(phase, &lost);
+        assert_eq!(next, over_globe, "{phase:?}");
+        assert!(actions.contains(&placed), "{phase:?}: {actions:?}");
+        // Not knowing the fly's place, the globe's fly stays where it is.
+        let unknown = NavInputs {
+            region_fly: None,
+            ..lost
+        };
+        let (_, actions) = step_nav(phase, &unknown);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, NavAction::PlaceOnGlobe { .. })),
+            "{phase:?}: {actions:?}"
+        );
+    }
+    // A hop whose region is gone from the inputs (no centre) comes out the same way.
+    let hop = phases[4];
+    let gone = NavInputs {
+        region_state: RegionState::InRegion,
+        region_centre: None,
+        ..lost
+    };
+    let (next, actions) = step_nav(hop, &gone);
+    assert_eq!(next, over_globe);
+    assert!(actions.contains(&placed), "{actions:?}");
+    // A dive that fails never left the globe: its fly is already over the place.
+    let diving = NavPhase::Diving {
+        target: centre,
+        snapshot: YearsBp(0.0),
+        since_s: 0.0,
+        started: true,
+    };
+    let (next, actions) = step_nav(
+        diving,
+        &NavInputs {
+            globe_altitude_km: DIVE_ALTITUDE_KM - 100.0,
+            ..lost
+        },
+    );
+    assert_eq!(next, over_globe);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, NavAction::PlaceOnGlobe { .. })),
+        "{actions:?}"
+    );
+}
+
 #[test]
 fn only_an_opaque_cloud_covers_the_view() {
     let changing = |fade: Fade| NavPhase::ChangingSnapshot {

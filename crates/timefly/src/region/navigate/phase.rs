@@ -17,6 +17,9 @@
 //!   [`NavPhase::Emerging`] climbs it to the cloud top over [`EMERGE_S`].
 //! - **Snapshot changes** inside a region keep M2's rules behind a [`Fade`] through the cloud; a
 //!   change whose crust does not exist climbs out (§9, M2 §6.2).
+//! - **A region lost** from under the fly (a generation error, or the region gone while it is
+//!   shown) comes out over the globe above the fly's place in it, at the dive altitude, as a
+//!   climb does ([`NavAction::PlaceOnGlobe`] from [`NavInputs::region_fly`]).
 //! - **The hop** (§8). Flying out within [`preload_distance_m`](timefly_core::flight::hop::preload_distance_m) of the inner field's edge
 //!   ([`should_preload`]) requests the neighbour past it ([`neighbour_centre`],
 //!   [`NavAction::Preload`]; [`NavPhase::Hopping`]). Within [`LIFT_LEAD_M`] of the edge the lift
@@ -790,10 +793,24 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
         elapsed_s: gather_elapsed_for(i.shown_density),
         centre: i.region_centre,
     };
-    // Over the globe, out of the cloud: where a region that vanished leaves the fly.
+    // Over the globe, out of the cloud: where a dive that fails leaves the fly.
     let out_over_globe = NavPhase::Emerging {
         world: World::Globe,
         elapsed_s: 0.0,
+    };
+    // A region lost from under the fly (its generation failed, or it is gone) leaves it over
+    // the globe above its place in the region at the dive altitude, as a climb does, not over
+    // the dive point, which may be a continent of hops away; not knowing the place, where the
+    // globe's fly is.
+    let lost_region = |actions: &mut Vec<NavAction>| {
+        if let Some((dir, heading)) = i.region_fly {
+            actions.push(NavAction::PlaceOnGlobe {
+                dir,
+                heading,
+                altitude_km: DIVE_ALTITUDE_KM,
+            });
+        }
+        out_over_globe
     };
     let next = match phase {
         NavPhase::Globe => {
@@ -875,7 +892,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
         NavPhase::Emerging { world, elapsed_s } => {
             let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(EMERGE_S as f32);
             if world == World::Region && i.region_state == RegionState::Globe {
-                out_over_globe
+                lost_region(&mut actions)
             } else if world == World::Region && i.climb_key {
                 climb(i)
             } else {
@@ -892,7 +909,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
         }
         NavPhase::Flying => {
             if i.region_state == RegionState::Globe {
-                out_over_globe
+                lost_region(&mut actions)
             } else if i.climb_key || i.region_height_m >= CLIMB_OUT_M {
                 climb(i)
             } else if let Some(change) = i.time_change {
@@ -933,7 +950,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
         } => {
             if i.region_state == RegionState::Globe {
                 // The generation failed; the region plugin removed the region.
-                return (out_over_globe, actions);
+                return (lost_region(&mut actions), actions);
             }
             if i.climb_key {
                 return (climb(i), actions);
@@ -997,7 +1014,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             let opaque = gather_density(elapsed_s) == 1.0;
             let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_GATHER_S as f32);
             if i.region_state == RegionState::Globe {
-                out_over_globe
+                lost_region(&mut actions)
             } else if opaque {
                 actions.push(NavAction::Leave);
                 // Over the fly's place; without one, over the region's centre heading north;
@@ -1030,7 +1047,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             turned_back,
         } => {
             if i.region_state == RegionState::Globe {
-                return (out_over_globe, actions);
+                return (lost_region(&mut actions), actions);
             }
             if i.climb_key || i.region_height_m >= CLIMB_OUT_M {
                 // Out to the globe, from the cloud already there. Leaving drops the neighbour
@@ -1045,7 +1062,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 return (step_hop_end(phase, agl, i, &mut actions), actions);
             }
             let Some(region) = i.region_centre else {
-                return (out_over_globe, actions);
+                return (lost_region(&mut actions), actions);
             };
             if lift == 0.0 && i.time_queued {
                 // A slider change before the lift: the hop is off, the change applies in flight
