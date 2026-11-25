@@ -269,6 +269,13 @@ impl Default for RegionSettings {
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RegionSystems;
 
+/// The region swap: [`RegionSwapRequested`] promotes [`PendingRegion`]. After
+/// [`RegionSystems`]; region navigation, which sends it, orders it after itself and before the
+/// terrain scene and the fly camera, so a swap is one frame: the message, the fly carried into
+/// the new region, the new region active and the terrain scene on its grid.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionSwapSystems;
+
 pub struct RegionPlugin;
 
 impl Plugin for RegionPlugin {
@@ -297,7 +304,6 @@ impl Plugin for RegionPlugin {
                 (
                     leave_region,
                     cancel_preload,
-                    swap_region,
                     start_region_request,
                     poll_tile_manifest,
                     poll_overview,
@@ -307,7 +313,9 @@ impl Plugin for RegionPlugin {
                 )
                     .chain()
                     .in_set(RegionSystems),
-            );
+            )
+            .configure_sets(Update, RegionSwapSystems.after(RegionSystems))
+            .add_systems(Update, swap_region.in_set(RegionSwapSystems));
         crate::clock::add_load_clock(app);
         launch::add_launch_systems(app);
     }

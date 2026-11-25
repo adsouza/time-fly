@@ -565,13 +565,12 @@ impl Game<'_, '_> {
             .map_or(RegionState::Globe, |s| *s.get())
     }
 
-    /// In a region and flying (or, without navigation, in a region).
+    /// In a region and flying (or, without navigation, in a region). A hop still preloading
+    /// counts ([`NavPhase::is_flying`]): the path never comes within the preload reach at its
+    /// own speed (ruling P5), but a test that plays it faster may.
     fn flying(&self) -> bool {
         self.state() == RegionState::InRegion
-            && self
-                .nav
-                .as_ref()
-                .is_none_or(|n| n.phase == NavPhase::Flying)
+            && self.nav.as_ref().is_none_or(|n| n.phase.is_flying())
     }
 
     /// Back on the globe, navigation included.

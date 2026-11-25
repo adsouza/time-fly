@@ -72,6 +72,16 @@
 //! cloud), then at 0.995 (`<prefix>-climb-0995.png`) and at 1.0 (`<prefix>-climb-opaque.png`,
 //! what the frame before the swap draws: everything but the fly covered). Then it lets the climb finish onto the globe.
 //!
+//! A fifth argument `hop` checks the region hop (M3 Task 9) twice, `hop1` once: after the start
+//! shot, for each hop the fly is put [`HOP_START_M`] short of the region's east edge, facing
+//! east at `AGL_M`, and `<prefix>-hopN-before.png` is shot there. Then it holds `W` out into the
+//! cloud bank, shooting `<prefix>-hopN-cloud.png` as the cloud closes on the old region's side
+//! and `<prefix>-hopN-swap.png` from the swap frame on the neighbour's, releases `W`, and once
+//! the cloud has cleared and the fly is back at its height, shoots `<prefix>-hopN-after.png`
+//! where the hop left it. Last, `<prefix>-hopN-same.png` is shot in the neighbour from the
+//! `before` shot's place and heading, carried into its frame: the same view in both regions.
+//! Each step logs a `region tour hop` line.
+//!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
 //! (as in the benches), the camera is held `AGL_M` above the centre, and after the settle it
@@ -107,6 +117,7 @@ use timefly::time::{GlobeTime, OLDER_KEY, YOUNGER_KEY};
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::CLOUD_TOP_KM;
 use timefly_core::flight::globe::GlobeFlight;
+use timefly_core::worldgen::frame::RegionFrame;
 
 /// Seconds after the region appears before the first shot, so its pipelines compile and the
 /// shadow cascades settle.
@@ -136,6 +147,18 @@ const TIMED_CLOUD_DENSITY: f32 = 0.5;
 const ABOVE_CLOUD_KM: f64 = 300.0;
 /// Frames after a swap before its shot is requested (each shot resolves a few frames later).
 const SWAP_SHOT_FRAMES: u32 = 1;
+/// The `hop` mode puts the fly this far short of the east edge: outside the lift's lead, so the
+/// first shot is clear.
+const HOP_START_M: f32 = 25_000.0;
+/// The `hop` mode's cloud shot: as the cloud passes this density on the old region's side.
+const HOP_CLOUD_SHOT_DENSITY: f32 = 0.95;
+/// Frames the `hop` mode waits after placing the fly before shooting: the chase camera's turn
+/// (its offsets glide with a 0.2 s time constant, and a placement may turn the fly a quarter
+/// round), the terrain's patches and the shadows settle, and a shot resolves a later frame. At
+/// about 200 fps, 90 frames left a third of the turn still to glide.
+const HOP_PLACE_FRAMES: u32 = 600;
+/// Frames the `hop` mode gives each stage before it gives up.
+const HOP_GIVE_UP_FRAMES: u32 = 6_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -167,6 +190,8 @@ enum Step {
     /// `lowclimb`: climbing out, the shots held below opaque and opaque; then to the globe.
     LowGather,
     LowAfter,
+    /// `hop`: [`hop_tour`] has the controls.
+    Hop,
     Done,
 }
 
@@ -186,6 +211,10 @@ enum Mode {
     /// `Backspace`).
     Dive {
         backspace: bool,
+    },
+    /// The region hop, `hops` times east (`hop`, `hop1`).
+    Hop {
+        hops: u32,
     },
 }
 
@@ -422,6 +451,9 @@ fn tour(
                 tour.step = Step::Plain;
                 tour.since = now;
                 tour.shot_taken = false;
+            } else if matches!(tour.mode, Mode::Hop { .. }) && tour.frames >= WIRE_FRAMES {
+                tour.step = Step::Hop;
+                tour.frames = 0;
             } else if tour.mode == Mode::Fly && tour.frames >= WIRE_FRAMES {
                 log_flight("start", &fly, region.as_deref(), &time);
                 tour.step = Step::Dive;
@@ -649,11 +681,198 @@ fn tour(
                 exit.write(AppExit::Success);
             }
         }
+        Step::Hop => {}
         Step::Done => {
             // Let the screenshots reach the disk: the readback and the PNG encode take more
             // than WIRE_FRAMES frames when frames are fast.
             if tour.frames >= DONE_FRAMES {
                 exit.write(AppExit::Success);
+            }
+        }
+    }
+}
+
+/// The `hop` mode's steps, each hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopStep {
+    Place,
+    Before,
+    Out,
+    Swap,
+    Settle,
+    After,
+    Same,
+}
+
+/// The `hop` mode's state.
+#[derive(Resource)]
+struct HopTour {
+    hops: u32,
+    hop: u32,
+    step: HopStep,
+    frames: u32,
+    shot: bool,
+    /// The `before` shot's pose and the region it was in.
+    before: Option<(FlyState, RegionFrame)>,
+}
+
+/// Logs a hop step: the phase, the cloud, the fly and the region, for the report.
+fn log_hop(label: &str, hop: u32, nav: &Navigation, fly: &FlyState, region: Option<&ActiveRegion>) {
+    let centre = region.map(|r| {
+        timefly_core::geo::geo_to_latlon(timefly_core::geo::render_to_geo(r.frame.center))
+    });
+    let ground = region.map_or(0.0, |r| {
+        timefly_core::terrain::blended_height_m(
+            &r.grid,
+            f64::from(fly.pos_m.x),
+            f64::from(fly.pos_m.z),
+        )
+    });
+    info!(
+        label,
+        hop,
+        phase = ?nav.phase,
+        density = nav.density,
+        x_m = fly.pos_m.x,
+        y_m = fly.pos_m.y,
+        z_m = fly.pos_m.z,
+        ground_m = ground,
+        yaw = fly.yaw,
+        centre_lat = centre.map(|c| c.0),
+        centre_lon = centre.map(|c| c.1),
+        "region tour hop"
+    );
+}
+
+/// The `hop` mode (see the module docs): each hop's shots on both sides of its cloud.
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
+fn hop_tour(
+    mut hop: ResMut<HopTour>,
+    mut tour: ResMut<Tour>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    nav: Res<Navigation>,
+    mut fly: ResMut<FlyState>,
+    region: Option<Res<ActiveRegion>>,
+    mut commands: Commands,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if tour.step != Step::Hop {
+        return;
+    }
+    hop.frames += 1;
+    let n = hop.hop + 1;
+    let region = region.as_deref();
+    let ground = |r: &ActiveRegion, x: f32, z: f32| {
+        timefly_core::terrain::blended_height_m(&r.grid, f64::from(x), f64::from(z)).max(0.0)
+    };
+    if hop.frames > HOP_GIVE_UP_FRAMES {
+        error!(step = ?hop.step, phase = ?nav.phase, "region tour: the hop never finished");
+        exit.write(AppExit::error());
+        return;
+    }
+    match hop.step {
+        HopStep::Place => {
+            keys.release(KeyCode::KeyW);
+            let Some(r) = region else {
+                return;
+            };
+            let x = timefly_core::flight::hop::EDGE_M - HOP_START_M;
+            *fly = FlyState {
+                pos_m: Vec3::new(x, ground(r, x, 0.0) + tour.agl_m, 0.0),
+                yaw: -std::f32::consts::FRAC_PI_2,
+                ..default()
+            };
+            hop.before = Some((*fly, r.frame));
+            log_hop("placed", n, &nav, &fly, region);
+            hop.step = HopStep::Before;
+            hop.frames = 0;
+        }
+        HopStep::Before => {
+            if hop.frames == HOP_PLACE_FRAMES {
+                log_hop("before", n, &nav, &fly, region);
+                shoot(&mut commands, &tour, &format!("hop{n}-before"));
+            } else if hop.frames > HOP_PLACE_FRAMES + WIRE_FRAMES {
+                hop.step = HopStep::Out;
+                hop.frames = 0;
+                hop.shot = false;
+            }
+        }
+        HopStep::Out => {
+            keys.press(KeyCode::KeyW);
+            if !hop.shot && nav.density >= HOP_CLOUD_SHOT_DENSITY {
+                log_hop("cloud", n, &nav, &fly, region);
+                shoot(&mut commands, &tour, &format!("hop{n}-cloud"));
+                hop.shot = true;
+            }
+            if matches!(nav.phase, NavPhase::Hopping { swapped: true, .. }) {
+                keys.release(KeyCode::KeyW);
+                log_hop("swapped", n, &nav, &fly, region);
+                hop.step = HopStep::Swap;
+                hop.frames = 0;
+            } else if matches!(
+                nav.phase,
+                NavPhase::Hopping {
+                    turned_back: true,
+                    ..
+                }
+            ) {
+                error!("region tour: the neighbour failed; the fly was turned back");
+                exit.write(AppExit::error());
+            }
+        }
+        HopStep::Swap => {
+            if hop.frames == SWAP_SHOT_FRAMES {
+                shoot(&mut commands, &tour, &format!("hop{n}-swap"));
+            } else if hop.frames > WIRE_FRAMES {
+                hop.step = HopStep::Settle;
+                hop.frames = 0;
+            }
+        }
+        HopStep::Settle => {
+            if nav.phase == NavPhase::Flying && nav.density == 0.0 {
+                log_hop("settled", n, &nav, &fly, region);
+                hop.step = HopStep::After;
+                hop.frames = 0;
+            }
+        }
+        HopStep::After => {
+            if hop.frames == 2 * WIRE_FRAMES {
+                log_hop("after", n, &nav, &fly, region);
+                shoot(&mut commands, &tour, &format!("hop{n}-after"));
+            } else if hop.frames > 3 * WIRE_FRAMES
+                && let (Some(r), Some((before, from))) = (region, hop.before)
+            {
+                // The `before` shot's place and heading, in the neighbour's frame, at the same
+                // height above its ground.
+                let (q, yaw) = timefly_core::flight::hop::carry_pose(
+                    &from,
+                    &r.frame,
+                    before.pos_m.as_dvec3(),
+                    before.yaw,
+                );
+                let (x, z) = (q.x as f32, q.z as f32);
+                *fly = FlyState {
+                    pos_m: Vec3::new(x, ground(r, x, z) + tour.agl_m, z),
+                    yaw,
+                    pitch: before.pitch,
+                };
+                hop.step = HopStep::Same;
+                hop.frames = 0;
+            }
+        }
+        HopStep::Same => {
+            if hop.frames == HOP_PLACE_FRAMES {
+                log_hop("same", n, &nav, &fly, region);
+                shoot(&mut commands, &tour, &format!("hop{n}-same"));
+            } else if hop.frames > HOP_PLACE_FRAMES + WIRE_FRAMES {
+                hop.hop += 1;
+                hop.frames = 0;
+                if hop.hop >= hop.hops {
+                    tour.step = Step::Done;
+                    tour.frames = 0;
+                } else {
+                    hop.step = HopStep::Place;
+                }
             }
         }
     }
@@ -903,7 +1122,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|cruise|cloud|time|cloudtime|dive|divekey|lowclimb] [AGL_M] [LATER_S]"
+             [shaded|fly|cruise|cloud|time|cloudtime|dive|divekey|lowclimb|hop|hop1] [AGL_M] [LATER_S]"
         );
         return AppExit::error();
     };
@@ -927,6 +1146,8 @@ fn main() -> AppExit {
         Some("lowclimb") => Mode::LowClimb,
         Some("dive") => Mode::Dive { backspace: false },
         Some("divekey") => Mode::Dive { backspace: true },
+        Some("hop") => Mode::Hop { hops: 2 },
+        Some("hop1") => Mode::Hop { hops: 1 },
         _ => Mode::Wire,
     };
     let diving = matches!(mode, Mode::Dive { .. });
@@ -977,6 +1198,19 @@ fn main() -> AppExit {
             shot: false,
         })
         .add_systems(PreUpdate, dive_tour.after(bevy::input::InputSystems));
+    } else if let Mode::Hop { hops } = mode {
+        app.insert_resource(HopTour {
+            hops,
+            hop: 0,
+            step: HopStep::Place,
+            frames: 0,
+            shot: false,
+            before: None,
+        })
+        .add_systems(
+            PreUpdate,
+            (tour, hop_tour).chain().after(bevy::input::InputSystems),
+        );
     } else {
         app.add_systems(PreUpdate, tour.after(bevy::input::InputSystems));
     }

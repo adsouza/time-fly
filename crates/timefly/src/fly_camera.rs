@@ -19,9 +19,10 @@
 //! - **A soft ceiling** at [`CAMERA_CEILING_M`], the region's cloud base: climbing slows over
 //!   the last [`CEILING_EASE_M`] (to no less than [`CEILING_MIN_EASE`] of its speed) and stops
 //!   at the ceiling.
-//! - **A soft edge:** past the inner field (`REGION_SIZE_M / 2` from the centre on either axis)
-//!   the camera gains an inward velocity proportional to how far out it is, a stand-in for the
-//!   parent spec's exit rule.
+//! - **No edge here:** the inner field's edge ([`EDGE_M`]) is crossed by a hop to the
+//!   neighbouring region (M3 Task 9, `crate::region::navigate`), which replaced M2's soft edge.
+//!   Navigation also decides when the keys fly at all ([`crate::region::navigate::NavPhase::fly_controls`]): during a
+//!   hop's lift the height is the lift's, and while it holds in the cloud the fly drifts.
 //!
 //! (The clearance and ceiling hold the fly; the chase camera keeps its own clearance.)
 //!
@@ -43,7 +44,6 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::math::{DQuat, DVec3};
 use bevy::prelude::*;
 use timefly_core::terrain::blended_height_m;
-use timefly_core::worldgen::REGION_SIZE_M;
 use timefly_core::worldgen::generate::RegionGrid;
 
 use timefly_core::flight::altitudes::{
@@ -54,7 +54,7 @@ pub use timefly_core::flight::chase::CHASE_START_LOOK_DEG;
 use timefly_core::flight::chase::{ChasePose, chase_pose, fly_scale, lift_above_ground};
 
 use crate::creature::{FlyPose, HOVER_EASE_S, bank_step, hover_offset};
-use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
+use crate::region::navigate::{Navigation, NavigationSystems};
 use crate::region::{ActiveRegion, CAMERA_START_ALTITUDE_M};
 use crate::terrain::view::REGION_FOV_DEG;
 use crate::terrain::{RegionViewSystems, TerrainScene, TerrainSceneSystems};
@@ -96,9 +96,6 @@ pub const MAX_PITCH_DEG: f32 = pitch_for_look_deg(CHASE_LOOK_MIN_DEG);
 pub const MAX_STEP_S: f32 = 0.5;
 /// The longest horizontal move between two floor checks within a step.
 pub const MAX_SUBSTEP_M: f32 = 250.0;
-/// The soft edge's spring: inward speed (m/s) per metre past the inner field.
-pub const EDGE_SPRING_PER_S: f32 = 1.0;
-
 /// The chase camera's smoothing time constant (s).
 pub const CHASE_SMOOTHING_S: f64 = 0.2;
 /// The chase camera's look-down pitch stays within this margin of the view's edge, so the fly
@@ -174,8 +171,8 @@ pub fn region_chase_pose(fly: &FlyState, ground_m: impl Fn(f64, f64) -> f64) -> 
     lift_above_ground(pose, |e| ground_m(e.x, e.z), f64::from(CAMERA_CLEARANCE_M))
 }
 
-/// Half the inner field: the soft edge starts here on either axis.
-pub const EDGE_M: f32 = (REGION_SIZE_M / 2.0) as f32;
+/// Half the inner field: a hop crosses the edge here, on either axis.
+pub use timefly_core::flight::hop::EDGE_M;
 
 /// Where the fly is and how the view looks: local metres in the region's frame (`+x` east, `−z`
 /// north, `+y` up from sea level), `yaw` (the fly's heading) about `+y` from north (positive
@@ -240,17 +237,6 @@ pub fn fly_speed(agl_m: f32) -> f32 {
     (agl_m * SPEED_PER_M_AGL).clamp(MIN_SPEED_MPS, MAX_SPEED_MPS)
 }
 
-/// The inward velocity (m/s) along one axis at coordinate `at_m`: zero within [`EDGE_M`], then
-/// [`EDGE_SPRING_PER_S`] per metre beyond it, pointing back toward the centre.
-pub fn edge_nudge(at_m: f32) -> f32 {
-    let excess = at_m.abs() - EDGE_M;
-    if excess > 0.0 {
-        -at_m.signum() * excess * EDGE_SPRING_PER_S
-    } else {
-        0.0
-    }
-}
-
 /// The next camera state. `ground_m(x, z)` is the terrain height at local metres (sea level is
 /// `y = 0`; below it, the sea is the floor). See the module docs for the rules.
 pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) -> f32) -> FlyState {
@@ -283,8 +269,6 @@ pub fn fly_step(state: FlyState, input: FlyInput, ground_m: impl Fn(f32, f32) ->
     if velocity.y > 0.0 {
         velocity.y *= ((CAMERA_CEILING_M - p.y) / CEILING_EASE_M).clamp(CEILING_MIN_EASE, 1.0);
     }
-    velocity.x += edge_nudge(p.x);
-    velocity.z += edge_nudge(p.z);
 
     // Substeps, each ending on or above the floor and under the ceiling.
     let delta = velocity * dt;
@@ -398,8 +382,10 @@ fn step_fly(
     mut drag: ResMut<LookDrag>,
     mut fly: ResMut<FlyState>,
 ) {
-    let flying = nav.is_some_and(|n| n.phase == NavPhase::Flying);
-    let (true, Some(region)) = (flying, region) else {
+    // Flying, or around a hop's lift, whose height is the lift's (and which slows the fly to a
+    // drift while it holds in the cloud).
+    let controls = nav.and_then(|n| n.phase.fly_controls());
+    let (Some(controls), Some(region)) = (controls, region) else {
         drag.0 = false;
         return;
     };
@@ -411,8 +397,13 @@ fn step_fly(
         }
     }
     let held = keys.as_deref().map(keys_to_input).unwrap_or_default();
+    let m = held.move_local;
     let input = FlyInput {
-        move_local: held.move_local,
+        move_local: Vec3::new(
+            m.x * controls.horizontal,
+            if controls.vertical { m.y } else { 0.0 },
+            m.z * controls.horizontal,
+        ),
         look_delta: match (&motion, drag.0) {
             (Some(m), true) => m.delta,
             _ => Vec2::ZERO,
@@ -749,45 +740,29 @@ mod tests {
     }
 
     #[test]
-    fn soft_edge_nudges_back() {
-        assert_eq!(edge_nudge(0.0), 0.0);
-        assert_eq!(edge_nudge(EDGE_M), 0.0);
-        assert!(edge_nudge(EDGE_M + 1_000.0) < 0.0);
-        assert!(edge_nudge(-EDGE_M - 1_000.0) > 0.0);
-        assert!((edge_nudge(EDGE_M + 1_000.0) + 1_000.0 * EDGE_SPRING_PER_S).abs() < 1e-3);
-        // Beyond REGION_SIZE_M / 2, with no input, the camera drifts back toward the centre on
-        // each axis it is out on; inside, it stays put.
+    fn the_field_edge_holds_no_one_back() {
+        // The hop crosses the edge (M3 Task 9): flying out past it, nothing pushes back.
         let ground = flat(100.0);
         let out = FlyState {
             pos_m: Vec3::new(EDGE_M + 10_000.0, 5_000.0, -EDGE_M - 4_000.0),
             yaw: 0.0,
             pitch: 0.0,
         };
-        let next = fly_step(out, input(Vec3::ZERO, false, 0.1), &ground);
-        assert!(next.pos_m.x < out.pos_m.x, "{next:?}");
-        assert!(next.pos_m.z > out.pos_m.z, "{next:?}");
-        assert_eq!(next.pos_m.y, out.pos_m.y);
-        let inside = FlyState {
-            pos_m: Vec3::new(EDGE_M - 1.0, 5_000.0, 0.0),
-            ..out
-        };
-        assert_eq!(
-            fly_step(inside, input(Vec3::ZERO, false, 0.1), &ground),
-            inside
-        );
-        // Flying straight out at full boost, the nudge holds the camera within a bounded band
-        // past the edge.
+        assert_eq!(fly_step(out, input(Vec3::ZERO, false, 0.1), &ground), out);
         let mut s = FlyState {
-            pos_m: Vec3::new(0.0, 8_000.0, 0.0),
+            pos_m: Vec3::new(EDGE_M - 1_000.0, 8_000.0, 0.0),
             yaw: -std::f32::consts::FRAC_PI_2, // facing east
             pitch: 0.0,
         };
-        for _ in 0..2_000 {
-            s = fly_step(s, input(Vec3::new(0.0, 0.0, -1.0), true, 0.05), &ground);
+        for _ in 0..20 {
+            let next = fly_step(s, input(Vec3::new(0.0, 0.0, -1.0), false, 0.1), &ground);
+            assert!(
+                (next.pos_m.x - s.pos_m.x - fly_speed(8_000.0 - 100.0) * 0.1).abs() < 1.0,
+                "{next:?}"
+            );
+            s = next;
         }
-        assert!(s.pos_m.x > EDGE_M, "{s:?}");
-        let band = BOOST * fly_speed(8_000.0 - 100.0) / EDGE_SPRING_PER_S;
-        assert!(s.pos_m.x < EDGE_M + band + 1.0, "{s:?}");
+        assert!(s.pos_m.x > EDGE_M + 10_000.0, "{s:?}");
     }
 
     #[test]

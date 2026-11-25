@@ -17,6 +17,21 @@
 //!   [`NavPhase::Emerging`] climbs it to the cloud top over [`EMERGE_S`].
 //! - **Snapshot changes** inside a region keep M2's rules behind a [`Fade`] through the cloud; a
 //!   change whose crust does not exist climbs out (§9, M2 §6.2).
+//! - **The hop** (§8). Flying out within [`preload_distance_m`](timefly_core::flight::hop::preload_distance_m) of the inner field's edge
+//!   ([`should_preload`]) requests the neighbour past it ([`neighbour_centre`],
+//!   [`NavAction::Preload`]; [`NavPhase::Hopping`]). Within [`LIFT_LEAD_M`] of the edge the lift
+//!   gathers: the cloud bank closes and the fly rises to [`HOP_ALTITUDE_M`] (a fly above that
+//!   stays at its height), both full at the edge and both following the fly's distance from it,
+//!   so turning back thins them again; the vertical controls are the lift's, and at full cover
+//!   the fly slows to a drift ([`HOLD_DRIFT`]) until the neighbour is ready. After a frame drawn
+//!   opaque, with the neighbour ready, the views swap ([`NavAction::SwapToNeighbour`]: the fly
+//!   carried into the neighbour by `carry_pose`, its height above the ground kept). Then the
+//!   cloud clears over [`CLOUD_CLEAR_S`] and the fly eases back to its height above the ground
+//!   before the lift ([`NavAction::ReturnToAgl`]), unless the player climbs or descends.
+//!   Turning back before the swap clears the cloud and then cancels the preload; a neighbour
+//!   that fails turns the fly round [`TURN_BACK_INSIDE_M`] inside the edge under the opaque
+//!   cloud ([`NavAction::TurnBack`], Review Focus 4). A slider change before the lift ends the
+//!   hop; during it, it waits.
 //! - **The cloud** is the largest of the altitude band of the world on screen
 //!   ([`globe_density`] or [`region_density`]) and the phase's own fade
 //!   ([`NavPhase::cloud_density`]). Every swap happens on a frame at exactly 1, after a frame
@@ -24,14 +39,15 @@
 //! - **The slider** holds during [`NavPhase::holds_time`] phases; the shell queues the change and
 //!   applies it once the transition ends ([`hold_slider`]).
 
-use bevy::math::DVec3;
+use bevy::math::{DVec3, Vec2};
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::{
-    CLOUD_GATHER_S, CLOUD_TOP_KM, DIVE_ALTITUDE_KM, EMERGE_S, GLOBE_MAX_ALTITUDE_KM,
-    REGION_CLOUD_BASE_M, REGION_EMERGE_TO_M,
+    CLOUD_CLEAR_S, CLOUD_GATHER_S, CLOUD_TOP_KM, DIVE_ALTITUDE_KM, EMERGE_S, GLOBE_MAX_ALTITUDE_KM,
+    HOP_ALTITUDE_M, LIFT_LEAD_M, REGION_CLOUD_BASE_M, REGION_EMERGE_TO_M,
 };
 use timefly_core::flight::cloud::{globe_density, region_density};
 use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, heading_to_region_yaw};
+use timefly_core::flight::hop::{EDGE_M, neighbour_centre, should_preload};
 use timefly_core::geo::RenderDir;
 use timefly_core::worldgen::frame::RegionFrame;
 
@@ -224,7 +240,49 @@ pub enum NavPhase {
         elapsed_s: f32,
         centre: Option<RenderDir>,
     },
+    /// A hop to the neighbour centred on `centre` (requested; the fly flies on). `lift`, from 0
+    /// to 1, is how far the lift and the cloud bank have gathered; `lift_from_agl_m` is the fly's
+    /// height above the ground before the lift, which it returns to. `failed` once the
+    /// neighbour failed: at full cover the fly turns back instead of swapping. The hop ends
+    /// under the opaque cloud, `swapped` into the neighbour or `turned_back` inside the edge;
+    /// then for `elapsed_s` of [`CLOUD_CLEAR_S`] the cloud clears while the fly returns to its
+    /// height.
+    Hopping {
+        centre: RenderDir,
+        lift_from_agl_m: f32,
+        swapped: bool,
+        elapsed_s: f32,
+        lift: f32,
+        failed: bool,
+        turned_back: bool,
+    },
 }
+
+/// How the fly camera's controls apply in a phase ([`NavPhase::fly_controls`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FlyControls {
+    /// The share of the horizontal speed the controls give.
+    pub horizontal: f32,
+    /// Whether climbing and descending are the player's.
+    pub vertical: bool,
+}
+
+/// The expected generation time (s) of a neighbour on this platform, for
+/// [`preload_distance_m`](timefly_core::flight::hop::preload_distance_m).
+#[cfg(target_arch = "wasm32")]
+pub const EXPECTED_GEN_S: f32 = timefly_core::flight::altitudes::EXPECTED_GEN_S_WEB as f32;
+/// The expected generation time (s) of a neighbour on this platform, for
+/// [`preload_distance_m`](timefly_core::flight::hop::preload_distance_m).
+#[cfg(not(target_arch = "wasm32"))]
+pub const EXPECTED_GEN_S: f32 = timefly_core::flight::altitudes::EXPECTED_GEN_S_NATIVE as f32;
+/// A failed neighbour turns the fly back this far inside the edge (Review Focus 4).
+pub const TURN_BACK_INSIDE_M: f32 = 10_000.0;
+/// While a hop holds in the cloud, the fly's horizontal speed is this share of its own *(call:
+/// the dive's drift, Task 7)*: a gentle drift (design §6), so a long wait never carries it far
+/// past the edge.
+pub const HOLD_DRIFT: f32 = 0.05;
+/// A hop's return to the fly's height above the ground is done within this.
+const RETURNED_M: f32 = 1.0;
 
 impl NavPhase {
     /// Whether the region camera, rather than the globe camera, should be showing.
@@ -232,9 +290,10 @@ impl NavPhase {
         match *self {
             NavPhase::Globe | NavPhase::Diving { .. } => false,
             NavPhase::Emerging { world, .. } => world == World::Region,
-            NavPhase::Flying | NavPhase::ChangingSnapshot { .. } | NavPhase::Climbing { .. } => {
-                true
-            }
+            NavPhase::Flying
+            | NavPhase::ChangingSnapshot { .. }
+            | NavPhase::Climbing { .. }
+            | NavPhase::Hopping { .. } => true,
         }
     }
 
@@ -250,6 +309,19 @@ impl NavPhase {
             NavPhase::Emerging { elapsed_s, .. } => emerge_density(elapsed_s),
             NavPhase::Climbing { elapsed_s, .. } => gather_density(elapsed_s),
             NavPhase::ChangingSnapshot { fade, .. } => fade.alpha(),
+            NavPhase::Hopping {
+                lift,
+                swapped,
+                turned_back,
+                elapsed_s,
+                ..
+            } => {
+                if swapped || turned_back {
+                    1.0 - ease01(elapsed_s / CLOUD_CLEAR_S as f32)
+                } else {
+                    ease01(lift)
+                }
+            }
             NavPhase::Globe | NavPhase::Diving { .. } | NavPhase::Flying => 0.0,
         };
         band.max(own)
@@ -273,11 +345,57 @@ impl NavPhase {
 
     /// Whether the slider waits (design §9): during the dive, the climb and the emergence, a
     /// time change is queued and applied once the transition ends ([`hold_slider`]).
+    ///
+    /// A hop holds it too; a change before its lift ends the hop ([`step_nav`]), so the slider
+    /// waits only while the cloud bank is up.
     pub fn holds_time(&self) -> bool {
         matches!(
             self,
-            NavPhase::Diving { .. } | NavPhase::Emerging { .. } | NavPhase::Climbing { .. }
+            NavPhase::Diving { .. }
+                | NavPhase::Emerging { .. }
+                | NavPhase::Climbing { .. }
+                | NavPhase::Hopping { .. }
         )
+    }
+
+    /// Whether the player is flying the region with no transition on screen: flying, or on a hop
+    /// whose neighbour is still only preloading (its lift has not begun), which leaves the region
+    /// and the view as they are.
+    pub fn is_flying(&self) -> bool {
+        match *self {
+            NavPhase::Flying => true,
+            NavPhase::Hopping {
+                lift,
+                swapped: false,
+                turned_back: false,
+                ..
+            } => lift == 0.0,
+            _ => false,
+        }
+    }
+
+    /// How the fly camera's controls apply, or `None` where they do not (navigation moves the
+    /// fly): all of them while flying and around a hop's lift; during the lift the height is
+    /// the lift's, and at full cover before the swap the fly slows to [`HOLD_DRIFT`].
+    pub fn fly_controls(&self) -> Option<FlyControls> {
+        let full = FlyControls {
+            horizontal: 1.0,
+            vertical: true,
+        };
+        match *self {
+            NavPhase::Flying => Some(full),
+            NavPhase::Hopping {
+                lift,
+                swapped: false,
+                turned_back: false,
+                ..
+            } if lift > 0.0 => Some(FlyControls {
+                horizontal: if lift >= 1.0 { HOLD_DRIFT } else { 1.0 },
+                vertical: false,
+            }),
+            NavPhase::Hopping { .. } => Some(full),
+            _ => None,
+        }
     }
 }
 
@@ -323,6 +441,18 @@ pub struct NavInputs {
     pub shown_density: f32,
     /// The height of `max(ground, sea)` under the region's fly in the terrain drawn.
     pub region_ground_m: f32,
+    /// The region's fly: where it is, `(x, z)` in local metres, and how fast it moved there
+    /// over the last frame.
+    pub region_pos_m: Vec2,
+    pub region_vel_mps: Vec2,
+    /// The neighbour ready in `PendingRegion`: its centre and snapshot.
+    pub neighbour: Option<(RenderDir, YearsBp)>,
+    /// `RegionPreloadFailed` arrived.
+    pub preload_failed: bool,
+    /// Climb or descend is held.
+    pub vertical_held: bool,
+    /// A slider change waits for the transition to end.
+    pub time_queued: bool,
 }
 
 /// What [`step_nav`] asks the shell to do.
@@ -360,6 +490,27 @@ pub enum NavAction {
     EaseFly {
         vertical_mps: f32,
     },
+    /// Request the neighbour centred here, at the region's snapshot (a newer request replaces
+    /// an older one).
+    Preload(RenderDir),
+    /// Drop the neighbour (`RegionPreloadCancelled`): its job, or a ready one.
+    CancelPreload,
+    /// Put the region's fly at `height_m` above sea level: the lift.
+    LiftTo {
+        height_m: f32,
+    },
+    /// Promote the ready neighbour (`RegionSwapRequested`), carry the fly into it at the same
+    /// height above the ground, and reset the chase camera's smoothing.
+    SwapToNeighbour,
+    /// Ease the region's fly toward `agl_m` above the ground, at the M2 speed for its height.
+    ReturnToAgl {
+        agl_m: f32,
+    },
+    /// Turn the region's fly round (180°) at `pos_m` (`x`, `z`), with the chase camera's
+    /// smoothing reset.
+    TurnBack {
+        pos_m: Vec2,
+    },
 }
 
 /// Whether the active region is the one centred on `requested` at `to` (centres within about
@@ -394,6 +545,75 @@ pub fn fly_on_globe(frame: &RegionFrame, x_m: f64, z_m: f64, yaw: f32) -> (Rende
     let d = dir.0;
     let tangent = ahead.0 - d * d.dot(ahead.0);
     (dir, tangent.normalize())
+}
+
+/// The edge a hop to the neighbour centred on `centre` crosses, in the frame of the region
+/// centred on `region`: the axis (0 for `x`, 1 for `z`) and the side (±1).
+fn hop_edge(region: RenderDir, centre: RenderDir) -> (usize, f32) {
+    let (x, z) = RegionFrame { center: region }
+        .dir_to_local(centre)
+        .unwrap_or((0.0, 0.0));
+    let axis = usize::from(z.abs() > x.abs());
+    let c = if axis == 0 { x } else { z };
+    (axis, if c < 0.0 { -1.0 } else { 1.0 })
+}
+
+/// The neighbour to request for the fly in the region, if it should be preloading: never the
+/// region itself (Task 8 note b; the region job does not check).
+fn neighbour_to_preload(i: &NavInputs) -> Option<RenderDir> {
+    let (Some(region), Some(snapshot)) = (i.region_centre, i.region_snapshot) else {
+        return None;
+    };
+    let (p, v) = (i.region_pos_m, i.region_vel_mps);
+    if i.region_state != RegionState::InRegion || !should_preload(p, v, v.length(), EXPECTED_GEN_S)
+    {
+        return None;
+    }
+    let centre = neighbour_centre(&RegionFrame { center: region }, p, v);
+    (!same_region(centre, snapshot, region, snapshot)).then_some(centre)
+}
+
+/// A hop starting now, to `centre`.
+fn hop_to(centre: RenderDir, i: &NavInputs) -> NavPhase {
+    NavPhase::Hopping {
+        centre,
+        lift_from_agl_m: i.region_height_m - i.region_ground_m,
+        swapped: false,
+        elapsed_s: 0.0,
+        lift: 0.0,
+        failed: false,
+        turned_back: false,
+    }
+}
+
+/// The lift's target for a fly `distance_m` short of the hop's edge (past it, negative): 0 at
+/// [`LIFT_LEAD_M`] and beyond, 1 at the edge and past it.
+fn lift_target(distance_m: f32) -> f32 {
+    let lead = LIFT_LEAD_M as f32;
+    ((lead - distance_m) / lead).clamp(0.0, 1.0)
+}
+
+/// `lift` moved toward `target` over `dt_s`: gathering at most over [`CLOUD_GATHER_S`], clearing
+/// at most over [`CLOUD_CLEAR_S`], so the cloud never pops when the hop starts near the edge.
+fn lift_toward(lift: f32, target: f32, dt_s: f32) -> f32 {
+    let dt = dt_s.max(0.0);
+    if target > lift {
+        (lift + dt / CLOUD_GATHER_S as f32).min(target)
+    } else {
+        (lift - dt / CLOUD_CLEAR_S as f32).max(target)
+    }
+}
+
+/// The fly's height at lift `lift` from `base` (its height above the ground before the lift,
+/// over the ground now): up to [`HOP_ALTITUDE_M`] by full cover, never down.
+fn lift_height_m(base: f32, lift: f32) -> f32 {
+    let top = base.max(HOP_ALTITUDE_M as f32);
+    let e = ease01(lift);
+    if e >= 1.0 {
+        top
+    } else {
+        base + (top - base) * e
+    }
 }
 
 /// The region `yaw` for a globe `heading` at the centre of the region centred on `centre`.
@@ -555,6 +775,9 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                     }
                     None => climb(i),
                 }
+            } else if let Some(centre) = neighbour_to_preload(i) {
+                actions.push(NavAction::Preload(centre));
+                hop_to(centre, i)
             } else {
                 NavPhase::Flying
             }
@@ -655,8 +878,168 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 NavPhase::Climbing { elapsed_s, centre }
             }
         }
+        NavPhase::Hopping {
+            centre,
+            lift_from_agl_m,
+            swapped,
+            elapsed_s,
+            lift,
+            failed,
+            turned_back,
+        } => {
+            if i.region_state == RegionState::Globe {
+                return (out_over_globe, actions);
+            }
+            if i.climb_key || i.region_height_m >= CLIMB_OUT_M {
+                // Leaving drops the neighbour too.
+                return (climb(i), actions);
+            }
+            let agl = i.region_height_m - i.region_ground_m;
+            if swapped || turned_back {
+                return (
+                    step_hop_end(
+                        centre,
+                        lift_from_agl_m,
+                        swapped,
+                        elapsed_s,
+                        agl,
+                        i,
+                        &mut actions,
+                    ),
+                    actions,
+                );
+            }
+            let Some(region) = i.region_centre else {
+                return (out_over_globe, actions);
+            };
+            if lift == 0.0 && i.time_queued {
+                // A slider change before the lift: the hop is off, the change applies in flight
+                // and drops the neighbour (built for the old snapshot) with its request.
+                actions.push(NavAction::CancelPreload);
+                return (NavPhase::Flying, actions);
+            }
+            let mut centre = centre;
+            // A job taking over for an enter or snapshot change drops the neighbour.
+            let mut failed = failed || i.preload_failed || i.region_state != RegionState::InRegion;
+            let (mut axis, mut side) = hop_edge(region, centre);
+            // Flying no longer out of the hop's edge, near another: retarget.
+            if side * i.region_vel_mps[axis] <= 0.0
+                && let Some(c) = neighbour_to_preload(i)
+                && hop_edge(region, c) != (axis, side)
+            {
+                actions.push(NavAction::Preload(c));
+                centre = c;
+                failed = false;
+                (axis, side) = hop_edge(region, c);
+            }
+            let out_m = side * i.region_pos_m[axis];
+            let outward = side * i.region_vel_mps[axis];
+            let target = if outward < 0.0 {
+                0.0
+            } else {
+                lift_target(EDGE_M - out_m)
+            };
+            let next_lift = lift_toward(lift, target, i.dt_s);
+            // The height above the ground the lift starts from follows the player until it does.
+            let lift_from_agl_m = if lift == 0.0 && next_lift == 0.0 {
+                agl
+            } else {
+                lift_from_agl_m
+            };
+            if next_lift == 0.0 && outward < 0.0 {
+                // Turned back, and the cloud has cleared: the hop is off, the region kept.
+                if lift > 0.0 {
+                    actions.push(NavAction::LiftTo {
+                        height_m: i.region_ground_m + lift_from_agl_m,
+                    });
+                }
+                actions.push(NavAction::CancelPreload);
+                return (NavPhase::Flying, actions);
+            }
+            if lift > 0.0 || next_lift > 0.0 {
+                actions.push(NavAction::LiftTo {
+                    height_m: lift_height_m(i.region_ground_m + lift_from_agl_m, next_lift),
+                });
+            }
+            let opaque = ease01(next_lift) == 1.0 && i.shown_density == 1.0;
+            let ready = i.region_state == RegionState::InRegion
+                && i.neighbour.is_some_and(|(c, snapshot)| {
+                    i.region_snapshot
+                        .is_some_and(|shown| same_region(c, snapshot, centre, shown))
+                });
+            let ended = |swapped: bool, turned_back: bool| NavPhase::Hopping {
+                centre,
+                lift_from_agl_m,
+                swapped,
+                elapsed_s: 0.0,
+                lift: next_lift,
+                failed,
+                turned_back,
+            };
+            if opaque && failed {
+                // Review Focus 4: round, inside the edge, under the opaque cloud.
+                let mut pos_m = i.region_pos_m;
+                pos_m[axis] = side * (EDGE_M - TURN_BACK_INSIDE_M);
+                actions.push(NavAction::CancelPreload);
+                actions.push(NavAction::TurnBack { pos_m });
+                ended(false, true)
+            } else if opaque && ready {
+                // After a frame drawn opaque, on a frame that is.
+                actions.push(NavAction::SwapToNeighbour);
+                ended(true, false)
+            } else {
+                NavPhase::Hopping {
+                    centre,
+                    lift_from_agl_m,
+                    swapped,
+                    elapsed_s,
+                    lift: next_lift,
+                    failed,
+                    turned_back,
+                }
+            }
+        }
     };
     (next, actions)
+}
+
+/// A hop that has ended under the cloud (`swapped`, or turned back): the cloud clears over
+/// [`CLOUD_CLEAR_S`] while the fly, `agl_m` above the ground, returns to `lift_from_agl_m`
+/// (climbing or descending makes the player's height the one to keep); then flying.
+fn step_hop_end(
+    centre: RenderDir,
+    lift_from_agl_m: f32,
+    swapped: bool,
+    elapsed_s: f32,
+    agl_m: f32,
+    i: &NavInputs,
+    actions: &mut Vec<NavAction>,
+) -> NavPhase {
+    let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32);
+    let lift_from_agl_m = if i.vertical_held {
+        agl_m
+    } else {
+        lift_from_agl_m
+    };
+    let returned = (agl_m - lift_from_agl_m).abs() <= RETURNED_M;
+    if !returned {
+        actions.push(NavAction::ReturnToAgl {
+            agl_m: lift_from_agl_m,
+        });
+    }
+    if returned && elapsed_s >= CLOUD_CLEAR_S as f32 {
+        NavPhase::Flying
+    } else {
+        NavPhase::Hopping {
+            centre,
+            lift_from_agl_m,
+            swapped,
+            elapsed_s,
+            lift: 1.0,
+            failed: !swapped,
+            turned_back: !swapped,
+        }
+    }
 }
 
 /// The slider's hold through a transition (design §9): the time shown, the time a transition

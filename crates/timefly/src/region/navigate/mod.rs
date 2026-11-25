@@ -16,6 +16,13 @@
 //! - **The slider** waits during a transition ([`hold_slider`]): a change is queued in
 //!   [`Navigation::slider`] and the time put back, then applied once on return to flying or the
 //!   globe.
+//! - **The hop** ([`NavPhase::Hopping`]): the fly's velocity is measured from its motion between
+//!   frames (a jump faster than it can fly, [`PLACEMENT_MPS`], is a placement and counts as
+//!   none). The neighbour is requested with `RegionRequested { purpose: Neighbour }` and
+//!   dropped with `RegionPreloadCancelled`; the swap writes `RegionSwapRequested` and carries the
+//!   fly in the same frame, and the region swap ([`RegionSwapSystems`]) runs right after
+//!   navigation, before the terrain scene and the fly camera, so that frame draws the new
+//!   region with the fly in it, under the opaque cloud.
 //! - **"Descending..."** shows only after a region has been generating for
 //!   [`CAPTION_DELAY_S`].
 //! - **"terrain detail unavailable here"** ([`FALLBACK_NOTICE_TEXT`]) shows for
@@ -35,6 +42,7 @@ use bevy::prelude::*;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::GLOBE_MAX_ALTITUDE_KM;
 use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, GlobeFlight};
+use timefly_core::flight::hop::carry_pose;
 use timefly_core::formats::Grid;
 use timefly_core::geo::RenderDir;
 use timefly_core::geodynamics::{Candidate, CrustModel, PlateIndex, ResolvedPosition};
@@ -48,13 +56,17 @@ use tracing::instrument;
 
 use super::frames::FrameCache;
 use super::{
-    ActiveRegion, LargeGenBudget, RegionEntered, RegionGenerated, RegionLeft, RegionRequested,
-    RegionSnapshotChanged, RegionState, RegionSystems,
+    ActiveRegion, LargeGenBudget, PendingRegion, RegionEntered, RegionGenerated, RegionLeft,
+    RegionPreloadCancelled, RegionPreloadFailed, RegionRequested, RegionSnapshotChanged,
+    RegionState, RegionSwapRequested, RegionSwapSystems, RegionSystems, RequestPurpose,
 };
 use crate::clock::LoadClock;
 use crate::cloud::{CloudDensity, add_cloud_density};
 use crate::data::GlobeData;
-use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyChase, FlyState};
+use crate::fly_camera::{
+    BOOST, CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyChase, FlyState, FlySystems, MAX_SPEED_MPS,
+    fly_speed, keys_to_input,
+};
 use crate::globe_flight::{GlobeChase, GlobeFlightState, GlobeFlightSystems, GlobeLook};
 use crate::terrain::{TerrainScene, TerrainSceneSystems, TerrainSettings};
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
@@ -63,10 +75,10 @@ use crate::ui::TEXT_COLOR;
 mod phase;
 
 pub use phase::{
-    CLIMB_OUT_M, DIVE_DRIFT_S, Fade, NavAction, NavInputs, NavPhase, SNAPSHOT_FADE_S,
-    START_TIMEOUT_S, SliderHold, TimeChange, World, dive_drift_mps, emerge_altitude_km,
-    emerge_density, emerge_height_m, fade_alpha, fly_on_globe, gather_density, gather_elapsed_for,
-    hold_slider, region_yaw, same_region, step_nav,
+    CLIMB_OUT_M, DIVE_DRIFT_S, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT, NavAction, NavInputs,
+    NavPhase, SNAPSHOT_FADE_S, START_TIMEOUT_S, SliderHold, TURN_BACK_INSIDE_M, TimeChange, World,
+    dive_drift_mps, emerge_altitude_km, emerge_density, emerge_height_m, fade_alpha, fly_on_globe,
+    gather_density, gather_elapsed_for, hold_slider, region_yaw, same_region, step_nav,
 };
 
 /// "Descending..." shows only once a region has been generating this long (design §6.1).
@@ -77,6 +89,9 @@ pub const CAPTION_TEXT: &str = "Descending...";
 pub const FALLBACK_NOTICE_TEXT: &str = "terrain detail unavailable here";
 /// How long the fallback notice shows after the region appears.
 pub const FALLBACK_NOTICE_S: f64 = 3.0;
+/// The region's fly never flies faster than this (twice its boosted cap): a faster jump between
+/// frames is a placement (a swap, a scripted pose), not flight, and gives no velocity.
+pub const PLACEMENT_MPS: f32 = 2.0 * BOOST * MAX_SPEED_MPS;
 
 /// The ICE-6G_C frames, the recent globe's geographic frame, end at 26 ka BP (1950), 26,076
 /// years before the game's present. Up to that age a direction is geographic: crust positions
@@ -162,6 +177,9 @@ pub struct Navigation {
     pub slider: SliderHold,
     /// The cloud's density from navigation in the last frame it ran.
     pub density: f32,
+    /// The region's fly's `(x, z)` when navigation last ran, after its placements: its motion
+    /// since gives its velocity.
+    pub last_fly_m: Option<Vec2>,
 }
 
 impl Navigation {
@@ -179,6 +197,7 @@ impl Default for Navigation {
             fallback_since: None,
             slider: SliderHold::default(),
             density: 0.0,
+            last_fly_m: None,
         }
     }
 }
@@ -218,6 +237,16 @@ impl Plugin for RegionNavigationPlugin {
                     // in the same frame; before the terrain, so camera and terrain move together.
                     .after(RegionSystems)
                     .before(TerrainSceneSystems)
+                    .before(GlobeFlightSystems::Step),
+            )
+            // A hop's swap lands in the frame navigation asks for it: before the terrain scene
+            // and either fly moves.
+            .configure_sets(
+                Update,
+                RegionSwapSystems
+                    .after(NavigationSystems)
+                    .before(TerrainSceneSystems)
+                    .before(FlySystems::Step)
                     .before(GlobeFlightSystems::Step),
             );
     }
@@ -410,6 +439,8 @@ struct Flies<'w> {
 struct NavWriters<'w> {
     requests: MessageWriter<'w, RegionRequested>,
     left: MessageWriter<'w, RegionLeft>,
+    cancels: MessageWriter<'w, RegionPreloadCancelled>,
+    swaps: MessageWriter<'w, RegionSwapRequested>,
     changes: MessageWriter<'w, TimeChanged>,
     terrain: ResMut<'w, TerrainSettings>,
     large_budget: Option<ResMut<'w, LargeGenBudget>>,
@@ -428,6 +459,8 @@ struct NavWorld<'w> {
     /// the old region after `ActiveRegion` became the new one, and the fly's local position is
     /// in its frame.
     scene: Option<Res<'w, TerrainScene>>,
+    /// A neighbour ready for a hop.
+    pending: Option<Res<'w, PendingRegion>>,
 }
 
 /// Sets the globe time to `to`, with a [`TimeChanged`] of `cause`, if it differs.
@@ -456,6 +489,7 @@ fn navigate(
         MessageReader<RegionEntered>,
         MessageReader<RegionGenerated>,
         MessageReader<RegionSnapshotChanged>,
+        MessageReader<RegionPreloadFailed>,
     ),
     mut time: ResMut<GlobeTime>,
     mut flies: Flies,
@@ -488,6 +522,14 @@ fn navigate(
     let generated = events.1.read().last().copied();
     let changed = events.2.read().count() > 0;
     let flight = flies.flight.0;
+    let pending = world.pending.as_deref().and_then(|p| p.0.as_ref());
+    let xz = Vec2::new(p.x, p.z);
+    let velocity = match nav.last_fly_m {
+        Some(last) if dt_s > 0.0 => Some((xz - last) / dt_s),
+        _ => None,
+    }
+    .filter(|v| v.length() <= PLACEMENT_MPS)
+    .unwrap_or(Vec2::ZERO);
     let inputs = NavInputs {
         now_s,
         load_s: clock.elapsed_s,
@@ -516,6 +558,15 @@ fn navigate(
         region_height_m: flies.fly.pos_m.y,
         shown_density: nav.density,
         region_ground_m: ground_m,
+        region_pos_m: xz,
+        region_vel_mps: velocity,
+        neighbour: pending.map(|r| (r.frame.center, r.grid.spec.snapshot)),
+        preload_failed: events.3.read().count() > 0,
+        vertical_held: world
+            .keys
+            .as_deref()
+            .is_some_and(|k| keys_to_input(k).move_local.y != 0.0),
+        time_queued: nav.slider.queued.is_some(),
         region_fly: shown_frame.map(|frame| {
             fly_on_globe(
                 &frame,
@@ -544,7 +595,9 @@ fn navigate(
         ground_m,
     };
     for action in actions {
-        apply_action(action, ease, region, &mut time, &mut flies, &mut out);
+        apply_action(
+            action, ease, region, pending, &mut time, &mut flies, &mut out,
+        );
     }
     if std::mem::discriminant(&phase) != std::mem::discriminant(&before) {
         info!(from = ?before, to = ?phase, "navigation phase");
@@ -582,6 +635,10 @@ fn navigate(
     };
     let density = phase.cloud_density(&after);
     out.cloud.raise(density);
+    let fly_xz = Vec2::new(flies.fly.pos_m.x, flies.fly.pos_m.z);
+    if nav.last_fly_m != Some(fly_xz) {
+        nav.last_fly_m = Some(fly_xz);
+    }
     if nav.density != density {
         nav.density = density;
     }
@@ -611,12 +668,13 @@ struct Ease {
     ground_m: f32,
 }
 
-/// Applies one action.
+/// Applies one action. `pending` is the neighbour ready for a hop's swap.
 #[instrument(level = "debug", skip_all, fields(?action))]
 fn apply_action(
     action: NavAction,
     ease: Ease,
     region: Option<&ActiveRegion>,
+    pending: Option<&ActiveRegion>,
     time: &mut GlobeTime,
     flies: &mut Flies,
     out: &mut NavWriters,
@@ -694,6 +752,78 @@ fn apply_action(
                     flies.flight.0.altitude_km = to;
                 }
             }
+        }
+        NavAction::Preload(era_dir) => {
+            if let Some(region) = region {
+                out.requests.write(RegionRequested {
+                    era_dir,
+                    snapshot: region.grid.spec.snapshot,
+                    purpose: RequestPurpose::Neighbour,
+                });
+            }
+        }
+        NavAction::CancelPreload => {
+            out.cancels.write(RegionPreloadCancelled);
+        }
+        NavAction::LiftTo { height_m } => {
+            let y = height_m
+                .min(CAMERA_CEILING_M)
+                .max(ease.ground_m + CAMERA_CLEARANCE_M);
+            if y != flies.fly.pos_m.y {
+                flies.fly.pos_m.y = y;
+            }
+        }
+        NavAction::SwapToNeighbour => {
+            let (Some(old), Some(new)) = (region, pending) else {
+                warn!("a hop's swap with no region or no neighbour ready; ignored");
+                return;
+            };
+            let p = flies.fly.pos_m;
+            let (q, yaw) = carry_pose(&old.frame, &new.frame, p.as_dvec3(), flies.fly.yaw);
+            let ground = blended_height_m(&new.grid, q.x, q.z).max(0.0);
+            let y = (ground + (p.y - ease.ground_m))
+                .min(CAMERA_CEILING_M)
+                .max(ground + CAMERA_CLEARANCE_M);
+            flies.fly.pos_m = Vec3::new(q.x as f32, y, q.z as f32);
+            flies.fly.yaw = yaw;
+            reset_fly_chase(flies);
+            out.swaps.write(RegionSwapRequested);
+            info!(
+                from = ?old.grid.spec.center,
+                to = ?new.grid.spec.center,
+                x_m = q.x,
+                z_m = q.z,
+                "hop: swapped to the neighbour"
+            );
+        }
+        NavAction::ReturnToAgl { agl_m } => {
+            let y = flies.fly.pos_m.y;
+            let agl = y - ease.ground_m;
+            let step = fly_speed(agl) * ease.dt_s;
+            let to = (y + (agl_m - agl).clamp(-step, step))
+                .min(CAMERA_CEILING_M)
+                .max(ease.ground_m + CAMERA_CLEARANCE_M);
+            if to != y {
+                flies.fly.pos_m.y = to;
+            }
+        }
+        NavAction::TurnBack { pos_m } => {
+            let fly = &mut flies.fly;
+            fly.pos_m.x = pos_m.x;
+            fly.pos_m.z = pos_m.y;
+            fly.yaw = (fly.yaw + 2.0 * std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            if let Some(region) = region {
+                let ground =
+                    blended_height_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y)).max(0.0);
+                fly.pos_m.y = fly.pos_m.y.max(ground + CAMERA_CLEARANCE_M);
+            }
+            reset_fly_chase(flies);
+            info!(
+                x_m = pos_m.x,
+                z_m = pos_m.y,
+                "hop: the neighbour failed; turned back"
+            );
         }
     }
 }

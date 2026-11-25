@@ -1528,3 +1528,54 @@ fn a_snapshot_request_drops_the_ready_neighbour() {
     assert_eq!(active(&app).grid.spec.snapshot, YearsBp(100.0e6));
     assert!(centred(&active(&app), 0.0, 0.0));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 9: a hop never waits on a neighbour request that gets no answer
+
+/// A neighbour request the job will not take (no region to be a neighbour of, an enter or
+/// snapshot job running, or another request winning the same frame) answers with
+/// `RegionPreloadFailed`, so whoever asked never waits for "ready or failed" in vain.
+#[test]
+fn an_ignored_neighbour_reports_failure() {
+    let failures = |app: &App| app.world().resource::<Seen>().failed.len();
+    // No active region.
+    let mut app = region_app(&tiny_root(), SMALL);
+    neighbour(&mut app, 0.0, 0.3);
+    app.update();
+    assert_eq!(failures(&app), 1);
+    assert!(pending(&app).is_none());
+
+    // While an enter job runs.
+    request(&mut app, 0.0, 0.0, 0.0);
+    app.update();
+    app.update();
+    assert_eq!(state(&app), RegionState::Generating);
+    neighbour(&mut app, 0.0, 0.3);
+    app.update();
+    assert_eq!(failures(&app), 2);
+    run_until(&mut app, RegionState::InRegion);
+    assert!(pending(&app).is_none());
+
+    // In the same frame as a snapshot request, which wins.
+    neighbour(&mut app, 0.0, 0.3);
+    request_for(&mut app, RequestPurpose::Snapshot, 0.0, 0.0, 100.0e6);
+    app.update();
+    assert_eq!(failures(&app), 3);
+    run_until(&mut app, RegionState::InRegion);
+    settle(&mut app, 300);
+    assert!(pending(&app).is_none());
+    assert_eq!(
+        failures(&app),
+        3,
+        "{:?}",
+        app.world().resource::<Seen>().failed
+    );
+    let reasons: Vec<_> = app
+        .world()
+        .resource::<Seen>()
+        .failed
+        .iter()
+        .map(|f| f.reason.clone())
+        .collect();
+    assert!(reasons.iter().all(|r| !r.is_empty()), "{reasons:?}");
+}

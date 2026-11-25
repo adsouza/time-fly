@@ -296,6 +296,16 @@ pub(super) fn start_region_request(
             _ => main = Some(request),
         }
     }
+    // Every neighbour request is answered, ready or failed: one the job will not take fails
+    // at once, so whoever asked (a hop) never waits on it.
+    if main.is_some()
+        && let Some(dropped) = neighbour
+    {
+        debug!(request = ?dropped, "neighbour requested with an enter or snapshot request; dropped");
+        failed.write(RegionPreloadFailed {
+            reason: "an enter or snapshot request came with it".to_string(),
+        });
+    }
     let Some(request) = main.or(neighbour) else {
         return;
     };
@@ -304,11 +314,20 @@ pub(super) fn start_region_request(
     if preload {
         // The concurrency rule: a neighbour never competes with an enter or snapshot job, and
         // needs a region to be a neighbour of. A neighbour job in flight is replaced below.
-        if job.is_some_and(|j| j.purpose != RequestPurpose::Neighbour) || active.is_none() {
+        let busy = job.is_some_and(|j| j.purpose != RequestPurpose::Neighbour);
+        if busy || active.is_none() {
             debug!(
                 ?request,
                 "neighbour requested while a region job runs or no region is active; ignored"
             );
+            failed.write(RegionPreloadFailed {
+                reason: if busy {
+                    "an enter or snapshot job is running"
+                } else {
+                    "no region is active"
+                }
+                .to_string(),
+            });
             return;
         }
     }
