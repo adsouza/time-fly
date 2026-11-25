@@ -149,6 +149,26 @@ impl EraHydrology {
         })
     }
 
+    /// A result holding only `rivers` and `lakes`: no ocean bits, no lake footprints. For the
+    /// refinement's fixtures.
+    #[cfg(test)]
+    pub(crate) fn with_rivers(
+        lattice: CubeLattice,
+        lakes: Vec<Lake>,
+        rivers: RiverGraph,
+    ) -> EraHydrology {
+        EraHydrology {
+            age: YearsBp(0.0),
+            lattice,
+            lakes,
+            rivers,
+            data_lakes: false,
+            unplaced_lake_levels: Vec::new(),
+            ocean: vec![0; lattice.len().div_ceil(64) as usize],
+            lake_nodes: Vec::new(),
+        }
+    }
+
     /// The bytes the result holds, by capacity.
     pub fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()

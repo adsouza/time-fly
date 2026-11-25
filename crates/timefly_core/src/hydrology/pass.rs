@@ -15,15 +15,15 @@ use super::graph::{Down, RiverGraph};
 use super::lakes::{Accumulation, Flats, place_levels};
 use super::levels::{LakeLevel, shipped_lake_levels};
 use super::params::{
-    CORRIDOR_FRACTION, HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, INCISION_WINDOW_M,
-    PRESENT_FRAME_MAX_MYR, RIVER_MIN_DISCHARGE_M3S,
+    HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, PRESENT_FRAME_MAX_MYR,
+    RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M,
 };
 use super::{CubeLattice, EraHydrology, HydroGraph, Routed, Routing, receiver_of};
 use crate::deep_time::YearsBp;
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
 use crate::surface::{FrameSelection, Timeline};
 use crate::worldgen::coarse::{CoarseField, SnapshotField, snapshot_sea_level_anomaly_m};
-use crate::worldgen::tiles::TileSet;
+use crate::worldgen::tiles::{TILE_MARGIN_M, TileSet};
 
 /// What the pass reads at one lattice node.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -170,10 +170,13 @@ impl NodeSource for SnapshotSource<'_> {
     }
 }
 
-/// How far beyond a region's inner field rivers must be known (m): a segment's relaxation
-/// corridor and the incision window past the lattice's 1.5-spacing reach.
+/// How far beyond a region's inner field its river refinement reads the terrain (m), for
+/// [`CoarseField::tiles_needed_with_margin`]: the farthest read
+/// ([`river_read_reach_m`](crate::worldgen::generate::rivers::river_read_reach_m) at
+/// [`SUBPOINT_M`]) plus [`TILE_MARGIN_M`] for the coarse lattice's taps around it. About 116 km
+/// on the recent lattice.
 pub fn river_tile_margin_m(lattice: &CubeLattice) -> f64 {
-    (1.5 + CORRIDOR_FRACTION) * lattice.mean_spacing_m() + INCISION_WINDOW_M
+    TILE_MARGIN_M + crate::worldgen::generate::rivers::river_read_reach_m(lattice, SUBPOINT_M)
 }
 
 /// Samples of consecutive nodes from `start`, for [`HydroPrep::add_samples`].
@@ -2105,10 +2108,10 @@ mod tests {
         };
         assert_eq!(hydro_lattice_for(&s, 100.0, small).0, CubeLattice { n: 24 });
         assert_eq!(hydro_lattice_for(&s, 0.0, small).0, CubeLattice { n: 45 });
-        // The margin: 1.9 spacings plus the incision window.
+        // The margin: at least the incision window plus two lattice steps and the corridor.
         let m = river_tile_margin_m(&CubeLattice { n: 900 });
         let spacing = CubeLattice { n: 900 }.mean_spacing_m();
-        assert!((m - (1.9 * spacing + 30_000.0)).abs() < 1e-6, "{m}");
+        assert!(m > 30_000.0 + 2.4 * spacing && m < 150_000.0, "{m}");
     }
 
     #[test]

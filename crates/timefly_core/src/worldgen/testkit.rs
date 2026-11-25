@@ -9,9 +9,91 @@ use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_
 use crate::geodynamics::{
     CrustModel, FootprintEntry, PlateFootprints, PlateId, PlateIndex, RotationTable,
 };
+use crate::hydrology::{CubeLattice, Down, EraHydrology, HydroGraph, Lake, RiverGraph};
 use crate::surface::{FrameMeta, FrameSource, Timeline};
+use crate::worldgen::coarse::{CoarseField, CoarseSample, LatticeKey};
 use crate::worldgen::frame::RegionFrame;
 use crate::worldgen::tiles::{TileSet, tests::tile_from};
+
+/// A synthetic coarse field: elevation from a function of the direction, geographic keys.
+pub struct FnField<G: Fn(RenderDir) -> f64 + Sync> {
+    pub f: G,
+    pub spacing_m: f64,
+    pub koppen: Option<u8>,
+}
+
+impl<G: Fn(RenderDir) -> f64 + Sync> CoarseField for FnField<G> {
+    fn sample(&self, era_dir: RenderDir) -> CoarseSample {
+        CoarseSample {
+            elevation_m: (self.f)(era_dir),
+            ice: 0.0,
+            koppen: self.koppen,
+            lattice: LatticeKey::Geographic(era_dir.0),
+        }
+    }
+
+    fn source_spacing_m(&self) -> f64 {
+        self.spacing_m
+    }
+}
+
+/// One river of a synthetic graph: lattice nodes in flow order, each with its discharge and pass
+/// elevation; the last node drains to `end` ([`Down::River`] names a *lattice* node of another
+/// chain).
+#[derive(Clone, Debug)]
+pub struct RiverChain {
+    pub nodes: Vec<u32>,
+    pub q: Vec<f32>,
+    pub bed: Vec<f32>,
+    pub end: Down,
+}
+
+/// An era's hydrology holding exactly `chains` (beds become the running minimum downstream, as
+/// the pass makes them), no ocean bits and no lake footprints.
+pub fn river_hydro(lattice: CubeLattice, chains: &[RiverChain], lakes: Vec<Lake>) -> EraHydrology {
+    let mut info: std::collections::BTreeMap<u32, (Down, f32, f32)> = Default::default();
+    for c in chains {
+        for (k, &v) in c.nodes.iter().enumerate() {
+            let down = match c.nodes.get(k + 1) {
+                Some(&next) => Down::River(next),
+                None => c.end,
+            };
+            assert!(
+                info.insert(v, (down, c.q[k], c.bed[k])).is_none(),
+                "node {v} is in two chains"
+            );
+        }
+    }
+    let nodes: Vec<u32> = info.keys().copied().collect();
+    for (&v, &(down, _, _)) in &info {
+        let end = match down {
+            Down::River(j) | Down::Ocean(j) | Down::Lake(_, j) | Down::Ice(j) => j,
+        };
+        assert!(
+            lattice.neighbours(v).contains(&Some(end)),
+            "{v} -> {end} is not a lattice step"
+        );
+    }
+    let rivers = RiverGraph::build(
+        &lattice,
+        nodes,
+        |v| info[&v].0,
+        |v| (info[&v].1, 1000.0, info[&v].2),
+        &lakes,
+    );
+    EraHydrology::with_rivers(lattice, lakes, rivers)
+}
+
+/// The nodes reached from `start` by `count` steps in neighbour direction `step` (0 = E, 2 = N,
+/// [`crate::hydrology::NEIGHBOUR_STEPS`]), `start` first.
+pub fn lattice_walk(lattice: &CubeLattice, start: u32, step: usize, count: u32) -> Vec<u32> {
+    let mut out = vec![start];
+    for _ in 0..count {
+        let last = *out.last().expect("start is in");
+        out.push(lattice.neighbours(last)[step].expect("an interior step"));
+    }
+    out
+}
 
 pub fn about_y(deg: f32) -> Quat {
     Quat::from_rotation_y(deg.to_radians())

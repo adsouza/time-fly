@@ -58,6 +58,12 @@ pub const WIDTH_EXP: f64 = 0.5;
 pub const DEPTH_COEFF: f64 = 0.27;
 pub const DEPTH_EXP: f64 = 0.39;
 pub const MANNING_N: f64 = 0.035;
+/// Hydraulic geometry reads discharge clamped to this *(Task 5's call)*: above the Amazon's
+/// wet-season flow, so no real river is touched, and it bounds a channel's reach (its valley
+/// and meanders), which the region's tile margin must cover ([`river_tile_margin_m`]).
+///
+/// [`river_tile_margin_m`]: super::river_tile_margin_m
+pub const MAX_CHANNEL_DISCHARGE_M3S: f64 = 300_000.0;
 
 // Speeds: lowland speeds lie in `LOWLAND_SPEED_MS`; rapids run at
 // `RAPID_SPEED_BASE_MS + RAPID_SPEED_GAIN_MS · rapid`, where `rapid` is the smoothstep of the

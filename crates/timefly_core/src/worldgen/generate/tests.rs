@@ -4,34 +4,11 @@ use crate::formats::Grid;
 use crate::geodynamics::{CrustModel, PlateIndex};
 use crate::globe::{PlateRotations, plate_rotations, rendered_surface};
 use crate::surface::FrameSelection;
-use crate::worldgen::coarse::{CoarseSample, LatticeKey};
 use crate::worldgen::coarse::{DeepField, RecentField, SnapshotField, snapshot_field};
 use crate::worldgen::testkit::*;
 use crate::worldgen::tiles::TileSet;
 use bevy_math::DVec3;
 use proptest::prelude::*;
-
-/// A synthetic coarse field: elevation from a function of the direction, geographic keys.
-struct FnField<G: Fn(RenderDir) -> f64 + Sync> {
-    f: G,
-    spacing_m: f64,
-    koppen: Option<u8>,
-}
-
-impl<G: Fn(RenderDir) -> f64 + Sync> CoarseField for FnField<G> {
-    fn sample(&self, era_dir: RenderDir) -> CoarseSample {
-        CoarseSample {
-            elevation_m: (self.f)(era_dir),
-            ice: 0.0,
-            koppen: self.koppen,
-            lattice: LatticeKey::Geographic(era_dir.0),
-        }
-    }
-
-    fn source_spacing_m(&self) -> f64 {
-        self.spacing_m
-    }
-}
 
 fn spec_at(centre: RenderDir, ma: f64, inner_res: u32, apron_res: u32) -> RegionSpec {
     RegionSpec {
@@ -854,6 +831,115 @@ fn deep_tiles_needed_cover_every_inner_read() {
         "the era square alone misses carried reads"
     );
     assert_eq!(g_era.2, g_all.2, "the apron reads only the overview");
+}
+
+#[test]
+fn tiles_needed_covers_every_river_read() {
+    use crate::hydrology::params::{INCISION_WINDOW_M, RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M};
+    use crate::hydrology::{CubeLattice, Down, river_tile_margin_m};
+    use std::sync::Mutex;
+    // The 1 Ma deep field of `deep_tiles_needed_cover_every_inner_read`: plate 101's present-day
+    // reads sit 0.9 degrees west of the era frame. Centred at lon -87.3, the carried inner
+    // square plus 5 km stays east of the tile edge at -90, but the reads of a river's upstream
+    // window west of the square cross it.
+    let crust = rift(0);
+    let frames = rift_frames(|_| (500.0, true));
+    let centre = dir(0.0, -87.3);
+    let frame = RegionFrame { center: centre };
+    let lattice = CubeLattice { n: 900 };
+    let margin = river_tile_margin_m(&lattice);
+    let probe = TileSet::new();
+    let needed = rift_deep(&crust, &frames, &probe, 1.0).tiles_needed_with_margin(&frame, margin);
+    // A 150,000-250,000 m³/s river flowing east through the region from 420 km west of its
+    // centre.
+    let mut nodes: Vec<u32> = Vec::new();
+    for k in 0..=840 {
+        let x = -420_000.0 + 1000.0 * f64::from(k);
+        let v = lattice.nearest(frame.local_to_dir(x, 10_000.0));
+        if nodes.last() != Some(&v) {
+            nodes.push(v);
+        }
+    }
+    let mouth = nodes.pop().expect("nodes");
+    let len = nodes.len();
+    let hydro = river_hydro(
+        lattice,
+        &[RiverChain {
+            q: (0..len).map(|k| 150_000.0 + 200.0 * k as f32).collect(),
+            bed: (0..len).map(|k| 400.0 - 4.0 * k as f32).collect(),
+            nodes,
+            end: Down::Ocean(mouth),
+        }],
+        vec![],
+    );
+    // Tiles at 100 m, the overview at 300 m: a read that misses a tile shows.
+    let with = |tiles: &[(u8, u8)]| {
+        let mut set = TileSet::new();
+        for &(r, c) in tiles {
+            set.insert(
+                r,
+                c,
+                crate::worldgen::tiles::tests::tile_from(r, c, |_, _| (100.0, 1)),
+            )
+            .unwrap();
+        }
+        set.set_overview(flat_overview(300.0, 0)).unwrap();
+        set
+    };
+    let exact = with(&needed);
+    let field = rift_deep(&crust, &frames, &exact, 1.0);
+    let reads: Mutex<Vec<RenderDir>> = Mutex::new(Vec::new());
+    let floor_at = |d: RenderDir| {
+        reads.lock().unwrap().push(d);
+        field.sample(d).elevation_m
+    };
+    let key_at = |d: RenderDir| (d.0, 1);
+    let mut builder = super::rivers::RiverBuilder::new(
+        &hydro,
+        &frame,
+        REGION_SIZE_M / 2.0,
+        SUBPOINT_M,
+        RIVER_MIN_DISCHARGE_M3S as f32,
+    );
+    while !builder.step(&floor_at, &key_at, 10_000) {}
+    let rivers = builder.finish();
+    assert!(!rivers.subpoints().is_empty());
+    let reads = reads.into_inner().unwrap();
+    assert!(reads.len() > 10_000, "{} reads", reads.len());
+    // Exactly the needed tiles read like every tile (the M2 pattern).
+    let mut everything: Vec<(u8, u8)> = Vec::new();
+    for r in 15..21 {
+        for c in 12..24 {
+            everything.push((r, c));
+        }
+    }
+    let all_tiles = with(&everything);
+    let all = rift_deep(&crust, &frames, &all_tiles, 1.0);
+    let misses = |field: &SnapshotField| {
+        reads
+            .iter()
+            .filter(|&&d| field.sample(d).elevation_m != all.sample(d).elevation_m)
+            .count()
+    };
+    assert_eq!(misses(&field), 0, "every river read lies in a needed tile");
+    // The hazards: the inner field's own tiles miss reads, and the reads reach past Task 3's
+    // margin (1.9 spacings plus the incision window).
+    let inner_tiles = rift_deep(&crust, &frames, &probe, 1.0).tiles_needed(&frame);
+    let inner = with(&inner_tiles);
+    assert!(misses(&rift_deep(&crust, &frames, &inner, 1.0)) > 0);
+    let basis = frame.basis();
+    let beyond = reads
+        .iter()
+        .map(|&d| {
+            let (x, z) = basis.dir_to_local(d).unwrap();
+            x.abs().max(z.abs()) - REGION_SIZE_M / 2.0
+        })
+        .fold(f64::MIN, f64::max);
+    let old = 1.9 * lattice.mean_spacing_m() + INCISION_WINDOW_M;
+    assert!(
+        beyond > old && beyond < margin,
+        "{beyond} vs {old}, {margin}"
+    );
 }
 
 /// Steps a prep through with `max_nodes` per step; returns (slowest step before the last,

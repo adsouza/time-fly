@@ -393,9 +393,9 @@ impl CoarseField for DeepField<'_> {
         }
     }
 
-    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+    fn tiles_needed_with_margin(&self, frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
         if self.is_modern() {
-            self.modern_tiles_needed(frame)
+            self.modern_tiles_needed(frame, margin_m)
         } else {
             Vec::new()
         }

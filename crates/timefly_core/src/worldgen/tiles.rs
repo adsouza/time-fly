@@ -210,20 +210,35 @@ impl TileSet {
     /// ([`CoarseField::tiles_needed`](crate::worldgen::coarse::CoarseField::tiles_needed)),
     /// which also covers reads moved by plate rotations.
     pub fn needed_for(frame: &RegionFrame) -> Vec<(u8, u8)> {
-        Self::covering(frame, REGION_SIZE_M, DQuat::IDENTITY)
+        Self::needed_for_margin(frame, TILE_MARGIN_M)
+    }
+
+    /// [`needed_for`](Self::needed_for) with the inner field widened by `margin_m` instead of
+    /// [`TILE_MARGIN_M`] (a region's river reads, `river_tile_margin_m`).
+    pub fn needed_for_margin(frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
+        Self::covering(frame, REGION_SIZE_M, margin_m, DQuat::IDENTITY)
     }
 
     /// [`needed_for`](Self::needed_for) for reads at `q · d` instead of `d`: the inner field
     /// carried rigidly by the rotation `q` (a plate's era-to-present rotation).
     pub fn needed_for_rotated(frame: &RegionFrame, q: DQuat) -> Vec<(u8, u8)> {
-        Self::covering(frame, REGION_SIZE_M, q)
+        Self::needed_for_rotated_margin(frame, q, TILE_MARGIN_M)
     }
 
-    /// The tiles the square of side `size_m` (plus the margin), carried by the rotation `q`,
-    /// touches. The image's latitude and longitude extremes lie on its boundary unless it
-    /// contains a pole, in which case it takes whole rows of tiles.
-    fn covering(frame: &RegionFrame, size_m: f64, q: DQuat) -> Vec<(u8, u8)> {
-        let half = size_m / 2.0 + TILE_MARGIN_M;
+    /// [`needed_for_rotated`](Self::needed_for_rotated) widened by `margin_m`.
+    pub fn needed_for_rotated_margin(
+        frame: &RegionFrame,
+        q: DQuat,
+        margin_m: f64,
+    ) -> Vec<(u8, u8)> {
+        Self::covering(frame, REGION_SIZE_M, margin_m, q)
+    }
+
+    /// The tiles the square of side `size_m` plus `margin_m` on every side, carried by the
+    /// rotation `q`, touches. The image's latitude and longitude extremes lie on its boundary
+    /// unless it contains a pole, in which case it takes whole rows of tiles.
+    fn covering(frame: &RegionFrame, size_m: f64, margin_m: f64, q: DQuat) -> Vec<(u8, u8)> {
+        let half = size_m / 2.0 + margin_m;
         let basis = frame.basis();
         let q = q.normalize();
         let image = |d: RenderDir| RenderDir((q * d.0).normalize());
@@ -460,7 +475,7 @@ pub(crate) mod tests {
                 crate::worldgen::APRON_SIZE_M,
             ] {
                 let frame = frame_at(lat, lon);
-                let needed = TileSet::covering(&frame, size, DQuat::IDENTITY);
+                let needed = TileSet::covering(&frame, size, TILE_MARGIN_M, DQuat::IDENTITY);
                 if size == crate::worldgen::REGION_SIZE_M {
                     assert_eq!(needed, TileSet::needed_for(&frame));
                 }

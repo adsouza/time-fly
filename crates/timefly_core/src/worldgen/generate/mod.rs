@@ -47,6 +47,7 @@ use crate::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
 
 mod detail;
 mod lattice;
+pub mod rivers;
 
 pub use detail::coastline_clamp;
 use detail::{Detail, octaves_for, smoothstep};
