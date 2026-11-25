@@ -312,9 +312,11 @@ below the cloud reads as the same place (§10).
      time, so that faster flight starts the preload earlier.
 
    The neighbour starts
-   generating. Its centre is ahead of the fly along its heading, snapped to the shared lattice,
+   generating. Its centre is ahead of the fly along its heading, past the edge it reaches first,
    so the fly arrives well inside it with room to continue *(call: about 100 km past the
-   current edge)*. One preload at a time. Turning away cancels it; a new heading retargets it
+   current edge)*. *(Not snapped to a lattice: every centre agrees on the planet-wide sample
+   lattice, so snapping buys nothing; the plan's ruling, "No lattice snapping of neighbour
+   centres", and its Task 9 ruling on the first edge reached.)* One preload at a time. Turning away cancels it; a new heading retargets it
    *(call)*.
 2. **The lift:** as the fly reaches the edge, it is lifted gently to about **60 km** (owner), and
    the cloud bank gathers around it. A fly already above 60 km is not lifted; the cloud forms
