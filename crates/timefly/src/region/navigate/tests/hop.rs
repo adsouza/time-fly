@@ -1794,9 +1794,77 @@ fn max_whiteout_frames(dt_s: f32) -> usize {
 }
 
 /// The most frames at `dt_s` a hop's end (the clear and the return to its height) may last
-/// (I2): the clear, and the return from the hop's height at the M2 speed for the height.
+/// (I2): [`HOP_END_MAX_S`], whatever the ground does to the return (the final review).
 fn max_ending_frames(dt_s: f32) -> usize {
-    ((CLOUD_CLEAR_S as f32 + 10.0) / dt_s).ceil() as usize
+    (HOP_END_MAX_S / dt_s).ceil() as usize + 1
+}
+
+/// An ended hop (swapped into the neighbour) in the Alps' region, `agl_m` above the ground,
+/// returning to `back_to_m`.
+fn hop_end(agl_m: f32, back_to_m: f32) -> (NavPhase, NavInputs) {
+    let phase = NavPhase::Hopping {
+        centre: east_of_alps(),
+        edge: HopEdge { axis: 0, side: 1.0 },
+        lift_from_agl_m: back_to_m,
+        swapped: true,
+        elapsed_s: 0.0,
+        lift: 1.0,
+        failed: false,
+        turned_back: false,
+    };
+    (phase, in_alps(0.0, agl_m))
+}
+
+/// The final review: over steep ground under boosted flight `ReturnToAgl` may never get within
+/// a metre, which held the slider and confined the fly at the next edge. The end is bounded:
+/// past the clear it lasts at most `HOP_END_MAX_S`.
+#[test]
+fn a_hops_end_is_bounded_when_the_return_never_arrives() {
+    // The shell never gets the fly nearer than 5 km to its height: the ground under it keeps
+    // rising and falling faster than the return.
+    let (mut phase, i) = hop_end(HOP_ALTITUDE_M as f32, 2_000.0);
+    let i = NavInputs {
+        region_height_m: i.region_ground_m + 7_000.0,
+        ..i
+    };
+    let mut frames = 0;
+    while phase != NavPhase::Flying {
+        let (next, actions) = step_nav(phase, &i);
+        assert!(
+            has(&actions, |a| matches!(a, NavAction::ReturnToAgl { .. })),
+            "{actions:?}"
+        );
+        phase = next;
+        frames += 1;
+        assert!(frames <= max_ending_frames(i.dt_s), "{phase:?}");
+    }
+    let ended = frames as f32 * i.dt_s;
+    assert!(
+        (ended - HOP_END_MAX_S).abs() <= i.dt_s + 1e-4,
+        "{ended} s against {HOP_END_MAX_S} s"
+    );
+    // The cap is past the clear.
+    assert!(HOP_END_MAX_S > CLOUD_CLEAR_S as f32);
+}
+
+/// The cap never cuts a return short over flat ground: the longest, from the hop's height down
+/// to the lowest the fly flies (its clearance over the ground), arrives before it.
+#[test]
+fn a_return_over_flat_ground_arrives_before_the_cap() {
+    let low = crate::fly_camera::CAMERA_CLEARANCE_M;
+    let (mut phase, mut i) = hop_end(HOP_ALTITUDE_M as f32, low);
+    let mut t = 0.0;
+    while phase != NavPhase::Flying {
+        phase = frame(phase, &mut i).0;
+        t += i.dt_s;
+        assert!(t < 60.0, "{phase:?}");
+    }
+    let agl = i.region_height_m - i.region_ground_m;
+    assert!((agl - low).abs() <= 1.0, "ended {agl} m up, for {low} m");
+    assert!(
+        t < HOP_END_MAX_S - 1.0,
+        "{t} s against the cap {HOP_END_MAX_S} s"
+    );
 }
 
 /// The re-review's Important (fix round 4): a moment's turn back in the hold (a tap of `S`, a

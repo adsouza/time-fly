@@ -262,7 +262,8 @@ pub enum NavPhase {
     /// - **I1.** The fly is outside the inner field only in the hold (at full cover, the one
     ///   place [`FlyControls::confined`] is off), drawn at density exactly 1.
     /// - **I2.** The white-out is bounded whatever the player and the neighbour job do: the hold
-    ///   lasts at most [`HOLD_MAX_S`], and the end starts clearing on its first frame.
+    ///   lasts at most [`HOLD_MAX_S`], and the end starts clearing on its first frame and lasts
+    ///   at most [`HOP_END_MAX_S`], whatever the ground does to the return.
     /// - **I3.** A swap happens on a frame drawn opaque after one drawn opaque, to the neighbour
     ///   asked for and ready, while the fly still flies out of `edge`; turning back from the
     ///   hold drops the neighbour, so that hop never swaps.
@@ -378,6 +379,13 @@ pub const HOLD_DRIFT: f32 = 0.05;
 pub const HOLD_MAX_S: f32 = 2.0 * crate::region::LOAD_TIMEOUT_S as f32;
 /// A hop's return to the fly's height above the ground is done within this.
 const RETURNED_M: f32 = 1.0;
+/// The longest a hop's end lasts (s): the clear ([`CLOUD_CLEAR_S`]) plus 12 s for the return to
+/// the fly's height *(call)*. The slowest return over flat ground, from [`HOP_ALTITUDE_M`] down to
+/// the fly's clearance over the ground at the M2 speed for its height, takes about 10 s. Over
+/// steep ground under boosted flight the return may never get within [`RETURNED_M`], and the
+/// end holds the slider and confines the fly (the next edge cannot hop) until it ends, so it
+/// ends here whatever the return does (the final review).
+pub const HOP_END_MAX_S: f32 = CLOUD_CLEAR_S as f32 + 12.0;
 
 impl NavPhase {
     /// Whether the region camera, rather than the globe camera, should be showing.
@@ -1203,7 +1211,8 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
 
 /// A hop that has ended under the cloud (`swapped`, or turned back): the cloud clears over
 /// [`CLOUD_CLEAR_S`] while the fly, `agl_m` above the ground, returns to `lift_from_agl_m`
-/// (climbing or descending makes the player's height the one to keep); then flying.
+/// (climbing or descending makes the player's height the one to keep); then flying, once
+/// returned or after [`HOP_END_MAX_S`] in all.
 fn step_hop_end(
     hop: NavPhase,
     agl_m: f32,
@@ -1223,7 +1232,7 @@ fn step_hop_end(
     };
     // Every ending put the fly inside the field, where the end's controls keep it: the clear
     // starts at once and nothing holds it (fix round 4).
-    let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32);
+    let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(HOP_END_MAX_S);
     let lift_from_agl_m = if i.vertical_held {
         agl_m
     } else {
@@ -1235,7 +1244,8 @@ fn step_hop_end(
             agl_m: lift_from_agl_m,
         });
     }
-    if returned && elapsed_s >= CLOUD_CLEAR_S as f32 {
+    let cleared = elapsed_s >= CLOUD_CLEAR_S as f32;
+    if cleared && (returned || elapsed_s >= HOP_END_MAX_S) {
         NavPhase::Flying
     } else {
         NavPhase::Hopping {
