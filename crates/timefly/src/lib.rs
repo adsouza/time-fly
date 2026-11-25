@@ -19,6 +19,7 @@ pub mod fly_camera;
 pub mod globe;
 pub mod globe_flight;
 pub mod gpu;
+pub mod hydro;
 pub mod region;
 pub mod sky;
 pub mod terrain;
@@ -38,6 +39,7 @@ use diagnostics::{DiagnosticsPlugin, Session};
 use fly_camera::FlyCameraPlugin;
 use globe::GlobePlugin;
 use globe_flight::GlobeFlightPlugin;
+use hydro::HydroPlugin;
 use region::RegionPlugin;
 use region::launch::LaunchRegion;
 use region::navigate::RegionNavigationPlugin;
@@ -155,7 +157,8 @@ pub fn app(session: &Session) -> App {
         time::TimePlugin,
         GlobeDataPlugin::default(),
         GlobePlugin,
-        RegionPlugin,
+        // The pass shares the region plugin's tile index and frame cache.
+        (RegionPlugin, HydroPlugin),
         TerrainCdlodPlugin,
         sky::SkyPlugin,
         water::WaterPlugin,

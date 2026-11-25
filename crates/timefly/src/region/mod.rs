@@ -6,14 +6,15 @@
 //! [`RegionRequested`]):
 //!
 //! 1. **Frames.** The globe frames the snapshot's coarse field reads (`frames_needed`), from the
-//!    bounded [`FrameCache`] or loaded again as [`CpuGrid`]s; the tile manifest on the first
-//!    request.
+//!    bounded [`FrameCache`] or loaded again as [`CpuGrid`]s ([`frames::FrameLoads`], shared
+//!    with the continental pass).
 //! 2. **Tiles.** A probe field gives the tiles the inner field reads (`tiles_needed`, which
 //!    follows plate rotations). Tiles not in the [`TileCache`] load through the asset server,
-//!    checked against the manifest. The overview loads once per session, outside any job, so
-//!    cancelling a request never cancels it. A missing or
-//!    corrupt tile is a `warn` and makes the region fall back (`fallback == true`), never a
-//!    failure.
+//!    checked against the manifest. The manifest and the overview load once per session, as
+//!    soon as the globe data is ready and outside any job, so cancelling a request never
+//!    cancels them. A missing or corrupt tile is a `warn` and makes the region fall back
+//!    (`fallback == true`), never a failure. With the tiles in, the job waits for its era's
+//!    continental pass ([`crate::hydro::HydroGate`]; [`RegionGenerated::hydro_wait_ms`]).
 //! 3. **Generation.** Native: the prep on an
 //!    [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool) task, then the rows
 //!    across the pool. Web: time-boxed slices of [`WEB_GEN_BUDGET_MS`] per frame, or
@@ -53,10 +54,10 @@ pub use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, LoadClock, advance_load_clock};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use frames::{CpuGrid, CpuGridLoader, FrameCache};
 pub use job::LOAD_TIMEOUT_S;
-pub(crate) use job::RegionJob;
+pub(crate) use job::{RegionJob, TileIndex, load_timed_out};
 use job::{
-    TileIndex, advance_frames, advance_tiles, cancel_preload, leave_region, poll_generation,
-    poll_overview, poll_tile_manifest, start_region_request, swap_region,
+    advance_frames, advance_tiles, cancel_preload, leave_region, poll_generation, poll_overview,
+    poll_tile_manifest, start_region_request, swap_region,
 };
 use tiles::{TileCache, TileManifest, TileManifestLoader};
 
@@ -155,9 +156,11 @@ pub struct RegionPreloadFailed {
     pub reason: String,
 }
 /// Domain event: a region's grid is ready. `millis` runs from the request to the grid being
-/// ready; `tiles_fetched` counts tiles loaded for it (cache hits excluded) and `bytes_fetched`
-/// their file bytes (the session's one-time manifest and overview not included); `fallback`
-/// says some tile it needs is missing, so part of the inner field uses globe-resolution data.
+/// ready, less the wait for the era's continental pass (`hydro_wait_ms`, reported apart: the
+/// generation-time targets bound the region's own work); `tiles_fetched` counts tiles loaded
+/// for it (cache hits excluded) and `bytes_fetched` their file bytes (the session's one-time
+/// manifest and overview not included); `fallback` says some tile it needs is missing, so part
+/// of the inner field uses globe-resolution data.
 #[derive(Message, Copy, Clone, Debug, PartialEq)]
 pub struct RegionGenerated {
     pub spec: RegionSpec,
@@ -167,6 +170,13 @@ pub struct RegionGenerated {
     /// Globe frame files loaded for it (0 when the frame cache held them all).
     pub frames_fetched: u32,
     pub fallback: bool,
+    /// How long the job waited for its era's continental pass (0 when it was cached, disabled
+    /// or failed), rounded up to whole milliseconds.
+    pub hydro_wait_ms: u32,
+    /// Whether the region generated with its era's hydrology ([`GenInputs::hydro`]).
+    ///
+    /// [`GenInputs::hydro`]: generate::GenInputs::hydro
+    pub hydrology: bool,
 }
 
 /// Domain event: the player entered a region from the globe (or from a region at the same

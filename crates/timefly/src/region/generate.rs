@@ -17,6 +17,7 @@ use std::time::Duration;
 use bevy::platform::time::Instant;
 use timefly_core::formats::Grid;
 use timefly_core::geodynamics::CrustModel;
+use timefly_core::hydrology::EraHydrology;
 use timefly_core::surface::Timeline;
 use timefly_core::worldgen::coarse::{
     CoarseField, FieldError, SnapshotField, frames_needed, snapshot_field,
@@ -63,6 +64,9 @@ pub struct GenInputs {
     pub frames: Vec<Option<Arc<Grid>>>,
     /// Some needed tile is missing (`tiles.missing(&needed)` is not empty).
     pub fallback: bool,
+    /// The era's continental pass ([`crate::hydro`]), or `None` when it is disabled or failed.
+    /// Task 7 hands it to the generator; for now it only travels with the inputs.
+    pub hydro: Option<Arc<EraHydrology>>,
 }
 
 fn field<'a>(
@@ -172,7 +176,7 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
 }
 
 /// A future that is pending once: it hands control back to whoever polls the run.
-struct YieldOnce(bool);
+pub(crate) struct YieldOnce(pub(crate) bool);
 
 impl Future for YieldOnce {
     type Output = ();
@@ -190,53 +194,62 @@ impl Future for YieldOnce {
 /// A slice budget the run reads at every check and its owner may change between slices
 /// ([`BudgetedRun::set_budget`]), in nanoseconds.
 #[derive(Clone, Debug)]
-struct SharedBudget(Arc<AtomicU64>);
+pub(crate) struct SharedBudget(Arc<AtomicU64>);
 
 impl SharedBudget {
-    fn new(budget: Duration) -> SharedBudget {
+    pub(crate) fn new(budget: Duration) -> SharedBudget {
         let b = SharedBudget(Arc::new(AtomicU64::new(0)));
         b.set(budget);
         b
     }
 
-    fn set(&self, budget: Duration) {
+    pub(crate) fn set(&self, budget: Duration) {
         let nanos = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
         self.0.store(nanos, Ordering::Relaxed);
     }
 
-    fn get(&self) -> Duration {
+    pub(crate) fn get(&self) -> Duration {
         Duration::from_nanos(self.0.load(Ordering::Relaxed))
     }
 }
 
 /// The time spent in the current slice, and the slices so far.
-struct Slice {
+pub(crate) struct Slice {
     budget: SharedBudget,
     started: Instant,
-    count: u32,
-    longest: Duration,
+    pub(crate) count: u32,
+    pub(crate) longest: Duration,
+    /// The time of every slice so far, the current one up to its last [`Slice::record`].
+    pub(crate) total: Duration,
+    /// The time of the finished slices.
+    done: Duration,
 }
 
 impl Slice {
-    fn new(budget: SharedBudget) -> Slice {
+    pub(crate) fn new(budget: SharedBudget) -> Slice {
         Slice {
             budget,
             started: Instant::now(),
             count: 1,
             longest: Duration::ZERO,
+            total: Duration::ZERO,
+            done: Duration::ZERO,
         }
     }
 
-    /// Counts the time spent so far in this slice towards the longest slice.
-    fn record(&mut self) -> Duration {
+    /// Counts the time spent so far in this slice towards the longest slice and the total.
+    pub(crate) fn record(&mut self) -> Duration {
         let spent = self.started.elapsed();
         self.longest = self.longest.max(spent);
+        self.total = self.done + spent;
         spent
     }
 
     /// Yields when the slice's budget is spent and starts the next slice on resuming.
-    async fn yield_if_spent(&mut self) {
-        if self.record() >= self.budget.get() {
+    pub(crate) async fn yield_if_spent(&mut self) {
+        let spent = self.record();
+        if spent >= self.budget.get() {
+            self.done += spent;
             YieldOnce(false).await;
             self.started = Instant::now();
             self.count += 1;

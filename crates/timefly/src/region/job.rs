@@ -14,13 +14,13 @@ use timefly_core::deep_time::YearsBp;
 use timefly_core::formats::Grid;
 use timefly_core::geo::RenderDir;
 use timefly_core::surface::Timeline;
-use timefly_core::worldgen::coarse::{frames_needed, snapshot_sea_level_anomaly_m};
+use timefly_core::worldgen::coarse::snapshot_sea_level_anomaly_m;
 #[cfg(not(target_arch = "wasm32"))]
 use timefly_core::worldgen::generate::RegionGrid;
 use timefly_core::worldgen::generate::RegionSpec;
 use tracing::instrument;
 
-use super::frames::{CpuGrid, CpuGridSettings, FrameCache};
+use super::frames::{CpuGrid, CpuGridSettings, FrameCache, FrameLoads, take_grid};
 #[cfg(not(target_arch = "wasm32"))]
 use super::generate::GenError;
 use super::generate::{self, BudgetedRun, GenInputs};
@@ -37,6 +37,7 @@ use crate::clock::LoadClock;
 #[cfg(test)]
 use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, advance_load_clock};
 use crate::data::{GlobeData, describe_load_error};
+use crate::hydro::{HydroGate, HydroWait};
 
 /// A load that has not finished after this long is abandoned, so a stalled fetch (not a 404,
 /// which fails at once) never leaves "Descending..." up: a tile or the overview counts as
@@ -67,7 +68,7 @@ struct Loading<A: Asset> {
     started_s: f64,
 }
 
-/// The tile manifest, loaded on the first request and kept.
+/// The tile manifest, loaded once the globe data is ready and kept.
 #[derive(Default)]
 enum ManifestState {
     #[default]
@@ -92,10 +93,11 @@ enum OverviewState {
     Failed,
 }
 
-/// Session-wide tile data loads. They belong to no job, so a superseded or abandoned request
-/// never cancels them.
+/// Session-wide tile data loads, started once the globe data is ready (the continental pass
+/// reads the overview with no region requested). They belong to no job, so a superseded or
+/// abandoned request never cancels them.
 #[derive(Resource, Default)]
-pub(super) struct TileIndex {
+pub(crate) struct TileIndex {
     manifest: ManifestState,
     overview: OverviewState,
 }
@@ -108,7 +110,8 @@ impl TileIndex {
         )
     }
 
-    fn overview_settled(&self) -> bool {
+    /// Whether the overview is in the [`TileCache`] or unavailable for the session.
+    pub(crate) fn overview_settled(&self) -> bool {
         matches!(self.overview, OverviewState::Ready | OverviewState::Failed)
     }
 
@@ -118,14 +121,6 @@ impl TileIndex {
             _ => None,
         }
     }
-}
-
-/// A frame file loading for some timeline frames (repeated files share one load).
-struct PendingFrame {
-    slot: u32,
-    frames: Vec<usize>,
-    handle: Handle<CpuGrid>,
-    started_s: f64,
 }
 
 /// A tile loading.
@@ -144,12 +139,7 @@ enum Running {
 }
 
 enum Stage {
-    Frames {
-        /// The image slots this request reads, kept in the [`FrameCache`].
-        slots: Vec<u32>,
-        pending: Vec<PendingFrame>,
-        frames: Vec<Option<Arc<Grid>>>,
-    },
+    Frames(FrameLoads),
     Tiles {
         frames: Vec<Option<Arc<Grid>>>,
         needed: Vec<(u8, u8)>,
@@ -158,12 +148,17 @@ enum Stage {
         pending: Vec<PendingTile>,
         fetched: u32,
         bytes: u64,
+        /// The wait for the era's continental pass, once the tiles are in.
+        hydro: HydroWait,
     },
     Running {
         run: Running,
         tiles_fetched: u32,
         bytes_fetched: u64,
         fallback: bool,
+        /// How long the job waited for the era's continental pass.
+        hydro_wait: Duration,
+        hydrology: bool,
     },
 }
 
@@ -182,17 +177,22 @@ pub(crate) struct RegionJob {
 }
 
 impl RegionJob {
-    /// Its purpose and stage, for diagnostics: `neighbour/frames`, `enter/running` and so on.
+    /// Its purpose and stage, for diagnostics: `neighbour/frames`, `enter/running`,
+    /// `snapshot/hydro` (waiting for the era's continental pass) and so on.
     pub(crate) fn describe(&self) -> &'static str {
         use RequestPurpose::{Enter, Neighbour, Snapshot};
+        let waiting = matches!(&self.stage, Stage::Tiles { hydro, .. } if hydro.waiting());
         match (self.purpose, &self.stage) {
-            (Enter, Stage::Frames { .. }) => "enter/frames",
+            (Enter, Stage::Frames(_)) => "enter/frames",
+            (Enter, Stage::Tiles { .. }) if waiting => "enter/hydro",
             (Enter, Stage::Tiles { .. }) => "enter/tiles",
             (Enter, Stage::Running { .. }) => "enter/running",
-            (Snapshot, Stage::Frames { .. }) => "snapshot/frames",
+            (Snapshot, Stage::Frames(_)) => "snapshot/frames",
+            (Snapshot, Stage::Tiles { .. }) if waiting => "snapshot/hydro",
             (Snapshot, Stage::Tiles { .. }) => "snapshot/tiles",
             (Snapshot, Stage::Running { .. }) => "snapshot/running",
-            (Neighbour, Stage::Frames { .. }) => "neighbour/frames",
+            (Neighbour, Stage::Frames(_)) => "neighbour/frames",
+            (Neighbour, Stage::Tiles { .. }) if waiting => "neighbour/hydro",
             (Neighbour, Stage::Tiles { .. }) => "neighbour/tiles",
             (Neighbour, Stage::Running { .. }) => "neighbour/running",
         }
@@ -217,19 +217,6 @@ pub(super) fn spec_for(
         apron_res: settings.apron_res,
         sea_level_anomaly_m: snapshot_sea_level_anomaly_m(timeline, request.snapshot.myr()),
     })
-}
-
-/// The frame files a snapshot reads: each image slot once, with the timeline frames it serves.
-fn frame_files(timeline: &Timeline, age_myr: f64) -> Vec<(u32, Vec<usize>)> {
-    let mut files: Vec<(u32, Vec<usize>)> = Vec::new();
-    for frame in frames_needed(timeline, age_myr) {
-        let slot = timeline.frames()[frame].image_slot;
-        match files.iter_mut().find(|(s, _)| *s == slot) {
-            Some((_, frames)) => frames.push(frame),
-            None => files.push((slot, vec![frame])),
-        }
-    }
-    files
 }
 
 pub(super) fn leave_region(
@@ -296,7 +283,6 @@ pub(super) fn start_region_request(
     globe: Option<Res<GlobeData>>,
     server: Res<AssetServer>,
     settings: Res<RegionSettings>,
-    mut index: ResMut<TileIndex>,
     mut frame_cache: ResMut<FrameCache>,
     active: Option<Res<ActiveRegion>>,
     job: Option<Res<RegionJob>>,
@@ -376,32 +362,13 @@ pub(super) fn start_region_request(
     };
     // A new job supersedes any ready neighbour, which may be at another snapshot.
     pending.region = None;
-    if matches!(index.manifest, ManifestState::Idle) {
-        index.manifest = ManifestState::Loading(Loading {
-            handle: server.load(TILE_MANIFEST_PATH),
-            started_s: now_s,
-        });
-    }
-    let timeline = &globe.timeline;
-    let mut frames = vec![None; timeline.frames().len()];
-    let mut slots = Vec::new();
-    let mut pending = Vec::new();
-    for (slot, served) in frame_files(timeline, spec.snapshot.myr()) {
-        slots.push(slot);
-        match frame_cache.get(slot) {
-            Some(grid) => {
-                for &f in &served {
-                    frames[f] = Some(grid.clone());
-                }
-            }
-            None => pending.push(PendingFrame {
-                slot,
-                handle: server.load::<CpuGrid>(globe.frame_path(served[0]).clone()),
-                frames: served,
-                started_s: now_s,
-            }),
-        }
-    }
+    let loads = FrameLoads::start(
+        &globe,
+        spec.snapshot.myr(),
+        &server,
+        &mut frame_cache,
+        now_s,
+    );
     let replaces = active
         .filter(|_| !preload)
         .map(|a| a.grid.spec.snapshot)
@@ -411,24 +378,29 @@ pub(super) fn start_region_request(
         purpose,
         started: Instant::now(),
         replaces,
-        frames_fetched: u32::try_from(pending.len()).unwrap_or(u32::MAX),
-        stage: Stage::Frames {
-            slots,
-            pending,
-            frames,
-        },
+        frames_fetched: loads.fetched(),
+        stage: Stage::Frames(loads),
     });
     if !preload {
         next.set_if_different(RegionState::Generating);
     }
 }
 
+/// Starts the tile manifest's load once the globe data is ready (before any region request:
+/// the continental pass reads the overview), and takes it in when it arrives.
 pub(super) fn poll_tile_manifest(
     mut index: ResMut<TileIndex>,
     server: Res<AssetServer>,
     mut manifests: ResMut<Assets<TileManifest>>,
+    globe: Option<Res<GlobeData>>,
     clock: Res<LoadClock>,
 ) {
+    if matches!(index.manifest, ManifestState::Idle) && globe.is_some() {
+        index.manifest = ManifestState::Loading(Loading {
+            handle: server.load(TILE_MANIFEST_PATH),
+            started_s: clock.elapsed_s,
+        });
+    }
     let ManifestState::Loading(Loading { handle, started_s }) = &index.manifest else {
         return;
     };
@@ -563,12 +535,6 @@ fn fail(
     next.set_if_different(RegionState::Globe);
 }
 
-/// Takes a loaded CPU grid out of the asset storage (dropping the caller's handle afterwards
-/// leaves no copy behind).
-fn take_grid(grids: &mut Assets<CpuGrid>, handle: &Handle<CpuGrid>) -> Option<Arc<Grid>> {
-    grids.remove(handle).map(|CpuGrid(grid)| Arc::new(grid))
-}
-
 fn load_checked(server: &AssetServer, path: &str, settings: CpuGridSettings) -> Handle<CpuGrid> {
     server
         .load_builder()
@@ -594,56 +560,20 @@ pub(super) fn advance_frames(
     let Some(mut job) = job else { return };
     let spec = job.spec;
     let purpose = job.purpose;
-    let Stage::Frames {
-        slots,
-        pending,
-        frames,
-    } = &mut job.stage
-    else {
+    let Stage::Frames(loads) = &mut job.stage else {
         return;
     };
-    let mut failure = None;
-    pending.retain(|p| match server.load_state(&p.handle) {
-        LoadState::Loaded => match take_grid(&mut grids, &p.handle) {
-            Some(grid) => {
-                for &f in &p.frames {
-                    frames[f] = Some(grid.clone());
-                }
-                frame_cache.insert(p.slot, grid, slots);
-                false
-            }
-            None => {
-                failure = Some(format!("frame {} vanished after loading", p.frames[0]));
-                false
-            }
-        },
-        LoadState::Failed(e) => {
-            let path = server.get_path(&p.handle).map(|p| p.to_string());
-            failure = Some(describe_load_error(path.as_deref().unwrap_or("?"), &e));
-            false
-        }
-        _ if load_timed_out(p.started_s, now_s, None) => {
-            let path = server.get_path(&p.handle).map(|p| p.to_string());
-            failure = Some(format!(
-                "{}: the load timed out after {LOAD_TIMEOUT_S:.0} s",
-                path.as_deref().unwrap_or("?")
-            ));
-            false
-        }
-        _ => true,
-    });
-    if let Some(why) = failure {
-        return fail(
-            &mut commands,
-            &mut next,
-            &mut preload_failed,
-            purpose,
-            why.trim_end(),
-        );
-    }
-    if !pending.is_empty() || !index.manifest_settled() {
+    // The manifest loads with the globe, so it has almost always settled by now.
+    if !index.manifest_settled() {
         return;
     }
+    let frames = match loads.poll(&server, &mut grids, &mut frame_cache, now_s) {
+        None => return,
+        Some(Err(why)) => {
+            return fail(&mut commands, &mut next, &mut preload_failed, purpose, &why);
+        }
+        Some(Ok(frames)) => frames,
+    };
     let Some(globe) = globe else {
         return fail(
             &mut commands,
@@ -653,7 +583,6 @@ pub(super) fn advance_frames(
             "the globe data is gone",
         );
     };
-    let frames = std::mem::take(frames);
     let probe_started = Instant::now();
     let needed = match generate::tiles_needed(&spec, &globe.timeline, &globe.crust, &frames) {
         Ok(needed) => needed,
@@ -698,6 +627,7 @@ pub(super) fn advance_frames(
         pending,
         fetched: 0,
         bytes: 0,
+        hydro: HydroWait::default(),
     };
 }
 
@@ -747,6 +677,7 @@ pub(super) fn advance_tiles(
     mut next: ResMut<NextState<RegionState>>,
     mut preload_failed: MessageWriter<RegionPreloadFailed>,
     clock: Res<LoadClock>,
+    mut hydro_gate: HydroGate,
 ) {
     let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
@@ -759,6 +690,7 @@ pub(super) fn advance_tiles(
         pending,
         fetched,
         bytes,
+        hydro,
     } = &mut job.stage
     else {
         return;
@@ -793,6 +725,11 @@ pub(super) fn advance_tiles(
     if !pending.is_empty() || !index.overview_settled() {
         return;
     }
+    // The era's continental pass: ready, or this job waits for it (and asks for it once).
+    let Some(hydrology) = hydro_gate.wait(spec.snapshot, hydro, now_s) else {
+        return;
+    };
+    let hydro_wait = hydro.waited();
     let Some(globe) = globe else {
         return fail(
             &mut commands,
@@ -822,7 +759,9 @@ pub(super) fn advance_tiles(
         tiles,
         frames: std::mem::take(frames),
         fallback,
+        hydro: hydrology,
     };
+    let hydrology = inputs.hydro.is_some();
     let run = match settings.mode {
         #[cfg(not(target_arch = "wasm32"))]
         GenMode::Parallel => Running::Task(
@@ -838,6 +777,8 @@ pub(super) fn advance_tiles(
         tiles_fetched: *fetched,
         bytes_fetched: *bytes,
         fallback,
+        hydro_wait,
+        hydrology,
     };
 }
 
@@ -861,6 +802,8 @@ pub(super) fn poll_generation(
         tiles_fetched,
         bytes_fetched,
         fallback,
+        hydro_wait,
+        hydrology,
     } = &mut job.stage
     else {
         return;
@@ -896,7 +839,10 @@ pub(super) fn poll_generation(
         }
     };
     let spec = job.spec;
-    let millis = u32::try_from(job.started.elapsed().as_millis()).unwrap_or(u32::MAX);
+    // The region's own time: the wait for the era's continental pass is reported apart.
+    let own = job.started.elapsed().saturating_sub(*hydro_wait);
+    let millis = u32::try_from(own.as_millis()).unwrap_or(u32::MAX);
+    let hydro_wait_ms = u32::try_from(hydro_wait.as_micros().div_ceil(1000)).unwrap_or(u32::MAX);
     let region = ActiveRegion {
         frame: spec.frame(),
         grid: Arc::new(grid),
@@ -915,6 +861,8 @@ pub(super) fn poll_generation(
         bytes_fetched: *bytes_fetched,
         frames_fetched: job.frames_fetched,
         fallback: *fallback,
+        hydro_wait_ms,
+        hydrology: *hydrology,
     });
     if purpose == RequestPurpose::Neighbour {
         commands.remove_resource::<RegionJob>();

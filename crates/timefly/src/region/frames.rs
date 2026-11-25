@@ -10,12 +10,17 @@ use std::fmt;
 use std::sync::Arc;
 
 use bevy::asset::io::Reader;
-use bevy::asset::{AssetLoader, LoadContext};
+use bevy::asset::{AssetLoader, LoadContext, LoadState};
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 use timefly_core::formats::{FormatError, Grid, read_tfgrid};
 use timefly_core::sha256::sha256_hex;
+use timefly_core::surface::Timeline;
+use timefly_core::worldgen::coarse::frames_needed;
 use tracing::instrument;
+
+use super::job::{LOAD_TIMEOUT_S, load_timed_out};
+use crate::data::{GlobeData, describe_load_error};
 
 /// A decoded `.tfgrid` kept on the CPU. It never becomes an [`Image`]. The region plugin takes
 /// each one out of `Assets<CpuGrid>` as soon as it loads, so it holds no handle afterwards.
@@ -200,6 +205,152 @@ impl FrameCache {
                 None => break,
             }
         }
+    }
+}
+
+/// Takes a loaded CPU grid out of the asset storage (dropping the caller's handle afterwards
+/// leaves no copy behind).
+pub(crate) fn take_grid(
+    grids: &mut Assets<CpuGrid>,
+    handle: &Handle<CpuGrid>,
+) -> Option<Arc<Grid>> {
+    grids.remove(handle).map(|CpuGrid(grid)| Arc::new(grid))
+}
+
+/// The frame files a snapshot reads: each image slot once, with the timeline frames it serves.
+fn frame_files(timeline: &Timeline, age_myr: f64) -> Vec<(u32, Vec<usize>)> {
+    let mut files: Vec<(u32, Vec<usize>)> = Vec::new();
+    for frame in frames_needed(timeline, age_myr) {
+        let slot = timeline.frames()[frame].image_slot;
+        match files.iter_mut().find(|(s, _)| *s == slot) {
+            Some((_, frames)) => frames.push(frame),
+            None => files.push((slot, vec![frame])),
+        }
+    }
+    files
+}
+
+/// A frame file loading for some timeline frames (repeated files share one load).
+struct PendingFrame {
+    slot: u32,
+    frames: Vec<usize>,
+    handle: Handle<CpuGrid>,
+    started_s: f64,
+}
+
+/// The globe frames one snapshot's coarse field reads, from the [`FrameCache`] or loaded as
+/// [`CpuGrid`]s. The region job and the continental pass each hold one; both may load the
+/// same file at once (the asset server shares the load), so a load whose grid another holder
+/// already took is answered from the cache.
+pub struct FrameLoads {
+    /// The image slots this snapshot reads, kept in the [`FrameCache`].
+    slots: Vec<u32>,
+    pending: Vec<PendingFrame>,
+    frames: Vec<Option<Arc<Grid>>>,
+    fetched: u32,
+}
+
+impl FrameLoads {
+    /// Starts the loads for `age_myr`'s frames that the cache does not hold (`now_s` on the
+    /// [`LoadClock`](crate::clock::LoadClock)).
+    pub fn start(
+        globe: &GlobeData,
+        age_myr: f64,
+        server: &AssetServer,
+        cache: &mut FrameCache,
+        now_s: f64,
+    ) -> FrameLoads {
+        let timeline = &globe.timeline;
+        let mut frames = vec![None; timeline.frames().len()];
+        let mut slots = Vec::new();
+        let mut pending = Vec::new();
+        for (slot, served) in frame_files(timeline, age_myr) {
+            slots.push(slot);
+            match cache.get(slot) {
+                Some(grid) => {
+                    for &f in &served {
+                        frames[f] = Some(grid.clone());
+                    }
+                }
+                None => pending.push(PendingFrame {
+                    slot,
+                    handle: server.load::<CpuGrid>(globe.frame_path(served[0]).clone()),
+                    frames: served,
+                    started_s: now_s,
+                }),
+            }
+        }
+        FrameLoads {
+            fetched: u32::try_from(pending.len()).unwrap_or(u32::MAX),
+            slots,
+            pending,
+            frames,
+        }
+    }
+
+    /// Frame files loaded for it (not in the cache when it started).
+    pub fn fetched(&self) -> u32 {
+        self.fetched
+    }
+
+    /// Takes in finished loads. `Some(Ok(frames))` once every frame is in (timeline frame `i`
+    /// at index `i`, `None` for frames the snapshot does not read), after which the loads are
+    /// spent; `Some(Err(why))` when a frame failed, was lost or timed out
+    /// ([`LOAD_TIMEOUT_S`]); `None` while loading.
+    pub fn poll(
+        &mut self,
+        server: &AssetServer,
+        grids: &mut Assets<CpuGrid>,
+        cache: &mut FrameCache,
+        now_s: f64,
+    ) -> Option<Result<Vec<Option<Arc<Grid>>>, String>> {
+        let mut failure = None;
+        let (slots, frames) = (&self.slots, &mut self.frames);
+        self.pending.retain(|p| {
+            let mut keep = |grid: Arc<Grid>| {
+                for &f in &p.frames {
+                    frames[f] = Some(grid.clone());
+                }
+                false
+            };
+            // Another holder took the shared load's grid into the cache.
+            if let Some(grid) = cache.peek(p.slot) {
+                return keep(grid);
+            }
+            match server.load_state(&p.handle) {
+                LoadState::Loaded => match take_grid(grids, &p.handle) {
+                    Some(grid) => {
+                        cache.insert(p.slot, grid.clone(), slots);
+                        keep(grid)
+                    }
+                    None => {
+                        failure = Some(format!("frame {} vanished after loading", p.frames[0]));
+                        false
+                    }
+                },
+                LoadState::Failed(e) => {
+                    let path = server.get_path(&p.handle).map(|p| p.to_string());
+                    failure = Some(describe_load_error(path.as_deref().unwrap_or("?"), &e));
+                    false
+                }
+                _ if load_timed_out(p.started_s, now_s, None) => {
+                    let path = server.get_path(&p.handle).map(|p| p.to_string());
+                    failure = Some(format!(
+                        "{}: the load timed out after {LOAD_TIMEOUT_S:.0} s",
+                        path.as_deref().unwrap_or("?")
+                    ));
+                    false
+                }
+                _ => true,
+            }
+        });
+        if let Some(why) = failure {
+            self.pending.clear();
+            return Some(Err(why.trim_end().to_string()));
+        }
+        self.pending
+            .is_empty()
+            .then(|| Ok(std::mem::take(&mut self.frames)))
     }
 }
 

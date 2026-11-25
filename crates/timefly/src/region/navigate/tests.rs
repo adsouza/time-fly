@@ -2003,6 +2003,8 @@ fn snapshot_change_regenerates_around_the_carried_position() {
         bytes_fetched: 0,
         frames_fetched: 0,
         fallback: false,
+        hydro_wait_ms: 0,
+        hydrology: false,
     });
     app.world_mut().write_message(RegionSnapshotChanged {
         from: YearsBp(0.0),
@@ -2240,6 +2242,8 @@ fn fake_job(
         bytes_fetched: 0,
         frames_fetched: 0,
         fallback: false,
+        hydro_wait_ms: 0,
+        hydrology: false,
     });
     changed.write(RegionSnapshotChanged {
         from: active.map_or(YearsBp(0.0), |a| a.grid.spec.snapshot),
