@@ -1187,7 +1187,8 @@ fn render_cloud_over_quad(
         cache: None,
     });
     // As `CloudMaterial` specializes Bevy's blended mesh pipeline: no culling, depth-tested,
-    // never writing depth.
+    // never writing depth. Copied by hand from `CloudMaterial::specialize` and `alpha_mode`
+    // (`src/cloud.rs`): keep the two in step.
     let cloud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("cloud"),
         layout: None,

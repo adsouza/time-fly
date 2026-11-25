@@ -210,7 +210,7 @@ The draft paired `fastnoise-lite` on the CPU with a different hash noise on the 
 - Real landforms and biome colours from data. Era-aware palettes (§6.3).
 - Soft ramped diffuse with hue-shifted shadows, brush-like triplanar noise breaking up surfaces, soft silhouettes on vegetation.
 - Gradient skies with painted clouds. Atmospheric perspective tinted per era and biome.
-- Light tilt-shift during zoom-and-swap transitions only *(call)*.
+- Light tilt-shift during zoom-and-swap transitions only *(call)*. *(Dropped in M3 Task 11: the cloud pass was over budget; see the M3 plan's rulings.)*
 - Optional painterly post-process (e.g. a cheap Kuwahara-style filter) only if it fits the web frame budget *(builder)*.
 
 ## 10. Cultural data (owner's CSV)
@@ -288,9 +288,9 @@ Watercraft appear on rivers, lakes, coasts and seas **only where and when the hi
 
 1. **Globe + slider:** plate-piece sphere, continuous drift, ice and sea level, painterly sky. Proves the data pipeline end to end.
 2. **Region worlds:** world generator, CDLOD fixes, painterly terrain, water, era vegetation palette.
-3. **Zoom-and-swap:** globe ↔ region and region ↔ region (M3). Region ↔ local moves to the local-worlds milestone, since local worlds don't exist before it *(owner, 2026-11-24)*.
+3. **Zoom-and-swap:** globe ↔ region and region ↔ region (M3). Region ↔ local moves to the local-worlds milestone, since local worlds don't exist before it *(builder's call, proposed in the M3 design §1.1 item 8; the owner did not object)*.
    - Then **lakes and rivers** at region scale, from the generator's hydrology (§7.5): a milestone of their own between M3 and M4 *(owner, 2026-11-24)*.
-4. **Local worlds:** CDLOD at fine scale with vegetation, entered from regions through the cloud (region ↔ local). Then the voxel close-up tier and underwater.
+4. **Local worlds:** CDLOD at fine scale with vegetation, entered from regions (region ↔ local), likely through the same cloud *(builder's call, not yet decided)*. Then the voxel close-up tier and underwater.
 5. **Captions, settlements and ships:** CSV import, captions, extra snapshots. Then generated settlements in local worlds, starting with one vernacular kit. Then ships, starting with one vessel type on one stretch of water.
 6. **First street site:** one kit, distant blocks, interiors. Then more sites.
 7. **Sound and polish.**

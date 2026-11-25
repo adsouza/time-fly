@@ -516,7 +516,8 @@ git commit -m "feat(core): flight altitudes, cloud density and chase camera"
 
 ### Rulings made while building (copied from the SDD ledger)
 
-Each is *what*; *why*; *cost if wrong*.
+Each is *what*; *why*; *cost if wrong*. The disk-guard branch's rulings, also in the ledger, are
+left out on purpose: they belong to that branch, not to this plan.
 
 **Pre-flight (before Task 1)**
 - **P1.** `chase_pose` takes a trailing `min_distance: f64` (regions pass `CHASE_MIN_DISTANCE_M`, the globe `CHASE_MIN_DISTANCE_M / 1000.0`). Why: one constant can't be in both metres and kilometres. Cost: a one-argument signature change.

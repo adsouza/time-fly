@@ -1,6 +1,8 @@
 # Milestone 3 (the fly and zoom-and-swap): performance
 
-Measured on 2026-11-24 and 25 for Task 11, on the M3 branch's last code commit before the docs.
+Measured on 2026-11-24 and 25 for Task 11. The benches ran on `4b79f08`, Task 10's last commit.
+The cloud cost re-measure and the web build used `e3bd6e9`, Task 11's code commit, which drops the
+tilt-shift (see "Cloud pass cost").
 
 | | |
 |---|---|
@@ -25,6 +27,15 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 |---|---|---|
 | `--region-bench` | PASS (exit 0) | **PASS** (exit 0) |
 | `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only**: open, owner decision pending |
+| Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: **over budget, open, owner decision pending** |
+
+**Cloud pass: the owner's options.** Dropping the tilt-shift (Task 5's ruling) saved nothing,
+because the cost is the noise itself: six evaluations a pixel. Ways to make it cheaper, each a
+look change:
+- drop to three octaves (`CLOUD_OCTAVES` allows 3–4);
+- skip the two sun taps (the lighting's `shape(toward)`);
+- shade the cloud at half resolution.
+Or accept the cost: the pass runs only during transitions.
 
 Every other gate passes in both runs: the eight regions' flight, the globe pan, warm
 generation, memory cycles, the 12 holds, flight outside the cloud, the swap worst frame and the
@@ -32,7 +43,7 @@ journey memory cycles.
 
 - **Cloud pass:** about 1.8 ms a frame at 2560 × 1440, over Task 5's 1 ms budget. So Task 11
   dropped the tilt-shift, as Task 5's ruling said. Without it the pass costs about 2.0–2.2 ms:
-  the noise is the cost (see "Cloud pass cost").
+  the noise is the cost (see "Cloud pass cost"). Open: the owner's options are listed above.
   - The benches ran on `4b79f08`, before that change. It touches only the cloud, which is
     hidden outside transitions, and it doesn't make the pass cheaper, so they weren't re-run.
 - **Near geometry under the cloud** (Task 7's rule), observed on Metal: PASS (a new GPU test).
@@ -185,8 +196,11 @@ the preload's start until the fly is flying again:
 | Run 2 | +30.0 | +26.7 | **+48.9** | **+42.3** | +11.0 | +3.3 |
 
 Three of the twelve hops go over the 40 MiB gate. Every cycle flies the same route (the Alps and
-much the same two neighbours east of them), so geography doesn't explain the spread. And the journey
-memory cycles come back flat (−1.3% and +6.6% over the cycles), so the hops don't leak.
+much the same two neighbours east of them), so geography doesn't explain the spread.
+
+The journey memory cycles (on the globe after each climb) read −1.3% in run 2 and +6.6% in run 1.
+Run 1's cycle 2 sat 44 MiB above cycle 1 (675.5, 719.9, 670.3 MiB) and came back down in cycle 3.
+Over three cycles that shows no growth trend, but it doesn't prove the memory flat.
 
 **What the peak is made of** (code reading and arithmetic, no extra runs):
 
@@ -213,8 +227,13 @@ Design §8's estimate of "about 10 MiB of grid data, plus about 10 MiB of GPU te
 the generator's working set and the overlap at the swap. The gate's 40 MiB sits right at the top
 of these sums.
 
-**Why the spread is so wide (3 to 49 MiB).** `phys_footprint` counts dirty pages that the process
-holds, the GPU driver's allocations included. Neither allocator hands every free straight back:
+**The sums don't explain the whole peak.** The worst computed sum is about 43 MiB, and the
+observed worst is 48.9 MiB. So at least 6 MiB of the worst peak is unaccounted for by the parts
+above.
+
+**Why the spread is so wide (3 to 49 MiB): a hypothesis, not measured.** `phys_footprint` counts
+dirty pages that the process holds, the GPU driver's allocations included. Neither allocator hands
+every free straight back:
 - macOS malloc keeps freed medium and large blocks in its magazines and regions for reuse;
 - Metal's driver pools freed texture and staging memory in its heaps.
 
@@ -225,10 +244,13 @@ just returned pages (for example after the globe's climb), the same work reads +
 Page and heap granularity (16 KiB pages, multi-MiB heap blocks) adds a few MiB of noise either
 way. The baseline is the same kind of reading, so it moves with it.
 
+Nothing here was measured, and run 1 cuts against it: its cycle 3 read +23.9 and +36.3 MiB, not
+small. Reuse may explain part of the spread; it doesn't explain it all.
+
 **Options for the owner:**
-1. **Raise the gate to a justified number.** About +64 MiB covers the worst sum above (43 MiB),
-   one more texture set of slack and the allocator spread. Cheapest; it records what a hop
-   really costs.
+1. **Raise the gate.** About +64 MiB would sit above every observed hop (worst +48.9 MiB) and the
+   computed sum (about 43 MiB), with about 15 MiB to spare. But the peak isn't fully explained
+   (at least 6 MiB unaccounted for), so the margin is a judgement, not a proof. Cheapest.
 2. **Release the old region's GPU resources earlier.** For example, free the old textures on the
    swap frame (or stop the job's lattice from overlapping the swap). This cuts about 10 MiB off
    the swap's sum, but the preload's working set still dominates.
@@ -241,8 +263,10 @@ way. The baseline is the same kind of reading, so it moves with it.
    copy and the overlap with the old textures out of the swap frame. It also lowers the hop's
    32–35 ms swap frame, but it doesn't lower the peak by itself: the new textures would be
    resident earlier, alongside the old.
-5. **Look into the hop's memory** before calling M3 done, for example by logging the grid,
-   lattice and texture allocations against the footprint during one hop.
+5. **Investigate first: log the grid, lattice and texture allocations against the footprint
+   during one hop.** This is the way to close the unexplained part of the peak (at least 6 MiB)
+   and to test the allocator-reuse hypothesis. It would also give option 1 a measured number,
+   and options 2–4 a measured saving.
 
 ## Cloud pass cost (Task 5's ≤ 1 ms, Task 7's early-Z loss)
 
@@ -286,9 +310,7 @@ used the GPU during the runs.
   transitions: the gather, the hold and the clear. Every flight and swap frame in the benches
   above stayed on 60 Hz natively. Chrome renders at a larger size (3200 × 1800 in M2's gated
   runs), where it would cost proportionally more: the Chrome journey run will tell.
-- **If it needs to be cheaper:** drop to three octaves (`CLOUD_OCTAVES` allows 3–4), skip the two
-  sun taps (the lighting's `shape(toward)`), or shade the cloud at half resolution. Each is a
-  look change, for the owner.
+- **If it needs to be cheaper:** see the owner's options under "Summary".
 
 ## The cloud over near geometry, observed on Metal
 
