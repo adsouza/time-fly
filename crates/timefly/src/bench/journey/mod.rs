@@ -102,6 +102,7 @@ pub const JOURNEY_REGION: BenchRegion = BenchRegion {
         years: 0.0,
     },
     pan_from_previous: false,
+    flight_gated: true,
 };
 /// The globe's fly is over the region once within this arc of it (degrees): wider than a frame's
 /// travel at the top of globe flight (the track's 30°/s cap is 1° a frame at 30 fps), so it never
@@ -204,6 +205,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
                 years: 0.0,
             },
             pan_from_previous: false,
+            flight_gated: true,
         },
         yaw: NORTH_YAW,
         heading: "north",
@@ -228,6 +230,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
                 years: 0.0,
             },
             pan_from_previous: false,
+            flight_gated: true,
         },
         yaw: NORTH_YAW,
         heading: "north",
@@ -250,6 +253,7 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
                 years: 0.0,
             },
             pan_from_previous: false,
+            flight_gated: true,
         },
         yaw: WEST_YAW,
         heading: "west",
@@ -574,6 +578,7 @@ impl JourneyBenchConfig {
                     name: CHOSEN_REGION,
                     arg,
                     pan_from_previous: false,
+                    flight_gated: true,
                 },
                 yaw: EAST_YAW,
                 heading: "east",

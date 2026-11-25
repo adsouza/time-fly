@@ -376,6 +376,9 @@ packages on Vulkan. Record the adapter and backend.
 **Benches** *(call)*:
 - `--region-bench` keeps its eight regions and gates. Its scripted flight drives the fly
   instead of the free camera, and it gains a high-altitude segment near the cloud base.
+  *(Owner, 2026-11-25: the Red Sea's and Pangaea's flights are reported only, not gated: at
+  2560 × 1440 uncapped they run near the interval, which is the terrain's cost. Every other
+  region's flight, and a `--region`-picked run's, still gates.)*
 - A new **journey bench** (`--journey-bench` / `?journey-bench`): from the globe, dive into one
   of the bench regions, fly to the edge and hop twice, then climb back out, several times.
   *(Owner, 2026-11-25: a set of routes instead, for geographic diversity: the Andes flown north
