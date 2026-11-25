@@ -14,7 +14,7 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::bench::bench_exit;
-use timefly::bench::journey::{JourneyBench, JourneyBenchConfig, JourneyBenchPlugin};
+use timefly::bench::journey::{CRUISE_AGL_M, JourneyBench, JourneyBenchConfig, JourneyBenchPlugin};
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::fly_camera::FlyCameraPlugin;
 use timefly::globe::GlobeRenderStatus;
@@ -22,6 +22,7 @@ use timefly::globe_flight::GlobeFlightPlugin;
 use timefly::region::navigate::RegionNavigationPlugin;
 use timefly::region::{GenMode, RegionPlugin, RegionSettings};
 use timefly::time::TimePlugin;
+use timefly_core::flight::altitudes::HOP_ALTITUDE_M;
 
 const STEP: Duration = Duration::from_micros(16_667);
 const WALL_LIMIT: Duration = Duration::from_secs(240);
@@ -134,9 +135,10 @@ fn a_journey_run_reaches_the_summary() {
         .filter(|l| l.starts_with("hold: "))
         .collect();
     assert_eq!(holds.len(), 4, "{summary}");
+    // At a fixed step, every gate passes: a FAIL here is a bench or game fault.
     for (line, name) in holds.iter().zip(["dive", "hop 1", "hop 2", "climb"]) {
         assert!(line.starts_with(&format!("hold: {name} ")), "{line}");
-        assert!(line.contains(" ms (cycle 1) -> "), "{line}");
+        assert!(line.ends_with(" ms (cycle 1) -> PASS"), "{line}");
     }
     // Every swap was seen: the dive's, both hops' and the climb's.
     let swaps = summary
@@ -147,14 +149,29 @@ fn a_journey_run_reaches_the_summary() {
         assert!(swaps.contains(name), "{swaps}");
     }
     assert_eq!(swaps.matches(" ms (cycle 1)").count(), 4, "{swaps}");
+    assert!(swaps.ends_with("-> PASS"), "{swaps}");
+    // Both hops flew from the cruise, under the cloud bank, so each lift rose to it and the fly
+    // came back down to the cruise after the swap, ready to lift again.
+    let bench = app.world().resource::<JourneyBench>();
+    let hops = bench.hops();
+    assert_eq!(hops.len(), 2, "{hops:?}");
+    for (i, hop) in hops.iter().enumerate() {
+        assert_eq!((hop.cycle, hop.hop), (0, i as u32 + 1), "{hop:?}");
+        let from = hop.from_agl_m.expect("the lift began");
+        assert!(from <= CRUISE_AGL_M + 100.0, "{hop:?}");
+        assert!(from < HOP_ALTITUDE_M as f32, "{hop:?}");
+        let peak = hop.peak_height_m.expect("a height in the hop");
+        assert!(peak >= HOP_ALTITUDE_M as f32 - 1.0, "{hop:?}");
+    }
+    assert!(summary.contains("\nhop lift ("), "{summary}");
     // At a fixed step every frame is 16.67 ms, so the flight frames pass.
     let flight = summary
         .lines()
         .find(|l| l.starts_with("flight (outside the cloud): frames "))
         .unwrap();
     assert!(flight.ends_with("-> PASS"), "{flight}");
-    let pass = summary.contains("\nresult: PASS\n");
-    assert_eq!(exit, vec![bench_exit(pass)], "{summary}");
+    assert!(summary.contains("\nresult: PASS\n"), "{summary}");
+    assert_eq!(exit, vec![bench_exit(true)], "{summary}");
 
     // Reported once.
     app.update();

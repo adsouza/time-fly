@@ -1,10 +1,10 @@
 use bevy::math::{DVec3, Vec2, Vec3};
-use timefly_core::flight::altitudes::DIVE_ALTITUDE_KM;
+use timefly_core::flight::altitudes::{DIVE_ALTITUDE_KM, HOP_ALTITUDE_M, REGION_EMERGE_TO_M};
 use timefly_core::flight::globe::{GlobeFlight, globe_fly_step};
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
 
 use super::*;
-use crate::fly_camera::{FlyInput, FlyState, fly_step, keys_to_input};
+use crate::fly_camera::{FlyInput, FlyState, MAX_SPEED_MPS, fly_speed, fly_step, keys_to_input};
 use crate::globe_flight::{descent_ease, globe_input};
 use crate::region::navigate::{HopEdge, World};
 
@@ -216,17 +216,29 @@ fn the_globe_keys_fly_to_the_region_and_descend_to_the_dive() {
 }
 
 #[test]
-fn the_region_keys_turn_east_then_fly_out_steadily() {
+fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
     let flat = |_: f32, _: f32| 0.0;
     for fps in [60.0_f32, 30.0] {
         for yaw in [0.0, 1.0, std::f32::consts::PI, -2.5, EAST_YAW] {
+            // Where the fly emerges: the region's centre at `REGION_EMERGE_TO_M`.
             let mut fly = FlyState {
-                pos_m: Vec3::new(0.0, 230_000.0, 0.0),
+                pos_m: Vec3::new(0.0, REGION_EMERGE_TO_M as f32, 0.0),
                 yaw,
                 ..default()
             };
-            for _ in 0..(fps as usize * 25) {
-                let keys = region_keys(&NavPhase::Flying, fly.yaw);
+            // As the shell keeps it: down at the cruise once, cruising from then on.
+            let mut cruising = false;
+            let mut cruise_at = None;
+            for frame in 0..(fps as usize * 45) {
+                cruising |= fly.pos_m.y <= CRUISE_AGL_M;
+                if cruising && cruise_at.is_none() {
+                    cruise_at = Some(frame as f32 / fps);
+                }
+                if !cruising {
+                    // The descent is straight down: no travel toward the edge yet.
+                    assert_eq!((fly.pos_m.x, fly.pos_m.z), (0.0, 0.0), "{yaw} at {fps} fps");
+                }
+                let keys = region_keys(&NavPhase::Flying, fly.yaw, fly.pos_m.y, cruising);
                 let k = keys_to_input(&held(&keys));
                 let input = FlyInput {
                     move_local: k.move_local,
@@ -238,9 +250,19 @@ fn the_region_keys_turn_east_then_fly_out_steadily() {
                 };
                 fly = fly_step(fly, input, flat);
             }
-            // At the east edge, near the middle of it, facing east.
+            // Down from 230 km in about 21 s, at the 10 km/s cap all the way.
+            let cruise_at = cruise_at.unwrap_or_else(|| panic!("{yaw} at {fps} fps never cruised"));
+            assert!(cruise_at < 23.0, "{yaw} at {fps} fps: {cruise_at} s");
+            // At the east edge, near the middle of it, facing east, at the cruise height: under
+            // the hop's lift, and still at the speed cap.
             let p = fly.pos_m;
             assert!(p.x >= 149_000.0, "{yaw} at {fps} fps: {p}");
+            assert!(
+                (CRUISE_AGL_M - 500.0..=CRUISE_AGL_M).contains(&p.y),
+                "{yaw} at {fps} fps: {p}"
+            );
+            assert!(p.y < HOP_ALTITUDE_M as f32);
+            assert_eq!(fly_speed(p.y), MAX_SPEED_MPS);
             assert!(p.z.abs() < 15_000.0, "{yaw} at {fps} fps: {p}");
             let off = (fly.yaw - EAST_YAW + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
                 - std::f32::consts::PI;
@@ -255,9 +277,27 @@ fn the_region_keys_turn_east_then_fly_out_steadily() {
         hopping(true, false, 1.0),
     ] {
         for yaw in [EAST_YAW, EAST_YAW + 0.04, 0.0] {
-            assert_eq!(region_keys(&phase, yaw), [KeyCode::KeyW], "{phase:?}");
+            assert_eq!(
+                region_keys(&phase, yaw, CRUISE_AGL_M, true),
+                [KeyCode::KeyW],
+                "{phase:?}"
+            );
         }
     }
+    // Facing east: above the cruise it descends, without flying; once cruising, a valley that
+    // puts it higher above the ground does not stop it.
+    assert_eq!(
+        region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, false),
+        [KeyCode::ControlLeft]
+    );
+    assert_eq!(
+        region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, true),
+        [KeyCode::KeyW]
+    );
+    assert_eq!(
+        region_keys(&NavPhase::Flying, EAST_YAW, CRUISE_AGL_M, false),
+        [KeyCode::KeyW]
+    );
     // Nothing while navigation moves the fly.
     for phase in [
         NavPhase::Emerging {
@@ -270,7 +310,10 @@ fn the_region_keys_turn_east_then_fly_out_steadily() {
         },
         NavPhase::Globe,
     ] {
-        assert!(region_keys(&phase, 0.0).is_empty(), "{phase:?}");
+        assert!(
+            region_keys(&phase, 0.0, REGION_EMERGE_TO_M as f32, false).is_empty(),
+            "{phase:?}"
+        );
     }
 }
 
@@ -314,4 +357,59 @@ fn hop_memory_is_gated_on_the_peak_natively_and_on_growth_on_the_web() {
         hop_memory_gate(&[(mib(64), None, mib(96)), (mib(96), None, None)], true),
         None
     );
+}
+
+#[test]
+fn a_hop_started_again_keeps_one_record_and_records_its_lift() {
+    let mut bench = JourneyBench::new(JourneyBenchConfig::new(60, false));
+    bench.stage = Stage::Region {
+        cycle: 0,
+        hops: 0,
+        since: 0.0,
+        cruising: true,
+    };
+    let hop = |lift: f32, swapped: bool| NavPhase::Hopping {
+        centre: RenderDir(DVec3::X),
+        edge: HopEdge { axis: 0, side: 1.0 },
+        lift_from_agl_m: 19_800.0,
+        swapped,
+        elapsed_s: 0.0,
+        lift,
+        failed: false,
+        turned_back: false,
+    };
+    // Preloads, turns back before the lift, preloads again, lifts, swaps, returns.
+    let frames = [
+        (NavPhase::Flying, 0.0, 19_800.0),
+        (hop(0.0, false), 0.0, 19_800.0),
+        (NavPhase::Flying, 0.0, 19_800.0),
+        (hop(0.0, false), 0.0, 19_800.0),
+        (hop(0.5, false), 0.8, 40_000.0),
+        (hop(1.0, false), 1.0, 60_000.0),
+        (hop(1.0, true), 1.0, 60_000.0),
+        (hop(1.0, true), 0.6, 30_000.0),
+        (NavPhase::Flying, 0.0, 19_900.0),
+    ];
+    let mut before = NavPhase::Flying;
+    for (i, (phase, density, height_m)) in frames.into_iter().enumerate() {
+        let frame = Frame {
+            before,
+            phase,
+            density,
+            frame_ms: 16.0,
+            now: i as f64 / 60.0,
+            swapped: is_swap(&before, &phase),
+            height_m,
+        };
+        record_frame(&mut bench, 0, frame);
+        before = phase;
+    }
+    // One hop, numbered as its hold is, with the lift it made.
+    let hops = bench.hops();
+    assert_eq!(hops.len(), 1, "{hops:?}");
+    assert_eq!((hops[0].cycle, hops[0].hop), (0, 1));
+    assert_eq!(hops[0].from_agl_m, Some(19_800.0));
+    assert_eq!(hops[0].peak_height_m, Some(60_000.0));
+    let holds: Vec<Transition> = bench.holds.iter().map(|h| h.transition).collect();
+    assert_eq!(holds, [Transition::Hop(1)]);
 }

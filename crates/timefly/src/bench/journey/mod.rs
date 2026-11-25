@@ -7,10 +7,16 @@
 //! 1. **Flies the globe** to above [`JourneyBenchConfig::region`] (within [`ARRIVE_DEG`]) with the
 //!    turn keys and `W` ([`globe_keys`]), then descends with `Ctrl` until the dive commits below
 //!    `DIVE_ALTITUDE_KM`. It lets go while the dive waits in the cloud and the fly emerges.
-//! 2. **Flies east** in the region ([`region_keys`]): turns to face east, then holds `W` to the
-//!    edge. The neighbour preloads, the lift and the cloud bank gather, the fly holds in the
-//!    cloud and the views swap. `W` stays held, alone, through the whole hop: a turn could point
-//!    the wish back into the field, which ends a hop from its hold. Then it does the same again.
+//! 2. **Descends, then flies east** in the region ([`region_keys`]). The fly emerges at 230 km,
+//!    above `HOP_ALTITUDE_M`, where a hop's lift would do nothing; so before the first hop it
+//!    holds `Ctrl` alone, straight down in place (about 21 s at the 10 km/s cap), to
+//!    [`CRUISE_AGL_M`] above the ground, turning to face east meanwhile. Then it holds `W` to the
+//!    edge, still at the speed cap, so the preload's lead is the worst case. The neighbour
+//!    preloads, the lift raises the fly to the cloud bank and the cloud gathers, the fly holds in
+//!    the cloud and the views swap; after the swap `ReturnToAgl` brings it back to the cruise, so
+//!    the second hop lifts too. `W` stays held, alone, through the whole hop: a turn could point
+//!    the wish back into the field, which ends a hop from its hold. The summary's `hop lift` line
+//!    reports each hop's lift (reported only).
 //! 3. **Climbs out** with `Backspace` after [`HOPS_PER_CYCLE`] hops, and rests on the globe for
 //!    [`LEAVE_SETTLE_SECS`] before memory is sampled.
 //!
@@ -37,7 +43,8 @@
 //! - **Journey memory cycles**: memory on the globe after each journey within
 //!   [`CYCLE_MEMORY_TOLERANCE`] of the first's ([`memory_cycles_pass`]).
 //!
-//! A stage that does not finish within [`STAGE_TIMEOUT_SECS`], a dive that comes back out over
+//! A stage that does not finish within [`STAGE_TIMEOUT_SECS`] (the longest, the region's, is
+//! about 21 s of descent, 15 s and 25 s of flight and two holds: about 65 s natively), a dive that comes back out over
 //! the globe, or a hop that turns back fails the run with the reason. On native the run exits
 //! after the summary: 0 on PASS, `FAILED_RESULT_EXIT_CODE` on FAIL, as the other benches.
 
@@ -45,12 +52,15 @@ use bevy::ecs::system::SystemParam;
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use timefly_core::deep_time::YearsBp;
+use timefly_core::flight::altitudes::HOP_ALTITUDE_M;
 use timefly_core::flight::globe::GlobeFlight;
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
+use timefly_core::terrain::blended_height_m;
 
 use super::region::{
-    BenchRegion, CYCLE_MEMORY_TOLERANCE, Screen, cycle_memory, cycle_memory_kind, dunes_line, emit,
-    gate_word, host_stall_line, memory_cycles_pass, pacing_for, pacing_name, show_mib,
+    BenchRegion, CHOSEN_REGION, CYCLE_MEMORY_TOLERANCE, Screen, cycle_memory, cycle_memory_kind,
+    dunes_line, emit, gate_word, host_stall_line, memory_cycles_pass, pacing_for, pacing_name,
+    show_mib,
 };
 use super::{
     MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
@@ -62,8 +72,8 @@ use crate::diagnostics::SessionInfo;
 use crate::fly_camera::FlyState;
 use crate::globe::GlobeRenderStatus;
 use crate::globe_flight::GlobeFlightState;
-use crate::region::RegionState;
 use crate::region::navigate::{LEAVE_KEY, NavPhase, Navigation, NavigationSystems, World};
+use crate::region::{ActiveRegion, RegionState};
 use crate::terrain::TerrainOptions;
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 
@@ -85,6 +95,11 @@ pub const ARRIVE_DEG: f64 = 2.0;
 pub const EAST_YAW: f32 = -std::f32::consts::FRAC_PI_2;
 /// Within this of east (degrees) the region's fly flies on: wider than a frame's turn at 30 fps.
 pub const YAW_TOLERANCE_DEG: f32 = 3.0;
+/// The region's fly descends to this height above the ground before it flies east: under
+/// `HOP_ALTITUDE_M`, so each hop's lift rises to the cloud bank and the fly returns here after
+/// the swap, and from 12.5 km up `fly_speed` is at its 10 km/s cap, so the east leg is still the
+/// fastest flight (the preload's worst lead).
+pub const CRUISE_AGL_M: f32 = 20_000.0;
 /// The turn keys rest within this of the wanted heading (degrees), so they never chatter.
 const TURN_DEADBAND_DEG: f64 = 1.5;
 /// Over the globe, `W` flies only while the heading is within this of the region's bearing
@@ -277,11 +292,17 @@ pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
     keys
 }
 
-/// The keys flying the region's fly, heading `yaw`, in `phase`: while flying, turn to face east
-/// and fly forward within [`YAW_TOLERANCE_DEG`] of it; through a hop, `W` alone (a turn could
-/// point the wish back in, which ends a hop from its hold); nothing while navigation moves the
-/// fly.
-pub fn region_keys(phase: &NavPhase, yaw: f32) -> Vec<KeyCode> {
+/// The keys flying the region's fly, heading `yaw`, `agl_m` above the ground, in `phase`:
+/// - flying, not yet `cruising` and above [`CRUISE_AGL_M`]: descend (`Ctrl`) in place, turning
+///   toward east meanwhile;
+/// - flying otherwise: turn to face east and fly forward within [`YAW_TOLERANCE_DEG`] of it
+///   (once cruising, a valley that puts the fly higher above the ground does not stop it);
+/// - through a hop, `W` alone (a turn could point the wish back in, which ends a hop from its
+///   hold);
+/// - nothing while navigation moves the fly.
+///
+/// The shell sets `cruising` once the fly has been at or under [`CRUISE_AGL_M`].
+pub fn region_keys(phase: &NavPhase, yaw: f32, agl_m: f32, cruising: bool) -> Vec<KeyCode> {
     match phase {
         NavPhase::Hopping { .. } => vec![KeyCode::KeyW],
         NavPhase::Flying => {
@@ -297,7 +318,9 @@ pub fn region_keys(phase: &NavPhase, yaw: f32) -> Vec<KeyCode> {
                     KeyCode::ArrowRight
                 });
             }
-            if err.abs() <= YAW_TOLERANCE_DEG.to_radians() {
+            if !cruising && agl_m > CRUISE_AGL_M {
+                keys.push(KeyCode::ControlLeft);
+            } else if err.abs() <= YAW_TOLERANCE_DEG.to_radians() {
                 keys.push(KeyCode::KeyW);
             }
             keys
@@ -324,6 +347,18 @@ impl JourneyBenchConfig {
             exit_when_done,
         }
     }
+
+    /// The bench over the region at `arg` (`--journey-bench --region=…`).
+    pub fn chosen(target_fps: u32, exit_when_done: bool, arg: RegionArg) -> Self {
+        JourneyBenchConfig {
+            region: BenchRegion {
+                name: CHOSEN_REGION,
+                arg,
+                pan_from_previous: false,
+            },
+            ..JourneyBenchConfig::new(target_fps, exit_when_done)
+        }
+    }
 }
 
 /// Where the run is. Times are `Time<Real>` seconds; `cycle` counts from 0.
@@ -348,6 +383,8 @@ enum Stage {
         cycle: u32,
         hops: u32,
         since: f64,
+        /// Down at [`CRUISE_AGL_M`] once: from then on it flies east, whatever the ground does.
+        cruising: bool,
     },
     /// `Backspace` took: climbing out and emerging over the globe.
     Climb {
@@ -392,9 +429,18 @@ struct SwapRecord {
     frames_left: u32,
 }
 
-/// One hop's memory: the in-region baseline before it, its peak, and on return to flying.
-#[derive(Copy, Clone, Debug, Default)]
-struct HopMemory {
+/// One hop: its lift, and its memory (the in-region baseline before it, its peak, and on return
+/// to flying).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct HopRecord {
+    /// The journey, from 0.
+    pub cycle: u32,
+    /// The hop's number in its journey, from 1.
+    pub hop: u32,
+    /// The height above the ground the lift started from (`lift_from_agl_m`), once it began.
+    pub from_agl_m: Option<f32>,
+    /// The fly's highest height above sea level during the hop.
+    pub peak_height_m: Option<f32>,
     baseline: Option<u64>,
     peak: Option<u64>,
     end: Option<u64>,
@@ -412,7 +458,7 @@ pub struct JourneyBench {
     flight_ms: Vec<f32>,
     holds: Vec<HoldRecord>,
     swaps: Vec<SwapRecord>,
-    hops: Vec<HopMemory>,
+    hops: Vec<HopRecord>,
     /// The memory sampled on the last frame flown in a region.
     in_region: Option<u64>,
     /// The memory on the globe after each journey.
@@ -449,6 +495,11 @@ impl JourneyBench {
     /// The run's result, once the summary is out.
     pub fn passed(&self) -> Option<bool> {
         self.passed
+    }
+
+    /// The hops so far, in order.
+    pub fn hops(&self) -> &[HopRecord] {
+        &self.hops
     }
 
     /// Starts timing `transition`'s hold (a hop that starts again after turning back before its
@@ -494,6 +545,7 @@ fn drive_journey_keys(
     nav: Option<Res<Navigation>>,
     flight: Option<Res<GlobeFlightState>>,
     fly: Option<Res<FlyState>>,
+    region: Option<Res<ActiveRegion>>,
     keys: Option<ResMut<ButtonInput<KeyCode>>>,
 ) {
     let Some(mut keys) = keys else {
@@ -512,7 +564,26 @@ fn drive_journey_keys(
                 vec![LEAVE_KEY]
             }
         }
-        Stage::Region { .. } => fly.map_or(Vec::new(), |f| region_keys(&phase, f.yaw)),
+        Stage::Region {
+            cycle,
+            hops,
+            since,
+            cruising,
+        } => fly.map_or(Vec::new(), |f| {
+            let ground = region.as_deref().map_or(0.0, |r| {
+                blended_height_m(&r.grid, f64::from(f.pos_m.x), f64::from(f.pos_m.z)).max(0.0)
+            });
+            let agl_m = f.pos_m.y - ground;
+            // Down at the cruise once (while flying): cruising from then on.
+            let cruising = cruising || (phase == NavPhase::Flying && agl_m <= CRUISE_AGL_M);
+            bench.stage = Stage::Region {
+                cycle,
+                hops,
+                since,
+                cruising,
+            };
+            region_keys(&phase, f.yaw, agl_m, cruising)
+        }),
         _ => Vec::new(),
     };
     let held = std::mem::take(&mut bench.keys_held);
@@ -538,6 +609,7 @@ struct Game<'w> {
     session: Option<Res<'w, SessionInfo>>,
     globe: Option<Res<'w, GlobeData>>,
     options: Option<Res<'w, TerrainOptions>>,
+    fly: Option<Res<'w, FlyState>>,
 }
 
 /// What the bench changes.
@@ -575,7 +647,16 @@ fn measure_journey(
     }
     let swapped = is_swap(&before, &phase);
     if let Some(cycle) = bench.stage.cycle() {
-        record_frame(bench, cycle, before, phase, density, frame_ms, now, swapped);
+        let frame = Frame {
+            before,
+            phase,
+            density,
+            frame_ms,
+            now,
+            swapped,
+            height_m: game.fly.as_ref().map_or(0.0, |f| f.pos_m.y),
+        };
+        record_frame(bench, cycle, frame);
     }
     let timed_out = |since: f64| now - since > STAGE_TIMEOUT_SECS;
     let fail = match bench.stage {
@@ -628,6 +709,7 @@ fn measure_journey(
                     cycle,
                     hops: 0,
                     since: now,
+                    cruising: false,
                 };
                 None
             }
@@ -643,12 +725,22 @@ fn measure_journey(
             } => Some("the dive did not reach the region in time".to_string()),
             _ => Some("the dive came back out over the globe (see the log)".to_string()),
         },
-        Stage::Region { cycle, hops, since } => {
+        Stage::Region {
+            cycle,
+            hops,
+            since,
+            cruising,
+        } => {
             let hops = hops + u32::from(swapped);
             if swapped {
                 info!(cycle = cycle + 1, hop = hops, "journey bench: hopped");
             }
-            bench.stage = Stage::Region { cycle, hops, since };
+            bench.stage = Stage::Region {
+                cycle,
+                hops,
+                since,
+                cruising,
+            };
             match phase {
                 NavPhase::Hopping {
                     turned_back: true, ..
@@ -713,18 +805,31 @@ fn start_journey(bench: &mut JourneyBench, cycle: u32, now: f64) {
     bench.stage = Stage::Approach { cycle, since: now };
 }
 
-/// One frame of the script: its flight time, holds, swaps and memory.
-#[expect(clippy::too_many_arguments, reason = "one frame's readings")]
-fn record_frame(
-    bench: &mut JourneyBench,
-    cycle: u32,
+/// One frame's readings, after navigation.
+#[derive(Copy, Clone, Debug)]
+struct Frame {
+    /// Navigation's phase last frame and this one.
     before: NavPhase,
     phase: NavPhase,
     density: f32,
     frame_ms: f32,
     now: f64,
     swapped: bool,
-) {
+    /// The region fly's height above sea level.
+    height_m: f32,
+}
+
+/// One frame of the script: its flight time, holds, swaps, hops and memory.
+fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
+    let Frame {
+        before,
+        phase,
+        density,
+        frame_ms,
+        now,
+        swapped,
+        height_m,
+    } = frame;
     if density == 0.0 {
         bench.flight_ms.push(frame_ms);
     }
@@ -733,20 +838,27 @@ fn record_frame(
         Stage::Region { hops, .. } => hops,
         _ => 0,
     };
-    let memory = cycle_memory();
+    // Sampled only where the gates read it: flying in a region and through a hop.
+    let memory = matches!(phase, NavPhase::Flying | NavPhase::Hopping { .. })
+        .then(cycle_memory)
+        .flatten();
     let entered = std::mem::discriminant(&phase) != std::mem::discriminant(&before);
     match phase {
         NavPhase::Diving { .. } if entered => bench.start_hold(Transition::Dive, cycle),
         NavPhase::Hopping { .. } if entered => {
-            bench.start_hold(Transition::Hop(hops_done + 1), cycle);
+            let hop = hops_done + 1;
+            bench.start_hold(Transition::Hop(hop), cycle);
             match bench.hops.last_mut() {
-                // Started again after turning back before its lift: the same hop.
-                Some(last) if last.open => {}
-                _ => bench.hops.push(HopMemory {
+                // Started again after turning back before its lift: the same hop, keyed as its
+                // hold is, its baseline kept.
+                Some(last) if last.cycle == cycle && last.hop == hop => last.open = true,
+                _ => bench.hops.push(HopRecord {
+                    cycle,
+                    hop,
                     baseline: bench.in_region,
                     peak: memory,
-                    end: None,
                     open: true,
+                    ..default()
                 }),
             }
         }
@@ -778,14 +890,23 @@ fn record_frame(
                 hop.open = false;
             }
         }
-        NavPhase::Hopping { .. } => {
+        NavPhase::Hopping {
+            lift,
+            lift_from_agl_m,
+            swapped,
+            ..
+        } => {
             if let Some(hop) = bench.hops.last_mut().filter(|h| h.open) {
                 hop.peak = super::max_opt(hop.peak, memory);
+                hop.peak_height_m = Some(hop.peak_height_m.map_or(height_m, |p| p.max(height_m)));
+                // Frozen once the lift begins; the return after the swap may move it.
+                if !swapped && lift > 0.0 {
+                    hop.from_agl_m = Some(lift_from_agl_m);
+                }
             }
         }
         _ => {
             if let Some(hop) = bench.hops.last_mut().filter(|h| h.open) {
-                hop.end = memory;
                 hop.open = false;
             }
         }
@@ -959,6 +1080,32 @@ fn finish(
         ));
     }
 
+    // Hop lift (reported only): the lift's start and the hop's highest height.
+    let lifts: Vec<String> = bench
+        .hops
+        .iter()
+        .map(|h| {
+            let km =
+                |m: Option<f32>| m.map_or("n/a".to_string(), |m| format!("{:.1} km", m / 1000.0));
+            format!(
+                "hop {} {} -> {} (cycle {})",
+                h.hop,
+                km(h.from_agl_m),
+                km(h.peak_height_m),
+                h.cycle + 1
+            )
+        })
+        .collect();
+    out.push(format!(
+        "hop lift (reported only; from the height above the ground before the lift to the hop's highest height above sea level, the lift rising to {:.0} km): {}",
+        HOP_ALTITUDE_M / 1000.0,
+        if lifts.is_empty() {
+            "no hop".to_string()
+        } else {
+            lifts.join(", ")
+        }
+    ));
+
     // Hop memory.
     let samples: Vec<_> = bench
         .hops
@@ -976,20 +1123,20 @@ fn finish(
     let each: Vec<String> = bench
         .hops
         .iter()
-        .enumerate()
-        .map(|(i, h)| {
+        .map(|h| {
             let top = if web { h.end } else { h.peak };
-            match (h.baseline, top) {
-                (Some(b), Some(t)) => format!("{}: {}", i + 1, signed_mib(t as i64 - b as i64)),
-                _ => format!("{}: n/a", i + 1),
-            }
+            let over = match (h.baseline, top) {
+                (Some(b), Some(t)) => signed_mib(t as i64 - b as i64),
+                _ => "n/a".to_string(),
+            };
+            format!("hop {} {over} (cycle {})", h.hop, h.cycle + 1)
         })
         .collect();
     match hop_memory_gate(&samples, web) {
         Some((ok, worst)) => {
             pass &= ok;
             out.push(format!(
-                "hop memory peak ({hop_scope}): worst {} over the baseline; hops {} -> {}",
+                "hop memory peak ({hop_scope}): worst {} over the baseline; {} -> {}",
                 signed_mib(worst),
                 each.join(", "),
                 gate_word(ok)

@@ -79,6 +79,39 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
     window
 }
 
+/// The benchmark a launch runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChosenBench {
+    Scrub,
+    Region(RegionBenchConfig),
+    Journey(JourneyBenchConfig),
+}
+
+/// The benchmark the launch arguments ask for: the region bench over the journey bench over the
+/// scrub bench. With `--region`, the region and journey benches fly that region (the region
+/// bench only that one, with no pan or memory cycles); the scrub bench leaves it to the launch.
+pub fn chosen_bench(
+    args: &LaunchArgs,
+    target_fps: u32,
+    exit_when_done: bool,
+) -> Option<ChosenBench> {
+    if args.region_bench {
+        Some(ChosenBench::Region(match args.region {
+            Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
+            None => RegionBenchConfig::new(target_fps, exit_when_done),
+        }))
+    } else if args.journey_bench {
+        Some(ChosenBench::Journey(match args.region {
+            Some(region) => JourneyBenchConfig::chosen(target_fps, exit_when_done, region),
+            None => JourneyBenchConfig::new(target_fps, exit_when_done),
+        }))
+    } else if args.scrub_bench {
+        Some(ChosenBench::Scrub)
+    } else {
+        None
+    }
+}
+
 /// Builds the Time Fly app. Plugins are added here as milestones land.
 pub fn app(session: &Session) -> App {
     let args = session.args().clone();
@@ -149,30 +182,25 @@ pub fn app(session: &Session) -> App {
     app.insert_resource(terrain::TerrainOptions {
         dunes: !args.no_dunes,
     });
-    if args.region_bench {
-        // The region bench enters its own regions and takes precedence over the scrub bench.
-        // With `--region` it benches only that region (one flight, no pan or memory cycles).
-        let config = match args.region {
-            Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
-            None => RegionBenchConfig::new(target_fps, exit_when_done),
-        };
-        app.add_plugins(RegionBenchPlugin(config));
-    } else if args.journey_bench {
-        // The journey bench flies the player's keys from the globe; it takes precedence over the
-        // scrub bench, and a `--region` launch region would only stand in its way.
-        app.add_plugins(JourneyBenchPlugin(JourneyBenchConfig::new(
-            target_fps,
-            exit_when_done,
-        )));
-    } else {
-        if let Some(region) = args.region {
-            app.insert_resource(LaunchRegion(region));
+    // The benches enter their own regions; a `--region` launch region is play or the scrub
+    // bench's start.
+    match chosen_bench(&args, target_fps, exit_when_done) {
+        Some(ChosenBench::Region(config)) => {
+            app.add_plugins(RegionBenchPlugin(config));
         }
-        if args.scrub_bench {
-            app.add_plugins(ScrubBenchPlugin {
-                target_fps,
-                exit_when_done,
-            });
+        Some(ChosenBench::Journey(config)) => {
+            app.add_plugins(JourneyBenchPlugin(config));
+        }
+        chosen => {
+            if let Some(region) = args.region {
+                app.insert_resource(LaunchRegion(region));
+            }
+            if chosen == Some(ChosenBench::Scrub) {
+                app.add_plugins(ScrubBenchPlugin {
+                    target_fps,
+                    exit_when_done,
+                });
+            }
         }
     }
     app
@@ -181,6 +209,66 @@ pub fn app(session: &Session) -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_benches_take_precedence_in_order() {
+        use bench::region::CHOSEN_REGION;
+        let arg = args::parse_region("20,37.5,0").unwrap();
+        let chosen = |args: LaunchArgs| chosen_bench(&args, 60, true);
+        // The region bench over the journey bench over the scrub bench.
+        let all = LaunchArgs {
+            scrub_bench: true,
+            region_bench: true,
+            journey_bench: true,
+            ..default()
+        };
+        assert_eq!(
+            chosen(all.clone()),
+            Some(ChosenBench::Region(RegionBenchConfig::new(60, true)))
+        );
+        let journey = LaunchArgs {
+            region_bench: false,
+            ..all.clone()
+        };
+        assert_eq!(
+            chosen(journey.clone()),
+            Some(ChosenBench::Journey(JourneyBenchConfig::new(60, true)))
+        );
+        assert_eq!(
+            chosen(LaunchArgs {
+                journey_bench: false,
+                ..journey.clone()
+            }),
+            Some(ChosenBench::Scrub)
+        );
+        assert_eq!(chosen(LaunchArgs::default()), None);
+        // `--region` names the region either bench flies.
+        let Some(ChosenBench::Journey(c)) = chosen(LaunchArgs {
+            region: Some(arg),
+            ..journey
+        }) else {
+            panic!("not the journey bench");
+        };
+        assert_eq!((c.region.name, c.region.arg), (CHOSEN_REGION, arg));
+        assert_eq!(c.cycles, JourneyBenchConfig::new(60, true).cycles);
+        assert_eq!(
+            chosen(LaunchArgs {
+                region: Some(arg),
+                ..all
+            }),
+            Some(ChosenBench::Region(RegionBenchConfig::single(
+                60, true, arg
+            )))
+        );
+        // A bare `--region` is play, not a bench.
+        assert_eq!(
+            chosen(LaunchArgs {
+                region: Some(arg),
+                ..default()
+            }),
+            None
+        );
+    }
 
     #[test]
     fn the_canvas_fills_its_page() {
