@@ -11,7 +11,9 @@
 //!   `hydro: None` and a `warn`; a wait longer than [`HYDRO_WAIT_MAX_S`] gives up the same way,
 //!   so a dive or a hop's hold never waits on the pass past M3's bounds.
 //! - **One pass at a time** ([`admit`]): a region request replaces a prefetch (or a region pass
-//!   for another era); a prefetch replaces only a prefetch.
+//!   for another era); a prefetch replaces only a prefetch. A replaced native task is cancelled
+//!   (it stops within one sample block or one step) and the next pass's run waits until it has
+//!   stopped ([`job::HydroTasks`]), so two passes never run at once.
 //! - **The run.** Native: an [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool) task
 //!   that samples the lattice in parallel blocks, then steps the pass. Web: time-boxed slices of
 //!   [`WEB_HYDRO_BUDGET_MS`] per frame, or
@@ -414,6 +416,7 @@ impl Plugin for HydroPlugin {
             .init_resource::<HydroCache>()
             .init_resource::<ClimateIndex>()
             .init_resource::<Settle>()
+            .init_resource::<job::HydroTasks>()
             .add_domain_event::<HydroRequested>()
             .add_domain_event::<HydroPassFinished>()
             .add_domain_event::<HydroPassFailed>()
@@ -424,6 +427,7 @@ impl Plugin for HydroPlugin {
                     climate::poll_climate_manifest,
                     prefetch_settled_era,
                     job::start_hydro_requests,
+                    job::poll_replaced,
                     job::advance_hydro_job,
                     job::poll_hydro_run,
                 )

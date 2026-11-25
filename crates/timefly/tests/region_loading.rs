@@ -2043,6 +2043,44 @@ fn a_region_request_preempts_a_prefetch() {
     stalls.lock().unwrap().clear();
 }
 
+/// Review fix round 1: a region request that replaces a prefetch already running natively
+/// cancels its task, and the region's pass starts only once that task has stopped: never two
+/// passes at once. The lattice is large enough (6 × 320² nodes) for the prefetch to be caught
+/// mid-run.
+#[test]
+fn replacing_a_running_pass_stops_it_before_the_next_starts() {
+    use timefly::hydro::job::HydroTasks;
+    let sizes = LatticeSizes {
+        recent_n: 320,
+        deep_n: 8,
+    };
+    let mut app = region_app_with(&tiny_root(), SMALL, None, |app| {
+        add_hydro_sized(app, true, sizes);
+    });
+    update_until(&mut app, "the present day's prefetch running", |app| {
+        app.world().resource::<HydroTasks>().live() == 1
+    });
+    assert_eq!(
+        app.world().resource::<HydroCache>().status(YearsBp(0.0)),
+        HydroStatus::Running
+    );
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    let tasks = app.world().resource::<HydroTasks>();
+    assert_eq!(tasks.replaced(), 1);
+    assert_eq!(tasks.peak(), 1, "two passes ran at once");
+    assert_eq!(
+        (tasks.cancelled(), tasks.completed_after_replace()),
+        (1, 0),
+        "the replaced task did not stop early"
+    );
+    assert!(!tasks.draining() && tasks.live() == 0);
+    let seen = hydro_seen(&app);
+    let ages: Vec<YearsBp> = seen.finished().iter().map(|f| f.age).collect();
+    assert_eq!(ages, [ka(21.0)]);
+    assert!(seen.generated()[0].hydrology);
+}
+
 /// Disabled, no pass runs, not even on the settled globe, and a region never waits.
 #[test]
 fn a_disabled_pass_never_holds_a_region() {

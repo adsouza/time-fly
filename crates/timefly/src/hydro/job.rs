@@ -9,7 +9,8 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -49,9 +50,13 @@ use crate::region::{LOAD_TIMEOUT_S, LargeGenBudget, TileIndex, gen_budget, load_
 
 /// Nodes per parallel sampling block on native.
 pub const SAMPLE_BLOCK_NODES: u32 = 4096;
-/// Units per [`HydroPrep::step`] on native: the task checks for cancellation and measures the
-/// working bytes between steps (about 30 checks at n = 900), and is otherwise one long run.
-pub const NATIVE_STEP_UNITS: u32 = 1 << 20;
+/// Units per [`HydroPrep::step`] on native: the task checks for cancellation between steps
+/// (about 180 checks at n = 900, each step at most about 40 ms there, the pass's final build
+/// being the longest) and is otherwise one long run.
+pub const NATIVE_STEP_UNITS: u32 = 1 << 18;
+/// The native task measures [`HydroPrep::working_bytes`] (which walks the basins) every this
+/// many steps, and at the end.
+pub const NATIVE_BYTES_EVERY: u32 = 4;
 /// A time-boxed run's first step, in units; later steps aim at a quarter of the slice budget
 /// from the measured rate, between [`SLICED_MIN_UNITS`] and [`SLICED_MAX_UNITS`].
 pub const SLICED_FIRST_UNITS: u32 = 1024;
@@ -141,6 +146,25 @@ fn node_blocks(len: u32, block: u32) -> Vec<Range<u32>> {
         .collect()
 }
 
+/// Why a native run ended without a result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PassError {
+    /// Its cancel flag was set: it stopped at the next sample block or step, having sampled
+    /// `nodes_sampled` nodes and done `units` units of the pass after sampling.
+    Cancelled { nodes_sampled: u64, units: u64 },
+    /// The era's field could not be built.
+    Field(String),
+}
+
+impl std::fmt::Display for PassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PassError::Cancelled { .. } => f.write_str("cancelled"),
+            PassError::Field(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Steps the pass to the end in [`NATIVE_STEP_UNITS`] steps; `false` if cancelled.
 #[cfg(not(target_arch = "wasm32"))]
 fn step_native<S: NodeSource, C: ClimateSource>(
@@ -152,6 +176,7 @@ fn step_native<S: NodeSource, C: ClimateSource>(
     peak: &mut usize,
     longest: &mut Duration,
 ) -> bool {
+    let mut steps = 0u32;
     loop {
         if cancel.load(Ordering::Relaxed) {
             return false;
@@ -159,7 +184,10 @@ fn step_native<S: NodeSource, C: ClimateSource>(
         let t = Instant::now();
         let done = prep.step(source, climate, table, NATIVE_STEP_UNITS);
         *longest = (*longest).max(t.elapsed());
-        *peak = (*peak).max(prep.working_bytes());
+        steps += 1;
+        if done || steps.is_multiple_of(NATIVE_BYTES_EVERY) {
+            *peak = (*peak).max(prep.working_bytes());
+        }
         if done {
             return true;
         }
@@ -168,13 +196,15 @@ fn step_native<S: NodeSource, C: ClimateSource>(
 
 /// The pass on the calling thread, its sampling in parallel [`SAMPLE_BLOCK_NODES`] blocks
 /// across the [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool). `cancel` stops it
-/// between steps.
+/// within one sample block (each block checks it first, and sampling checks it once more at
+/// the end) or one step.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOutput, String> {
+pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOutput, PassError> {
     use bevy::tasks::AsyncComputeTaskPool;
+    use timefly_core::hydrology::NodeBlock;
 
     let started = Instant::now();
-    let field = inputs.field()?;
+    let field = inputs.field().map_err(PassError::Field)?;
     let (lattice, mode) = inputs.lattice();
     let source = SnapshotSource::new(
         &field,
@@ -187,9 +217,26 @@ pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOut
     let shared = &source;
     let blocks = AsyncComputeTaskPool::get().scope(|s| {
         for range in node_blocks(lattice.len(), SAMPLE_BLOCK_NODES) {
-            s.spawn(async move { HydroPrep::sample_range(&lattice, shared, range) });
+            s.spawn(async move {
+                if cancel.load(Ordering::Relaxed) {
+                    // Skipped: the run is abandoned after the scope.
+                    return NodeBlock {
+                        start: range.start,
+                        samples: Vec::new(),
+                        data_lakes: false,
+                    };
+                }
+                HydroPrep::sample_range(&lattice, shared, range)
+            });
         }
     });
+    // The flag only ever turns on, so a block that skipped is always seen here.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(PassError::Cancelled {
+            nodes_sampled: blocks.iter().map(|b| b.samples.len() as u64).sum(),
+            units: 0,
+        });
+    }
     for block in blocks {
         prep.add_samples(block);
     }
@@ -219,7 +266,10 @@ pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOut
         ),
     };
     if !done {
-        return Err("cancelled".to_string());
+        return Err(PassError::Cancelled {
+            nodes_sampled: u64::from(lattice.len()),
+            units: prep.units_done() - u64::from(lattice.len()),
+        });
     }
     let units = prep.units_done();
     let cpu = started.elapsed();
@@ -396,24 +446,104 @@ impl HydroRun {
     }
 }
 
-/// Sets its flag when dropped: a replaced or abandoned native task stops at its next step.
+/// A native task's cancel flag, also set when dropped (an app shutting down mid-pass): the
+/// task stops within one sample block or one step.
 #[cfg(not(target_arch = "wasm32"))]
 struct CancelOnDrop(Arc<AtomicBool>);
 
 #[cfg(not(target_arch = "wasm32"))]
+impl CancelOnDrop {
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.cancel();
     }
 }
 
 enum Run {
     #[cfg(not(target_arch = "wasm32"))]
     Task {
-        task: Task<Result<PassOutput, String>>,
-        _cancel: CancelOnDrop,
+        task: Task<Result<PassOutput, PassError>>,
+        cancel: CancelOnDrop,
     },
     Sliced(HydroRun),
+}
+
+/// Native pass tasks running now and the most that ever ran at once.
+#[derive(Debug, Default)]
+struct TaskGauge {
+    live: AtomicU32,
+    peak: AtomicU32,
+}
+
+/// Counts a task as running until dropped (when its closure returns).
+#[cfg(not(target_arch = "wasm32"))]
+struct Live(Arc<TaskGauge>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Live {
+    fn enter(gauge: Arc<TaskGauge>) -> Live {
+        let now = gauge.live.fetch_add(1, Ordering::SeqCst) + 1;
+        gauge.peak.fetch_max(now, Ordering::SeqCst);
+        Live(gauge)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The native pass tasks. A replaced pass's task is cancelled and kept here until it has
+/// stopped (within one sample block or one step); the next pass's run starts only then, so two
+/// passes never share the pool or hold their working memory at once. On the web a replaced
+/// run is a sliced future on the main thread and simply dropped.
+#[derive(Resource, Default)]
+pub struct HydroTasks {
+    gauge: Arc<TaskGauge>,
+    draining: Vec<Run>,
+    replaced: u32,
+    cancelled: u32,
+    completed_after_replace: u32,
+}
+
+impl HydroTasks {
+    /// Pass tasks running now.
+    pub fn live(&self) -> u32 {
+        self.gauge.live.load(Ordering::SeqCst)
+    }
+
+    /// The most pass tasks that ever ran at once.
+    pub fn peak(&self) -> u32 {
+        self.gauge.peak.load(Ordering::SeqCst)
+    }
+
+    /// Running passes replaced by another era's request.
+    pub fn replaced(&self) -> u32 {
+        self.replaced
+    }
+
+    /// Replaced passes that stopped early.
+    pub fn cancelled(&self) -> u32 {
+        self.cancelled
+    }
+
+    /// Replaced passes that finished anyway (their result discarded).
+    pub fn completed_after_replace(&self) -> u32 {
+        self.completed_after_replace
+    }
+
+    /// Whether a replaced task is still stopping.
+    pub fn draining(&self) -> bool {
+        !self.draining.is_empty()
+    }
 }
 
 /// A climate grid loading.
@@ -444,6 +574,9 @@ enum Stage {
         climate: ClimateLoads,
     },
     Running(Run),
+    /// Its run moved to [`HydroTasks`] to stop; the job is being replaced.
+    #[cfg(not(target_arch = "wasm32"))]
+    Replaced,
 }
 
 /// The pass in flight. Replacing or removing it drops its loads and its run (a native task
@@ -467,6 +600,8 @@ pub(super) fn start_hydro_requests(
     mut frame_cache: ResMut<FrameCache>,
     clock: Res<LoadClock>,
     mut commands: Commands,
+    job: Option<ResMut<HydroJob>>,
+    mut tasks: ResMut<HydroTasks>,
 ) {
     let mut start = None;
     for request in requests.read() {
@@ -496,6 +631,24 @@ pub(super) fn start_hydro_requests(
     let (Some(age), Some(globe)) = (start, globe) else {
         return;
     };
+    // A running native task is cancelled and kept until it stops ([`HydroTasks`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(mut old) = job
+        && matches!(old.stage, Stage::Running(Run::Task { .. }))
+        && let Stage::Running(run) = std::mem::replace(&mut old.stage, Stage::Replaced)
+    {
+        if let Run::Task { cancel, .. } = &run {
+            cancel.cancel();
+        }
+        debug!(
+            age_years = old.age.0,
+            "continental pass replaced; its task is stopping"
+        );
+        tasks.replaced += 1;
+        tasks.draining.push(run);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (job, &mut tasks);
     let frames = FrameLoads::start(
         &globe,
         age.myr(),
@@ -534,6 +687,40 @@ fn fail(
         age,
         reason: reason.to_string(),
     });
+}
+
+/// Takes in replaced tasks that have stopped.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn poll_replaced(mut tasks: ResMut<HydroTasks>) {
+    let tasks = &mut *tasks;
+    let (mut cancelled, mut completed) = (0, 0);
+    tasks.draining.retain_mut(|run| match run {
+        Run::Task { task, .. } => match bevy::tasks::futures::check_ready(task) {
+            None => true,
+            Some(Err(PassError::Cancelled {
+                nodes_sampled,
+                units,
+            })) => {
+                debug!(nodes_sampled, units, "replaced continental pass stopped");
+                cancelled += 1;
+                false
+            }
+            Some(Ok(_)) => {
+                completed += 1;
+                false
+            }
+            Some(Err(PassError::Field(_))) => false,
+        },
+        Run::Sliced(_) => false,
+    });
+    tasks.cancelled += cancelled;
+    tasks.completed_after_replace += completed;
+}
+
+/// The web drops a replaced sliced run at once: nothing is ever kept to stop.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn poll_replaced(mut tasks: ResMut<HydroTasks>) {
+    tasks.draining.clear();
 }
 
 /// Moves the climate loads on; a grid that fails makes the climate zonal for the session.
@@ -634,6 +821,7 @@ pub(super) fn advance_hydro_job(
     mut cache: ResMut<HydroCache>,
     mut failed: MessageWriter<HydroPassFailed>,
     clock: Res<LoadClock>,
+    tasks: Res<HydroTasks>,
 ) {
     let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
@@ -657,7 +845,8 @@ pub(super) fn advance_hydro_job(
     let ClimateLoads::Ready(beyer) = climate else {
         return;
     };
-    if ready.is_none() || !index.overview_settled() {
+    // Never two passes at once: a replaced task must have stopped first.
+    if ready.is_none() || !index.overview_settled() || tasks.draining() {
         return;
     }
     let Some(globe) = globe else {
@@ -685,26 +874,29 @@ pub(super) fn advance_hydro_job(
             Duration::from_secs_f64(WEB_HYDRO_BUDGET_MS / 1000.0),
         ))
     } else {
-        start_task(inputs)
+        start_task(inputs, &tasks)
     };
     job.stage = Stage::Running(run);
 }
 
 /// The native run: a task on the async compute pool.
 #[cfg(not(target_arch = "wasm32"))]
-fn start_task(inputs: HydroInputs) -> Run {
+fn start_task(inputs: HydroInputs, tasks: &HydroTasks) -> Run {
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();
+    let gauge = tasks.gauge.clone();
     Run::Task {
-        task: bevy::tasks::AsyncComputeTaskPool::get()
-            .spawn(async move { run_parallel(&inputs, &flag) }),
-        _cancel: CancelOnDrop(cancel),
+        task: bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+            let _live = Live::enter(gauge);
+            run_parallel(&inputs, &flag)
+        }),
+        cancel: CancelOnDrop(cancel),
     }
 }
 
 /// The web has no task pool threads (never called there: the web's runs are sliced).
 #[cfg(target_arch = "wasm32")]
-fn start_task(inputs: HydroInputs) -> Run {
+fn start_task(inputs: HydroInputs, _tasks: &HydroTasks) -> Run {
     Run::Sliced(HydroRun::new(
         inputs,
         Duration::from_secs_f64(WEB_HYDRO_BUDGET_MS / 1000.0),
@@ -728,7 +920,9 @@ pub(super) fn poll_hydro_run(
     };
     let result = match run {
         #[cfg(not(target_arch = "wasm32"))]
-        Run::Task { task, .. } => bevy::tasks::futures::check_ready(task),
+        Run::Task { task, .. } => {
+            bevy::tasks::futures::check_ready(task).map(|r| r.map_err(|e| e.to_string()))
+        }
         Run::Sliced(run) => {
             let large = large_budget.is_some_and(|b| b.0);
             let budget = gen_budget(run.base_budget(), large, false);
@@ -937,16 +1131,24 @@ mod tests {
         assert_eq!(out.units, expected.units);
     }
 
+    /// A cancelled run samples nothing more: each block checks the flag before sampling.
     #[test]
-    fn a_cancelled_task_stops() {
+    fn a_cancelled_task_stops_before_sampling() {
         let inputs = tiny_inputs(
             0.0,
             LatticeSizes {
-                recent_n: 16,
+                recent_n: 64,
                 deep_n: 8,
             },
         );
         let err = run_parallel(&inputs, &AtomicBool::new(true)).unwrap_err();
-        assert_eq!(err, "cancelled");
+        assert_eq!(
+            err,
+            PassError::Cancelled {
+                nodes_sampled: 0,
+                units: 0
+            }
+        );
+        assert_eq!(err.to_string(), "cancelled");
     }
 }
