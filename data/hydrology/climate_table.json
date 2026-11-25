@@ -1,0 +1,21 @@
+{
+  "description": "The owner's climate table for the continental water pass (rivers and lakes design 4.1). Breakpoint lists are [temperature C, mm/yr], ascending, linear between breakpoints and clamped at the ends. Runoff is Turc-Pike: P - P / (1 + (P/PET)^n)^(1/n), or P where PET is 0. A lake's net evaporation is max(0, E(T) - P). Ice nodes run off ice_melt_runoff_mm. biome_climate gives each zonal biome a typical [precipitation mm/yr, temperature C], used past 120 ka and where the Beyer et al. 2020 grids have no value. Read by timefly_core's tests, the game shell (Task 4) and the Python reference pass (Task 11).",
+  "pet_mm": [[-20, 0], [-10, 120], [0, 300], [10, 650], [20, 1100], [30, 1600]],
+  "lake_evaporation_mm": [[-20, 50], [-10, 200], [0, 450], [10, 900], [20, 1500], [30, 2200]],
+  "turc_pike_n": 2.0,
+  "ice_melt_runoff_mm": 300,
+  "biome_climate": {
+    "TropicalRainforest": [2500, 26],
+    "MonsoonSavanna": [1200, 25],
+    "HotDesert": [60, 26],
+    "ColdDesert": [150, 8],
+    "Steppe": [350, 10],
+    "Mediterranean": [600, 16],
+    "TemperateBroadleaf": [900, 11],
+    "TemperateRainforest": [2000, 10],
+    "Boreal": [550, -2],
+    "Tundra": [300, -10],
+    "IceCap": [200, -25],
+    "Alpine": [900, -2]
+  }
+}

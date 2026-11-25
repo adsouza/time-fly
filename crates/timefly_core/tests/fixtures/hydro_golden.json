@@ -1,5 +1,5 @@
 {
-  "description": "Golden routing grid for the continental water pass (rivers and lakes, Task 2). A 4 x 5 GridGraph, row 0 north, at 1,000 m spacing; column 0 is ocean at -10 m. Cells are [row, col]. receiver is null for ocean. q holds discharge per case; null for ocean. Task 3 adds the lake cases B and C; the Python reference (Task 11) reads the same file.",
+  "description": "Golden routing grid for the continental water pass (rivers and lakes, Task 2). A 4 x 5 GridGraph, row 0 north, at 1,000 m spacing; column 0 is ocean at -10 m. Cells are [row, col]. receiver is null for ocean. q holds discharge per case; null for ocean. Each case gives the evaporation capacity per basin node and the lake it makes (Task 3); the Python reference (Task 11) reads the same file.",
   "rows": 4,
   "cols": 5,
   "spacing_m": 1000.0,
@@ -37,9 +37,33 @@
   "q": {
     "A": {
       "description": "unit runoff on every land node, no evaporation",
+      "capacity_m3s": 0.0,
+      "lake": { "kind": "Open", "level_m": 3.0, "inflow_m3s": 12.0, "evaporation_m3s": 0.0, "outflow_m3s": 12.0 },
       "q": [
         [null, 1.0, 1.0, 1.0, 1.0],
         [null, 13.0, 12.0, 4.0, 1.0],
+        [null, 1.0, 2.0, 4.0, 1.0],
+        [null, 1.0, 1.0, 1.0, 1.0]
+      ]
+    },
+    "B": {
+      "description": "unit runoff; each basin node evaporates up to 2 m3/s. Open: the basin's 8 m3/s of capacity is below its 12 m3/s inflow, so it spills 4 m3/s over the rim (1, 1). Inside the basin, discharge re-accumulates along the routing receivers into the exit.",
+      "capacity_m3s": 2.0,
+      "lake": { "kind": "Open", "level_m": 3.0, "inflow_m3s": 12.0, "evaporation_m3s": 8.0, "outflow_m3s": 4.0 },
+      "q": [
+        [null, 1.0, 1.0, 1.0, 1.0],
+        [null, 5.0, 12.0, 4.0, 1.0],
+        [null, 1.0, 2.0, 4.0, 1.0],
+        [null, 1.0, 1.0, 1.0, 1.0]
+      ]
+    },
+    "C": {
+      "description": "unit runoff; each basin node evaporates up to 5 m3/s. Terminal: the 1 m group holds 5 m3/s, the 2 m group 15 more, so 12 m3/s stands 7/15 of the way from 2 m to the 3 m spill: level 2 + 7/15 m. The lake's nodes are sinks and keep their own water; nothing reaches the rim.",
+      "capacity_m3s": 5.0,
+      "lake": { "kind": "Terminal", "level_m": 2.466666666666667, "inflow_m3s": 12.0, "evaporation_m3s": 12.0, "outflow_m3s": 0.0 },
+      "q": [
+        [null, 1.0, 1.0, 1.0, 1.0],
+        [null, 1.0, 2.0, 4.0, 1.0],
         [null, 1.0, 2.0, 4.0, 1.0],
         [null, 1.0, 1.0, 1.0, 1.0]
       ]

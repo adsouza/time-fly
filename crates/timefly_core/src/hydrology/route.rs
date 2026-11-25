@@ -55,6 +55,8 @@ pub struct Basin {
 /// The routing of one elevation field over one graph.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Routed {
+    /// The elevation routed, one value per node.
+    pub elevation_m: Vec<f32>,
     pub ocean: Vec<bool>,
     /// The depression-filled surface. Equal to the elevation on the ocean.
     pub filled_m: Vec<f32>,
@@ -145,6 +147,7 @@ pub struct Routing {
     reach: u32,
     lowest: u32,
     ocean: Vec<bool>,
+    ocean_count: u32,
     any_ocean: bool,
     heap: BinaryHeap<Reverse<(u32, u64, u32)>>,
     seq: u64,
@@ -156,6 +159,7 @@ pub struct Routing {
     basins: Vec<Basin>,
     basin_of: Vec<u32>,
     open: Option<Basin>,
+    units: u64,
 }
 
 impl Routing {
@@ -168,8 +172,10 @@ impl Routing {
     pub(crate) fn with_strait_m(elevation_m: Vec<f32>, strait_m: f64) -> Self {
         let len = elevation_m.len();
         assert!(u32::try_from(len).is_ok(), "too many nodes");
+        // Arrays the later phases need are allocated when those phases start, so they do not add
+        // to the ocean dilation's peak (`working_bytes`).
         Self {
-            filled: elevation_m.clone(),
+            filled: Vec::new(),
             elevation: elevation_m,
             strait_m,
             phase: Phase::Label { next: 0 },
@@ -182,16 +188,18 @@ impl Routing {
             reach: 0,
             lowest: 0,
             ocean: vec![false; len],
+            ocean_count: 0,
             any_ocean: false,
             heap: BinaryHeap::new(),
             seq: 0,
-            visited: vec![false; len],
-            parent: vec![NO_PARENT; len],
-            order: Vec::with_capacity(len),
-            receiver: vec![RECEIVER_NONE; len],
+            visited: Vec::new(),
+            parent: Vec::new(),
+            order: Vec::new(),
+            receiver: Vec::new(),
             basins: Vec::new(),
-            basin_of: vec![NO_BASIN; len],
+            basin_of: Vec::new(),
             open: None,
+            units: 0,
         }
     }
 
@@ -205,15 +213,50 @@ impl Routing {
         );
         let mut left = budget;
         while left > 0 && self.phase != Phase::Done {
-            left = left.saturating_sub(self.unit(g));
+            let cost = self.unit(g);
+            self.units += u64::from(cost);
+            left = left.saturating_sub(cost);
         }
         self.phase == Phase::Done
+    }
+
+    /// The units of work done so far.
+    pub fn units_done(&self) -> u64 {
+        self.units
+    }
+
+    /// The bytes the router holds now, by capacity.
+    pub fn working_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let basins: usize = self
+            .basins
+            .iter()
+            .chain(self.open.as_ref())
+            .map(|b| size_of::<Basin>() + b.nodes.capacity() * 4)
+            .sum();
+        4 * (self.elevation.capacity()
+            + self.filled.capacity()
+            + self.component.capacity()
+            + self.component_start.capacity()
+            + self.component_nodes.capacity()
+            + self.steps.capacity()
+            + self.queue.capacity()
+            + self.order.capacity()
+            + self.basin_of.capacity())
+            + self.component_ocean.capacity()
+            + self.ocean.capacity()
+            + self.visited.capacity()
+            + self.parent.capacity()
+            + self.receiver.capacity()
+            + self.heap.capacity() * size_of::<Reverse<(u32, u64, u32)>>()
+            + basins
     }
 
     /// The result. Panics unless [`Routing::step`] has returned `true`.
     pub fn finish(self) -> Routed {
         assert_eq!(self.phase, Phase::Done, "routing is not finished");
         Routed {
+            elevation_m: self.elevation,
             ocean: self.ocean,
             filled_m: self.filled,
             receiver: self.receiver,
@@ -300,6 +343,7 @@ impl Routing {
         self.component_ocean[c] = true;
         self.any_ocean = true;
         let (start, end) = (self.component_start[c], self.component_start[c + 1]);
+        self.ocean_count += end - start;
         for k in start..end {
             let v = self.component_nodes[k as usize];
             self.ocean[v as usize] = true;
@@ -341,6 +385,12 @@ impl Routing {
         self.component_nodes = Vec::new();
         self.component_ocean = Vec::new();
         self.steps = Vec::new();
+        self.queue = VecDeque::new();
+        let len = self.elevation.len();
+        self.filled = self.elevation.clone();
+        self.visited = vec![false; len];
+        self.parent = vec![NO_PARENT; len];
+        self.order = Vec::with_capacity(len - self.ocean_count as usize);
         self.phase = Phase::Seed { next: 0 };
     }
 
@@ -379,6 +429,7 @@ impl Routing {
         let Some(Reverse((_, _, c))) = self.heap.pop() else {
             self.heap = BinaryHeap::new();
             self.visited = Vec::new();
+            self.receiver = vec![RECEIVER_NONE; self.elevation.len()];
             self.phase = Phase::Receivers { next: 0 };
             return 1;
         };
@@ -401,6 +452,7 @@ impl Routing {
 
     fn pick_receiver(&mut self, g: &impl HydroGraph, next: u32) -> u32 {
         if next == self.len() {
+            self.basin_of = vec![NO_BASIN; self.elevation.len()];
             self.phase = Phase::Basins { next: 0 };
             return 1;
         }
@@ -472,6 +524,8 @@ impl Routing {
 
     fn redirect(&mut self, g: &impl HydroGraph, basin: u32, k: u32) -> u32 {
         let Some(b) = self.basins.get(basin as usize) else {
+            self.parent = Vec::new();
+            self.queue = VecDeque::new();
             self.phase = Phase::Done;
             return 1;
         };

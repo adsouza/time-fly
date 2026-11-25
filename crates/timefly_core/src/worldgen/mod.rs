@@ -8,7 +8,7 @@ pub mod frame;
 pub mod generate;
 pub mod noise;
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
 pub mod tiles;
 pub mod wind;
 

@@ -1,16 +1,33 @@
 //! The continental water pass (rivers and lakes design §4.1): a pure function of an era's
-//! elevation on a global lattice. This part fills depressions, picks the ocean, routes every
-//! node to a receiver and lists the basins. Climate, lakes and discharge come later (Task 3).
+//! elevation, ice and climate on a global lattice. Routing fills depressions, picks the ocean,
+//! routes every node to a receiver and lists the basins ([`Routing`]). The climate gives each
+//! node its runoff and each basin its evaporation ([`climate`]); the lakes settle by water
+//! balance; the rivers form a graph ([`RiverGraph`]). [`HydroPrep`] runs the whole pass for an
+//! era, resumably, and returns an [`EraHydrology`].
 //!
 //! Every rule here is mirrored by the Python reference pass (Task 11), so the neighbour order,
 //! the tie rules and the float formats are part of the contract, not implementation details.
 
+pub mod climate;
+mod graph;
+mod lakes;
 mod lattice;
 pub mod params;
+mod pass;
 mod route;
 
+pub use graph::{Down, NEAR_BUCKET_TEXELS, RiverGraph, RiverNode};
+pub use lakes::{Lake, LakeKind};
 pub use lattice::{CubeLattice, GridGraph, NEIGHBOUR_STEPS};
+pub use pass::{
+    HydroPrep, LatticeSizes, NodeBlock, NodeSample, NodeSource, SnapshotSource, SourceMode,
+    hydro_lattice_for, river_tile_margin_m,
+};
 pub use route::{Basin, NO_BASIN, RECEIVER_EXIT, RECEIVER_NONE, Routed, Routing, receiver_of};
+
+use crate::deep_time::YearsBp;
+use crate::geo::RenderDir;
+use lakes::LakeNode;
 
 /// A graph the pass routes over. Node ids are `0..len()`.
 pub trait HydroGraph: Sync {
@@ -35,4 +52,105 @@ pub trait HydroGraph: Sync {
 
     /// The mean distance between neighbouring nodes in metres. Sets the ocean's strait reach.
     fn mean_spacing_m(&self) -> f64;
+}
+
+/// The lake at a direction, from the lattice's four bilinear taps.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct LakeTap {
+    pub lake: u16,
+    pub level_m: f32,
+    pub kind: LakeKind,
+    /// The taps' distance from the shore in nodes (1 on a shore node, 0 off the lake),
+    /// interpolated bilinearly.
+    pub shore_steps: f32,
+}
+
+/// The continental pass's result for one era.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EraHydrology {
+    pub age: YearsBp,
+    pub lattice: CubeLattice,
+    pub lakes: Vec<Lake>,
+    pub rivers: RiverGraph,
+    /// Whether lakes held by the data's own surfaces were looked for (present-day sources).
+    pub data_lakes: bool,
+    /// One bit per node.
+    ocean: Vec<u64>,
+    /// Lake footprint nodes, sorted by node.
+    lake_nodes: Vec<LakeNode>,
+}
+
+impl EraHydrology {
+    pub fn is_ocean(&self, node: u32) -> bool {
+        self.ocean[(node / 64) as usize] >> (node % 64) & 1 == 1
+    }
+
+    /// Whether any of the four bilinear taps at `dir` is ocean.
+    pub fn ocean_tap(&self, dir: RenderDir) -> bool {
+        self.lattice
+            .taps(dir)
+            .iter()
+            .any(|&(node, _)| self.is_ocean(node))
+    }
+
+    fn lake_node(&self, node: u32) -> Option<&LakeNode> {
+        self.lake_nodes
+            .binary_search_by_key(&node, |n| n.node)
+            .ok()
+            .map(|k| &self.lake_nodes[k])
+    }
+
+    /// The lake whose footprint holds `node`.
+    pub fn lake_of(&self, node: u32) -> Option<u16> {
+        self.lake_node(node).map(|n| n.lake)
+    }
+
+    /// `node`'s distance from its lake's shore in nodes, 0 off every lake.
+    pub fn shore_steps(&self, node: u32) -> u16 {
+        self.lake_node(node).map_or(0, |n| n.shore_steps)
+    }
+
+    /// The highest-level lake among the four taps at `dir` (ties: the lowest lake index), with
+    /// the taps' shore distance in that lake interpolated bilinearly (0 for taps off it).
+    pub fn lake_tap(&self, dir: RenderDir) -> Option<LakeTap> {
+        let taps = self
+            .lattice
+            .taps(dir)
+            .map(|(node, w)| (self.lake_node(node), w));
+        let mut best: Option<u16> = None;
+        for (n, _) in &taps {
+            let Some(n) = n else { continue };
+            let better = best.is_none_or(|b| {
+                let (lb, ln) = (&self.lakes[b as usize], &self.lakes[n.lake as usize]);
+                ln.level_m > lb.level_m || (ln.level_m == lb.level_m && n.lake < b)
+            });
+            if better {
+                best = Some(n.lake);
+            }
+        }
+        let lake = best?;
+        let shore_steps = taps
+            .iter()
+            .filter_map(|(n, w)| {
+                n.filter(|n| n.lake == lake)
+                    .map(|n| w * f64::from(n.shore_steps))
+            })
+            .sum::<f64>() as f32;
+        let l = &self.lakes[lake as usize];
+        Some(LakeTap {
+            lake,
+            level_m: l.level_m,
+            kind: l.kind,
+            shore_steps,
+        })
+    }
+
+    /// The bytes the result holds, by capacity.
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.lakes.capacity() * std::mem::size_of::<Lake>()
+            + self.rivers.bytes()
+            + 8 * self.ocean.capacity()
+            + self.lake_nodes.capacity() * std::mem::size_of::<LakeNode>()
+    }
 }

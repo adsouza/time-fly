@@ -26,6 +26,11 @@ pub const DATA_LAKE_MIN_NODES: u32 = 2;
 pub const DATA_LAKE_MIN_BALANCE: f64 = 0.25;
 pub const DATA_LAKE_MAX_DEPTH_M: f64 = 50.0;
 pub const DATA_LAKE_DEPTH_RAMP_NODES: f64 = 2.0;
+/// A lake by the water balance must stand at least this deep over its basin's lowest node *(Task
+/// 3's call)*. Shallower water over a 10 km node is noise in the data: an open basin passes its
+/// inflow through, and a terminal one is a dry playa unless a river reaches it
+/// ([`RIVER_MIN_DISCHARGE_M3S`]).
+pub const MIN_LAKE_DEPTH_M: f64 = DATA_LAKE_FLAT_TOL_M;
 
 // Rivers.
 
