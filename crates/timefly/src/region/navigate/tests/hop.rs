@@ -66,12 +66,12 @@ fn hop_frame(
     wish: &mut Vec2,
 ) -> (NavPhase, Vec<NavAction>, f32, f32) {
     let out = frame(phase, i);
-    if out
-        .1
-        .iter()
-        .any(|a| matches!(a, NavAction::TurnBack { .. }))
-    {
-        *wish = -*wish;
+    // A turn back faces the fly as it says (the keys fly it that way).
+    if let Some(yaw) = out.1.iter().find_map(|a| match *a {
+        NavAction::TurnBack { yaw, .. } => Some(yaw),
+        _ => None,
+    }) {
+        *wish = Vec2::new(-yaw.sin(), -yaw.cos()) * wish.length();
     }
     // As the shell moves the fly: at its controls' share of the wish, kept inside the field
     // unless they free it, its velocity measured from the move, or the wish where an edge holds
@@ -294,10 +294,14 @@ fn turning_back_cancels_the_preload_and_keeps_the_region() {
         let inside = back.iter().position(|f| f.x_m <= EDGE_M).unwrap_or(0);
         assert!(back[..inside].iter().all(|f| f.density == 1.0), "{start}");
         let clear_frames = (CLOUD_CLEAR_S / 0.1).ceil() as usize + 3;
+        let clear = back
+            .iter()
+            .position(|f| f.density == 0.0)
+            .unwrap_or(back.len());
         assert!(
-            back.len() - inside <= clear_frames,
-            "{start}: {} frames after back inside",
-            back.len() - inside
+            clear - inside <= clear_frames,
+            "{start}: cleared {} frames after back inside",
+            clear - inside
         );
         assert_eq!(end.density, 0.0);
         // The fly is back at its height above the ground.
@@ -562,7 +566,7 @@ fn a_failed_neighbour_returns_the_fly_inside_the_edge() {
             .enumerate()
             .filter_map(|(k, f)| {
                 f.actions.iter().find_map(|a| match *a {
-                    NavAction::TurnBack { pos_m } => Some((k, pos_m)),
+                    NavAction::TurnBack { pos_m, .. } => Some((k, pos_m)),
                     _ => None,
                 })
             })
@@ -1425,6 +1429,13 @@ fn angled_approaches_to_a_held_edge_still_hop() {
     }
 }
 
+/// The player turns to `wish` in the hold: the velocity navigation sees in that frame (past the
+/// edge the keys count, `velocity_at_edges`).
+fn turn_to(i: &mut NavInputs, wish: Vec2) {
+    i.region_vel_mps =
+        timefly_core::flight::hop::velocity_at_edges(i.region_pos_m, i.region_vel_mps, wish);
+}
+
 /// Holds past the east edge for `hold` frames at 10 km/s, no neighbour ready; returns the
 /// phase and inputs there, the fly some km out.
 fn held_past_the_edge(start_z: f32, hold: usize) -> (NavPhase, NavInputs) {
@@ -1452,16 +1463,21 @@ fn held_past_the_edge(start_z: f32, hold: usize) -> (NavPhase, NavInputs) {
 /// until the fly is back inside the field.
 #[test]
 fn the_cloud_stays_up_until_the_fly_is_back_inside() {
-    // Straight back in (west), and back in toward the north edge, retargeting there.
-    for (start_z, back) in [
-        (0.0, Vec2::NEG_X),
-        (-(EDGE_M - 30_000.0), Vec2::new(-0.3, -1.0).normalize()),
-    ] {
+    // Straight back in (west); and north along the edge, retargeting to the north edge while
+    // still out past the east one, then back in (west). (Turning back in at a slant is a turn
+    // back, fix round 3: it ends the hop rather than retargeting.)
+    for (start_z, back) in [(0.0, Vec2::NEG_X), (-(EDGE_M - 30_000.0), Vec2::NEG_Y)] {
         let (phase, mut i) = held_past_the_edge(start_z, 100);
         let mut wish = back * 10_000.0;
+        turn_to(&mut i, wish);
         let (mut frames, mut z) = (Vec::new(), Vec::new());
         let mut p = phase;
         for _ in 0..6_000 {
+            // Once retargeted north, back in.
+            if matches!(p, NavPhase::Hopping { edge, .. } if edge.axis == 1) && wish.x == 0.0 {
+                wish = Vec2::NEG_X * 10_000.0;
+                turn_to(&mut i, wish);
+            }
             let (next, actions, _, density) = hop_frame(p, &mut i, &mut wish);
             z.push(i.region_pos_m.y);
             frames.push(HopFrame {
@@ -1545,4 +1561,151 @@ fn angled_approaches_hop_in_the_shell() {
         );
         assert_pose_follows_the_camera(&frames);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 3: a turn back out of the hold never swaps, and lands facing inward
+
+/// Flies `phase` with `wish` until the fly is `inside_m` inside the east edge and flying, at
+/// most `frames` frames, with `each` adjusting the inputs first; returns the frames and `z`s.
+fn back_in(
+    mut phase: NavPhase,
+    i: &mut NavInputs,
+    wish: &mut Vec2,
+    frames: usize,
+    mut each: impl FnMut(&NavPhase, &mut NavInputs),
+) -> (Vec<HopFrame>, Vec<f32>) {
+    let (mut out, mut z) = (Vec::new(), Vec::new());
+    for _ in 0..frames {
+        each(&phase, i);
+        let (next, actions, _, density) = hop_frame(phase, i, wish);
+        z.push(i.region_pos_m.y);
+        out.push(HopFrame {
+            phase: next,
+            actions,
+            density,
+            height_m: i.region_height_m,
+            x_m: i.region_pos_m.x,
+        });
+        phase = next;
+        if phase == NavPhase::Flying && i.region_pos_m.abs().max_element() < EDGE_M - 1_000.0 {
+            break;
+        }
+    }
+    (out, z)
+}
+
+/// The re-review's Important: turning back out of the hold ends the hop. A neighbour that
+/// becomes ready on the way back in is never swapped to; the fly stays in its region and is
+/// back inside before the cloud clears.
+#[test]
+fn a_turn_back_out_of_the_hold_never_swaps() {
+    let (phase, mut i) = held_past_the_edge(0.0, 100);
+    let mut wish = Vec2::NEG_X * 10_000.0;
+    turn_to(&mut i, wish);
+    let (frames, z) = back_in(phase, &mut i, &mut wish, 3_000, |_, i| {
+        // Ready on the way back.
+        i.neighbour = Some((east_of_alps(), YearsBp(0.0)));
+    });
+    assert_eq!(
+        frames.last().unwrap().phase,
+        NavPhase::Flying,
+        "never back to flying"
+    );
+    assert!(
+        frames.iter().all(|f| !has(&f.actions, leaves)),
+        "swapped or left"
+    );
+    assert!(
+        frames[0].actions.contains(&NavAction::CancelPreload),
+        "the turn did not cancel the preload: {:?}",
+        frames[0].actions
+    );
+    assert_eq!(i.region_centre, Some(alps()));
+    let bad = outside_in_clear_air(&frames, &z);
+    assert!(bad.is_empty(), "{:?}", &bad[..bad.len().min(3)]);
+}
+
+/// A neighbour that fails while the fly is on its way back in, or while it holds flying along
+/// the edge: it never ends up facing out.
+#[test]
+fn a_failure_on_the_way_back_lands_facing_inward() {
+    // On the way back in, straight and slanting along the edge.
+    for back in [Vec2::NEG_X, Vec2::new(0.0, 1.0)] {
+        let (phase, mut i) = held_past_the_edge(0.0, 100);
+        let mut wish = back * 10_000.0;
+        turn_to(&mut i, wish);
+        let (frames, z) = back_in(phase, &mut i, &mut wish, 6_000, |_, i| {
+            i.preload_failed = true;
+            // Along the edge, out there, it never comes back in by itself: once turned, fly on.
+        });
+        let turn = frames.iter().find_map(|f| {
+            f.actions.iter().find_map(|a| match *a {
+                NavAction::TurnBack { yaw, .. } => Some(yaw),
+                _ => None,
+            })
+        });
+        if let Some(yaw) = turn {
+            assert!(
+                (yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+                "{back}: turned to {yaw}, not west"
+            );
+        }
+        // Facing (and flying) west, into the field.
+        assert!(
+            wish.x < 0.0 && wish.y.abs() < 1e-3 * wish.length(),
+            "{back}: facing {wish}"
+        );
+        assert_eq!(
+            frames.last().unwrap().phase,
+            NavPhase::Flying,
+            "{back}: stranded"
+        );
+        assert!(i.region_pos_m.x < EDGE_M, "{back}: {}", i.region_pos_m);
+        let bad = outside_in_clear_air(&frames, &z);
+        assert!(bad.is_empty(), "{back}: {:?}", &bad[..bad.len().min(3)]);
+    }
+}
+
+/// Minor 1: past the east edge, turned north along it and retargeted to the north edge, the
+/// north neighbour fails: the turn back brings the fly inside on both axes, facing in (south)
+/// across the north edge, and the cloud waits for that.
+#[test]
+fn a_failed_corner_retarget_lands_inside_on_both_axes() {
+    let (phase, mut i) = held_past_the_edge(-(EDGE_M - 30_000.0), 100);
+    let mut wish = Vec2::NEG_Y * 10_000.0;
+    turn_to(&mut i, wish);
+    let mut retargeted = false;
+    let (frames, z) = back_in(phase, &mut i, &mut wish, 6_000, |phase, i| {
+        if let NavPhase::Hopping { edge, .. } = *phase {
+            retargeted |= edge.axis == 1;
+        }
+        // The north neighbour fails once asked for.
+        i.preload_failed = retargeted;
+    });
+    assert!(retargeted, "never retargeted north");
+    let (turn, yaw) = frames
+        .iter()
+        .find_map(|f| {
+            f.actions.iter().find_map(|a| match *a {
+                NavAction::TurnBack { pos_m, yaw } => Some((pos_m, yaw)),
+                _ => None,
+            })
+        })
+        .expect("turned back");
+    let inside = EDGE_M - TURN_BACK_INSIDE_M;
+    assert_eq!(turn, Vec2::new(inside, -inside), "not inside on both axes");
+    assert_eq!(
+        yaw,
+        std::f32::consts::PI,
+        "not facing south, into the field"
+    );
+    let bad = outside_in_clear_air(&frames, &z);
+    assert!(
+        bad.is_empty(),
+        "{} frames: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(3)]
+    );
+    assert_eq!(frames.last().unwrap().phase, NavPhase::Flying);
 }

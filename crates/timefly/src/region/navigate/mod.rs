@@ -815,15 +815,13 @@ fn apply_action(
                 flies.fly.pos_m.y = to;
             }
         }
-        NavAction::TurnBack { pos_m } => {
+        NavAction::TurnBack { pos_m, yaw } => {
             let fly = &mut flies.fly;
             fly.pos_m.x = pos_m.x;
             fly.pos_m.z = pos_m.y;
-            // Turned round: `yaw + π`, wrapped into [−π, π) (adding another π before the
-            // `rem_euclid` and taking it off after maps any yaw there).
-            let turned = fly.yaw + std::f32::consts::PI;
-            fly.yaw = (turned + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-                - std::f32::consts::PI;
+            // Facing into the field along the hop's axis (not `yaw + π`: a fly already facing in,
+            // or along the edge, would face out).
+            fly.yaw = yaw;
             if let Some(region) = region {
                 let ground =
                     blended_height_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y)).max(0.0);

@@ -94,16 +94,18 @@ pub fn confine(prev_m: Vec2, next_m: Vec2) -> Vec2 {
     next_m.clamp(-limit, limit)
 }
 
-/// The fly's velocity for [`should_preload`]: as `measured_mps` (its motion over the last
-/// frame), except on an axis where it is at or past the edge (held there by [`confine`]) and the
-/// player's `wish_mps` points out of it, where the wish's component counts. Held at an edge
-/// while pushing out at an angle, it slides along it, so its motion alone shows no way out.
+/// The fly's velocity for [`should_preload`] and the hop: as `measured_mps` (its motion over the
+/// last frame), except on an axis where it is at or past the edge and the player's `wish_mps`
+/// has a component on it, which counts instead. Held at an edge ([`confine`]) while pushing out
+/// at an angle, the fly slides along it, so its motion alone shows no way out (fix round 2);
+/// and past it, in a hop's hold, the player turning back in is seen in the frame they turn, not
+/// a frame later from the drift (fix round 3). A wish back in never starts a hop.
 pub fn velocity_at_edges(pos_m: Vec2, measured_mps: Vec2, wish_mps: Vec2) -> Vec2 {
     /// Within this of the edge counts as held at it (the clamp puts it exactly there).
     const AT_EDGE_M: f32 = 1.0;
     let mut v = measured_mps;
     for a in 0..2 {
-        if pos_m[a].abs() >= EDGE_M - AT_EDGE_M && pos_m[a] * wish_mps[a] > 0.0 {
+        if pos_m[a].abs() >= EDGE_M - AT_EDGE_M && wish_mps[a] != 0.0 {
             v[a] = wish_mps[a];
         }
     }
@@ -292,17 +294,20 @@ mod tests {
         // At a corner, held on both axes.
         let wish = Vec2::new(1.0, -1.0) * 5_000.0;
         assert_eq!(velocity_at_edges(Vec2::new(e, -e), Vec2::ZERO, wish), wish);
-        // Inside the field, or wishing back in, or along the edge: the motion as measured.
+        // Inside the field, or with no wish on the axis: the motion as measured.
         let m = Vec2::new(700.0, -20.0);
         assert_eq!(velocity_at_edges(Vec2::new(e - 5_000.0, 0.0), m, wish), m);
-        assert_eq!(
-            velocity_at_edges(Vec2::new(e, 0.0), m, Vec2::new(-3_000.0, 0.0)),
-            m
-        );
-        assert_eq!(
-            velocity_at_edges(Vec2::new(-e, 0.0), Vec2::ZERO, Vec2::X * 100.0),
-            Vec2::ZERO
-        );
+        let along = velocity_at_edges(Vec2::new(e, 0.0), m, Vec2::new(0.0, 9.0));
+        assert_eq!(along, m);
+        // Past the edge (a hop's hold), turning back in: seen at once, not from the drift out
+        // (fix round 3); it is no outward motion, so it starts no hop.
+        let out = Vec2::new(e + 2_000.0, 0.0);
+        let back = velocity_at_edges(out, m, Vec2::new(-3_000.0, 0.0));
+        assert_eq!(back, Vec2::new(-3_000.0, -20.0));
+        assert!(!should_preload(out, back, back.length(), 3.0));
+        let v = velocity_at_edges(Vec2::new(-e, 0.0), Vec2::ZERO, Vec2::X * 100.0);
+        assert_eq!(v, Vec2::X * 100.0);
+        assert!(!should_preload(Vec2::new(-e, 0.0), v, v.length(), 3.0));
     }
 
     /// The horizontal `(x, z)` of a local position.

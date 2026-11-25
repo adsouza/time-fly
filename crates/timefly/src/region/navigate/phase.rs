@@ -305,11 +305,41 @@ impl HopEdge {
         }
     }
 
+    /// The yaw (about `+y` from north, positive west) facing into the field across this edge,
+    /// along its axis: west (+π/2) from the east edge, east from the west, north (0) from the
+    /// south (`+z`) and south (π) from the north.
+    pub fn inward_yaw(self) -> f32 {
+        // Facing `d` is `atan2(−d.x, −d.z)`; inward is `−side` along the axis.
+        if self.axis == 0 {
+            self.side * std::f32::consts::FRAC_PI_2
+        } else if self.side > 0.0 {
+            0.0
+        } else {
+            std::f32::consts::PI
+        }
+    }
+
     /// How far out along this edge's axis `v` points (a position: how far out; a velocity: how
     /// fast out of the edge).
     pub fn out(self, v: Vec2) -> f32 {
         self.side * v[self.axis]
     }
+}
+
+/// Where a failed neighbour puts the fly at `pos_m` (Review Focus 4): [`TURN_BACK_INSIDE_M`]
+/// inside `edge`, and as far inside any other edge it is out past (a corner retarget from the
+/// hold); otherwise where it is.
+fn turn_back_pos(edge: HopEdge, pos_m: Vec2) -> Vec2 {
+    let inside = EDGE_M - TURN_BACK_INSIDE_M;
+    let mut p = pos_m;
+    for a in 0..2 {
+        if a == edge.axis {
+            p[a] = edge.side * inside;
+        } else if p[a].abs() > EDGE_M {
+            p[a] = p[a].signum() * inside;
+        }
+    }
+    p
 }
 
 /// A failed neighbour turns the fly back this far inside the edge (Review Focus 4).
@@ -548,10 +578,12 @@ pub enum NavAction {
     ReturnToAgl {
         agl_m: f32,
     },
-    /// Turn the region's fly round (180°) at `pos_m` (`x`, `z`), with the chase camera's
-    /// smoothing reset.
+    /// Turn the region's fly back into the field: put it at `pos_m` (`x`, `z`) facing `yaw`
+    /// (inward along the hop's axis, whatever way it faced), with the chase camera's smoothing
+    /// reset.
     TurnBack {
         pos_m: Vec2,
+        yaw: f32,
     },
 }
 
@@ -966,6 +998,26 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             // the cloud stays opaque until the fly is back inside: it is outside the field only
             // under full cover (fix round 2).
             let outside = i.region_pos_m.abs().max_element() > EDGE_M;
+            if outside && outward < 0.0 {
+                // Turned back out of the hold (fix round 3): the hop is off, so no swap can
+                // follow and a ready neighbour is dropped. It ends as a turn back, with no
+                // placement: the fly already heads in, at full speed again, and the cloud
+                // stays opaque until it is back inside, then clears.
+                actions.push(NavAction::CancelPreload);
+                return (
+                    NavPhase::Hopping {
+                        centre,
+                        edge,
+                        lift_from_agl_m,
+                        swapped: false,
+                        elapsed_s: 0.0,
+                        lift: 1.0,
+                        failed,
+                        turned_back: true,
+                    },
+                    actions,
+                );
+            }
             let target = if outside {
                 1.0
             } else if outward < 0.0 {
@@ -1013,10 +1065,11 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             };
             if opaque && failed {
                 // Review Focus 4: round, inside the edge, under the opaque cloud.
-                let mut pos_m = i.region_pos_m;
-                pos_m[edge.axis] = edge.side * (EDGE_M - TURN_BACK_INSIDE_M);
                 actions.push(NavAction::CancelPreload);
-                actions.push(NavAction::TurnBack { pos_m });
+                actions.push(NavAction::TurnBack {
+                    pos_m: turn_back_pos(edge, i.region_pos_m),
+                    yaw: edge.inward_yaw(),
+                });
                 ended(false, true)
             } else if opaque && ready {
                 // After a frame drawn opaque, on a frame that is.
@@ -1059,7 +1112,14 @@ fn step_hop_end(
     else {
         return hop;
     };
-    let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32);
+    // The clear waits until the fly is back inside the field on both axes (fix round 3: a turn
+    // back out of the hold ends the hop out there).
+    let outside = i.region_pos_m.abs().max_element() > EDGE_M;
+    let elapsed_s = if outside {
+        0.0
+    } else {
+        (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32)
+    };
     let lift_from_agl_m = if i.vertical_held {
         agl_m
     } else {
