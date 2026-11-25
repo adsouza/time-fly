@@ -299,9 +299,13 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         params: sky_params(era, biome),
     });
     // Positions only, triangle lists: the quad gives the cloud's pipeline the same key as the
-    // full-screen triangle's.
+    // full-screen triangle's. Clear (density 0, so it draws nothing), at a depth of 1: at 0 its
+    // plane would project to an infinite clip z.
     let cloud = cloud_m.add(CloudMaterial {
-        params: CloudParams::default(),
+        params: CloudParams {
+            state: Vec4::new(0.0, 1.0, 0.0, 1.0),
+            ..default()
+        },
     });
     // The fly's vertex layout (with the wing attribute) for both of its materials.
     let fly_mesh = meshes.add(dragonfly_mesh());
@@ -613,5 +617,19 @@ mod tests {
                 RenderLayers::layer(WARMUP_LAYER)
             );
         }
+    }
+
+    /// The warm-up cloud's depth is positive, so its plane never projects to an infinite clip
+    /// z (Tint, the final review).
+    #[test]
+    fn the_warm_up_cloud_sits_at_a_finite_depth() {
+        let mut app = warmup_app();
+        *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
+        app.update();
+        let world = app.world();
+        let clouds = world.resource::<Assets<CloudMaterial>>();
+        let (_, cloud) = clouds.iter().next().unwrap();
+        assert_eq!(cloud.params.state.x, 0.0, "clear: it draws nothing");
+        assert!(cloud.params.state.y > 0.0, "{:?}", cloud.params.state);
     }
 }
