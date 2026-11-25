@@ -59,12 +59,15 @@ pub struct ClimateTable {
     pub biome_climate: [Climate; 12],
 }
 
-/// Piecewise linear through `points`, clamped at the ends. 0 for an empty table.
+/// Piecewise linear through `points`, clamped at the ends. 0 for an empty table; NaN for NaN.
 fn piecewise(points: &[(f32, f32)], x: f32) -> f64 {
     let (Some(&(x0, y0)), Some(&(x1, y1))) = (points.first(), points.last()) else {
         return 0.0;
     };
     let x = f64::from(x);
+    if x.is_nan() {
+        return f64::NAN;
+    }
     if x <= f64::from(x0) {
         return f64::from(y0);
     }
@@ -351,6 +354,11 @@ pub(crate) mod tests {
         assert_eq!(t.lake_evaporation_at(45.0), 2200.0);
         assert_eq!(t.lake_evaporation_at(-40.0), 50.0);
         assert!((t.pet_at(5.0) - 475.0).abs() < 1e-9);
+        // A NaN temperature reads NaN from the table, and gives no runoff or evaporation
+        // rather than a panic.
+        assert!(t.pet_at(f32::NAN).is_nan());
+        assert_eq!(t.runoff_mm(c(500.0, f32::NAN)), 0.0);
+        assert_eq!(t.net_evaporation_mm(c(500.0, f32::NAN)), 0.0);
     }
 
     /// A climate grid filled by `f(row, col) -> (temp, precip)`.

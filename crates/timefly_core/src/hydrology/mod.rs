@@ -12,6 +12,7 @@ pub mod climate;
 mod graph;
 mod lakes;
 mod lattice;
+pub mod levels;
 pub mod params;
 mod pass;
 mod route;
@@ -74,6 +75,9 @@ pub struct EraHydrology {
     pub rivers: RiverGraph,
     /// Whether lakes held by the data's own surfaces were looked for (present-day sources).
     pub data_lakes: bool,
+    /// Lake level table entries whose point lies in no depression basin, by name: the shell
+    /// warns about each. Empty without data lakes, when the table is not used.
+    pub unplaced_lake_levels: Vec<String>,
     /// One bit per node.
     ocean: Vec<u64>,
     /// Lake footprint nodes, sorted by node.

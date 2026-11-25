@@ -149,7 +149,9 @@ Success, as the owner described it, means:
   that is its level, and the water balance only decides lakes the data doesn't hold (past and
   deep eras, or new basins). In recent eras, a data lake keeps its present level plus the
   ICE-6G change. This avoids, for example, a Caspian filled to its spill level over the Volga
-  lowlands.
+  lowlands. Big deep lakes whose bathymetry ETOPO holds instead of their surface (the Caspian at
+  −660 m in the data, Baikal, and the five Great Lakes) take their level from the hand-made
+  table `data/hydrology/lake_levels.json` (owner, 2026-11-25).
 - **Lakes.** The surface is flat at the lake's level. The shoreline is where the refined terrain
   meets that level within the lake's footprint, so it is fractal like the coast. Inflows and
   outflows join the lake at the right level.
@@ -207,6 +209,8 @@ overlap exact" lesson applied to water.)
 - Lakes are in this milestone (the owner named it "rivers and lakes", 2026-11-24).
 - Past climate from Beyer et al. 2020 for eras up to 120 ka, read in parts so it stays within a
   few hundred MB (2026-11-25).
+- Hand-made level table for big deep lakes whose bed ETOPO holds (the Caspian, Baikal and the
+  Great Lakes): `data/hydrology/lake_levels.json` (2026-11-25).
 
 ## 6. Left to the builder
 
@@ -250,9 +254,10 @@ The builder confirms this on the present-day Caspian and records it.
     show both networks over the same map.
 - **Past climate, manual check.** At a snapshot between 9 and 6 ka, the Sahara shows lakes and
   rivers (Lake Mega-Chad among them). At 0 ka it is dry.
-- **Lakes in the reality check.** Present-day levels of the Caspian, Dead Sea, Titicaca, Great
-  Salt Lake and Lake Victoria are within 5 m of the data's surface, and no large lake appears
-  in the reference's arid basins.
+- **Lakes in the reality check.** Present-day levels of the Dead Sea, Titicaca, Great Salt Lake
+  and Lake Victoria are within 5 m of the data's surface, the Caspian's (and the other table
+  lakes') within 5 m of `data/hydrology/lake_levels.json`, and no large lake appears in the
+  reference's arid basins.
 - **Pure tests.**
   - Water never flows uphill along a refined centreline.
   - Discharge only grows downstream.

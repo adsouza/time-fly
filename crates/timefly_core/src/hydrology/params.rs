@@ -31,6 +31,10 @@ pub const DATA_LAKE_MAX_BALANCE: f64 = 10.0;
 /// A flat outside every depression is a data lake (one that drains, like Victoria) when it has
 /// at least this many connected nodes within [`DATA_LAKE_FLAT_TOL_M`] of its lowest.
 pub const DATA_LAKE_FLAT_MIN_NODES: u32 = 20;
+/// ... and when at most this many of its nodes have a strictly lower neighbour off the flat: a
+/// lake drains through a narrow outlet, while a stair of F16 quantisation on a plateau or a
+/// sloping delta has a long lower edge (fix round 2).
+pub const DATA_LAKE_FLAT_MAX_OUTLETS: u32 = 3;
 pub const DATA_LAKE_MAX_DEPTH_M: f64 = 50.0;
 pub const DATA_LAKE_DEPTH_RAMP_NODES: f64 = 2.0;
 /// A lake by the water balance must stand at least this deep over its basin's lowest node *(Task
