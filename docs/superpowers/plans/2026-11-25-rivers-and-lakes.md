@@ -417,11 +417,17 @@ The refinement, which the tests pin:
 gather: river nodes whose segment (node → down) comes within half_size + V_max + 2·subpoint, then
   their upstream within INCISION_WINDOW_M + one spacing of coarse path distance (great-circle
   node-to-node lengths, global). Rivers below min_q are skipped.
-relax: each node → the lowest floor_at on a 7 × 7 grid over ±C in its own north/east (C =
-  CORRIDOR_FRACTION × mean spacing; ties: smaller offset, then grid index). Segment sub-points sit
-  at t = k/K (K = ceil(length / subpoint)), k = 0..K−1, plus k = K on a terminal segment. Each is
-  the lowest of 13 offsets across the chord between the relaxed nodes (ties: smaller |offset|,
-  then the negative side), smoothed [1,2,1]/4 with the ends fixed.
+relax: each node → the lowest interior local minimum of floor_at on a 7 × 7 grid over ±C in its
+  own north/east (C = CORRIDOR_FRACTION × mean spacing): a grid point off the border, strictly
+  lower than both neighbours along its row or both along its column (ties: smaller offset, then
+  grid index); with none, the node stays put. Segment sub-points sit at t = k/K (K = ceil(length
+  / subpoint)), k = 0..K−1, plus k = K on a terminal segment. Each takes the lowest interior
+  local minimum of its 13 samples across the chord between the relaxed nodes (not at either
+  edge, strictly lower than both neighbours; ties: smaller |offset|, then the negative side), or
+  offset 0 when there is none; smoothed [1,2,1]/4 with the ends fixed. (Task 6 fix round 1: on
+  a tilted plain the lowest sample is at the edge, and taking it made hairpins at every node.
+  Nodes use row-or-column minima because a valley floor falls downstream, so it is never lower
+  than all eight neighbours.)
 meander: λ = 11 w. A = 1.5 w × (1 − smoothstep(MEANDER_FLAT_SLOPE, pass slope)), and 0 if λ < 2 km.
   Offset = A × fbm(key_at(p), λ, 2 octaves) along the normal. A, λ and the normal interpolate in t
   from node values; a node's normal bisects its outgoing segment and its main incoming one (the

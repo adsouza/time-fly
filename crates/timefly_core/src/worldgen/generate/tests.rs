@@ -1652,12 +1652,18 @@ mod water {
     /// Walks every refined centreline in the inner field (away from the apron blend)
     /// downstream at 50 m steps. The water rule evaluated at the centreline
     /// (`sample_texel_in`) never rises. The grid's bilinear read (`blended_water`) never rises
-    /// by more than 1e-3 m on straight reaches; within two texels of a vertex where the
-    /// centreline turns by more than 5°, it can, by up to the level's fall over a few texels:
-    /// texels on either side of the bend take the level of different legs. The bound there is
-    /// `1e-3 + 4 × texel × slope`, `slope` the steeper of the two sub-segments' level slopes.
+    /// by more than 1e-3 m, except within two texels of a real bend: a vertex where the
+    /// centreline turns by more than 5° (meanders, confluences, kinks at nodes). There the
+    /// texels on either side of the bend take the level of different legs (each texel holds the
+    /// level of its nearest point), so the read can rise by up to the level's fall over a few
+    /// texels; the bound there is `1e-3 + 4 × texel × slope`, `slope` the steeper of the two
+    /// sub-segments' level slopes. Segment joins count as vertices (the down segment's first
+    /// sub-segment is looked up); a river's end into the sea or a lake does not. Reads whose
+    /// four texels include one whose water is not a river (at a mouth, the sea's level 0 beside
+    /// the channel) mix two waters and are not bounded; they are counted.
     #[test]
     fn water_never_flows_uphill_along_a_refined_centreline() {
+        // Task 5's tree in its own valleys: confluences and meanders.
         let (hydro, f) = valley_tree();
         let field = FnField {
             f,
@@ -1665,9 +1671,33 @@ mod water {
             koppen: Some(26),
         };
         let spec = spec_at(LAT.dir(eq(410)), 0.0, 1025, 513);
-        let g = RegionGenerator::new(spec, &field, Some(&hydro));
+        let (straight, bends) = assert_never_uphill(spec, &field, &hydro);
+        assert!(
+            straight > 2000 && bends > 2000,
+            "{straight} straight, {bends} bends"
+        );
+        // The pass's rivers on the wet continent, where the edge-minimum relaxation made
+        // hairpins before fix round 1.
+        let (hydro, spec, f) = continent_region(1025, 513);
+        let field = FnField {
+            f,
+            spacing_m: 1852.0,
+            koppen: None,
+        };
+        let (straight, bends) = assert_never_uphill(spec, &field, &hydro);
+        assert!(straight > 20_000, "{straight} straight, {bends} bends");
+    }
+
+    /// [`water_never_flows_uphill_along_a_refined_centreline`]'s walk; returns the steps on
+    /// straight reaches and near bends.
+    fn assert_never_uphill<F: CoarseField>(
+        spec: RegionSpec,
+        field: &F,
+        hydro: &EraHydrology,
+    ) -> (usize, usize) {
+        let g = RegionGenerator::new(spec, field, Some(hydro));
         let rivers: &RegionRivers = g.rivers(FieldKind::Inner).unwrap();
-        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let grid = RegionGenerator::new(spec, field, Some(hydro)).finish();
         let basis = spec.frame().basis();
         let texel = grid.inner.spacing_m();
         let inner_only = REGION_SIZE_M / 2.0 - 4.0 * grid.apron.spacing_m() - texel;
@@ -1691,20 +1721,28 @@ mod water {
             t0.angle_between(t1).to_degrees()
         };
         let slope = |s: &(DVec3, DVec3, f32, f32)| f64::from(s.2 - s.3) / metres(s.0, s.1).max(1.0);
+        // Each segment's first sub-segment, by its start's bits: a segment's last sub-segment
+        // ends exactly there.
+        let first: std::collections::HashMap<[u64; 3], (DVec3, DVec3, f32, f32)> = segments
+            .iter()
+            .map(|seg| (seg[0].0.to_array().map(f64::to_bits), seg[0]))
+            .collect();
         let (mut point_steps, mut straight, mut bends) = (0usize, 0usize, 0usize);
+        let (mut mixed_steps, mut last_mixed) = (0usize, false);
         let (mut worst_straight, mut worst_bend) = (f32::NEG_INFINITY, f64::NEG_INFINITY);
         for seg in &segments {
             let mut last: Option<(f32, f32)> = None;
             for (j, sub) in seg.iter().enumerate() {
                 let (a, b) = (sub.0, sub.1);
                 let n = (metres(a, b) / 50.0).ceil().max(1.0) as u32;
-                // A bend at either end: its turn, and the steeper slope beside it. A segment's
-                // ends are bends (the next segment is not at hand).
+                // The turn at either end, and the steeper slope beside it: none at a river's
+                // end, and none at a segment's start, which the upstream segment's walk saw.
                 let start =
                     (j > 0).then(|| (turn(seg[j - 1].0, a, b), slope(&seg[j - 1]).max(slope(sub))));
-                let end = seg
+                let next = seg
                     .get(j + 1)
-                    .map(|nx| (turn(a, b, nx.1), slope(sub).max(slope(nx))));
+                    .or_else(|| first.get(&b.to_array().map(f64::to_bits)));
+                let end = next.map(|nx| (turn(a, b, nx.1), slope(sub).max(slope(nx))));
                 for i in 0..n {
                     let p = chord_point(a, b, f64::from(i) / f64::from(n));
                     let Some((x, z)) = basis.dir_to_local(RenderDir(p)) else {
@@ -1718,10 +1756,18 @@ mod water {
                         .sample_texel_in(FieldKind::Inner, RenderDir(p))
                         .water_level_m;
                     let read = blended_water(&grid, x, z).level_m;
+                    // The four texels of the bilinear read.
+                    let (u, v) = (
+                        ((x + REGION_SIZE_M / 2.0) / texel).floor() as usize,
+                        ((z + REGION_SIZE_M / 2.0) / texel).floor() as usize,
+                    );
+                    let res = grid.inner.res as usize;
+                    let mixed = [(v, u), (v, u + 1), (v + 1, u), (v + 1, u + 1)]
+                        .iter()
+                        .any(|&(r, c)| grid.inner.river[r * res + c] == RIVER_NONE);
                     let near = |v: DVec3, bend: Option<(f64, f64)>| {
-                        let s =
-                            bend.map_or(f64::INFINITY, |(deg, s)| if deg > 5.0 { s } else { -1.0 });
-                        (metres(p, v) < 2.0 * texel).then_some(s)
+                        let (deg, s) = bend?;
+                        (deg > 5.0 && metres(p, v) < 2.0 * texel).then_some(s)
                     };
                     let bend_slope = [near(a, start), near(b, end)]
                         .into_iter()
@@ -1734,7 +1780,9 @@ mod water {
                         );
                         point_steps += 1;
                         let rise = read - read_before;
-                        if bend_slope < 0.0 {
+                        if mixed || last_mixed {
+                            mixed_steps += 1;
+                        } else if bend_slope < 0.0 {
                             worst_straight = worst_straight.max(rise);
                             assert!(rise <= 1e-3, "{read_before} -> {read} at ({x:.0}, {z:.0})");
                             straight += 1;
@@ -1749,17 +1797,15 @@ mod water {
                         }
                     }
                     last = Some((point, read));
+                    last_mixed = mixed;
                 }
             }
         }
         println!(
             "{point_steps} steps: {straight} straight (worst rise {worst_straight} m), {bends} near \
-             bends (worst {worst_bend:.2} of the bound)"
+             bends (worst {worst_bend:.2} of the bound), {mixed_steps} beside standing water"
         );
-        assert!(
-            straight > 2000 && bends > 2000,
-            "{straight} straight, {bends} bends"
-        );
+        (straight, bends)
     }
 
     // ---- A sub-texel river: a hand-made chain on Task 5's n = 819 equator row. ----
@@ -2464,6 +2510,21 @@ mod water {
                 .iter()
                 .filter(|s| len(s.0, s.1) > 2.0 * SUBPOINT_M)
                 .count();
+            // Rivers at least 182 m wide meander (λ = 11 w ≥ 2 km).
+            let meandering = g
+                .rivers(FieldKind::Inner)
+                .unwrap()
+                .sub_segments()
+                .filter(|(a, b)| len(a.dir, b.dir) > 2.0 * SUBPOINT_M && a.half_width_m >= 91.0)
+                .count();
+            let over = subs
+                .iter()
+                .filter(|s| len(s.0, s.1) > 1.5 * SUBPOINT_M)
+                .count();
+            println!(
+                "long sub-segments on meandering rivers: {meandering} of {long}; longer than 1.5 \
+                 sub-points: {over}"
+            );
             let longest = subs.iter().map(|s| len(s.0, s.1)).fold(0.0, f64::max);
             let mut hairpins = 0;
             for w in subs.windows(2) {

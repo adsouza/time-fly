@@ -26,11 +26,18 @@
 //!   of the region's square; D = the refined segments up to 500 m downstream of R; then every
 //!   refined segment upstream of R ∪ D whose end lies within L + 500 m of path above the
 //!   start of an R or D segment.
-//! Relax: a river node → the lowest floor_at on a 7 × 7 grid over ±C in its own north/east
-//!   (ties: smaller i² + j², then grid index (j + 3)·7 + (i + 3), i east, j north). Ocean, lake
-//!   and ice end nodes stay put. Sub-point k (0 < k < K) is the lowest of 13 offsets ±C across
-//!   the great circle between the relaxed ends (ties: smaller |offset|, then the negative
-//!   side, the right bank); offsets are smoothed [1, 2, 1] / 4 with the end offsets 0.
+//! Relax (interior minima only, Task 6 fix round 1): a river node → the lowest interior local
+//!   minimum of floor_at on a 7 × 7 grid over ±C in its own north/east: a grid point with
+//!   |i|, |j| ≤ 2 (off the border) strictly lower than both row neighbours (i ± 1) or both
+//!   column neighbours (j ± 1) (ties: smaller i² + j², then grid index (j + 3)·7 + (i + 3),
+//!   i east, j north); none: the node stays put. Ocean, lake and ice end nodes stay put.
+//!   Sub-point k (0 < k < K): the 13 samples at offsets ±C across the great circle between the
+//!   relaxed ends; its raw offset is the lowest interior local minimum (|j| ≤ 5, strictly
+//!   lower than samples j ± 1; ties: smaller |offset|, then the negative side, the right
+//!   bank), or 0 when there is none; offsets are smoothed [1, 2, 1] / 4 with the end offsets 0.
+//!   On a plain or a slope the minimum lies at the search's edge, and taking it sent each
+//!   segment sideways out of its pinned node and back (hairpins); a real valley is an
+//!   interior minimum.
 //! Meander (R only): node values A = 1.5·w·(1 − smoothstep(MEANDER_FLAT_SLOPE, pass slope)),
 //!   λ = 11·w, A = 0 if λ < 2 km; the pass slope is (bed − down bed) / len. A node's normal is
 //!   left of the bisector of its outgoing chord and its main incoming one (largest discharge,
@@ -249,8 +256,13 @@ fn end_node(n: &RiverNode, nodes: &[RiverNode]) -> u32 {
     }
 }
 
-/// A river node relaxed onto the valley floor: the lowest `floor_at` on a 7 × 7 grid over
-/// `±C` in the node's own north and east (ties: smaller offset, then grid index).
+/// A river node relaxed onto the valley floor: the lowest interior local minimum of
+/// `floor_at` on a 7 × 7 grid over `±C` in the node's own north and east (ties: smaller
+/// offset, then grid index). A grid point is one when it is off the grid's border and strictly
+/// lower than both its neighbours along its row (east-west) or along its column (north-south):
+/// a valley floor falls downstream, so it is never lower than all eight neighbours, but it is
+/// lower than both of its neighbours across the valley. With none (a plain, a slope), the node
+/// stays put.
 pub fn relax_node(lattice: &CubeLattice, node: u32, floor_at: &impl Fn(RenderDir) -> f64) -> DVec3 {
     let p = lattice.dir(node).0;
     let basis = RegionFrame {
@@ -258,36 +270,50 @@ pub fn relax_node(lattice: &CubeLattice, node: u32, floor_at: &impl Fn(RenderDir
     }
     .basis();
     let half = (NODE_SEARCH_GRID / 2) as i32;
+    let side = NODE_SEARCH_GRID as i32;
     let step = corridor_m(lattice) / f64::from(half);
-    let mut best = (f64::INFINITY, i32::MAX, i32::MAX, p);
-    for j in -half..=half {
-        for i in -half..=half {
-            let index = (j + half) * NODE_SEARCH_GRID as i32 + (i + half);
+    let grid: Vec<(f64, DVec3)> = (-half..=half)
+        .flat_map(|j| (-half..=half).map(move |i| (i, j)))
+        .map(|(i, j)| {
             let d = basis
                 .local_to_dir(f64::from(i) * step, -f64::from(j) * step)
                 .0;
-            let f = clean(floor_at(RenderDir(d)));
+            (clean(floor_at(RenderDir(d))), d)
+        })
+        .collect();
+    let at = |i: i32, j: i32| grid[((j + half) * side + (i + half)) as usize].0;
+    let mut best = (f64::INFINITY, i32::MAX, i32::MAX, p);
+    for j in 1 - half..half {
+        for i in 1 - half..half {
+            let f = at(i, j);
+            let minimum =
+                (f < at(i - 1, j) && f < at(i + 1, j)) || (f < at(i, j - 1) && f < at(i, j + 1));
+            let index = (j + half) * side + (i + half);
             let r2 = i * i + j * j;
-            if (f, r2, index) < (best.0, best.1, best.2) {
-                best = (f, r2, index, d);
+            if minimum && (f, r2, index) < (best.0, best.1, best.2) {
+                best = (f, r2, index, grid[index as usize].1);
             }
         }
     }
     best.3
 }
 
-/// The raw corridor offset at chord point `c`: the lowest of 13 offsets across the chord (ties:
-/// smaller |offset|, then the negative side).
+/// The raw corridor offset at chord point `c`: the lowest interior local minimum of the 13
+/// samples across the chord (not at either edge, strictly lower than both neighbours; ties:
+/// smaller |offset|, then the negative side), or 0 when there is none.
 fn raw_offset(c: DVec3, normal: DVec3, corridor: f64, floor_at: &impl Fn(RenderDir) -> f64) -> f64 {
     let dir = across(c, normal);
     let half = (CORRIDOR_SAMPLES / 2) as i32;
+    let offset = |j: i32| f64::from(j) * corridor / f64::from(half);
+    let f: Vec<f64> = (-half..=half)
+        .map(|j| clean(floor_at(RenderDir(offset_point(c, dir, offset(j))))))
+        .collect();
+    let at = |j: i32| f[(j + half) as usize];
     let mut best = (f64::INFINITY, i32::MAX, true, 0.0);
-    for j in -half..=half {
-        let o = f64::from(j) * corridor / f64::from(half);
-        let f = clean(floor_at(RenderDir(offset_point(c, dir, o))));
-        let key = (f, j.abs(), j > 0);
-        if key < (best.0, best.1, best.2) {
-            best = (key.0, key.1, key.2, o);
+    for j in 1 - half..half {
+        let key = (at(j), j.abs(), j > 0);
+        if at(j) < at(j - 1) && at(j) < at(j + 1) && key < (best.0, best.1, best.2) {
+            best = (key.0, key.1, key.2, offset(j));
         }
     }
     best.3
@@ -1646,6 +1672,150 @@ mod tests {
         assert_eq!(rapid_from_speed(7.0), 1.0);
     }
 
+    // ---- A tilted plain (fix round 1 of Task 6). ----
+
+    /// Task 5's first relaxation, kept to show the hazard: the lowest of all 49 grid points
+    /// and of all 13 corridor offsets, edges included.
+    fn legacy_centreline(
+        hydro: &EraHydrology,
+        river: u32,
+        floor_at: &impl Fn(RenderDir) -> f64,
+    ) -> Vec<DVec3> {
+        let lattice = hydro.lattice;
+        let corridor = corridor_m(&lattice);
+        let relax = |node: u32| {
+            let p = lattice.dir(node).0;
+            let basis = RegionFrame {
+                center: RenderDir(p),
+            }
+            .basis();
+            let half = (NODE_SEARCH_GRID / 2) as i32;
+            let step = corridor / f64::from(half);
+            let mut best = (f64::INFINITY, i32::MAX, i32::MAX, p);
+            for j in -half..=half {
+                for i in -half..=half {
+                    let index = (j + half) * NODE_SEARCH_GRID as i32 + (i + half);
+                    let d = basis
+                        .local_to_dir(f64::from(i) * step, -f64::from(j) * step)
+                        .0;
+                    let f = clean(floor_at(RenderDir(d)));
+                    if (f, i * i + j * j, index) < (best.0, best.1, best.2) {
+                        best = (f, i * i + j * j, index, d);
+                    }
+                }
+            }
+            best.3
+        };
+        let nodes = hydro.rivers.nodes();
+        let n = &nodes[river as usize];
+        let end = end_node(n, nodes);
+        let (c0, c1) = (lattice.dir(n.node).0, lattice.dir(end).0);
+        let p0 = relax(n.node);
+        let p1 = if matches!(n.down, Down::River(_)) {
+            relax(end)
+        } else {
+            c1
+        };
+        let k_max = sub_count(lattice.distance_m(n.node, end), SUBPOINT_M);
+        let normal = chord_normal(p0, p1, c0, c1);
+        let raw: Vec<f64> = (0..=k_max)
+            .map(|k| {
+                if k == 0 || k == k_max {
+                    return 0.0;
+                }
+                let c = chord_point(p0, p1, t_of(k, k_max));
+                let dir = across(c, normal);
+                let half = (CORRIDOR_SAMPLES / 2) as i32;
+                let mut best = (f64::INFINITY, i32::MAX, true, 0.0);
+                for j in -half..=half {
+                    let o = f64::from(j) * corridor / f64::from(half);
+                    let f = clean(floor_at(RenderDir(offset_point(c, dir, o))));
+                    if (f, j.abs(), j > 0) < (best.0, best.1, best.2) {
+                        best = (f, j.abs(), j > 0, o);
+                    }
+                }
+                best.3
+            })
+            .collect();
+        smoothed_points(p0, p1, normal, &raw)
+    }
+
+    /// The tilted-plain fixture: a 50 m river (no meanders) along row 450 of the recent lattice
+    /// (n = 900), on a plain falling 1e-3 along the river and 3e-3 across it.
+    fn tilted_plain() -> (EraHydrology, impl Fn(RenderDir) -> f64, RenderDir) {
+        let lat = CubeLattice { n: 900 };
+        let at = |col: u32| lat.node(CubeFace::PosX, col, 450);
+        let cols: Vec<u32> = (420..=480).collect();
+        let hydro = river_hydro(
+            lat,
+            &[RiverChain {
+                nodes: cols.iter().map(|&c| at(c)).collect(),
+                q: vec![100.0; cols.len()],
+                bed: cols
+                    .iter()
+                    .map(|&c| (500.0 - 1e-3 * along_m(lat.dir(at(c)).0)) as f32)
+                    .collect(),
+                end: Down::Ocean(at(481)),
+            }],
+            vec![],
+        );
+        let floor = |d: RenderDir| 400.0 - 1e-3 * along_m(d.0) + 3e-3 * north_m(d.0);
+        (hydro, floor, lat.dir(at(450)))
+    }
+
+    /// Fix round 1's ruling: on a tilted plain, the corridor's lowest sample is at its edge, so
+    /// relaxing to it sends every segment out sideways from its pinned node and back in (the
+    /// hairpins). Only interior minima count now, so the river stays on its coarse line.
+    #[test]
+    fn a_tilted_plain_leaves_the_river_on_its_line() {
+        let (hydro, floor, centre) = tilted_plain();
+        let rr = build_at(&hydro, centre, &floor, 997);
+        let lat = hydro.lattice;
+        let nodes = hydro.rivers.nodes();
+        // The signed distance of a point from its segment's coarse line.
+        let offset = |river: u32, p: DVec3| {
+            let n = &nodes[river as usize];
+            let (c0, c1) = (lat.dir(n.node).0, lat.dir(end_node(n, nodes)).0);
+            p.dot(c0.cross(c1).normalize()).asin() * EARTH_RADIUS_M
+        };
+        let (mut subsegs, mut flips, mut longest, mut widest) = (0, 0, 0.0f64, 0.0f64);
+        let mut last: Option<f64> = None;
+        for (a, b) in rr.sub_segments() {
+            longest = longest.max(metres_between(a.dir, b.dir));
+            subsegs += 1;
+            let o = offset(a.river, a.dir);
+            widest = widest.max(o.abs());
+            if let Some(prev) = last
+                && prev.abs() > 1.0
+                && o.abs() > 1.0
+                && prev.signum() != o.signum()
+            {
+                flips += 1;
+            }
+            last = Some(o);
+        }
+        assert!(subsegs > 500, "{subsegs} sub-segments");
+        assert!(
+            longest <= 1.5 * SUBPOINT_M,
+            "a sub-segment of {longest:.0} m"
+        );
+        assert_eq!(flips, 0, "offset sign flips");
+        // A plain has no interior minimum: nodes and sub-points stay on the coarse line.
+        assert!(widest < 1.0, "{widest:.1} m off the coarse line");
+        // The hazard: the old rule's centrelines on the same plain.
+        let mut old_longest = 0.0f64;
+        for river in by_river(&rr).keys() {
+            let pts = legacy_centreline(&hydro, *river, &floor);
+            for w in pts.windows(2) {
+                old_longest = old_longest.max(metres_between(w[0], w[1]));
+            }
+        }
+        assert!(
+            old_longest > 3.0 * SUBPOINT_M,
+            "the old rule's longest leg {old_longest:.0} m"
+        );
+    }
+
     #[test]
     fn the_relaxed_river_lies_in_the_valley_floor() {
         // A 50 m river (no meanders) on the equator row; the valley's axis runs 3 km north.
@@ -1860,7 +2030,8 @@ mod tests {
             gorge_m in 100.0f64..500.0,
         ) {
             let hydro = tree(2e-3);
-            let g = col_along(390) + gorge_at * (col_along(430) - col_along(390));
+            // The gorge inside the region's reach (columns 397-421; the square spans 396-422).
+            let g = col_along(397) + gorge_at * (col_along(421) - col_along(397) - 8000.0);
             let floor = valley_field(bumps, (g, gorge_m));
             let b = built(&hydro, &floor);
             let mut incised = 0;
