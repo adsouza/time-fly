@@ -475,7 +475,7 @@ git commit -m "feat(core): flight altitudes, cloud density and chase camera"
     - `hold: <transition> <ms>` for each transition. Native ≤ 3,000 ms is gated. Web ≤ 8,000 ms is reported only.
     - `flight: median/p95/worst`, outside the cloud. M2's region gates.
     - `swap worst frame`. Native ≤ 100 ms.
-    - `hop memory peak`. Native ≤ in-region baseline + 40 MiB. Web: wasm linear memory flat across hops after the first.
+    - `hop memory peak`. Native ≤ in-region baseline + 40 MiB (raised to + 64 MiB after Task 11; see the rulings). Web: wasm linear memory flat across hops after the first.
     - `journey memory cycles`. Every cycle within 10% of cycle 1.
     - `result: PASS|FAIL`, with exit codes as in the region bench.
 
@@ -565,3 +565,4 @@ left out on purpose: they belong to that branch, not to this plan.
 **Task 11**
 - The journey bench's hop-memory FAIL (worst +48.9 MiB against the spec's +40 MiB) is recorded as open, pending the owner; neither the gate nor the bench changes. Why: the gate is the spec's, so changing it is the owner's call; every other gate passes and memory is flat across journeys. Cost: M3 can't be called done until the owner decides (options in `docs/testing/m3/performance.md`).
 - The Chrome WebGPU step is split: the implementer builds `web-release`, proves it by string grep and writes the serve instructions; the controller runs the owner's Chrome (Incognito) and commits the numbers. Why: a subagent can't drive the owner's Chrome. Cost: none.
+- Hop memory (after the FAIL above): measured with an off-by-default trace (`timefly::hop_memory=trace`), then the generator's lattice moved to 512 KiB chunks (`ec9293e`), and the native gate raised to the owner's +64 MiB (`HOP_MEMORY_LIMIT_MIB`). Why: macOS 27 keeps a freed block resident and reuses it only for a request of the same size, and the lattice's size changes with every region, so each hop added up to 22 MiB of new pages; in chunks it reuses the last region's, and a hop reads about +22 MiB. The first hop of a run still reads up to +37.5 MiB (2.5 MiB under +40) and the parts add up to about +44 MiB with no reuse, so +40 would flap; the owner allowed +64 ("+64 is fine if we need it"). Freeing the old textures a frame earlier was tried and dropped: Metal frees them when the frames in flight finish, so the footprint didn't change. Cost: a hop may now add up to 64 MiB natively before the bench fails; region generation is about 3–5% slower (the rows read nodes through a chunk index). Breakdown in `docs/testing/m3/performance.md`, "Hop memory".

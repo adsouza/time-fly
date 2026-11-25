@@ -26,8 +26,19 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 | Bench | Run 1 | Run 2 (judged) |
 |---|---|---|
 | `--region-bench` | PASS (exit 0) | **PASS** (exit 0) |
-| `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only**: open, owner decision pending |
+| `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only** |
+| `--journey-bench` after the hop-memory work (`ec9293e`, gate +64 MiB; 2560 × 1440 uncapped) | PASS (exit 0): hop memory worst +34.1 MiB | **PASS** (exit 0): hop memory worst +29.5 MiB; every gate passes |
 | Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: over the 1 ms budget, **accepted by the owner** (2026-11-25) |
+
+**Hop memory: fixed in part, gate raised.** A per-frame memory trace found that most of the hop
+peak, and its +3 to +54 MiB spread, was malloc keeping each region's freed generator lattice
+resident; the lattice now lives in fixed-size chunks that the next region reuses. The first hop
+of a run still reads up to +37.5 MiB, too close to +40 to gate on, so the native gate is the
+owner's +64 MiB (2026-11-25). See "Hop memory" below. The journey bench was re-run for this on a
+newer build and a different display (a 4K monitor, so the 2560 × 1440 window rendered in full,
+uncapped rather than display-paced): its flight and swap numbers there aren't comparable with
+Task 11's table below. One of the eight runs, `k2`, failed the flight gate's uncapped rule (p95
+16.86 ms against 16.67; every other run 12.1–16.5 ms); see "Hop memory" for the runs.
 
 **Cloud pass: accepted.** On 2026-11-25 the owner accepted the pass at about 2 ms, so the
 noise stays as it is. Dropping the tilt-shift (Task 5's ruling) saved nothing, because the cost
@@ -175,7 +186,7 @@ result: FAIL
 | Hold per transition (native ≤ 3,000 ms) | dives 721, 540, 538 ms; hops and climbs 31–35 ms | dives 725, 538, 537 ms; hops and climbs 31–36 ms | PASS |
 | Flight outside the cloud (R14, display-paced) | 11,442 frames, 16.68 / 18.33 / 36.80 ms, 1 stall, 1 missed (0.01%) | 10,980 frames, 16.66 / 18.69 / 23.78 ms, 0 stalls, 0 missed | PASS |
 | Swap worst frame (native ≤ 100 ms) | worst 36.15 ms | worst 34.66 ms | PASS |
-| Hop memory peak (≤ baseline + 40 MiB) | worst **+43.3 MiB** | worst **+48.9 MiB** | **FAIL: open, owner decision pending** |
+| Hop memory peak (≤ baseline + 40 MiB) | worst **+43.3 MiB** | worst **+48.9 MiB** | **FAIL** at `4b79f08`; **PASS** after the lattice fix (`ec9293e`): worst +34.5 MiB judged, see below |
 | Journey memory cycles (≤ +10%) | 675.5, 719.9, 670.3 MiB: +6.6% | 666.1, 657.0, 657.5 MiB: −1.3% | PASS |
 
 - **Holds.** A dive holds 0.54–0.73 s at full cover natively: the region generates in about
@@ -186,88 +197,165 @@ result: FAIL
   plan's ruling), dives 22–29 ms, climbs 18–19 ms. All under the white-out, and a third of the
   100 ms gate.
 
-### Hop memory: open, owner decision pending
+### Hop memory: measured; the lattice fixed, the gate raised to +64 MiB
 
-Per hop, in MiB over the in-region baseline (the last flying frame before the hop), peak from
-the preload's start until the fly is flying again:
+**Outcome.** The worst hop read +48.9 MiB in Task 11. Measured with a per-frame memory trace,
+about half of that peak was malloc keeping a freed generator lattice resident, and that freed
+memory is what made the peaks swing from +3 to +54 MiB. Storing the lattice in fixed-size
+chunks (`ec9293e`) lets each region reuse the last region's lattice pages: a hop now reads about
++22 MiB, and the spread is gone. But the first hop of a run still reads +31 to +37.5 MiB (the
+swap's upload, plus pages for the terrain's image data that no freed block yet fits), only
+2.5 MiB under +40 at worst. That isn't a margin a gate can hold, so the gate is now the owner's
+**+64 MiB** (`HOP_MEMORY_LIMIT_MIB`), with the fix kept. Judged run: worst +29.5 MiB, PASS.
 
-| | Cycle 1, hop 1 | Cycle 1, hop 2 | Cycle 2, hop 1 | Cycle 2, hop 2 | Cycle 3, hop 1 | Cycle 3, hop 2 |
-|---|---|---|---|---|---|---|
-| Run 1 | **+43.3** | +27.7 | +31.8 | +29.5 | +23.9 | +36.3 |
-| Run 2 | +30.0 | +26.7 | **+48.9** | **+42.3** | +11.0 | +3.3 |
+**How it was measured.** `458d07b` adds an off-by-default trace
+(`TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory=trace`, `crate::bench::journey::trace`). On
+every region frame it logs, next to navigation's phase:
+- the footprint and its parts from `task_info(TASK_VM_INFO)`: `phys_footprint` (what the bench
+  gates), `internal` (dirty anonymous pages: malloc's) and the graphics ledger (Metal's textures
+  and buffers);
+- `malloc_zone_statistics`: bytes in live blocks and bytes malloc holds;
+- what it can attribute: the neighbour's grid, the job's stage, the terrain's image data on the
+  CPU and the field textures in the render world.
 
-Three of the twelve hops go over the 40 MiB gate. Every cycle flies the same route (the Alps and
-much the same two neighbours east of them), so geography doesn't explain the spread.
+A native generation also logs from its worker thread at each step: the lattice and coast field
+built, the row blocks done, the grid assembled, the generator dropped. Three trace runs went
+into this: two before the fix (`t1`, `t2`) and one after (`f1`). The bench's own numbers in the
+trace runs match its untraced runs.
 
-The journey memory cycles (on the globe after each climb) read −1.3% in run 2 and +6.6% in run 1.
-Run 1's cycle 2 sat 44 MiB above cycle 1 (675.5, 719.9, 670.3 MiB) and came back down in cycle 3.
-Over three cycles that shows no growth trend, but it doesn't prove the memory flat.
+**What the allocator does (the cause of the spread).** On macOS 27.2 a freed `malloc` block
+keeps its pages dirty and counted in `phys_footprint`. malloc stops counting it as held, but
+the pages stay until a request of *the same size* reuses them; sleeping doesn't release them,
+and `malloc_zone_pressure_relief` returns 0. In a C test, a freed 20 MiB block was reused by
+the next 20 MiB request, but a 22 MiB request took 22 MiB of new pages; 30 frees of distinct
+sizes left 580 MiB resident. `MallocLargeCache=0` makes frees return at once, which points at
+malloc's large-block cache.
 
-**What the peak is made of** (code reading and arithmetic, no extra runs):
+The generator's lattice was one allocation per cube-face block, and its size changes with
+every region (19.5–24.5 MiB on this route). So whether a hop's lattice took new pages depended
+on whether an earlier region had freed a block at least as large of the same size: the
+allocator-reuse hypothesis, confirmed, with size as the reason. The other big buffers have fixed
+sizes (the grid's fields and the terrain's image data are 1025² × 4 B or 513² × 4 B, the row
+blocks 16 rows), so they are reused from the second hop on.
 
-| Part | Size | When it is resident |
+**Before the fix: the worst hop and the smallest** (MiB over the baseline, run `t1`, display-paced
+at 1920 × 951; read from the trace):
+
+Worst, cycle 1 hop 2, **+53.5**:
+
+| Step | Footprint | Of which |
 |---|---|---|
-| The neighbour's grid (`RegionGrid`: inner 1025² × (4 B height + 4 B surface), apron 513² × 8 B) | 10.5 MB = **10.0 MiB** | from the end of the preload's generation until the swap, alongside the active grid |
-| The generator's working set on the job's worker: the node lattice (`PackedNode`, 8 B a node) | about 2.3 M nodes for a recent mid-latitude region (M2's Task 4: 54 tiles) = **17.5 MiB**; up to 4.1 M nodes at a cube corner = **31.4 MiB** | during the preload's generation only; freed when the job finishes |
-| The rest of the job (the coast-distance field, 513² × f32; new source tiles, 301² × 2 × f16 each, 0–2 per hop) | about **1–2 MiB** | during the preload; the tiles stay in the 96-tile cache |
-| The new terrain textures at the swap (`replace_fields`: inner height `R32Float` 4.2 MB, inner surface `Rgba8Unorm` 4.2 MB, apron 1.05 MB each) | 10.5 MB = **10.0 MiB** on the GPU | from the swap frame on. They are `RENDER_WORLD` only, so the CPU copy goes once uploaded, but the upload passes through wgpu's staging memory (about the same 10 MiB) until the frame's commands complete |
-| The old region's textures | **10.0 MiB** on the GPU | the old handles are replaced on the swap frame, but the asset is dropped on the next frame, the render world frees the texture after the next extract, and Metal releases it once the frames in flight finish: 2–3 frames of overlap |
-| The water | none | it rebinds the terrain's new textures; it uploads nothing of its own |
+| Lattice and coast field built (22.0 MiB) | +21.9 | all new pages: no freed block of that size to reuse |
+| Row blocks (10.0 MiB) | +21.9 | +0: reused freed pages |
+| Grid assembled (10.0 MiB) | +29.4 | +7.5 new |
+| Generator dropped | +29.4 | the lattice's 22 MiB freed, but its pages stay counted |
+| Swap frame: the terrain's image data (10 MiB on the CPU) | +37.9 | +8.1 new |
+| Swap + 1 | +39.8 | +1.9 |
+| Swap + 2: the upload | **+53.5** | internal +8.3 more (staging), graphics +16.0, other −10.2 |
+| Back to flying | +37.5 | 28 MiB of freed pages still counted (in use: +9.0) |
 
-The old grid itself goes on the swap frame, when `ActiveRegion` and the terrain scene both let go
-of it. (During the hold the scene still holds it, as Task 8 noted, but the neighbour isn't
-swapped in until the hold ends.)
+Smallest, cycle 3 hop 2, **+10.8**: the same route's lattice from cycle 2 had left a block of
+the same size, so the lattice, rows and grid took +0.6 MiB in all; the image data reused freed
+pages too. The peak is only the upload's transient, and the frame sample caught the graphics
+ledger at +10.2, not the +16–22 it reaches on other hops.
 
-So the parts that can overlap inside one peak window add up to:
-- during the preload: the neighbour grid as it fills (10.0) + the lattice (17.5–31.4) + 1–2 =
-  **about 29–43 MiB**;
-- at the swap: the neighbour grid (10.0) + the new textures (10.0) + the staging copy (up to
-  10.0) + the old textures not yet released (10.0) = **about 30–40 MiB**.
+The bench's per-frame sample adds its own noise: it reads the footprint once a frame on the
+main thread while the render thread uploads. The trace's render-world samples saw up to +48.0
+MiB in hops whose frame samples read +33.5.
 
-Design §8's estimate of "about 10 MiB of grid data, plus about 10 MiB of GPU textures" left out
-the generator's working set and the overlap at the swap. The gate's 40 MiB sits right at the top
-of these sums.
+**After the fix: the same breakdown** (run `f1`, uncapped at 2560 × 1440; this run also had the
+early texture free described below, which changed nothing measurable):
 
-**The sums don't explain the whole peak.** The worst computed sum is about 43 MiB, and the
-observed worst is 48.9 MiB. So at least 6 MiB of the worst peak is unaccounted for by the parts
-above.
+| Step | Cycle 1 hop 1 (the run's worst, +32.7) | Cycle 2 hop 2 (typical, +23.0) |
+|---|---|---|
+| Lattice built (20.5 / 24.5 MiB) | +0.3: the dive's lattice chunks reused | +0.3 |
+| Rows, grid, generator dropped | +3.5: mostly reused freed pages | +1.2 |
+| Swap frame: the image data | +10.6 (+8.0 new: the first hop of a run) | +1.1 (reused) |
+| Swap + 1 | +14.6 | +3.5 |
+| Swap + 2 and + 3: the upload | **+32.7**: internal +21.6, graphics +21.1, other −10.0 | **+23.0**: internal +11.1, graphics +21.8, other −10.0 |
+| Swap + 5 | +10.7 | +0.9 |
+| Back to flying | +11.3 | +1.1 |
 
-**Why the spread is so wide (3 to 49 MiB): a hypothesis, not measured.** `phys_footprint` counts
-dirty pages that the process holds, the GPU driver's allocations included. Neither allocator hands
-every free straight back:
-- macOS malloc keeps freed medium and large blocks in its magazines and regions for reuse;
-- Metal's driver pools freed texture and staging memory in its heaps.
+**What every hop's peak is now.** The peak is the swap's upload, for two or three frames:
+- about +10 MiB of internal pages, the upload's staging (wgpu writes the 10 MiB of field data
+  through a staging buffer), freed three frames later;
+- the graphics ledger +21–22 MiB, while the footprint's remainder (not internal, not graphics)
+  falls by 10 MiB in the same frames: about +12 MiB net. The likeliest reading is the new
+  textures plus the staging buffer, with the old textures' 10 MiB leaving another ledger; the
+  trace doesn't separate those, so this is not verified;
+- on the first hop of a run only, the image data's 10 MiB as new pages (about +8 MiB measured);
+  later hops reuse the previous upload's.
 
-So a hop's peak shows only the part of the working set the process doesn't already hold from an
-earlier hop or entry. In cycle 3 of run 2, the earlier cycles' freed lattice and texture memory
-was still held and was reused, and the peak read only +3.3 and +11.0 MiB. When the allocator has
-just returned pages (for example after the globe's climb), the same work reads +43 to +49 MiB.
-Page and heap granularity (16 KiB pages, multi-MiB heap blocks) adds a few MiB of noise either
-way. The baseline is the same kind of reading, so it moves with it.
+So a hop reads about +22 MiB, the first hop of a run about +31 to +37.5. The two regions' grids
+overlap only from the preload to the swap, as the design says, and since the neighbour's grid
+appears to reuse the dive's freed image data (the same sizes), it adds almost nothing.
 
-Nothing here was measured, and run 1 cuts against it: its cycle 3 read +23.9 and +36.3 MiB, not
-small. Reuse may explain part of the spread; it doesn't explain it all.
+**Why +64 MiB, not +40.** Over eight runs with the fix (`f1`, `j1`, `j2`, `k1`, `k2`, `k3` and
+the two at +64), the first hop of a run read +32.7, +31.0, +34.3, +2.1, +33.3, +37.5, +34.1 and
++29.5 MiB; every later hop read +2.0 to +35.9, most of them about +22. The first hop's +37.5 is
+2.5 MiB under +40. And without any page reuse at all the parts add up to about +44 MiB: the
+neighbour's grid 10, the image data 10, the upload's staging 10, the textures net 12, the
+lattice's growth over the last region's 2. That case needs the freed pages gone before the hop's
+baseline is read (the OS could reclaim them under memory pressure); the runs never showed it.
++64 MiB sits about 26 MiB above the worst hop measured and 20 MiB above that sum. The bench
+still samples the footprint once a frame on the main thread, as before; the render thread's own
+samples were higher in the traces (up to +48.0 MiB in a hop whose frame samples read +33.5), so
+the gate reads what the bench has always read, not the true instantaneous peak.
 
-**Options for the owner:**
-1. **Raise the gate.** About +64 MiB would sit above every observed hop (worst +48.9 MiB) and the
-   computed sum (about 43 MiB), with about 15 MiB to spare. But the peak isn't fully explained
-   (at least 6 MiB unaccounted for), so the margin is a judgement, not a proof. Cheapest.
-2. **Release the old region's GPU resources earlier.** For example, free the old textures on the
-   swap frame (or stop the job's lattice from overlapping the swap). This cuts about 10 MiB off
-   the swap's sum, but the preload's working set still dominates.
-3. **Measure the peak differently.** Take the median of the hops, or leave out cycle 1, or count
-   only the bytes the hop allocates (grid, lattice, textures) instead of the process footprint.
-   This would show the hop's own cost without the allocator's noise. Leaving out cycle 1 alone
-   wouldn't pass run 2 (cycle 2 read +48.9).
-4. **Pre-upload the neighbour's textures** before the swap (the alternative to the plan's ruling
-   "the terrain is uploaded at the swap frame, not before"). This moves the upload, its staging
-   copy and the overlap with the old textures out of the swap frame. It also lowers the hop's
-   32–35 ms swap frame, but it doesn't lower the peak by itself: the new textures would be
-   resident earlier, alongside the old.
-5. **Investigate first: log the grid, lattice and texture allocations against the footprint
-   during one hop.** This is the way to close the unexplained part of the peak (at least 6 MiB)
-   and to test the allocator-reuse hypothesis. It would also give option 1 a measured number,
-   and options 2–4 a measured saving.
+**What else could lower it** (not done; each is bigger than a contained change):
+- free the old grid before the terrain's new image data is allocated on the swap frame, so the
+  image data reuses the old grid's blocks (the same sizes): about 8–10 MiB off the first hop.
+  The water and sky hold the old grid until after the terrain uploads, so this reorders the
+  swap frame;
+- upload the fields over several frames (Bevy's bytes-per-frame limit): less staging at once,
+  but the new terrain would appear a few frames after the swap, against the plan's ruling that
+  it uploads on the swap frame.
+
+**Tried and dropped: freeing the old textures a frame earlier.** Running
+`Assets::<Image>::track_assets` again in `PostUpdate` frees a replaced region's old field
+textures in the swap frame's extraction instead of the next one. It worked in the render world
+(the old and new textures no longer overlapped there: the field-texture count stayed at 14
+through the swap instead of 14 → 18 → 14), but the footprint didn't change. The graphics ledger
+peaked at +21–22 MiB with it and without it: Metal frees textures when the frames in flight
+finish, whichever frame Bevy drops them in. The change and its test were reverted.
+
+**The journey memory cycles** are flatter too: +0.2%, −3.0%, +1.2%, +0.2%, +1.1%, +1.3%, +0.5%
+and +1.0% in the eight runs after the fix. Before it, `t1` read +16.4% (a FAIL) and Task 11's
+run 1 +6.6%; the likeliest cause is the same retained lattice pages (not traced per cycle).
+
+| Run | Fix | Render | Hop peaks, cycle 1 hop 1, 1 h 2, 2 h 1, 2 h 2, 3 h 1, 3 h 2 (MiB) | Worst |
+|---|---|---|---|---|
+| Task 11 run 1 | before | 1920 × 951 paced | +43.3, +27.7, +31.8, +29.5, +23.9, +36.3 | +43.3 |
+| Task 11 run 2 | before | 1920 × 951 paced | +30.0, +26.7, +48.9, +42.3, +11.0, +3.3 | +48.9 |
+| `t1` (trace) | before | 1920 × 951 paced | +33.3, +53.5, +16.2, +17.7, +22.0, +10.8 | +53.5 |
+| `t2` (trace) | before | 2560 × 1440 uncapped | +9.6, +39.6, +40.5, +36.8, +17.9, +22.9 | +40.5 |
+| `f1` (trace) | lattice + early texture free | 2560 × 1440 uncapped | +32.7, +26.4, +22.0, +23.0, +21.8, +22.2 | +32.7 |
+| `j1` | lattice + early texture free | 2560 × 1440 uncapped | +31.0, +35.9, +4.0, +22.2, +30.8, +22.2 | +35.9 |
+| `j2` | lattice + early texture free | 2560 × 1440 uncapped | +34.3, +23.9, +23.0, +23.2, +21.8, +22.3 | +34.3 |
+| `k1` | lattice | 2560 × 1440 uncapped | +2.1, +23.4, +11.7, +22.3, +21.8, +22.9 | +23.4 |
+| `k2` | lattice | 2560 × 1440 uncapped | +33.3, +5.8, +34.5, +23.8, +23.7, +22.0 | +34.5 |
+| `k3` | lattice | 2560 × 1440 uncapped | +37.5, +26.4, +21.8, +23.4, +23.8, +9.8 | +37.5 |
+| run 1 (gate +64) | lattice | 2560 × 1440 uncapped | +34.1, +32.9, +22.0, +25.2, +21.8, +23.0 | +34.1 |
+| **run 2 (gate +64, judged)** | lattice | 2560 × 1440 uncapped | +29.5, +2.0, +22.0, +22.9, +22.1, +18.7 | **+29.5** |
+
+**The other gates in these runs.** Every hold, swap frame and journey memory cycle passed in all
+eight runs with the fix (holds: dives 541–1,004 ms, hops 15–34 ms; swap frames at most 66.86 ms,
+in `j1` while the workspace tests were building; cycles −3.0% to +1.3%). Flight outside the
+cloud passed in seven: `k2` read p95 16.86 ms against the uncapped rule's 16.67, with its third
+cycle's holds and swap frames slower than every other run's (hops 33–34 ms, swap frames 24–25
+ms, against 23–27 and 12–14 ms), which reads as other load on the machine rather than the
+change. The two runs at +64 MiB passed everything: run 1 p95 16.37 ms, run 2 (judged) 12.77 ms,
+swap worst 38.84 and 28.56 ms.
+
+**Generation is about 3–5% slower** with the chunked lattice: on the same display, the first
+dive's prep took 314–317 ms (runs `k1`, `k2`) against 307 ms before (`t2`), and every
+generation's rows 154–164 ms against 148–153 ms (the rows read every node through the chunk
+index). One `--region-bench` run with the lattice fix (`r1`, 2560 × 1440; the display paced some
+regions and not others) passed every gate: warm generation median 333 ms, max 346 ms (Task 11:
+316 / 332 ms); first entries 338–2,124 ms (Task 11: 332–1,865 ms; reported only natively);
+memory cycles −0.0%; all eight regions PASS. Part of that is the larger, uncapped render
+competing with the generator's threads; the journey comparison above, at the same render size,
+puts the lattice's share at about 5% of the rows.
 
 ## Cloud pass cost (Task 5's ≤ 1 ms, Task 7's early-Z loss)
 
