@@ -20,9 +20,8 @@
 //!   ([`crate::sky::sky_tint`]). The colour is display colour in both worlds: the globe camera
 //!   does not tone map and the region's tone-maps in each material, so the cloud does neither and
 //!   looks the same in each.
-//! - **No tilt-shift.** Design §6's tilt-shift (softer top and bottom bands mid-transition) was
-//!   dropped in M3 Task 11: the pass measured 1.8 ms at 2560 × 1440 against Task 5's 1 ms
-//!   budget (`docs/testing/m3/performance.md`).
+//! - **Tilt-shift** ([`tilt_shift`], design §6): between densities 0.05 and 0.95 the top and
+//!   bottom bands of the cloud lose their fine octaves and soften, in the same pass.
 //! - **Warm pipelines.** It draws (at density 0, invisibly) while the globe prepares its GPU
 //!   assets behind the loading screen, and the region warm-up draws one too
 //!   (`crate::terrain::warmup`), so the first transition never waits for a pipeline in either
@@ -71,6 +70,10 @@ pub const MAX_STEP_DEPTHS: f32 = 2.0;
 /// The wind the wisps drift on, in cloud depths per second of real time, so they keep moving
 /// while a transition holds (and while virtual time is paused).
 pub const CLOUD_WIND: Vec3 = Vec3::new(0.06, 0.015, 0.04);
+/// The densities between which the tilt-shift runs, and how far it eases in and out.
+pub const TILT_SHIFT_FROM: f32 = 0.05;
+pub const TILT_SHIFT_TO: f32 = 0.95;
+pub const TILT_SHIFT_EASE: f32 = 0.1;
 /// A density fainter than this draws nothing (M3 Task 7): the shader's wisps stay under one
 /// 8-bit step, and an altitude band's smoothstep tail (a fly left at 2,499.9999999 km after
 /// climbing out) no longer keeps the full-screen pass running. Applied once, in
@@ -110,7 +113,7 @@ pub struct CloudSystems;
 /// `CloudParams` in `cloud.wesl`.
 #[derive(ShaderType, Copy, Clone, Debug, Default, PartialEq, Reflect)]
 pub struct CloudParams {
-    /// x: density; y: the cloud's view depth (world units); z: unused (0); w: the
+    /// x: density; y: the cloud's view depth (world units); z: the tilt-shift amount; w: the
     /// view's aspect (width over height).
     pub state: Vec4,
     /// The fly's hole in the opaque cloud ([`fly_hole`]): xy its centre (NDC), z the radius
@@ -326,6 +329,19 @@ pub fn cloud_covers(
     !in_hole || ground_view_depth >= hole.w
 }
 
+/// The tilt-shift amount at `density`: 1 between [`TILT_SHIFT_FROM`] and [`TILT_SHIFT_TO`],
+/// easing in and out over [`TILT_SHIFT_EASE`], 0 outside.
+pub fn tilt_shift(density: f32) -> f32 {
+    if !(TILT_SHIFT_FROM..=TILT_SHIFT_TO).contains(&density) {
+        return 0.0;
+    }
+    let ease = |x: f32| {
+        let t = (x / TILT_SHIFT_EASE).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    ease(density - TILT_SHIFT_FROM).min(ease(TILT_SHIFT_TO - density))
+}
+
 /// The wisps' offset after the camera moved to `eye`: the travel since `prev`, in cloud depths
 /// (`depth` world units each), added to `motion`. A different camera than last frame (a swap of
 /// worlds), no previous frame, or a jump past [`MAX_STEP_DEPTHS`] carries the wisps on
@@ -462,7 +478,7 @@ fn update_cloud(
     };
     let (zenith, horizon, _) = sky_tint(era, biome);
     let params = CloudParams {
-        state: Vec4::new(d, depth, 0.0, aspect),
+        state: Vec4::new(d, depth, tilt_shift(d), aspect),
         fly: hole,
         motion: motion.offset.extend(0.0),
         sun: sun.normalize_or(Vec3::Y).extend(0.0),
@@ -707,19 +723,30 @@ mod tests {
         );
     }
 
-    /// M3 Task 11: the cloud pass measured 1.8 ms at 2560 × 1440 against Task 5's 1 ms budget,
-    /// so the tilt-shift is dropped (Task 5's ruling): every pixel shades every octave with one
-    /// softness, and `state.z` is unused (0).
     #[test]
-    fn the_cloud_has_no_tilt_shift() {
+    fn the_tilt_shift_runs_only_mid_transition() {
+        assert_eq!(tilt_shift(0.0), 0.0);
+        assert_eq!(tilt_shift(0.04), 0.0);
+        assert_eq!(tilt_shift(0.5), 1.0);
+        assert_eq!(tilt_shift(0.96), 0.0);
+        assert_eq!(tilt_shift(1.0), 0.0);
+        let mut last = 0.0;
+        for i in 5..=50 {
+            let t = tilt_shift(i as f32 / 100.0);
+            assert!(t >= last && (0.0..=1.0).contains(&t));
+            last = t;
+        }
+    }
+
+    /// The owner asked for the tilt-shift's softer edges back (2026-11-25), and accepted the
+    /// pass at about 2 ms (it measured 1.8 ms with the tilt-shift, 2.0–2.2 ms without): the
+    /// shader softens its bands by `state.z`, and mid-transition the game feeds it 1.
+    #[test]
+    fn the_tilt_shift_reaches_the_shader_mid_transition() {
         let wesl = include_str!("../assets/shaders/cloud.wesl");
         assert!(
-            !wesl.contains("cloud.state.z"),
-            "the shader still reads the tilt-shift"
-        );
-        assert!(
-            !wesl.contains("band"),
-            "the shader still has the tilt-shift's bands"
+            wesl.contains("cloud.state.z"),
+            "the shader doesn't read the tilt-shift"
         );
         let mut app = cloud_app();
         let fov = REGION_FOV_DEG.to_radians();
@@ -731,7 +758,7 @@ mod tests {
         want(&mut app, &[0.5]);
         let state = params(&app).state;
         assert_eq!(state.x, 0.5);
-        assert_eq!(state.z, 0.0, "the tilt-shift is still fed to the shader");
+        assert_eq!(state.z, 1.0, "the tilt-shift isn't fed to the shader");
     }
 
     /// Fix round 1 (minor 4): the floor for an invisible cloud sits in the one sink every source

@@ -257,7 +257,7 @@ of world looks alike)*.
   moving and the fly still flapping, and the fly's motion eases to a gentle drift
   (spec §11.2's "gentle slowdown"). "Descending..." appears after 1 s, as in M2.
 - **Tilt-shift:** a light tilt-shift during transitions only (spec §9's call), if it fits the
-  budget. *(Dropped in Task 11: the pass was over budget; see the plan's rulings.)*
+  budget. *(Dropped in Task 11 when the pass was over budget, then restored at the owner's request on 2026-11-25: the owner accepted the pass at about 2 ms; see the plan's rulings.)*
 
 ## 7. The dive and the climb (globe ↔ region)
 

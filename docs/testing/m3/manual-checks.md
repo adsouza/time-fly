@@ -47,6 +47,8 @@ tree):
 - [ ] The cloud gathers around the fly, turns fully white, and the region appears below it.
       No frame shows a cut: land never changes shape, place or colour while you can see it.
 - [ ] The fly is in view and the right way up throughout, including inside the white-out.
+- [ ] While the cloud gathers and clears, its top and bottom bands are softer than its middle
+      (the tilt-shift, restored at your request on 2026-11-25).
 - [ ] Climbing out lands over the same spot on the globe, heading the same way.
 - [ ] `Backspace` climbs out the same way, with no jump.
 

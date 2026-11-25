@@ -210,7 +210,7 @@ The draft paired `fastnoise-lite` on the CPU with a different hash noise on the 
 - Real landforms and biome colours from data. Era-aware palettes (§6.3).
 - Soft ramped diffuse with hue-shifted shadows, brush-like triplanar noise breaking up surfaces, soft silhouettes on vegetation.
 - Gradient skies with painted clouds. Atmospheric perspective tinted per era and biome.
-- Light tilt-shift during zoom-and-swap transitions only *(call)*. *(Dropped in M3 Task 11: the cloud pass was over budget; see the M3 plan's rulings.)*
+- Light tilt-shift during zoom-and-swap transitions only *(call)*. *(Dropped in M3 Task 11 when the cloud pass was over budget, then restored at the owner's request on 2026-11-25; see the M3 plan's rulings.)*
 - Optional painterly post-process (e.g. a cheap Kuwahara-style filter) only if it fits the web frame budget *(builder)*.
 
 ## 10. Cultural data (owner's CSV)

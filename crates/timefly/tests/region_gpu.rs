@@ -1057,7 +1057,7 @@ fn render_cloud_over_quad(
 ) -> Vec<[u8; 4]> {
     use bevy::camera::{CameraProjection, PerspectiveProjection};
     use bevy::math::{Mat4, Vec4};
-    use timefly::cloud::{CloudParams, DEPTH_PAST_FLY};
+    use timefly::cloud::{CloudParams, DEPTH_PAST_FLY, tilt_shift};
 
     let (w, h) = (VEIL_SIZE, VEIL_SIZE);
     // Bevy's own projection (infinite reverse-Z), as the game's cameras use it.
@@ -1080,7 +1080,7 @@ fn render_cloud_over_quad(
         state: Vec4::new(
             VEIL_DENSITY,
             VEIL_FLY_DISTANCE * DEPTH_PAST_FLY,
-            0.0,
+            tilt_shift(VEIL_DENSITY),
             w as f32 / h as f32,
         ),
         // No hole: the fly isn't drawn here.

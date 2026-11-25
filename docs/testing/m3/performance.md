@@ -2,7 +2,8 @@
 
 Measured on 2026-11-24 and 25 for Task 11. The benches ran on `4b79f08`, Task 10's last commit.
 The cloud cost re-measure and the web build used `e3bd6e9`, Task 11's code commit, which drops the
-tilt-shift (see "Cloud pass cost").
+tilt-shift (see "Cloud pass cost"). On 2026-11-25 the owner asked for the tilt-shift back, and it
+is back in the game (about 1.8 ms, inside the owner's accepted 2 ms).
 
 | | |
 |---|---|
@@ -42,8 +43,8 @@ Task 11's table below. One of the eight runs, `k2`, failed the flight gate's unc
 16.86 ms against 16.67; every other run 12.1–16.5 ms); see "Hop memory" for the runs.
 
 **Cloud pass: accepted.** On 2026-11-25 the owner accepted the pass at about 2 ms, so the
-noise stays as it is. Dropping the tilt-shift (Task 5's ruling) saved nothing, because the cost
-is the noise itself: six evaluations a pixel. If it ever needs to be cheaper, each of these is a
+noise stays as it is, and the tilt-shift is back at the owner's request. Dropping it (Task 5's
+ruling) had saved nothing, because the cost is the noise itself: six evaluations a pixel. If it ever needs to be cheaper, each of these is a
 look change:
 - drop to three octaves (`CLOUD_OCTAVES` allows 3–4);
 - skip the two sun taps (the lighting's `shape(toward)`);
@@ -56,9 +57,10 @@ journey memory cycles.
 
 - **Cloud pass:** about 1.8 ms a frame at 2560 × 1440, over Task 5's 1 ms budget. So Task 11
   dropped the tilt-shift, as Task 5's ruling said. Without it the pass costs about 2.0–2.2 ms:
-  the noise is the cost (see "Cloud pass cost"). The owner accepted that cost on 2026-11-25.
-  - The benches ran on `4b79f08`, before that change. It touches only the cloud, which is
-    hidden outside transitions, and it doesn't make the pass cheaper, so they weren't re-run.
+  the noise is the cost (see "Cloud pass cost"). The owner accepted that cost on 2026-11-25
+  and asked for the tilt-shift's softer edges back, so it is restored: the pass is at about
+  1.8 ms again.
+  - The benches ran on `4b79f08`, which has the tilt-shift, so they match the restored cloud.
 - **Near geometry under the cloud** (Task 7's rule), observed on Metal: PASS (a new GPU test).
 - **Chrome WebGPU:** pending; the controller runs it.
 - The owner's checks are in `manual-checks.md` and the deferred minors in `deferred.md`, both in
@@ -430,7 +432,9 @@ On the web the run becomes about 10 minutes (5 journeys at about 2 minutes each,
 **Result: about 1.8 ms a frame at 2560 × 1440, over the 1 ms budget, so the tilt-shift was
 dropped (Task 5's ruling). Dropping it didn't lower the cost: about 2.0–2.2 ms after.** The cost
 is the pass itself, six gradient-noise evaluations a pixel over 3.7 Mpx; the tilt-shift only
-scaled octaves that were computed anyway.
+scaled octaves that were computed anyway. **Then (2026-11-25) the owner accepted about 2 ms and
+asked for the tilt-shift back, so it is restored**: the `4b79f08` row below (about 1.8 ms) is
+the cloud as it now ships.
 
 **Method.** `examples/region_tour.rs` in `time` mode with `--offscreen`, so the region camera
 draws into a 2560 × 1440 image whatever the window (a window the compositor isn't showing gets
