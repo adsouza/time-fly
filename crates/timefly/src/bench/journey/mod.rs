@@ -536,6 +536,7 @@ impl Plugin for JourneyBenchPlugin {
                     measure_journey.after(NavigationSystems),
                 ),
             );
+        trace::add_trace(app);
     }
 }
 
@@ -1197,6 +1198,8 @@ fn finish(
         controls.exit.write(bench_exit(pass));
     }
 }
+
+pub mod trace;
 
 #[cfg(test)]
 mod tests;

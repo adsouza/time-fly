@@ -170,7 +170,7 @@ enum Stage {
 /// The request in flight. Replacing or removing it drops its handles and task, which cancels
 /// its loads and its run.
 #[derive(Resource)]
-pub(super) struct RegionJob {
+pub(crate) struct RegionJob {
     spec: RegionSpec,
     purpose: RequestPurpose,
     started: Instant,
@@ -179,6 +179,24 @@ pub(super) struct RegionJob {
     /// Frame files it loads (not in the frame cache).
     frames_fetched: u32,
     stage: Stage,
+}
+
+impl RegionJob {
+    /// Its purpose and stage, for diagnostics: `neighbour/frames`, `enter/running` and so on.
+    pub(crate) fn describe(&self) -> &'static str {
+        use RequestPurpose::{Enter, Neighbour, Snapshot};
+        match (self.purpose, &self.stage) {
+            (Enter, Stage::Frames { .. }) => "enter/frames",
+            (Enter, Stage::Tiles { .. }) => "enter/tiles",
+            (Enter, Stage::Running { .. }) => "enter/running",
+            (Snapshot, Stage::Frames { .. }) => "snapshot/frames",
+            (Snapshot, Stage::Tiles { .. }) => "snapshot/tiles",
+            (Snapshot, Stage::Running { .. }) => "snapshot/running",
+            (Neighbour, Stage::Frames { .. }) => "neighbour/frames",
+            (Neighbour, Stage::Tiles { .. }) => "neighbour/tiles",
+            (Neighbour, Stage::Running { .. }) => "neighbour/running",
+        }
+    }
 }
 
 /// The spec a request asks for, or `None` for a direction that is not one. Its sea-level

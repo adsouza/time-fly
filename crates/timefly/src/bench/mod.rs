@@ -766,6 +766,103 @@ pub(crate) mod memory {
         (js_heap, linear)
     }
 
+    /// One reading of the process's memory as the kernel and malloc split it (macOS only), for
+    /// the hop-memory trace ([`crate::bench::journey::trace`]).
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct MemorySplit {
+        /// `phys_footprint`: what the bench gates.
+        pub footprint: u64,
+        /// Dirty anonymous memory: malloc's pages, and anything else the process maps privately.
+        pub internal: u64,
+        pub compressed: u64,
+        /// Pages malloc marked reusable (freed, not counted in the footprint).
+        pub reusable: u64,
+        /// Memory tagged as graphics (Metal's textures and buffers), in the footprint.
+        pub graphics: u64,
+        /// Non-volatile purgeable memory (some driver allocations), in the footprint.
+        pub purgeable: u64,
+        /// malloc's bytes in live blocks, all zones.
+        pub malloc_in_use: u64,
+        /// The bytes malloc's zones hold from the kernel, live or free.
+        pub malloc_held: u64,
+    }
+
+    /// The task's VM info, rev 7 (`<mach/task_info.h>`, packed to 4 bytes).
+    #[cfg(target_os = "macos")]
+    #[repr(C, packed(4))]
+    #[derive(Copy, Clone)]
+    pub(super) struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        min_address: u64,
+        max_address: u64,
+        /// rev 3: 21 ledgers, from `ledger_phys_footprint_peak` to
+        /// `ledger_tag_neural_nofootprint_compressed`; graphics footprint is index 13.
+        ledgers: [i64; 21],
+        limit_bytes_remaining: u64,
+        decompressions: i32,
+        ledger_swapins: i64,
+        neural_nofootprint_total: i64,
+        neural_nofootprint_peak: i64,
+    }
+
+    /// The process's memory split ([`MemorySplit`]), or `None` off macOS or on a failed call.
+    pub fn split() -> Option<MemorySplit> {
+        #[cfg(target_os = "macos")]
+        {
+            const TASK_VM_INFO: libc::task_flavor_t = 22;
+            const PURGEABLE_NONVOLATILE: usize = 1;
+            const GRAPHICS_FOOTPRINT: usize = 13;
+            // SAFETY: `task_info` writes at most `count` natural_t words into the plain-data
+            // struct and updates `count`; `malloc_zone_statistics` with a null zone sums all
+            // zones into the plain-data struct.
+            unsafe {
+                let mut vm: TaskVmInfo = std::mem::zeroed();
+                let mut count = (size_of::<TaskVmInfo>() / size_of::<libc::natural_t>())
+                    as libc::mach_msg_type_number_t;
+                #[expect(deprecated, reason = "libc points at the mach2 crate; one call")]
+                let task = libc::mach_task_self();
+                let ok = libc::task_info(task, TASK_VM_INFO, (&raw mut vm).cast(), &mut count);
+                if ok != libc::KERN_SUCCESS {
+                    return None;
+                }
+                let mut stats: libc::malloc_statistics_t = std::mem::zeroed();
+                libc::malloc_zone_statistics(std::ptr::null_mut(), &mut stats);
+                let ledgers = vm.ledgers;
+                Some(MemorySplit {
+                    footprint: vm.phys_footprint,
+                    internal: vm.internal,
+                    compressed: vm.compressed,
+                    reusable: vm.reusable,
+                    graphics: ledgers[GRAPHICS_FOOTPRINT].max(0) as u64,
+                    purgeable: ledgers[PURGEABLE_NONVOLATILE].max(0) as u64,
+                    malloc_in_use: stats.size_in_use as u64,
+                    malloc_held: stats.size_allocated as u64,
+                })
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
     #[cfg(target_os = "macos")]
     fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
         let mut buf = [0u8; 128];
@@ -791,6 +888,30 @@ pub(crate) mod memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_memory_split_reads_the_kernels_footprint() {
+        // The packed struct is rev 7's 93 natural_t words.
+        assert_eq!(size_of::<memory::TaskVmInfo>(), 93 * 4);
+        let split = memory::split().expect("task_info and malloc statistics");
+        let rusage = memory::footprint_now().expect("the footprint");
+        // The same ledger read twice: within a few MiB of allocation between the calls.
+        assert!(
+            split.footprint.abs_diff(rusage) < 8 << 20,
+            "{split:?} vs {rusage}"
+        );
+        assert!(split.internal > 0 && split.internal <= split.footprint + (64 << 20));
+        // A 64 MiB block written through shows up as in use, then as held.
+        let block = vec![1u8; 64 << 20];
+        let with = memory::split().unwrap();
+        assert!(
+            with.malloc_in_use >= split.malloc_in_use + (60 << 20),
+            "{with:?}"
+        );
+        assert!(with.malloc_held >= with.malloc_in_use);
+        drop(block);
+    }
 
     #[test]
     fn scrub_bench_reports_percentiles() {

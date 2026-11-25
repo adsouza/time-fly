@@ -131,11 +131,14 @@ pub fn row_blocks(rows: u32, block: u32) -> Vec<Range<u32>> {
 pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
     use bevy::tasks::AsyncComputeTaskPool;
 
+    use crate::bench::journey::trace::trace_generation;
+
     let started = Instant::now();
     let field = inputs.field()?;
-    let generator = RegionPrep::new(inputs.spec, &field).finish();
+    let owned = RegionPrep::new(inputs.spec, &field).finish();
     let prep_ms = started.elapsed().as_secs_f64() * 1e3;
-    let generator = &generator;
+    trace_generation("prep done: lattice and coast field", owned.working_bytes());
+    let generator = &owned;
     let inner = row_blocks(generator.rows_in(FieldKind::Inner), NATIVE_BLOCK_ROWS);
     let apron = row_blocks(generator.rows_in(FieldKind::Apron), NATIVE_BLOCK_ROWS);
     let inner_blocks = inner.len();
@@ -146,8 +149,18 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
             }
         }
     });
+    trace_generation(
+        "rows done: row blocks",
+        blocks
+            .iter()
+            .map(|b| b.elevation_m.capacity() * 4 + b.surface.capacity() * 4)
+            .sum(),
+    );
     let apron_blocks = blocks.split_off(inner_blocks);
     let grid = generator.assemble(blocks, apron_blocks);
+    trace_generation("assembled: grid", grid.bytes());
+    drop(owned);
+    trace_generation("generator dropped", 0);
     info!(
         prep_ms = format!("{prep_ms:.0}"),
         rows_ms = format!("{:.0}", started.elapsed().as_secs_f64() * 1e3 - prep_ms),

@@ -53,6 +53,7 @@ pub use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, LoadClock, advance_load_clock};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use frames::{CpuGrid, CpuGridLoader, FrameCache};
 pub use job::LOAD_TIMEOUT_S;
+pub(crate) use job::RegionJob;
 use job::{
     TileIndex, advance_frames, advance_tiles, cancel_preload, leave_region, poll_generation,
     poll_overview, poll_tile_manifest, start_region_request, swap_region,
