@@ -30,7 +30,7 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 | `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only** |
 | `--journey-bench` after the hop-memory work (`ec9293e`, gate +64 MiB; the Alps; 2560 × 1440 uncapped) | PASS (exit 0): hop memory worst +34.1 MiB | PASS (exit 0): hop memory worst +29.5 MiB |
 | `--journey-bench`, the owner's route set (`d3b38ff`; 2560 × 1440) | FAIL (exit 3) as run: Pangaea's flight, uncapped p95 18.40 ms; hop memory worst **+48.0 MiB**. Re-judged under the fix-round rules (one pacing per run; Pangaea's flight reported only, owner 2026-11-25): **PASS** | **PASS** (exit 0, display-paced): hop memory worst +30.2 MiB; every gate passes; unchanged when re-judged |
-| **At HEAD (final, `ed78ff8`; 2560 × 1440)**: `--region-bench` | FAIL: Pangaea and Red Sea, uncapped | **FAIL: Red Sea alone** (uncapped p95 18.15 ms); see "Native at HEAD (final)" |
+| **At HEAD (final, `ed78ff8`; 2560 × 1440)**: `--region-bench` | FAIL: Pangaea and Red Sea, uncapped | **FAIL: Red Sea alone** (uncapped p95 18.15 ms), **accepted by the owner** (2026-11-25) as the terrain's cost; see "Native at HEAD (final)" |
 | **At HEAD (final)**: `--journey-bench` | PASS (display-paced) | **PASS** (display-paced): hop memory worst +22.0 MiB |
 | Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: over the 1 ms budget, **accepted by the owner** (2026-11-25) |
 
@@ -539,8 +539,9 @@ display-paced there: p95 17.59 ms, PASS). An A/B of Red Sea alone (`--region-ben
 passed every time: base p95 18.12 / 18.19 / 18.27 ms, HEAD 18.45 / 18.53 ms, medians 16.67–16.71 ms
 both. Nothing in the wave adds GPU work in flight (the warm-up's fly is gone before the first
 region; the pitch is a transform). An uncapped A/B wasn't possible, since the display decides
-the pacing. **The owner's call**: as Pangaea's was, this is the terrain's cost at 2560 × 1440
-when the display doesn't pace the run.
+the pacing. **The owner accepted it (2026-11-25)**, as with Pangaea: it is the terrain's cost at
+2560 × 1440 when the display doesn't pace the run. The region bench's Red Sea and Pangaea
+flights at 2560 × 1440 uncapped are known failures, not M3 regressions.
 
 **Journey bench, run 2.** Holds: dives 404–723 ms, hops 32–36 ms, climbs 32–34 ms (run 1: 405–720,
 33–34, 33–34). Flight per route, display-paced, all PASS (Pangaea's reported only): medians
