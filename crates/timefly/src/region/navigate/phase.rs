@@ -28,10 +28,12 @@
 //!   carried into the neighbour by `carry_pose`, its height above the ground kept). Then the
 //!   cloud clears over [`CLOUD_CLEAR_S`] and the fly eases back to its height above the ground
 //!   before the lift ([`NavAction::ReturnToAgl`]), unless the player climbs or descends.
-//!   Turning back before the swap clears the cloud and then cancels the preload; a neighbour
-//!   that fails turns the fly round [`TURN_BACK_INSIDE_M`] inside the edge under the opaque
-//!   cloud ([`NavAction::TurnBack`], Review Focus 4). A slider change before the lift ends the
-//!   hop; during it, it waits.
+//!   Turning back before the swap clears the cloud and then cancels the preload; turning back
+//!   from the hold, past the edge, cancels it at once and brings the fly in to the edge under
+//!   the opaque cloud ([`NavAction::PlaceInside`]). A neighbour that fails, or a hold longer
+//!   than [`HOLD_MAX_S`], turns the fly round [`TURN_BACK_INSIDE_M`] inside the edge under the
+//!   opaque cloud ([`NavAction::TurnBack`], Review Focus 4). A slider change before the lift
+//!   ends the hop; during it, it waits.
 //! - **The cloud** is the largest of the altitude band of the world on screen
 //!   ([`globe_density`] or [`region_density`]) and the phase's own fade
 //!   ([`NavPhase::cloud_density`]). Every swap happens on a frame at exactly 1, after a frame
@@ -39,18 +41,21 @@
 //! - **The slider** holds during [`NavPhase::holds_time`] phases; the shell queues the change and
 //!   applies it once the transition ends ([`hold_slider`]).
 
-use bevy::math::{DVec3, Vec2};
+use bevy::math::{DVec2, DVec3, Vec2};
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::{
     CLOUD_CLEAR_S, CLOUD_GATHER_S, CLOUD_TOP_KM, DIVE_ALTITUDE_KM, EMERGE_S, GLOBE_MAX_ALTITUDE_KM,
-    HOP_ALTITUDE_M, LIFT_LEAD_M, REGION_CLOUD_BASE_M, REGION_EMERGE_TO_M,
+    HOP_ALTITUDE_M, LIFT_LEAD_M, NEIGHBOUR_PAST_EDGE_M, REGION_CLOUD_BASE_M, REGION_EMERGE_TO_M,
 };
 use timefly_core::flight::cloud::{globe_density, region_density};
 use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, heading_to_region_yaw};
-use timefly_core::flight::hop::{EDGE_M, neighbour_centre, should_preload};
+use timefly_core::flight::hop::{
+    EDGE_M, carry_pose, into_field, neighbour_centre, preload_distance_m, should_preload,
+};
 use timefly_core::geo::RenderDir;
 use timefly_core::worldgen::frame::RegionFrame;
 
+use crate::clock::LOAD_CLOCK_MAX_DELTA_S;
 use crate::fly_camera::fly_speed;
 use crate::region::{RegionRequested, RegionState, RequestPurpose};
 use crate::time::nearest_snapshot;
@@ -247,6 +252,23 @@ pub enum NavPhase {
     /// under the opaque cloud, `swapped` into the neighbour or `turned_back` inside the edge;
     /// then for `elapsed_s` of [`CLOUD_CLEAR_S`] the cloud clears while the fly returns to its
     /// height. `edge` is the edge of the region it crosses, worked out once per neighbour.
+    /// Before the end, `elapsed_s` is the time held at full cover, across retargets.
+    ///
+    /// Its invariants (fix round 4; `a_hop_keeps_its_invariants_whatever_the_player_does`
+    /// checks them on random play):
+    /// - **I1.** The fly is outside the inner field only in the hold (at full cover, the one
+    ///   place [`FlyControls::confined`] is off), drawn at density exactly 1.
+    /// - **I2.** The white-out is bounded whatever the player and the neighbour job do: the hold
+    ///   lasts at most [`HOLD_MAX_S`], and the end starts clearing on its first frame.
+    /// - **I3.** A swap happens on a frame drawn opaque after one drawn opaque, to the neighbour
+    ///   asked for and ready, while the fly still flies out of `edge`; turning back from the
+    ///   hold drops the neighbour, so that hop never swaps.
+    /// - **I4.** A failure ([`NavAction::TurnBack`], facing in) or a turn back from the hold
+    ///   ([`NavAction::PlaceInside`], moving in) puts the fly inside the field.
+    ///
+    /// The hold ends in one place in [`step_nav`], and every ending puts the fly inside the
+    /// field on that opaque frame (the swap's carry lands well inside the neighbour); the end
+    /// is then confined like flying, so I1 holds by construction.
     Hopping {
         centre: RenderDir,
         edge: HopEdge,
@@ -268,10 +290,8 @@ pub struct FlyControls {
     pub vertical: bool,
     /// Whether the fly is kept inside the inner field ([`timefly_core::flight::hop::confine`]):
     /// everywhere but a hop's hold at full cover, so the fly is past the edge only under an
-    /// opaque cloud: it gets out only from the hold, and a hop keeps its cloud opaque while the
-    /// fly is out (fix rounds 1 and 2: a hop ending, a failed one's retries, a flight a hop
-    /// cannot start from, and a turn or retarget out of the hold never leave it out in clear
-    /// air).
+    /// opaque cloud: it gets out only from the hold, a hop keeps its cloud opaque while the fly
+    /// is out, and every way the hold ends puts it back inside (I1 on [`NavPhase::Hopping`]).
     pub confined: bool,
 }
 
@@ -348,6 +368,11 @@ pub const TURN_BACK_INSIDE_M: f32 = 10_000.0;
 /// the dive's drift, Task 7)*: a gentle drift (design §6), so a long wait never carries it far
 /// past the edge.
 pub const HOLD_DRIFT: f32 = 0.05;
+/// The longest a hop holds at full cover, across retargets, before it counts as failed and
+/// turns the fly back *(call: twice the region job's load timeout, a safety net that a stalled
+/// load reaches first; counted on the same clamped clock)*: whatever the job and the player do,
+/// the white-out ends (fix round 4).
+pub const HOLD_MAX_S: f32 = 2.0 * crate::region::LOAD_TIMEOUT_S as f32;
 /// A hop's return to the fly's height above the ground is done within this.
 const RETURNED_M: f32 = 1.0;
 
@@ -585,6 +610,12 @@ pub enum NavAction {
         pos_m: Vec2,
         yaw: f32,
     },
+    /// Bring the region's fly back inside the field at `pos_m` (`x`, `z`), facing as it does,
+    /// with the chase camera's smoothing reset: a turn back out of a hop's hold, under the opaque
+    /// cloud (fix round 4).
+    PlaceInside {
+        pos_m: Vec2,
+    },
 }
 
 /// Whether the active region is the one centred on `requested` at `to` (centres within about
@@ -622,7 +653,10 @@ pub fn fly_on_globe(frame: &RegionFrame, x_m: f64, z_m: f64, yaw: f32) -> (Rende
 }
 
 /// The neighbour to request for the fly in the region, if it should be preloading: never the
-/// region itself (Task 8 note b; the region job does not check).
+/// region itself (Task 8 note b; the region job does not check), and only across an edge the fly
+/// is near and flying out of. The edge a slanting heading reaches first can lie across the
+/// field from the one [`should_preload`] saw (fix round 4: a fly past the north edge, turning
+/// in with a little drift east, retargeted to the south neighbour 300 km away and swapped there).
 fn neighbour_to_preload(i: &NavInputs) -> Option<RenderDir> {
     let (Some(region), Some(snapshot)) = (i.region_centre, i.region_snapshot) else {
         return None;
@@ -633,7 +667,31 @@ fn neighbour_to_preload(i: &NavInputs) -> Option<RenderDir> {
         return None;
     }
     let centre = neighbour_centre(&RegionFrame { center: region }, p, v);
-    (!same_region(centre, snapshot, region, snapshot)).then_some(centre)
+    let edge = HopEdge::toward(region, centre);
+    let near = EDGE_M - edge.out(p) <= preload_distance_m(v.length(), EXPECTED_GEN_S);
+    (near && edge.out(v) > 0.0 && !same_region(centre, snapshot, region, snapshot))
+        .then_some(centre)
+}
+
+/// Where a swap to the neighbour centred on `centre` would put the fly at `pos_m` in the region
+/// centred on `region` (the shell's `carry_pose`): `(x, z)` in the neighbour's local metres.
+fn carried_m(region: RenderDir, centre: RenderDir, pos_m: Vec2) -> DVec2 {
+    let p = DVec3::new(f64::from(pos_m.x), 0.0, f64::from(pos_m.y));
+    let (q, _) = carry_pose(
+        &RegionFrame { center: region },
+        &RegionFrame { center: centre },
+        p,
+        0.0,
+    );
+    DVec2::new(q.x, q.z)
+}
+
+/// The neighbour across `edge` of the region centred on `region`, level with the fly at `pos_m`:
+/// [`NEIGHBOUR_PAST_EDGE_M`] past the edge, as [`neighbour_centre`] places it.
+fn neighbour_level(region: RenderDir, edge: HopEdge, pos_m: Vec2) -> RenderDir {
+    let mut c = pos_m.as_dvec2();
+    c[edge.axis] = f64::from(edge.side) * (f64::from(EDGE_M) + NEIGHBOUR_PAST_EDGE_M);
+    RegionFrame { center: region }.local_to_dir(c.x, c.y)
 }
 
 /// A hop starting now, to `centre` past `edge`.
@@ -992,32 +1050,22 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 failed = false;
                 edge = HopEdge::toward(region, c);
             }
+            // The neighbour must carry the fly inside its field (I1). One asked for along an
+            // older heading lies level with where that heading crossed the edge; a fly that
+            // turned since (sliding along another edge to a corner, say) can come out more than
+            // a field's half from it along the edge, so ask again, level with the fly.
+            let along = carried_m(region, centre, i.region_pos_m)[1 - edge.axis];
+            if along.abs() > f64::from(EDGE_M) {
+                let c = neighbour_level(region, edge, i.region_pos_m);
+                actions.push(NavAction::Preload(c));
+                centre = c;
+                failed = false;
+            }
             let out_m = edge.out(i.region_pos_m);
             let outward = edge.out(i.region_vel_mps);
             // Past an edge (the hold drifts out, and turning back or retargeting starts there),
-            // the cloud stays opaque until the fly is back inside: it is outside the field only
-            // under full cover (fix round 2).
+            // the cloud stays opaque: the fly is outside the field only under full cover (I1).
             let outside = i.region_pos_m.abs().max_element() > EDGE_M;
-            if outside && outward < 0.0 {
-                // Turned back out of the hold (fix round 3): the hop is off, so no swap can
-                // follow and a ready neighbour is dropped. It ends as a turn back, with no
-                // placement: the fly already heads in, at full speed again, and the cloud
-                // stays opaque until it is back inside, then clears.
-                actions.push(NavAction::CancelPreload);
-                return (
-                    NavPhase::Hopping {
-                        centre,
-                        edge,
-                        lift_from_agl_m,
-                        swapped: false,
-                        elapsed_s: 0.0,
-                        lift: 1.0,
-                        failed,
-                        turned_back: true,
-                    },
-                    actions,
-                );
-            }
             let target = if outside {
                 1.0
             } else if outward < 0.0 {
@@ -1047,12 +1095,27 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                     height_m: lift_height_m(i.region_ground_m + lift_from_agl_m, next_lift),
                 });
             }
+            // Time at full cover, across retargets: past the budget the hold counts as failed
+            // (I2, whatever the job and the player do). Counted as the `LoadClock` counts the
+            // job's own timeouts, so a stalled frame (a hidden tab) is one short frame here too.
+            let elapsed_s = if next_lift >= 1.0 {
+                elapsed_s + i.dt_s.clamp(0.0, LOAD_CLOCK_MAX_DELTA_S as f32)
+            } else {
+                elapsed_s
+            };
+            let failed = failed || elapsed_s >= HOLD_MAX_S;
             let opaque = ease01(next_lift) == 1.0 && i.shown_density == 1.0;
+            // Ready, and near enough the edge to land inside the neighbour's field (a fly held
+            // out past another edge may still be short of this one).
             let ready = i.region_state == RegionState::InRegion
                 && i.neighbour.is_some_and(|(c, snapshot)| {
                     i.region_snapshot
                         .is_some_and(|shown| same_region(c, snapshot, centre, shown))
-                });
+                })
+                && carried_m(region, centre, i.region_pos_m)
+                    .abs()
+                    .max_element()
+                    <= f64::from(EDGE_M);
             let ended = |swapped: bool, turned_back: bool| NavPhase::Hopping {
                 centre,
                 edge,
@@ -1063,7 +1126,19 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 failed,
                 turned_back,
             };
-            if opaque && failed {
+            // The hold ends here, and only here: on a frame drawn opaque after one drawn opaque,
+            // with the fly put back inside the field on that frame (I1, I4), so the end that
+            // follows is always inside, confined, and clears at once (I2).
+            if opaque && outside && outward < 0.0 {
+                // Turned back out of the hold (fix rounds 3 and 4): the hop is off, so no swap
+                // can follow and a ready neighbour is dropped (I3). The fly is brought in to the
+                // edge, unseen, moving and facing as the player has it.
+                actions.push(NavAction::CancelPreload);
+                actions.push(NavAction::PlaceInside {
+                    pos_m: into_field(i.region_pos_m),
+                });
+                ended(false, true)
+            } else if opaque && failed {
                 // Review Focus 4: round, inside the edge, under the opaque cloud.
                 actions.push(NavAction::CancelPreload);
                 actions.push(NavAction::TurnBack {
@@ -1112,14 +1187,9 @@ fn step_hop_end(
     else {
         return hop;
     };
-    // The clear waits until the fly is back inside the field on both axes (fix round 3: a turn
-    // back out of the hold ends the hop out there).
-    let outside = i.region_pos_m.abs().max_element() > EDGE_M;
-    let elapsed_s = if outside {
-        0.0
-    } else {
-        (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32)
-    };
+    // Every ending put the fly inside the field, where the end's controls keep it: the clear
+    // starts at once and nothing holds it (fix round 4).
+    let elapsed_s = (elapsed_s + i.dt_s.max(0.0)).min(CLOUD_CLEAR_S as f32);
     let lift_from_agl_m = if i.vertical_held {
         agl_m
     } else {

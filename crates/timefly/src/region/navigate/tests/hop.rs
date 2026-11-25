@@ -1,6 +1,8 @@
 //! The region hop (Task 9): `step_nav`'s hop, pure, then headless hops with the stand-in
 //! neighbour job, the region swap, the terrain scene and both cameras.
 
+use proptest::prelude::*;
+
 use super::*;
 
 use crate::bench::region::path::{BenchPath, SCRIPT_SECS};
@@ -85,8 +87,9 @@ fn hop_frame(
         _ => to,
     };
     let moved = (i.region_pos_m - from) / i.dt_s;
-    i.region_vel_mps =
-        timefly_core::flight::hop::velocity_at_edges(i.region_pos_m, moved, *wish * share);
+    // The keys' wish at full speed, as the shell reads it (`wish_mps`), whatever share of it
+    // the controls give.
+    i.region_vel_mps = timefly_core::flight::hop::velocity_at_edges(i.region_pos_m, moved, *wish);
     out
 }
 
@@ -1708,4 +1711,648 @@ fn a_failed_corner_retarget_lands_inside_on_both_axes() {
         &bad[..bad.len().min(3)]
     );
     assert_eq!(frames.last().unwrap().phase, NavPhase::Flying);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 4: a turn back in the cloud can never strand the fly
+//
+// The hop's invariants, checked frame by frame on random play by
+// `a_hop_keeps_its_invariants_whatever_the_player_does`:
+// - I1: the fly is outside the inner field only in a hop's hold, drawn at density exactly 1;
+// - I2: the white-out and a hop's end each last a bounded time, whatever the player and the
+//   neighbour job do;
+// - I3: a swap happens on a frame drawn opaque after one drawn opaque, to the neighbour asked
+//   for and ready, while the player still flies out of the hop's edge;
+// - I4: a failure or a turn back leaves the fly inside the field, moving or facing in.
+
+/// The most frames at `dt_s` a hop may draw in a row at full cover (I2): its hold's budget,
+/// and the frame that ends it.
+fn max_whiteout_frames(dt_s: f32) -> usize {
+    (HOLD_MAX_S / dt_s).ceil() as usize + 2
+}
+
+/// The most frames at `dt_s` a hop's end (the clear and the return to its height) may last
+/// (I2): the clear, and the return from the hop's height at the M2 speed for the height.
+fn max_ending_frames(dt_s: f32) -> usize {
+    ((CLOUD_CLEAR_S as f32 + 10.0) / dt_s).ceil() as usize
+}
+
+/// The re-review's Important (fix round 4): a moment's turn back in the hold (a tap of `S`, a
+/// yaw sweep past the perpendicular), then out again. The fly is never held in the white-out:
+/// it is back in the field on the turn's frame, flying within the clear and the return to its
+/// height, and its push out then hops again, through the cloud.
+#[test]
+fn a_moment_turned_back_in_the_hold_never_strands_the_fly() {
+    for (back, turn_frames) in [
+        (Vec2::NEG_X, 1),
+        (Vec2::new(-1.0, 0.4).normalize(), 1),
+        (Vec2::NEG_X, 3),
+    ] {
+        let (phase, mut i) = held_past_the_edge(0.0, 100);
+        let dt = i.dt_s;
+        let mut wish = back * 10_000.0;
+        turn_to(&mut i, wish);
+        let (mut frames, mut z) = (Vec::new(), Vec::new());
+        let mut p = phase;
+        let bound = max_ending_frames(dt) + turn_frames + 1;
+        let mut again = None;
+        for k in 0..bound + 200 {
+            if k == turn_frames {
+                // Out again.
+                wish = Vec2::X * 10_000.0;
+                turn_to(&mut i, wish);
+            }
+            if let NavPhase::Hopping {
+                centre,
+                swapped: false,
+                turned_back: false,
+                ..
+            } = p
+                && again.is_some()
+            {
+                // The new hop's neighbour is ready once asked for.
+                i.neighbour = Some((centre, YearsBp(0.0)));
+            }
+            let (next, actions, _, density) = hop_frame(p, &mut i, &mut wish);
+            z.push(i.region_pos_m.y);
+            if again.is_none() && k > 0 && has(&actions, |a| matches!(a, NavAction::Preload(_))) {
+                again = Some(k);
+            }
+            let swap = has(&actions, |a| matches!(a, NavAction::SwapToNeighbour));
+            frames.push(HopFrame {
+                phase: next,
+                actions,
+                density,
+                height_m: i.region_height_m,
+                x_m: i.region_pos_m.x,
+            });
+            p = next;
+            if swap {
+                break;
+            }
+        }
+        // Bounded: flying, then hopping again, within the end's time.
+        let flying = frames.iter().position(|f| f.phase == NavPhase::Flying);
+        assert!(
+            flying.is_some_and(|k| k <= bound),
+            "{back} for {turn_frames}: stranded; flying at {flying:?} of {bound}, ending {:?} at \
+             ({}, {}) density {}",
+            frames.last().unwrap().phase,
+            i.region_pos_m.x,
+            i.region_pos_m.y,
+            frames.last().unwrap().density
+        );
+        assert!(
+            again.is_some_and(|k| k <= bound + 1),
+            "{back} for {turn_frames}: never hopped again ({again:?})"
+        );
+        assert!(
+            frames.last().is_some_and(|f| swapped(&f.phase)),
+            "{back} for {turn_frames}: the push out never swapped: {:?}",
+            frames.last().map(|f| f.phase)
+        );
+        // The turn ended the hop: no swap to the old neighbour, the preload dropped, and the fly
+        // back in the field on that frame.
+        let turn = &frames[0];
+        assert!(
+            turn.actions.contains(&NavAction::CancelPreload),
+            "{back}: {:?}",
+            turn.actions
+        );
+        assert!(
+            frames[..again.unwrap()]
+                .iter()
+                .all(|f| !has(&f.actions, leaves)),
+            "{back}: swapped or left before hopping again"
+        );
+        assert!(
+            turn.x_m <= EDGE_M && z[0].abs() <= EDGE_M,
+            "{back}: still out at ({}, {})",
+            turn.x_m,
+            z[0]
+        );
+        let bad = outside_in_clear_air(&frames, &z);
+        assert!(bad.is_empty(), "{back}: {:?}", &bad[..bad.len().min(3)]);
+    }
+}
+
+/// I2 without the neighbour job's help: a neighbour that never answers, or a player who keeps
+/// retargeting at a corner (each retarget asks again), still ends the white-out within the
+/// hold's budget, turned back inside and facing in.
+#[test]
+fn a_hold_ends_within_its_budget_whatever_the_job_and_the_player_do() {
+    for zigzag in [false, true] {
+        let start_z = if zigzag { -(EDGE_M - 20_000.0) } else { 0.0 };
+        let (phase, mut i) = held_past_the_edge(start_z, 100);
+        let dt = i.dt_s;
+        let mut wish = Vec2::X * 10_000.0;
+        turn_to(&mut i, wish);
+        let (mut frames, mut z) = (Vec::new(), Vec::new());
+        let mut p = phase;
+        let mut asked = 0;
+        for k in 0..max_whiteout_frames(dt) + max_ending_frames(dt) {
+            if zigzag && k % 10 == 0 {
+                // North along the east edge, then east again: each turn retargets.
+                wish = if (k / 10) % 2 == 0 {
+                    Vec2::NEG_Y
+                } else {
+                    Vec2::X
+                } * 10_000.0;
+                turn_to(&mut i, wish);
+            }
+            let (next, actions, _, density) = hop_frame(p, &mut i, &mut wish);
+            asked += actions
+                .iter()
+                .filter(|a| matches!(a, NavAction::Preload(_)))
+                .count();
+            z.push(i.region_pos_m.y);
+            frames.push(HopFrame {
+                phase: next,
+                actions,
+                density,
+                height_m: i.region_height_m,
+                x_m: i.region_pos_m.x,
+            });
+            p = next;
+            if p == NavPhase::Flying {
+                break;
+            }
+        }
+        if zigzag {
+            assert!(asked >= 4, "the corner never retargeted: {asked} requests");
+        }
+        let run = frames
+            .iter()
+            .scan(0usize, |n, f| {
+                *n = if f.density == 1.0 { *n + 1 } else { 0 };
+                Some(*n)
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            run <= max_whiteout_frames(dt),
+            "zigzag {zigzag}: {run} frames of white-out, ending {:?}",
+            frames.last().map(|f| f.phase)
+        );
+        let (pos, yaw) = frames
+            .iter()
+            .find_map(|f| {
+                f.actions.iter().find_map(|a| match *a {
+                    NavAction::TurnBack { pos_m, yaw } => Some((pos_m, yaw)),
+                    _ => None,
+                })
+            })
+            .expect("never turned back");
+        assert!(pos.abs().max_element() < EDGE_M, "{pos}");
+        let facing = Vec2::new(-yaw.sin(), -yaw.cos());
+        let edge = frames
+            .iter()
+            .find_map(|f| match f.phase {
+                NavPhase::Hopping {
+                    edge,
+                    turned_back: true,
+                    ..
+                } => Some(edge),
+                _ => None,
+            })
+            .unwrap();
+        assert!(edge.out(facing) < -0.99, "facing {facing} across {edge:?}");
+        assert_eq!(p, NavPhase::Flying, "zigzag {zigzag}: never flying");
+        assert_eq!(i.region_centre, Some(alps()));
+        let bad = outside_in_clear_air(&frames, &z);
+        assert!(bad.is_empty(), "{:?}", &bad[..bad.len().min(3)]);
+    }
+}
+
+/// The hold's budget counts as the `LoadClock` does: a stalled frame (a hidden tab, a laptop
+/// asleep) is one short frame, not a minute of white-out that turns the fly back.
+#[test]
+fn a_stalled_frame_never_spends_the_holds_budget() {
+    let (phase, mut i) = held_past_the_edge(0.0, 100);
+    let held = |p: &NavPhase| match *p {
+        NavPhase::Hopping { elapsed_s, .. } => elapsed_s,
+        _ => f32::NAN,
+    };
+    let before = held(&phase);
+    i.dt_s = 60.0;
+    let (next, actions) = step_nav(phase, &i);
+    assert!(
+        !has(&actions, |a| matches!(a, NavAction::TurnBack { .. })),
+        "{actions:?}"
+    );
+    let spent = held(&next) - before;
+    assert!(
+        spent > 0.0 && spent <= crate::clock::LOAD_CLOCK_MAX_DELTA_S as f32,
+        "{spent} s"
+    );
+}
+
+/// The re-review's Important, in the shell: with the real fly camera, the fly holding past the
+/// east edge faces west for one frame, then east again. It is never held in the white-out: back
+/// in the field on the turn's frame, then flying and hopping again; never out in clear air.
+#[test]
+fn a_moment_turned_back_in_the_hold_never_strands_the_fly_in_the_shell() {
+    // The neighbour stays unready through the hold.
+    let (mut app, _) = hop_app(100_000, false, EDGE_M - 10_000.0);
+    let east = -std::f32::consts::FRAC_PI_2;
+    // Far enough out that a frame back in at full speed leaves it out.
+    let out = |a: &App| a.world().resource::<FlyState>().pos_m.x > EDGE_M + 3_000.0;
+    run_until(&mut app, 2_000, out);
+    assert!(out(&app));
+    let asked = |a: &App| {
+        a.world()
+            .resource::<Seen>()
+            .requests
+            .iter()
+            .filter(|r| r.purpose == RequestPurpose::Neighbour)
+            .count()
+    };
+    let before = asked(&app);
+    app.world_mut().resource_mut::<FlyState>().yaw = east + std::f32::consts::PI;
+    app.update();
+    app.world_mut().resource_mut::<FlyState>().yaw = east;
+    let turned = app.world().resource::<FlyState>().pos_m;
+    let bound = max_ending_frames(STEP.as_secs_f32()) + 1;
+    for _ in 0..bound {
+        if asked(&app) > before {
+            break;
+        }
+        app.update();
+    }
+    assert!(
+        asked(&app) > before,
+        "stranded: {:?} at {:?}, density {}",
+        phase(&app),
+        app.world().resource::<FlyState>().pos_m,
+        app.world().resource::<CloudDensity>().0
+    );
+    assert!(turned.x <= EDGE_M, "still out after the turn: {turned:?}");
+    let frames = drawn(&app);
+    let bad: Vec<_> = frames
+        .iter()
+        .filter(|f| f.fly.pos_m.x.abs().max(f.fly.pos_m.z.abs()) > EDGE_M && f.density < 1.0)
+        .map(|f| format!("{:?} at {}", f.fly.pos_m, f.density))
+        .collect();
+    assert!(bad.is_empty(), "{:?}", &bad[..bad.len().min(3)]);
+    assert!(frames.iter().all(|f| f.scene_centre == Some(alps())));
+    assert_eq!(app.world().resource::<Seen>().left, 0);
+    assert_pose_follows_the_camera(&frames);
+}
+
+/// Plays `segments` (a wish, held for some frames) from flying at `start` in the Alps' region,
+/// a hop's neighbour ready at once when `ready_for` its edge, until a swap; returns the frames,
+/// the fly's `z` after each, and where the swap put the fly.
+fn play(
+    start: Vec2,
+    segments: &[(Vec2, usize)],
+    ready_for: impl Fn(HopEdge) -> bool,
+) -> (Vec<HopFrame>, Vec<f32>, Option<Vec2>) {
+    let mut i = in_alps(0.0, HOP_AGL_M);
+    i.region_pos_m = start;
+    let mut phase = NavPhase::Flying;
+    let (mut frames, mut z) = (Vec::new(), Vec::new());
+    for &(w, n) in segments {
+        let mut wish = w;
+        turn_to(&mut i, wish);
+        for _ in 0..n {
+            i.neighbour = match phase {
+                NavPhase::Hopping {
+                    centre,
+                    edge,
+                    swapped: false,
+                    turned_back: false,
+                    ..
+                } if ready_for(edge) => Some((centre, YearsBp(0.0))),
+                _ => None,
+            };
+            let (next, actions, _, density) = hop_frame(phase, &mut i, &mut wish);
+            let swap = has(&actions, |a| matches!(a, NavAction::SwapToNeighbour));
+            z.push(i.region_pos_m.y);
+            frames.push(HopFrame {
+                phase: next,
+                actions,
+                density,
+                height_m: i.region_height_m,
+                x_m: i.region_pos_m.x,
+            });
+            phase = next;
+            if swap {
+                return (frames, z, Some(i.region_pos_m));
+            }
+        }
+    }
+    (frames, z, None)
+}
+
+/// Found by the property (fix round 4): a neighbour asked for along an older heading is asked
+/// for again, level with the fly, once the fly would come out more than a field's half from it
+/// along the edge, so the swap lands it inside the neighbour's field (boosted south-west, then
+/// turned south-east to slide down the east edge to the corner).
+#[test]
+fn a_swap_always_lands_inside_the_neighbours_field() {
+    let segments = [
+        (Vec2::new(-28_284.271, 28_284.271), 23),
+        (Vec2::ZERO, 1),
+        (Vec2::new(7_337.435, 6_794.266), 600),
+    ];
+    let (frames, z, landed) = play(Vec2::new(EDGE_M, -34_697.81), &segments, |_| true);
+    let landed = landed
+        .unwrap_or_else(|| panic!("never swapped, ending {:?}", frames.last().map(|f| f.phase)));
+    assert!(
+        landed.abs().max_element() <= EDGE_M,
+        "landed outside the neighbour's field at {landed}"
+    );
+    assert!(
+        preloads(&frames).len() >= 2,
+        "asked once: {:?}",
+        preloads(&frames)
+    );
+    let bad = outside_in_clear_air(&frames, &z);
+    assert!(bad.is_empty(), "{:?}", &bad[..bad.len().min(3)]);
+}
+
+/// Found by the property (fix round 4): a fly held past the east edge 30 km from the south one,
+/// turning back in while its hold drift still carries it south, turns back. It never retargets
+/// to the west neighbour across the field, the edge its slanting heading reaches first.
+#[test]
+fn a_turn_back_never_retargets_across_the_field() {
+    let mut i = in_alps(EDGE_M - 15_000.0, HOP_AGL_M);
+    i.region_pos_m.y = 120_000.0;
+    let mut wish = Vec2::new(10_000.0, 600.0);
+    i.region_vel_mps = wish;
+    let mut phase = NavPhase::Flying;
+    for _ in 0..2_000 {
+        phase = hop_frame(phase, &mut i, &mut wish).0;
+        if i.region_pos_m.x > EDGE_M + 2_000.0 {
+            break;
+        }
+    }
+    assert!(lift_of(&phase) == 1.0 && i.region_pos_m.x > EDGE_M + 2_000.0);
+    let mut wish = Vec2::new(-10_000.0, 600.0);
+    turn_to(&mut i, wish);
+    let (frames, z) = back_in(phase, &mut i, &mut wish, 3_000, |p, i| {
+        if let NavPhase::Hopping { centre, .. } = *p {
+            i.neighbour = Some((centre, YearsBp(0.0)));
+        }
+    });
+    let turn = &frames[0];
+    assert!(
+        turn.actions.contains(&NavAction::CancelPreload)
+            && has(&turn.actions, |a| matches!(
+                a,
+                NavAction::PlaceInside { .. }
+            )),
+        "not turned back: {:?}",
+        turn.actions
+    );
+    assert!(preloads(&frames).is_empty(), "{:?}", preloads(&frames));
+    assert!(frames.iter().all(|f| !has(&f.actions, leaves)));
+    assert_eq!(frames.last().unwrap().phase, NavPhase::Flying);
+    assert_eq!(i.region_centre, Some(alps()));
+    let bad = outside_in_clear_air(&frames, &z);
+    assert!(bad.is_empty(), "{:?}", &bad[..bad.len().min(3)]);
+}
+
+/// Found by the property (fix round 4), shrunk and replayed: held out past the south edge, the
+/// fly retargets east while 54 km short of the east edge, with the east neighbour ready. The
+/// swap waits until it would land the fly inside the neighbour's field.
+#[test]
+fn a_swap_waits_until_the_fly_would_land_inside() {
+    let v = Vec2::new;
+    let segments = [
+        (v(10_000.0, 0.0), 9, false),
+        (v(-9_999.648, -83.842_16), 42, false),
+        (v(-0.000_437_113_9, 10_000.0), 10, false),
+        (v(9_572.613, 2_892.245), 18, false),
+        (v(6_297.324_7, 7_768.120_6), 22, false),
+        (v(740.190_4, -672.397_34), 1, false),
+        (v(0.0, 0.0), 1, false),
+    ];
+    let answers = vec![Answer::Ready(1), Answer::Never, Answer::Ready(1)];
+    if let Err(e) = check_hop_invariants(v(EDGE_M - 35_503.605, 135_015.7), &segments, answers) {
+        panic!("{e}");
+    }
+}
+
+/// How the pure property's stand-in job answers a neighbour request.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    /// Ready this many frames after the request.
+    Ready(u32),
+    /// Failed this many frames after the request.
+    Fail(u32),
+    /// Never (a job that hangs).
+    Never,
+}
+
+/// The pure property's stand-in neighbour job: the requests are answered as `answers` says, in
+/// turn; a cancel or a newer request drops the one before, ready or not.
+struct PureJob {
+    answers: Vec<Answer>,
+    next: usize,
+    asked: Option<(RenderDir, Answer, u32)>,
+}
+
+impl PureJob {
+    /// Before a frame: the answer due now, into the inputs.
+    fn answer(&mut self, i: &mut NavInputs) {
+        i.preload_failed = false;
+        let Some((centre, answer, waited)) = self.asked.as_mut() else {
+            return;
+        };
+        *waited += 1;
+        match *answer {
+            Answer::Ready(k) if *waited >= k => {
+                i.neighbour = Some((*centre, YearsBp(0.0)));
+                self.asked = None;
+            }
+            Answer::Fail(k) if *waited >= k => {
+                i.preload_failed = true;
+                self.asked = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// After a frame: its requests and cancels.
+    fn hear(&mut self, actions: &[NavAction], i: &mut NavInputs) {
+        for a in actions {
+            match *a {
+                NavAction::Preload(centre) => {
+                    i.neighbour = None;
+                    let answer = self.answers[self.next % self.answers.len()];
+                    self.next += 1;
+                    self.asked = Some((centre, answer, 0));
+                }
+                NavAction::CancelPreload => {
+                    i.neighbour = None;
+                    self.asked = None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A player's wish: mostly out of the east edge (where the hops start), else along a compass
+/// point (along an edge exactly) or anywhere; at rest, cruising or boosted.
+fn wish_strategy() -> impl Strategy<Value = Vec2> {
+    use std::f32::consts::{FRAC_PI_3, FRAC_PI_4, TAU};
+    let dir = prop_oneof![
+        3 => -FRAC_PI_3..FRAC_PI_3,
+        2 => (0u8..8).prop_map(|k| f32::from(k) * FRAC_PI_4),
+        1 => 0.0f32..TAU,
+    ];
+    let speed = prop_oneof![
+        1 => Just(0.0f32),
+        2 => Just(1_000.0f32),
+        3 => Just(10_000.0f32),
+        1 => Just(40_000.0f32),
+    ];
+    (dir, speed).prop_map(|(a, s)| Vec2::new(a.cos(), a.sin()) * s)
+}
+
+fn answer_strategy() -> impl Strategy<Value = Answer> {
+    prop_oneof![
+        3 => (1u32..120).prop_map(Answer::Ready),
+        2 => (1u32..120).prop_map(Answer::Fail),
+        1 => Just(Answer::Never),
+    ]
+}
+
+/// Plays `segments` (a wish, held for some frames, with climb or descend held or not) from
+/// flying at `start` in the Alps' region, the neighbour job answering as `answers` says, then
+/// holds the last wish long enough for any white-out to have ended; checks I1–I4 on every
+/// frame.
+fn check_hop_invariants(
+    start: Vec2,
+    segments: &[(Vec2, u32, bool)],
+    answers: Vec<Answer>,
+) -> Result<(), TestCaseError> {
+    let mut i = in_alps(0.0, HOP_AGL_M);
+    i.region_pos_m = start;
+    let dt = i.dt_s;
+    let (max_whiteout, max_ending) = (max_whiteout_frames(dt), max_ending_frames(dt));
+    let tail = (
+        segments.last().unwrap().0,
+        (max_whiteout + max_ending) as u32 + 20,
+        false,
+    );
+    let mut job = PureJob {
+        answers,
+        next: 0,
+        asked: None,
+    };
+    let mut phase = NavPhase::Flying;
+    let (mut whiteout, mut ending) = (0usize, 0usize);
+    for (k, &(w, frames, vertical)) in segments.iter().chain([&tail]).enumerate() {
+        let mut wish = w;
+        turn_to(&mut i, wish);
+        i.vertical_held = vertical;
+        for f in 0..frames {
+            job.answer(&mut i);
+            let (before, seen, shown, ready) =
+                (phase, i.region_vel_mps, i.shown_density, i.neighbour);
+            let (next, actions, _, density) = hop_frame(phase, &mut i, &mut wish);
+            job.hear(&actions, &mut i);
+            phase = next;
+            let at = format!(
+                "segment {k} frame {f}: {before:?} -> {next:?}, at {} moving {seen}, density \
+                 {density}, {actions:?}",
+                i.region_pos_m
+            );
+            let outside = i.region_pos_m.abs().max_element() > EDGE_M;
+            // I1.
+            prop_assert!(!outside || density == 1.0, "I1, out in clear air: {at}");
+            prop_assert!(
+                !outside || next.fly_controls().is_some_and(|c| !c.confined),
+                "I1, out but not in a hold: {at}"
+            );
+            // I2.
+            whiteout = if density == 1.0 { whiteout + 1 } else { 0 };
+            prop_assert!(
+                whiteout <= max_whiteout,
+                "I2, {whiteout} frames white: {at}"
+            );
+            let ends = matches!(
+                next,
+                NavPhase::Hopping { swapped: true, .. }
+                    | NavPhase::Hopping {
+                        turned_back: true,
+                        ..
+                    }
+            );
+            ending = if ends { ending + 1 } else { 0 };
+            prop_assert!(ending <= max_ending, "I2, {ending} frames ending: {at}");
+            // I3.
+            if has(&actions, |a| matches!(a, NavAction::SwapToNeighbour)) {
+                prop_assert!(shown == 1.0 && density == 1.0, "I3, not opaque: {at}");
+                let NavPhase::Hopping { centre, edge, .. } = before else {
+                    return Err(TestCaseError::fail(format!(
+                        "I3, a swap out of a hop: {at}"
+                    )));
+                };
+                prop_assert!(
+                    ready.is_some_and(|(c, s)| same_region(c, s, centre, YearsBp(0.0))),
+                    "I3, not the neighbour asked for: {at}"
+                );
+                prop_assert!(edge.out(seen) >= 0.0, "I3, swapped turning back: {at}");
+            }
+            prop_assert!(
+                !has(&actions, |a| matches!(
+                    a,
+                    NavAction::Leave | NavAction::CancelRequest
+                )),
+                "left the region: {at}"
+            );
+            // I4.
+            let edge = match next {
+                NavPhase::Hopping { edge, .. } => Some(edge),
+                _ => None,
+            };
+            for a in &actions {
+                match *a {
+                    NavAction::TurnBack { yaw, .. } => {
+                        prop_assert!(!outside, "I4, turned back outside: {at}");
+                        let facing = Vec2::new(-yaw.sin(), -yaw.cos());
+                        prop_assert!(
+                            edge.is_some_and(|e| e.out(facing) < -0.99),
+                            "I4, turned back facing out: {at}"
+                        );
+                    }
+                    NavAction::PlaceInside { .. } => {
+                        prop_assert!(!outside, "I4, placed outside: {at}");
+                        prop_assert!(
+                            edge.is_some_and(|e| e.out(seen) < 0.0),
+                            "I4, placed without turning back: {at}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// I1–I4 on every frame of random play near an edge: random wishes held for random spans
+    /// (moments included), climb or descend held at random, and a neighbour job that is ready,
+    /// fails or hangs after random delays (fix round 4). `quarter` turns the play by that many
+    /// quarter turns, so each edge is the one first flown at.
+    #[test]
+    fn a_hop_keeps_its_invariants_whatever_the_player_does(
+        from_edge in 0.0f32..60_000.0,
+        along in -EDGE_M..EDGE_M,
+        quarter in 0u8..4,
+        segments in prop::collection::vec((wish_strategy(), 1u32..60, any::<bool>()), 1..30),
+        answers in prop::collection::vec(answer_strategy(), 1..6),
+    ) {
+        // A quarter turn takes east (+x) to south (+z).
+        let turn = |v: Vec2| (0..quarter).fold(v, |v, _| Vec2::new(-v.y, v.x));
+        let segments: Vec<_> = segments.into_iter().map(|(w, n, v)| (turn(w), n, v)).collect();
+        check_hop_invariants(turn(Vec2::new(EDGE_M - from_edge, along)), &segments, answers)?;
+    }
 }

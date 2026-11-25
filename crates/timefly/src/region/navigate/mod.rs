@@ -75,11 +75,11 @@ use crate::ui::TEXT_COLOR;
 mod phase;
 
 pub use phase::{
-    CLIMB_OUT_M, DIVE_DRIFT_S, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT, HopEdge, NavAction,
-    NavInputs, NavPhase, SNAPSHOT_FADE_S, START_TIMEOUT_S, SliderHold, TURN_BACK_INSIDE_M,
-    TimeChange, World, dive_drift_mps, emerge_altitude_km, emerge_density, emerge_height_m,
-    fade_alpha, fly_on_globe, gather_density, gather_elapsed_for, hold_slider, region_yaw,
-    same_region, step_nav,
+    CLIMB_OUT_M, DIVE_DRIFT_S, EXPECTED_GEN_S, Fade, FlyControls, HOLD_DRIFT, HOLD_MAX_S, HopEdge,
+    NavAction, NavInputs, NavPhase, SNAPSHOT_FADE_S, START_TIMEOUT_S, SliderHold,
+    TURN_BACK_INSIDE_M, TimeChange, World, dive_drift_mps, emerge_altitude_km, emerge_density,
+    emerge_height_m, fade_alpha, fly_on_globe, gather_density, gather_elapsed_for, hold_slider,
+    region_yaw, same_region, step_nav,
 };
 
 /// "Descending..." shows only once a region has been generating this long (design §6.1).
@@ -832,6 +832,22 @@ fn apply_action(
                 x_m = pos_m.x,
                 z_m = pos_m.y,
                 "hop: the neighbour failed; turned back"
+            );
+        }
+        NavAction::PlaceInside { pos_m } => {
+            let fly = &mut flies.fly;
+            fly.pos_m.x = pos_m.x;
+            fly.pos_m.z = pos_m.y;
+            if let Some(region) = region {
+                let ground =
+                    blended_height_m(&region.grid, f64::from(pos_m.x), f64::from(pos_m.y)).max(0.0);
+                fly.pos_m.y = fly.pos_m.y.max(ground + CAMERA_CLEARANCE_M);
+            }
+            reset_fly_chase(flies);
+            info!(
+                x_m = pos_m.x,
+                z_m = pos_m.y,
+                "hop: turned back in the cloud; the hop is off"
             );
         }
     }

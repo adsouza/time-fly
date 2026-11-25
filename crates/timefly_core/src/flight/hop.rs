@@ -94,6 +94,13 @@ pub fn confine(prev_m: Vec2, next_m: Vec2) -> Vec2 {
     next_m.clamp(-limit, limit)
 }
 
+/// The nearest place to `pos_m` inside the inner field (on or within [`EDGE_M`] on each axis):
+/// where a hop that ends past the edge, under the opaque cloud, puts the fly, so it is outside
+/// the field only in a hop's hold.
+pub fn into_field(pos_m: Vec2) -> Vec2 {
+    pos_m.clamp(Vec2::splat(-EDGE_M), Vec2::splat(EDGE_M))
+}
+
 /// The fly's velocity for [`should_preload`] and the hop: as `measured_mps` (its motion over the
 /// last frame), except on an axis where it is at or past the edge and the player's `wish_mps`
 /// has a component on it, which counts instead. Held at an edge ([`confine`]) while pushing out
@@ -278,6 +285,19 @@ mod tests {
             confine(out, out - Vec2::new(500.0, 0.0)),
             out - Vec2::new(500.0, 0.0)
         );
+    }
+
+    #[test]
+    fn into_the_field_is_the_nearest_place_inside() {
+        let e = EDGE_M;
+        let p = Vec2::new(100_000.0, -20_000.0);
+        assert_eq!(into_field(p), p);
+        assert_eq!(into_field(Vec2::new(e + 4_000.0, 7.0)), Vec2::new(e, 7.0));
+        assert_eq!(
+            into_field(Vec2::new(-e - 1.0, -e - 900.0)),
+            Vec2::new(-e, -e)
+        );
+        assert_eq!(into_field(Vec2::new(3.0, e + 0.5)), Vec2::new(3.0, e));
     }
 
     #[test]

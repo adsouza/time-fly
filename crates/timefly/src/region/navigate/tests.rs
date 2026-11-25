@@ -427,7 +427,9 @@ fn frame(phase: NavPhase, i: &mut NavInputs) -> (NavPhase, Vec<NavAction>, f32, 
                 let step = fly_speed(agl) * i.dt_s;
                 i.region_height_m += (agl_m - agl).clamp(-step, step);
             }
-            NavAction::TurnBack { pos_m, .. } => i.region_pos_m = pos_m,
+            NavAction::TurnBack { pos_m, .. } | NavAction::PlaceInside { pos_m } => {
+                i.region_pos_m = pos_m;
+            }
             NavAction::SwapToNeighbour => {
                 let (centre, _) = i.neighbour.take().expect("a swap with a neighbour ready");
                 let old = RegionFrame {
