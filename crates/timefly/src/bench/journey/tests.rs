@@ -637,7 +637,7 @@ fn journeys_are_named_and_their_memory_compared_by_route() {
 }
 
 #[test]
-fn route_checks_judge_the_first_hop() {
+fn route_checks_judge_the_hop_they_name() {
     let corner = RenderDir(dir(35.26, 135.0));
     let near = HopRecord {
         centre: Some(corner),

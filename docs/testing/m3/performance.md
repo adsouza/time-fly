@@ -193,7 +193,7 @@ result: FAIL
 | Hold per transition (native ≤ 3,000 ms) | dives 721, 540, 538 ms; hops and climbs 31–35 ms | dives 725, 538, 537 ms; hops and climbs 31–36 ms | PASS |
 | Flight outside the cloud (R14, display-paced) | 11,442 frames, 16.68 / 18.33 / 36.80 ms, 1 stall, 1 missed (0.01%) | 10,980 frames, 16.66 / 18.69 / 23.78 ms, 0 stalls, 0 missed | PASS |
 | Swap worst frame (native ≤ 100 ms) | worst 36.15 ms | worst 34.66 ms | PASS |
-| Hop memory peak (≤ baseline + 40 MiB) | worst **+43.3 MiB** | worst **+48.9 MiB** | **FAIL** at `4b79f08`; **PASS** after the lattice fix (`ec9293e`) and the +64 MiB gate: worst +29.5 MiB in the judged run, see below |
+| Hop memory peak (≤ baseline + 40 MiB, the gate as run at `4b79f08`; +64 MiB since) | worst **+43.3 MiB** | worst **+48.9 MiB** | **FAIL** at `4b79f08`; **PASS** after the lattice fix (`ec9293e`) and the +64 MiB gate: worst +29.5 MiB in the judged run, see below |
 | Journey memory cycles (≤ +10%) | 675.5, 719.9, 670.3 MiB: +6.6% | 666.1, 657.0, 657.5 MiB: −1.3% | PASS |
 
 - **Holds.** A dive holds 0.54–0.73 s at full cover natively: the region generates in about

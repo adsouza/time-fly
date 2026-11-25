@@ -11,11 +11,12 @@
 //!    and `W` ([`globe_keys`]), then descends with `Ctrl`, still steering in to within
 //!    [`SETTLE_DEG`], until the dive commits below `DIVE_ALTITUDE_KM`. It lets go while the dive
 //!    waits in the cloud and the fly emerges.
-//! 2. **Descends, then flies out** along the route's heading in the region ([`region_keys`]; the
-//!    text below says east, the headless tests' Alps route). The fly emerges at 230 km,
+//! 2. **Descends, then flies out** along the route's heading in the region ([`region_keys`]:
+//!    north for the Andes, Pangaea and the Grand Canyon, west for Mt Fuji, east for the headless
+//!    tests' Alps). The fly emerges at 230 km,
 //!    above `HOP_ALTITUDE_M`, where a hop's lift would do nothing; so before the first hop it
 //!    holds `Ctrl` alone, straight down in place (about 21 s at the 10 km/s cap), to
-//!    [`CRUISE_AGL_M`] above the ground, turning to face east meanwhile. Then it holds `W` to the
+//!    [`CRUISE_AGL_M`] above the ground, turning to face the heading meanwhile. Then it holds `W` to the
 //!    edge, still at the speed cap, so the preload's lead is the worst case. The neighbour
 //!    preloads, the lift raises the fly to the cloud bank and the cloud gathers, the fly holds in
 //!    the cloud and the views swap; after the swap `ReturnToAgl` brings it back to the cruise, so
@@ -108,18 +109,20 @@ pub const JOURNEY_REGION: BenchRegion = BenchRegion {
 /// it the fly descends.
 pub const ARRIVE_DEG: f64 = 2.0;
 /// Inside [`ARRIVE_DEG`] the fly keeps steering toward the region while it descends, until it
-/// is within this arc (degrees): a route's first hop has to reach what the route is chosen for
-/// (a cube corner, a coast, a site), 250 km from wherever the dive lands.
+/// is within this arc (degrees): a route's hops have to reach what the route is chosen for (a
+/// cube corner, a coast, a site), one or two hops from wherever the dive lands.
 pub const SETTLE_DEG: f64 = 0.25;
 /// The region fly's headings (yaw about `+y` from north, positive west).
 pub const EAST_YAW: f32 = -std::f32::consts::FRAC_PI_2;
 pub const WEST_YAW: f32 = std::f32::consts::FRAC_PI_2;
 pub const NORTH_YAW: f32 = 0.0;
-/// A corner route's first hop must centre the neighbour within this of a cube-face corner
+/// The hop a corner route checks (Mt Fuji's second) must centre the neighbour within this of a
+/// cube-face corner
 /// (km): the inner field's half-width, so the corner lies in or at the edge of the neighbour's
 /// inner field, where the generator's lattice spans three cube faces.
 pub const CORNER_REACH_KM: f64 = 150.0;
-/// A coast route's first hop must give the neighbour's inner field a land share in this range.
+/// The hop a coast route checks (Mt Fuji's first) must give the neighbour's inner field a land
+/// share in this range.
 pub const COAST_LAND_SHARE: (f32, f32) = (0.05, 0.95);
 
 /// What a route's hop is chosen to cross, checked at run time (gated).
@@ -188,8 +191,8 @@ pub const ALPS_ROUTE: JourneyRoute = JourneyRoute {
 ///   2,450 m).
 /// - **Mt Fuji** west from the Pacific east of the Bōsō peninsula, present day: the first hop
 ///   flies from the sea over the Kantō coast onto Fuji (35.36° N, 138.73° E; 3,164 m in the 1′
-///   data, the local high point), and the second lands about 90 km from the cube corner at
-///   35.26° N, 135° E (render direction `(1, 1, 1) / √3`, with geo `(x, y, z)` = render
+///   data, the local high point), and the second lands 104–106 km from the cube corner at
+///   35.26° N, 135° E (measured; render direction `(1, 1, −1) / √3`, with geo `(x, y, z)` = render
 ///   `(z, x, y)`), where the generator's lattice spans three cube faces.
 pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
     JourneyRoute {
@@ -262,13 +265,14 @@ pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
     },
 ];
 /// The journeys of a run, by route: every route once, then the Andes again, so the memory
-/// cycles compare the Andes with itself (about 8 minutes natively).
+/// cycles compare the Andes with itself (about 7 minutes natively).
 pub const JOURNEY_ORDER: [usize; 5] = [0, 1, 2, 3, 0];
-/// Within this of east (degrees) the region's fly flies on: wider than a frame's turn at 30 fps.
+/// Within this of the route's heading (degrees) the region's fly flies on: wider than a frame's
+/// turn at 30 fps.
 pub const YAW_TOLERANCE_DEG: f32 = 3.0;
-/// The region's fly descends to this height above the ground before it flies east: under
+/// The region's fly descends to this height above the ground before it flies out: under
 /// `HOP_ALTITUDE_M`, so each hop's lift rises to the cloud bank and the fly returns here after
-/// the swap, and from 12.5 km up `fly_speed` is at its 10 km/s cap, so the east leg is still the
+/// the swap, and from 12.5 km up `fly_speed` is at its 10 km/s cap, so the leg out is still the
 /// fastest flight (the preload's worst lead).
 pub const CRUISE_AGL_M: f32 = 20_000.0;
 /// The turn keys rest within this of the wanted heading (degrees), so they never chatter.
@@ -675,7 +679,8 @@ pub fn land_share(grid: &RegionGrid) -> f32 {
     h.iter().filter(|&&e| e > 0.0).count() as f32 / h.len().max(1) as f32
 }
 
-/// A route's check of its first hop: `(pass, text)`. A hop not measured fails.
+/// A route's check of one of its hops (the hop [`JourneyRoute::crosses`] names): `(pass, text)`.
+/// A hop not measured fails.
 pub fn crossing_check(c: Crossing, hop: &HopRecord) -> (bool, String) {
     match c {
         Crossing::Corner => match hop.centre {
@@ -821,12 +826,12 @@ enum Stage {
         cycle: u32,
         since: f64,
     },
-    /// In the region, `hops` hops done: flying east and hopping.
+    /// In the region, `hops` hops done: flying out along the route's heading and hopping.
     Region {
         cycle: u32,
         hops: u32,
         since: f64,
-        /// Down at [`CRUISE_AGL_M`] once: from then on it flies east, whatever the ground does.
+        /// Down at [`CRUISE_AGL_M`] once: from then on it flies out, whatever the ground does.
         cruising: bool,
     },
     /// `Backspace` took: climbing out and emerging over the globe.
