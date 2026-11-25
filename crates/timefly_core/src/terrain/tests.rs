@@ -616,6 +616,48 @@ fn blended_water_mirrors_blended_height() {
     }
 }
 
+/// Once a grid's river texels are on the GPU the shell frees them (`Field::free_rivers`): the
+/// levels, and so the fly's floor, are unchanged, and `blended_water` reads no river.
+#[test]
+fn a_grid_without_its_rivers_keeps_its_levels() {
+    use crate::worldgen::generate::water::encode_river;
+    let mut grid = test_grid();
+    for f in [&mut grid.inner, &mut grid.apron] {
+        let n = f.river.len();
+        f.water_level_m = f.elevation_m.iter().map(|h| h + 2.0).collect();
+        f.river = (0..n)
+            .map(|i| encode_river(3.0, 1.0, -0.5, (i % 7) as f32))
+            .collect();
+    }
+    let before = grid.bytes();
+    let points = [
+        (0.0, 0.0),
+        (12_345.0, -67_890.0),
+        (140_000.0, 1.0),
+        (-9.0e5, 4.0e5),
+    ];
+    let kept: Vec<_> = points
+        .iter()
+        .map(|&(x, z)| (blended_surface_m(&grid, x, z), blended_water(&grid, x, z)))
+        .collect();
+    let freed = grid.inner.river.len() * 8 + grid.apron.river.len() * 8;
+    grid.inner.free_rivers();
+    grid.apron.free_rivers();
+    assert!(grid.inner.river.is_empty() && grid.apron.river.is_empty());
+    assert_eq!(before - grid.bytes(), freed);
+    for (&(x, z), (surface, water)) in points.iter().zip(&kept) {
+        assert_eq!(blended_surface_m(&grid, x, z), *surface, "({x}, {z})");
+        let w = blended_water(&grid, x, z);
+        assert_eq!(
+            (w.level_m, w.thickness_m),
+            (water.level_m, water.thickness_m)
+        );
+        assert_eq!(w.flow, [0.0, 0.0], "({x}, {z})");
+        let none = crate::hydrology::params::RIBBON_NONE_M as f32;
+        assert!(w.ribbon_m >= none - 1.0, "({x}, {z}): {w:?}");
+    }
+}
+
 #[test]
 fn curvature_drop_is_the_sagitta() {
     assert_eq!(curvature_drop_m(0.0), 0.0);

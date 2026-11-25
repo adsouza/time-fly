@@ -2337,6 +2337,109 @@ fn the_camera_clears_the_terrain_shown_through_a_snapshot_change() {
     }
 }
 
+/// One frame's terrain fields as drawn: whether the heights and the water textures are the
+/// scene grid's (read back from the images' first texel), and the cloud.
+#[derive(Copy, Clone, Debug)]
+struct FieldsDrawn {
+    density: f32,
+    pending: bool,
+    heights_current: bool,
+    water_current: bool,
+    centre: RenderDir,
+}
+
+#[derive(Resource, Default)]
+struct FieldFrames(Vec<FieldsDrawn>);
+
+fn record_fields(
+    scene: Option<Res<crate::terrain::TerrainScene>>,
+    images: Res<Assets<Image>>,
+    density: Res<CloudDensity>,
+    mut frames: ResMut<FieldFrames>,
+) {
+    let Some(scene) = scene else { return };
+    let first = |h: &Handle<Image>| {
+        let data = images
+            .get(h)
+            .and_then(|i| i.data.as_ref())
+            .expect("image data");
+        f32::from_le_bytes(data[..4].try_into().unwrap())
+    };
+    frames.0.push(FieldsDrawn {
+        density: density.0,
+        pending: scene.fields_pending(),
+        heights_current: first(&scene.inner_height) == scene.grid.inner.elevation_m[0]
+            && first(&scene.apron_height) == scene.grid.apron.elevation_m[0],
+        water_current: first(&scene.inner_water) == scene.grid.inner.water_level_m[0]
+            && first(&scene.apron_water) == scene.grid.apron.water_level_m[0],
+        centre: scene.grid.spec.center,
+    });
+}
+
+/// The hop's memory (follow-up), for any swap: a frame that draws fields of two grids (the
+/// staged replace's first frame) is drawn at density exactly 1, and there is one such frame
+/// per replace. `replaces` is how many replaces the frames should hold.
+fn assert_mixed_fields_only_under_the_cloud(frames: &[FieldsDrawn], replaces: usize) {
+    let mixed: Vec<usize> = (0..frames.len())
+        .filter(|&k| !(frames[k].heights_current && frames[k].water_current))
+        .collect();
+    for &k in &mixed {
+        let f = frames[k];
+        assert_eq!(f.density, 1.0, "frame {k} draws two grids' fields: {f:?}");
+        assert!(
+            f.pending && f.water_current && !f.heights_current,
+            "frame {k}: {f:?}"
+        );
+        assert!(frames[k + 1].heights_current, "frame {k} + 1 still mixed");
+    }
+    assert!(frames.iter().all(|f| f.pending == !f.heights_current));
+    assert_eq!(
+        mixed.len(),
+        replaces,
+        "one staged frame per replace: {mixed:?}"
+    );
+}
+
+/// The hop's memory (follow-up): a snapshot change's staged replace draws mixed fields only on
+/// its first frame, at density exactly 1, whether the region is ready early or late.
+#[test]
+fn a_snapshot_change_replaces_the_fields_under_the_opaque_cloud() {
+    for after in [0, 1, 3, 12] {
+        let mut app = nav_app(false);
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<bevy::render::storage::ShaderBuffer>()
+            .init_asset::<crate::terrain::material::TerrainMaterial>()
+            .add_plugins(crate::fly_camera::FlyCameraPlugin)
+            .insert_resource(FakeJob {
+                after,
+                ground_m: 2_150.0,
+                pending: None,
+            })
+            .init_resource::<FieldFrames>()
+            .add_systems(Update, fake_job.in_set(crate::region::RegionSystems))
+            .add_systems(Last, record_fields);
+        crate::terrain::add_terrain_systems(&mut app);
+        app.world_mut().spawn((
+            crate::globe::GlobeCamera,
+            Camera::default(),
+            IsDefaultUiCamera,
+        ));
+        enter(&mut app, &grid(RenderDir(ON_PLATE), YearsBp(0.0), 288.0));
+        app.world_mut().resource_mut::<FlyState>().pos_m = Vec3::new(0.0, 562.0, -5_000.0);
+        app.update();
+        set_time(&mut app, 100e6);
+        for _ in 0..40 {
+            app.update();
+        }
+        assert_eq!(phase(&app), NavPhase::Flying, "after {after}");
+        let frames = &app.world().resource::<FieldFrames>().0;
+        assert!(frames.last().unwrap().heights_current);
+        assert_mixed_fields_only_under_the_cloud(frames, 1);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The dive and the climb through both worlds' cameras
 

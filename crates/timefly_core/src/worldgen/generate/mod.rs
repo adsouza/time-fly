@@ -180,6 +180,18 @@ impl Field {
         self.size_m / f64::from(self.res - 1)
     }
 
+    /// Drops the river texels (8 B a texel) once the shell has them on the GPU: no CPU code
+    /// reads them after the upload. Readers then see [`RIVER_NONE`] everywhere
+    /// ([`river_at`](Self::river_at)); the levels, and the fly's floor, are unchanged.
+    pub fn free_rivers(&mut self) {
+        self.river = Vec::new();
+    }
+
+    /// Texel `i`'s river bits: [`RIVER_NONE`] once [`free_rivers`](Self::free_rivers) ran.
+    pub fn river_at(&self, i: usize) -> [u16; 4] {
+        self.river.get(i).copied().unwrap_or(RIVER_NONE)
+    }
+
     /// Local `(x, z)` metres of a texel.
     pub fn local_of(&self, row: u32, col: u32) -> (f64, f64) {
         local_of(self.res, self.size_m, row, col)

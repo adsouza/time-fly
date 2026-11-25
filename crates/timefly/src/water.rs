@@ -523,6 +523,19 @@ fn sync_water(
             commands.remove_resource::<RegionWater>();
             info!("region sea removed");
         }
+        (SkyAction::Keep, Some(scene), Some(water)) => {
+            // A staged replace's heights arrive the frame after its grid
+            // (`TerrainScene::fields_pending`).
+            let stale = materials.get(&water.material).is_some_and(|m| {
+                m.extension.inner_height != scene.inner_height
+                    || m.extension.apron_height != scene.apron_height
+            });
+            if stale && let Some(mut m) = materials.get_mut(&water.material) {
+                m.extension.inner_height = scene.inner_height.clone();
+                m.extension.apron_height = scene.apron_height.clone();
+                debug!("region sea rebound to the new height textures");
+            }
+        }
         _ => {}
     }
 }

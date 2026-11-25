@@ -890,6 +890,34 @@ fn the_hop_swaps_worlds_under_the_cloud() {
     assert_eq!(frames[flying].density, 0.0);
 }
 
+/// The hop's memory (follow-up): the swap's staged replace draws the new water over the old
+/// heights for one frame only, the swap frame, at density exactly 1; the cloud clears over the
+/// complete new fields. The old region's ground is 300 m higher, so the heights tell apart.
+#[test]
+fn a_hops_staged_swap_draws_mixed_fields_only_under_the_opaque_cloud() {
+    let (mut app, _) = hop_app(5, false, EDGE_M - 10_000.0);
+    enter(&mut app, &grid(alps(), YearsBp(0.0), HOP_GROUND_M + 300.0));
+    app.world_mut().resource_mut::<FlyState>().pos_m.y = HOP_GROUND_M + 300.0 + HOP_AGL_M;
+    app.init_resource::<FieldFrames>()
+        .add_systems(Last, record_fields);
+    run_until(&mut app, 600, |a| swapped(&phase(a)));
+    run_until(&mut app, 600, |a| phase(a) == NavPhase::Flying);
+    let frames = app.world().resource::<FieldFrames>().0.clone();
+    let swap = frames
+        .iter()
+        .position(|f| f.centre != alps())
+        .expect("the swap");
+    assert!(
+        frames[swap].pending,
+        "the swap frame starts the staged replace"
+    );
+    assert_mixed_fields_only_under_the_cloud(&frames, 1);
+    assert!(
+        frames[swap + 1].density < 1.0,
+        "the cloud clears from the next frame"
+    );
+}
+
 /// The time a hop has held at full cover, for the caption: only in the hold, before its end.
 #[test]
 fn only_a_hops_hold_counts_toward_the_caption() {

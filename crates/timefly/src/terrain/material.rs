@@ -414,16 +414,20 @@ pub const WATER_TEXEL_BYTES: usize = 16;
 /// [`blended_water`](timefly_core::terrain::blended_water) does: it interpolates the half-width
 /// `ribbon + |offset|` and the offset, then takes `half-width − |offset|`. Word 1 interpolates to
 /// the blended level minus the blended height, so the water shader needs no height texture.
-/// Render-world only: built at upload, freed once extracted (the grid keeps the CPU copy).
+/// Render-world only: built at upload, freed once extracted. The grid keeps its levels for the
+/// fly's floor and frees its river texels after the upload (`Field::free_rivers`); a freed
+/// field's texels carry no river.
 pub fn water_image(field: &Field) -> Image {
     const SIGN: u32 = 0x8000;
     let mut bytes = Vec::with_capacity(field.water_level_m.len() * WATER_TEXEL_BYTES);
-    for ((&level, &h), &[ribbon, east, north, offset]) in field
+    // `river_at`: a grid whose rivers were freed after an earlier upload draws none.
+    for (i, (&level, &h)) in field
         .water_level_m
         .iter()
         .zip(&field.elevation_m)
-        .zip(&field.river)
+        .enumerate()
     {
+        let [ribbon, east, north, offset] = field.river_at(i);
         let words = [
             level.to_bits(),
             (level - h).to_bits(),

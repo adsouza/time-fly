@@ -80,7 +80,7 @@ pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
     let s = blend_weight(grid, x_m, z_m);
     let read = |f: &Field| {
         let level = sample_field(f, x_m, z_m, |i| f.water_level_m[i]);
-        let decoded = |i: usize| decode_river(f.river[i]);
+        let decoded = |i: usize| decode_river(f.river_at(i));
         let hw = sample_field(f, x_m, z_m, |i| {
             let [ribbon, _, _, offset] = decoded(i);
             ribbon + offset.abs()

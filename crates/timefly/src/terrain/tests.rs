@@ -573,6 +573,161 @@ fn the_field_textures_cost_24_bytes_a_texel() {
     assert_eq!(texels * 24, 31_531_056);
 }
 
+/// A grid for the swap tests: [`wet_field`]s raised by `lift_m`, so two of them tell apart.
+fn wet_grid(lift_m: f32) -> RegionGrid {
+    let mut grid = (*grid()).clone();
+    grid.inner = wet_field(33, REGION_SIZE_M);
+    grid.apron = wet_field(17, APRON_SIZE_M);
+    for f in [&mut grid.inner, &mut grid.apron] {
+        f.elevation_m.iter_mut().for_each(|h| *h += lift_m);
+        f.water_level_m.iter_mut().for_each(|w| *w += lift_m);
+    }
+    grid
+}
+
+/// Enters `grid` as the region job does: the region holds the only reference.
+fn enter_owned(app: &mut App, grid: RegionGrid) {
+    let frame = RegionFrame {
+        center: grid.spec.center,
+    };
+    app.insert_resource(ActiveRegion {
+        grid: Arc::new(grid),
+        frame,
+    });
+}
+
+/// The first texel of an `R32Float` or an `Rgba32Uint` image, as f32 (the height, the level).
+fn first_f32(app: &App, id: AssetId<Image>) -> f32 {
+    let image = app.world().resource::<Assets<Image>>().get(id).unwrap();
+    f32::from_le_bytes(image.data.as_ref().unwrap()[..4].try_into().unwrap())
+}
+
+/// The hop's memory (follow-up): once the fields are on the GPU, the active grid lets its river
+/// texels go (8 B a texel, 10 MiB at full size). Nothing on the CPU reads them; the water
+/// textures hold them.
+#[test]
+fn the_active_grid_frees_its_rivers_once_uploaded() {
+    for replaced in [false, true] {
+        let mut app = pool_app();
+        if replaced {
+            enter_owned(&mut app, wet_grid(0.0));
+            for _ in 0..3 {
+                app.update();
+            }
+        }
+        let grid = wet_grid(500.0);
+        let (full, river) = (grid.bytes(), grid.inner.river.clone());
+        let freed = (33 * 33 + 17 * 17) * 8;
+        enter_owned(&mut app, grid);
+        for _ in 0..3 {
+            app.update();
+        }
+        let world = app.world();
+        let region = world.resource::<ActiveRegion>();
+        let scene = world.resource::<TerrainScene>();
+        assert!(
+            Arc::ptr_eq(&region.grid, &scene.grid),
+            "replaced {replaced}"
+        );
+        assert!(region.grid.inner.river.is_empty() && region.grid.apron.river.is_empty());
+        assert_eq!(full - region.grid.bytes(), freed, "replaced {replaced}");
+        // The water texture still carries them.
+        let image = world
+            .resource::<Assets<Image>>()
+            .get(&scene.inner_water)
+            .unwrap();
+        let data = image.data.as_ref().unwrap();
+        for i in [0, 17, 500, 1088] {
+            let [ribbon, east, north, offset] =
+                timefly_core::worldgen::generate::water::decode_river(river[i]);
+            let (_, [r, o, x, z]) = decode_water_texel(data, i);
+            assert_eq!([r, o, x, z], [ribbon, offset, east, -north], "texel {i}");
+        }
+    }
+}
+
+/// The hop's memory (follow-up): a replace spreads its uploads over two frames, the water
+/// first (the frame of the swap, under the opaque cloud), then the heights and surface codes,
+/// releasing each old set as its new one is made. Between the two, `fields_pending` says so.
+#[test]
+fn a_replace_uploads_the_water_first_and_the_heights_the_next_frame() {
+    use crate::water::{RegionWater, WaterMaterial, add_water_systems};
+    let mut app = pool_app();
+    app.init_asset::<crate::sky::SkyMaterial>()
+        .init_asset::<WaterMaterial>();
+    crate::sky::add_sky_systems(&mut app);
+    add_water_systems(&mut app);
+    enter_owned(&mut app, wet_grid(0.0));
+    for _ in 0..3 {
+        app.update();
+    }
+    let old = {
+        let s = app.world().resource::<TerrainScene>();
+        assert!(!s.fields_pending());
+        [
+            s.inner_height.id(),
+            s.apron_height.id(),
+            s.inner_surface.id(),
+            s.apron_surface.id(),
+            s.inner_water.id(),
+            s.apron_water.id(),
+        ]
+    };
+    let (old_h, new_h, new_w) = (
+        first_f32(&app, old[0]),
+        wet_grid(500.0).inner.elevation_m[0],
+        wet_grid(500.0).inner.water_level_m[0],
+    );
+    enter_owned(&mut app, wet_grid(500.0));
+    // The swap frame: the new water, the old heights.
+    app.update();
+    {
+        let s = app.world().resource::<TerrainScene>();
+        assert!(s.fields_pending(), "half done on the swap frame");
+        assert_eq!(first_f32(&app, s.inner_water.id()), new_w);
+        assert_eq!(first_f32(&app, s.inner_height.id()), old_h);
+        assert_eq!(s.inner_height.id(), old[0]);
+        assert_ne!(s.inner_water.id(), old[4]);
+        assert!(Arc::ptr_eq(
+            &s.grid,
+            &app.world().resource::<ActiveRegion>().grid
+        ));
+    }
+    let images = app.world().resource::<Assets<Image>>();
+    assert!(
+        images.get(old[4]).is_none() && images.get(old[5]).is_none(),
+        "old water kept"
+    );
+    assert_eq!(images.len(), 7, "never both water sets");
+    // The next frame: the new heights and surfaces; the old ones go.
+    app.update();
+    let world = app.world();
+    let s = world.resource::<TerrainScene>();
+    assert!(!s.fields_pending());
+    assert_eq!(first_f32(&app, s.inner_height.id()), new_h);
+    let m = world
+        .resource::<Assets<TerrainMaterial>>()
+        .get(&s.material)
+        .unwrap();
+    assert_eq!(m.extension.inner_height, s.inner_height);
+    assert_eq!(m.extension.apron_surface, s.apron_surface);
+    assert_eq!(s.height_range_m, height_range_m(&s.grid));
+    // The sea follows the new height textures too.
+    let water = world.resource::<RegionWater>();
+    let wm = world
+        .resource::<Assets<WaterMaterial>>()
+        .get(&water.material)
+        .unwrap();
+    assert_eq!(wm.extension.inner_height, s.inner_height);
+    assert_eq!(wm.extension.apron_height, s.apron_height);
+    let images = world.resource::<Assets<Image>>();
+    assert!(
+        old[..4].iter().all(|&id| images.get(id).is_none()),
+        "old fields kept"
+    );
+    assert_eq!(images.len(), 7);
+}
+
 /// A snapshot change uploads the new grid's water and drops the old textures.
 #[test]
 fn a_replaced_region_rebinds_the_water_textures() {

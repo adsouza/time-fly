@@ -4,8 +4,11 @@
 //! - **Scene.** When an [`ActiveRegion`] appears, the plugin uploads its fields as six textures
 //!   (heights, surface codes and water, inner and apron), builds one grid mesh, one
 //!   [`TerrainMaterial`] and one patch buffer, and spawns the [`RegionCamera`] and the
-//!   [`TerrainSun`]. A replaced region (a snapshot change) swaps the textures in place; a
-//!   removed one despawns everything and drops every handle, so the GPU memory goes back to
+//!   [`TerrainSun`], then frees the grid's river texels, which only the GPU reads. A replaced
+//!   region (a snapshot change, a hop) swaps the textures in place over two frames, the water
+//!   on the swap frame and the heights and surface codes on the next
+//!   ([`TerrainScene::fields_pending`]), so the upload's memory peaks twice at half the height.
+//!   A removed one despawns everything and drops every handle, so the GPU memory goes back to
 //!   where it was.
 //! - **Patches.** Every frame, [`select_patches`] runs for the region camera. Patch `i` goes into
 //!   buffer slot `i`, drawn by the pool entity whose [`MeshTag`] is `i`. The pool only grows, in
@@ -159,6 +162,17 @@ pub struct TerrainScene {
     pub sun: Entity,
     /// Whether a frame needing more than [`MAX_TERRAIN_PATCHES`] was already reported.
     overflow_reported: bool,
+    /// The heights and surface codes still to replace ([`TerrainScene::fields_pending`]).
+    fields_pending: bool,
+}
+
+impl TerrainScene {
+    /// Whether a replace is half done: the water textures are the new grid's while the heights
+    /// and surface codes are still the old one's. True for exactly one frame, the replace's
+    /// first, which a swap only makes at cloud density 1 (see `sync_terrain_scene`).
+    pub fn fields_pending(&self) -> bool {
+        self.fields_pending
+    }
 }
 
 /// One frame's patches: what goes into the buffer and onto the pool.
@@ -351,19 +365,55 @@ pub fn field_texture_bytes(grid: &RegionGrid) -> usize {
 
 #[instrument(level = "debug", skip_all, fields(inner = grid.inner.res, apron = grid.apron.res))]
 fn upload_fields(grid: &RegionGrid, images: &mut Assets<Image>) -> FieldImages {
-    let fields = FieldImages {
-        inner_height: images.add(height_image(&grid.inner)),
-        apron_height: images.add(height_image(&grid.apron)),
-        inner_surface: images.add(surface_image(&grid.inner)),
-        apron_surface: images.add(surface_image(&grid.apron)),
-        inner_water: images.add(water_image(&grid.inner)),
-        apron_water: images.add(water_image(&grid.apron)),
-    };
+    let [inner_water, apron_water] = upload_water(grid, images);
+    let [inner_height, apron_height, inner_surface, apron_surface] = upload_heights(grid, images);
     debug!(
         mib = format!("{:.1}", field_texture_bytes(grid) as f64 / 1_048_576.0),
         "terrain field textures uploaded"
     );
-    fields
+    FieldImages {
+        inner_height,
+        apron_height,
+        inner_surface,
+        apron_surface,
+        inner_water,
+        apron_water,
+    }
+}
+
+/// The water textures, inner and apron (16 B a texel).
+fn upload_water(grid: &RegionGrid, images: &mut Assets<Image>) -> [Handle<Image>; 2] {
+    [&grid.inner, &grid.apron].map(|f| images.add(water_image(f)))
+}
+
+/// The height and surface textures: inner and apron heights, then inner and apron surfaces
+/// (8 B a texel).
+fn upload_heights(grid: &RegionGrid, images: &mut Assets<Image>) -> [Handle<Image>; 4] {
+    [
+        images.add(height_image(&grid.inner)),
+        images.add(height_image(&grid.apron)),
+        images.add(surface_image(&grid.inner)),
+        images.add(surface_image(&grid.apron)),
+    ]
+}
+
+/// Frees the grid's river texels once its water textures hold them (8 B a texel, 10 MiB at full
+/// size): no CPU code reads them (the fly's floor reads the levels). Only while the region
+/// holds the only reference, which it does from the region job until the scene adopts the grid;
+/// otherwise they stay.
+fn free_rivers(grid: &mut Arc<RegionGrid>) {
+    match Arc::get_mut(grid) {
+        Some(g) => {
+            let before = g.bytes();
+            g.inner.free_rivers();
+            g.apron.free_rivers();
+            debug!(
+                freed = before - g.bytes(),
+                "region river texels freed after the upload"
+            );
+        }
+        None => debug!("the region grid is shared; its river texels stay"),
+    }
 }
 
 /// Gathers the region, decides with [`scene_action`], and builds, replaces or tears down the
@@ -371,9 +421,9 @@ fn upload_fields(grid: &RegionGrid, images: &mut Assets<Image>) -> FieldImages {
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn sync_terrain_scene(
     mut commands: Commands,
-    region: Option<Res<ActiveRegion>>,
+    region: Option<ResMut<ActiveRegion>>,
     terrain: Res<TerrainSettings>,
-    scene: Option<ResMut<TerrainScene>>,
+    mut scene: Option<ResMut<TerrainScene>>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
@@ -381,6 +431,12 @@ fn sync_terrain_scene(
     options: Option<Res<TerrainOptions>>,
 ) {
     let options = options.map_or_else(TerrainOptions::default, |o| *o);
+    // A staged replace's second frame comes first, whatever this frame brings.
+    if let Some(scene) = scene.as_deref_mut()
+        && scene.fields_pending
+    {
+        finish_replace(scene, &mut images, &mut materials, options);
+    }
     let action = match scene_action(
         region.as_ref().map(|r| &r.grid),
         scene.as_ref().map(|s| &s.grid),
@@ -389,10 +445,11 @@ fn sync_terrain_scene(
         action => action,
     };
     match (action, region, scene) {
-        (SceneAction::Build, Some(region), _) => {
+        (SceneAction::Build, Some(mut region), _) => {
+            // Freeing the rivers changes no value anything watches the region for.
             let scene = build_scene(
                 &mut commands,
-                &region.grid,
+                &mut region.bypass_change_detection().grid,
                 &mut images,
                 &mut meshes,
                 &mut buffers,
@@ -401,14 +458,12 @@ fn sync_terrain_scene(
             );
             commands.insert_resource(scene);
         }
-        (SceneAction::Replace, Some(region), Some(mut scene)) => {
+        (SceneAction::Replace, Some(mut region), Some(mut scene)) => {
             // The camera stays put: region navigation places it over the new region.
-            replace_fields(
+            begin_replace(
                 &mut scene,
-                &region.grid,
+                &mut region.bypass_change_detection().grid,
                 &mut images,
-                &mut materials,
-                options,
             );
         }
         (SceneAction::Teardown, _, Some(scene)) => {
@@ -425,7 +480,7 @@ fn sync_terrain_scene(
 #[instrument(level = "debug", skip_all, fields(snapshot_years = grid.spec.snapshot.0))]
 fn build_scene(
     commands: &mut Commands,
-    grid: &Arc<RegionGrid>,
+    grid: &mut Arc<RegionGrid>,
     images: &mut Assets<Image>,
     meshes: &mut Assets<Mesh>,
     buffers: &mut Assets<ShaderBuffer>,
@@ -435,6 +490,7 @@ fn build_scene(
     let settings = LodSettings::region();
     let params = TerrainParams::new(grid, &settings);
     let fields = upload_fields(grid, images);
+    free_rivers(grid);
     let palette = images.add(palette_image());
     let buffer = buffers.add(patch_buffer(&params, &[]));
     let material = materials.add(terrain_material(
@@ -469,6 +525,7 @@ fn build_scene(
         camera,
         sun,
         overflow_reported: false,
+        fields_pending: false,
     }
 }
 
@@ -510,31 +567,73 @@ fn terrain_material(
     }
 }
 
-/// A replaced region at the same LOD settings: new textures, the same material and pool.
-fn replace_fields(
+/// A replaced region at the same LOD settings, its uploads spread over two frames so the old
+/// and new image data and their staging never all peak together (the hop's memory, M3's gate).
+/// This frame, the swap's (at cloud density 1): the scene takes the new grid and its water
+/// textures, the old ones released first, and the grid's rivers are freed. The next frame
+/// ([`finish_replace`]): the heights and surface codes, and with them the patches' header, the
+/// bounds and the look. The terrain draws the old heights until then; the same material and
+/// pool throughout.
+fn begin_replace(scene: &mut TerrainScene, grid: &mut Arc<RegionGrid>, images: &mut Assets<Image>) {
+    release(images, &mut scene.inner_water);
+    release(images, &mut scene.apron_water);
+    let [inner_water, apron_water] = upload_water(grid, images);
+    free_rivers(grid);
+    scene.inner_water = inner_water;
+    scene.apron_water = apron_water;
+    scene.grid = grid.clone();
+    scene.fields_pending = true;
+    debug!(
+        mib = format!(
+            "{:.1}",
+            (grid.inner.res.pow(2) + grid.apron.res.pow(2)) as f64
+                * material::WATER_TEXEL_BYTES as f64
+                / 1_048_576.0
+        ),
+        "terrain water replaced; the heights follow next frame"
+    );
+}
+
+/// Takes `handle` and removes its image now, rather than once every handle has gone (a frame
+/// later): the render world then frees its texture in the frame the replacement is made. The
+/// materials that also hold it are rebound in the same frame.
+fn release(images: &mut Assets<Image>, handle: &mut Handle<Image>) {
+    let old = std::mem::take(handle);
+    images.remove(&old);
+}
+
+/// The second frame of a replace ([`begin_replace`]): the scene grid's heights and surface
+/// codes, the old ones released first.
+fn finish_replace(
     scene: &mut TerrainScene,
-    grid: &Arc<RegionGrid>,
     images: &mut Assets<Image>,
     materials: &mut Assets<TerrainMaterial>,
     options: TerrainOptions,
 ) {
-    let fields = upload_fields(grid, images);
-    if let Some(mut m) = materials.get_mut(&scene.material) {
-        m.extension.inner_height = fields.inner_height.clone();
-        m.extension.apron_height = fields.apron_height.clone();
-        m.extension.inner_surface = fields.inner_surface.clone();
-        m.extension.apron_surface = fields.apron_surface.clone();
-        m.extension.look = look_for(grid, options);
+    let grid = scene.grid.clone();
+    for h in [
+        &mut scene.inner_height,
+        &mut scene.apron_height,
+        &mut scene.inner_surface,
+        &mut scene.apron_surface,
+    ] {
+        release(images, h);
     }
-    scene.grid = grid.clone();
-    scene.params = TerrainParams::new(grid, &scene.settings);
-    scene.height_range_m = height_range_m(grid);
-    scene.inner_height = fields.inner_height;
-    scene.apron_height = fields.apron_height;
-    scene.inner_surface = fields.inner_surface;
-    scene.apron_surface = fields.apron_surface;
-    scene.inner_water = fields.inner_water;
-    scene.apron_water = fields.apron_water;
+    let [inner_height, apron_height, inner_surface, apron_surface] = upload_heights(&grid, images);
+    if let Some(mut m) = materials.get_mut(&scene.material) {
+        m.extension.inner_height = inner_height.clone();
+        m.extension.apron_height = apron_height.clone();
+        m.extension.inner_surface = inner_surface.clone();
+        m.extension.apron_surface = apron_surface.clone();
+        m.extension.look = look_for(&grid, options);
+    }
+    scene.inner_height = inner_height;
+    scene.apron_height = apron_height;
+    scene.inner_surface = inner_surface;
+    scene.apron_surface = apron_surface;
+    scene.params = TerrainParams::new(&grid, &scene.settings);
+    scene.height_range_m = height_range_m(&grid);
+    scene.fields_pending = false;
     info!("terrain fields replaced");
 }
 
