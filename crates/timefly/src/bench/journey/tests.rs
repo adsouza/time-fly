@@ -321,46 +321,147 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
     }
 }
 
+/// One hop's memory samples, on its route's first visit (`repeat` false) or a later one.
+fn hm(baseline: Option<u64>, peak: Option<u64>, end: Option<u64>, repeat: bool) -> HopMemory {
+    HopMemory {
+        baseline,
+        peak,
+        end,
+        repeat,
+    }
+}
+
 #[test]
 fn hop_memory_is_gated_on_the_peak_natively_and_on_growth_on_the_web() {
     let mib = |m: u64| Some(m << 20);
     // Natively: the worst peak over its own in-region baseline, at most +64 MiB (the owner's
-    // ruling of 2026-11-25; the measured breakdown is in `docs/testing/m3/performance.md`).
+    // ruling of 2026-11-25; the measured breakdown is in `docs/testing/m3/performance.md`),
+    // on every hop, a route's first visit's included.
     let hops = [
-        (mib(800), mib(830), mib(810)),
-        (mib(810), mib(855), mib(812)),
+        hm(mib(800), mib(830), mib(810), false),
+        hm(mib(810), mib(855), mib(812), true),
     ];
     assert_eq!(hop_memory_gate(&hops, false), Some((true, 45 << 20)));
     assert_eq!(
-        hop_memory_gate(&[(mib(800), mib(864), None)], false),
+        hop_memory_gate(&[hm(mib(800), mib(864), None, false)], false),
         Some((true, 64 << 20)),
         "exactly +64 MiB"
     );
     assert_eq!(
-        hop_memory_gate(&[(mib(800), mib(865), mib(800))], false),
+        hop_memory_gate(&[hm(mib(800), mib(865), mib(800), false)], false),
         Some((false, 65 << 20))
     );
     // A peak below the baseline (memory freed) is fine.
     assert_eq!(
-        hop_memory_gate(&[(mib(800), mib(790), mib(790))], false),
+        hop_memory_gate(&[hm(mib(800), mib(790), mib(790), true)], false),
         Some((true, -(10 << 20)))
     );
-    // The web: the first hop may grow the linear memory; no hop after it may.
+    // The web: a route's first visit may grow the linear memory (each hop reaches a region
+    // not flown before); no hop of a repeat visit may.
     let web = [
-        (mib(64), None, mib(96)),
-        (mib(96), None, mib(96)),
-        (mib(96), None, mib(96)),
+        hm(mib(64), None, mib(96), false),
+        hm(mib(96), None, mib(100), false),
+        hm(mib(100), None, mib(100), true),
+        hm(mib(100), None, mib(100), true),
     ];
     assert_eq!(hop_memory_gate(&web, true), Some((true, 0)));
-    let grows = [(mib(64), None, mib(96)), (mib(96), None, mib(100))];
+    let grows = [
+        hm(mib(64), None, mib(96), false),
+        hm(mib(96), None, mib(100), true),
+    ];
     assert_eq!(hop_memory_gate(&grows, true), Some((false, 4 << 20)));
-    // Not judged: no hops, a missing sample, or on the web a single hop.
+    // Not judged: no hops, a missing sample, or on the web no repeat visit.
     assert_eq!(hop_memory_gate(&[], false), None);
-    assert_eq!(hop_memory_gate(&[(None, mib(1), mib(1))], false), None);
-    assert_eq!(hop_memory_gate(&[(mib(64), None, mib(96))], true), None);
     assert_eq!(
-        hop_memory_gate(&[(mib(64), None, mib(96)), (mib(96), None, None)], true),
+        hop_memory_gate(&[hm(None, mib(1), mib(1), false)], false),
         None
+    );
+    assert_eq!(
+        hop_memory_gate(&[hm(mib(64), None, mib(96), false)], true),
+        None
+    );
+    assert_eq!(
+        hop_memory_gate(
+            &[
+                hm(mib(64), None, mib(96), false),
+                hm(mib(96), None, None, true)
+            ],
+            true
+        ),
+        None
+    );
+}
+
+#[test]
+fn web_hop_memory_on_the_route_set_lets_each_new_route_grow() {
+    // The route set flies the Andes, Pangaea, the Grand Canyon, Mt Fuji (its second hop at the
+    // cube corner, where the lattice is 35 MiB against the Andes' 14-16), then the Andes again.
+    // wasm linear memory never shrinks, so a larger region raises it for good: growth is a
+    // leak only on a repeat visit, the second Andes journey.
+    let config = JourneyBenchConfig::new(60, true);
+    assert_eq!(config.journeys, [0, 1, 2, 3, 0]);
+    let repeats: Vec<bool> = (0..5).map(|c| config.is_repeat(c)).collect();
+    assert_eq!(repeats, [false, false, false, false, true]);
+    let mib = |m: u64| Some(m << 20);
+    // (journey, linear memory before and after each of its two hops), MiB.
+    let run = |andes_again: u64| {
+        let growth: [(u32, [(u64, u64); 2]); 5] = [
+            (0, [(300, 340), (340, 344)]),
+            (1, [(344, 344), (344, 344)]),
+            (2, [(344, 352), (352, 356)]),
+            // Fuji over the coast, then the corner's larger lattice.
+            (3, [(380, 400), (400, 410)]),
+            (4, [(410, 410), (410, andes_again)]),
+        ];
+        growth
+            .iter()
+            .flat_map(|&(c, hops)| hops.map(|(b, e)| hm(mib(b), None, mib(e), config.is_repeat(c))))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hop_memory_gate(&run(410), true), Some((true, 0)));
+    assert_eq!(hop_memory_gate(&run(412), true), Some((false, 2 << 20)));
+    // A single route repeats from its second journey.
+    let single = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    let repeats: Vec<bool> = (0..3).map(|c| single.is_repeat(c)).collect();
+    assert_eq!(repeats, [false, true, true]);
+}
+
+#[test]
+fn web_memory_cycles_compare_a_repeat_with_the_memory_before_it() {
+    let config = JourneyBenchConfig::new(60, true);
+    let mib = |m: u64| Some(m << 20);
+    // On the globe after each journey. Natively each route against its own first visit: the
+    // Andes 500 then 520 (+4%).
+    let native = [mib(500), mib(480), mib(510), mib(560), mib(520)];
+    let judged = config.memory_cycle_verdicts(&native, false);
+    assert_eq!(judged.len(), 1, "{judged:?}");
+    let (route, visits, (ok, increase)) = judged[0];
+    assert_eq!((route, visits, ok), (0, 2, true));
+    assert!((increase - 0.04).abs() < 1e-9, "{increase}");
+    // On the web memory only grows: after Fuji's corner the second Andes visit reads 560 MiB,
+    // +12% of the first visit's 500, over the 10% tolerance though the Andes added nothing.
+    // Like with like is the memory just before the repeat (after Fuji): flat.
+    let web = [mib(500), mib(500), mib(510), mib(560), mib(560)];
+    let natively_read = config.memory_cycle_verdicts(&web, false);
+    assert!(!natively_read[0].2.0, "{natively_read:?}");
+    let judged = config.memory_cycle_verdicts(&web, true);
+    assert_eq!(judged.len(), 1, "{judged:?}");
+    assert_eq!(judged[0], (0, 2, (true, 0.0)));
+    // The repeat itself growing past the tolerance fails.
+    let leaks = [mib(500), mib(500), mib(510), mib(560), mib(620)];
+    let judged = config.memory_cycle_verdicts(&leaks, true);
+    assert!(!judged[0].2.0, "{judged:?}");
+    assert!((judged[0].2.1 - 60.0 / 560.0).abs() < 1e-9, "{judged:?}");
+    // One route: each repeat's own growth adds up, against the memory before the first repeat.
+    let single = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    let judged = single.memory_cycle_verdicts(&[mib(400), mib(420), mib(430)], true);
+    assert_eq!(judged.len(), 1);
+    assert!((judged[0].2.1 - 30.0 / 400.0).abs() < 1e-9, "{judged:?}");
+    // A sample missing: not judged.
+    assert!(
+        single
+            .memory_cycle_verdicts(&[mib(400), None, mib(430)], true)
+            .is_empty()
     );
 }
 

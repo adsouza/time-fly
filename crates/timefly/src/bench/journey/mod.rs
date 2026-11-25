@@ -43,11 +43,14 @@
 //!   change ([`is_swap`]). Natively gated at [`SWAP_FRAME_LIMIT_MS`]; reported only on the web.
 //! - **Hop memory peak**: natively, the process footprint's peak during each hop (preload to
 //!   back flying) over the in-region baseline (the last flying frame before it), at most
-//!   [`HOP_MEMORY_LIMIT_MIB`]. On the web, the wasm linear memory must not grow across any hop
-//!   after the first ([`hop_memory_gate`]).
+//!   [`HOP_MEMORY_LIMIT_MIB`]. On the web, the wasm linear memory never shrinks, so a route
+//!   larger than any before it raises it for good: a route's first visit may grow it, and no
+//!   hop of a repeat visit may ([`hop_memory_gate`], [`JourneyBenchConfig::is_repeat`]).
 //! - **Journey memory cycles**: memory on the globe after each journey within
 //!   [`CYCLE_MEMORY_TOLERANCE`] of the same route's first journey ([`memory_cycles_pass`] per
-//!   route, [`JourneyBenchConfig::by_route`]): a route is compared only with itself.
+//!   route, [`JourneyBenchConfig::by_route`]): a route is compared only with itself. On the web
+//!   the growth of a route's repeat visits is judged against the memory before them
+//!   ([`JourneyBenchConfig::memory_cycle_verdicts`]).
 //! - **Route checks** (gated): a route's hops cross what the route is chosen for
 //!   ([`Crossing`]: a coast by the neighbour's land share, a cube corner by its centre).
 //! - **Sites** (reported only): the canyon's depth and Fuji's height, read from the grid of the
@@ -400,27 +403,39 @@ pub fn hold_line(t: Transition, ms: f64, tag: &str, web: bool) -> (String, Optio
     }
 }
 
-/// The hop memory gate over each hop's `(baseline, peak, end)` samples. Natively (`web` false)
-/// the worst `peak − baseline` must be at most [`HOP_MEMORY_LIMIT_MIB`]; on the web the wasm
-/// linear memory (it only grows) must not grow, `end − baseline`, in any hop after the first.
-/// `(pass, worst bytes over the baseline)`, or `None` with a sample missing or nothing to judge.
-pub fn hop_memory_gate(
-    hops: &[(Option<u64>, Option<u64>, Option<u64>)],
-    web: bool,
-) -> Option<(bool, i64)> {
+/// One hop's memory samples, for [`hop_memory_gate`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HopMemory {
+    /// The in-region baseline: the last flying frame before the hop.
+    pub baseline: Option<u64>,
+    /// The highest sample during the hop.
+    pub peak: Option<u64>,
+    /// The sample once back flying.
+    pub end: Option<u64>,
+    /// Whether the hop is on a repeat visit of its route ([`JourneyBenchConfig::is_repeat`]).
+    pub repeat: bool,
+}
+
+/// The hop memory gate. Natively (`web` false) the worst `peak − baseline` of every hop must be
+/// at most [`HOP_MEMORY_LIMIT_MIB`]. On the web the wasm linear memory only grows, so a region
+/// larger than any before it (the Mt Fuji route's corner lattice, 35 MiB against the Andes'
+/// 14–16) raises it for good: each route's first visit may grow it, and no hop of a repeat
+/// visit may (`end − baseline` at most 0). `(pass, worst bytes over the baseline)` of the
+/// judged hops, or `None` with a sample missing or nothing to judge.
+pub fn hop_memory_gate(hops: &[HopMemory], web: bool) -> Option<(bool, i64)> {
     let over = |base: Option<u64>, top: Option<u64>| Some(top? as i64 - base? as i64);
     if web {
         let growth: Vec<i64> = hops
             .iter()
-            .skip(1)
-            .map(|&(base, _, end)| over(base, end))
+            .filter(|h| h.repeat)
+            .map(|h| over(h.baseline, h.end))
             .collect::<Option<_>>()?;
         let worst = growth.into_iter().max()?;
         Some((worst <= 0, worst))
     } else {
         let worst = hops
             .iter()
-            .map(|&(base, peak, _)| over(base, peak))
+            .map(|h| over(h.baseline, h.peak))
             .collect::<Option<Vec<i64>>>()?
             .into_iter()
             .max()?;
@@ -578,6 +593,55 @@ impl JourneyBenchConfig {
         } else {
             format!("cycle {}, {}", cycle + 1, self.route(cycle).region.name)
         }
+    }
+
+    /// Whether journey `cycle` visits a route flown earlier in the run.
+    pub fn is_repeat(&self, cycle: u32) -> bool {
+        let route = self.journeys[cycle as usize];
+        self.journeys[..cycle as usize].contains(&route)
+    }
+
+    /// The journey memory cycles' verdicts, `(route, visits, (pass, increase))`, for each route
+    /// flown more than once with every sample it needs. Natively each route's samples on the
+    /// globe ([`Self::by_route`]) go to [`memory_cycles_pass`]: its repeats against its first
+    /// visit. On the web the linear memory never shrinks, so after a larger route a repeat
+    /// starts higher than its first visit did; like with like is what the repeats themselves
+    /// added: each repeat visit's growth over the sample before it (the journey just before),
+    /// summed, against the memory before the route's first repeat, within
+    /// [`CYCLE_MEMORY_TOLERANCE`].
+    pub fn memory_cycle_verdicts(
+        &self,
+        on_globe: &[Option<u64>],
+        web: bool,
+    ) -> Vec<(usize, usize, (bool, f64))> {
+        if !web {
+            return self
+                .by_route(on_globe)
+                .into_iter()
+                .filter_map(|(r, samples)| {
+                    memory_cycles_pass(&samples).map(|result| (r, samples.len(), result))
+                })
+                .collect();
+        }
+        (0..self.routes.len())
+            .filter_map(|r| {
+                let visits: Vec<usize> = (0..on_globe.len().min(self.journeys.len()))
+                    .filter(|&j| self.journeys[j] == r)
+                    .collect();
+                let &first_repeat = visits.get(1)?;
+                let base = on_globe[first_repeat - 1]? as f64;
+                let mut grown = 0.0;
+                for &j in &visits[1..] {
+                    grown += on_globe[j]? as f64 - on_globe[j - 1]? as f64;
+                }
+                let increase = grown / base.max(1.0);
+                Some((
+                    r,
+                    visits.len(),
+                    (increase <= CYCLE_MEMORY_TOLERANCE, increase),
+                ))
+            })
+            .collect()
     }
 
     /// The memory samples on the globe after each journey, by route (in route order), each in
@@ -1607,13 +1671,18 @@ fn finish(
     ));
 
     // Hop memory.
-    let samples: Vec<_> = bench
+    let samples: Vec<HopMemory> = bench
         .hops
         .iter()
-        .map(|h| (h.baseline, h.peak, h.end))
+        .map(|h| HopMemory {
+            baseline: h.baseline,
+            peak: h.peak,
+            end: h.end,
+            repeat: config.is_repeat(h.cycle),
+        })
         .collect();
     let hop_scope = if web {
-        "wasm linear memory, which grows but never shrinks; gate: no growth in any hop after the first".to_string()
+        "wasm linear memory, which grows but never shrinks; gate: no growth in any hop of a route's repeat visit (a route's first visit may grow it)".to_string()
     } else {
         format!(
             "{}; gate: peak <= in-region baseline before the hop +{HOP_MEMORY_LIMIT_MIB} MiB",
@@ -1719,7 +1788,6 @@ fn finish(
 
     // Journey memory cycles: each route against its own first journey.
     let mut listed = Vec::new();
-    let mut judged = Vec::new();
     for (r, samples) in config.by_route(&bench.on_globe) {
         if samples.is_empty() {
             continue;
@@ -1735,10 +1803,12 @@ fn finish(
         } else {
             format!("{} {each}", config.routes[r].region.name)
         });
-        if let Some(result) = memory_cycles_pass(&samples) {
-            judged.push((config.routes[r].region.name, samples.len(), result));
-        }
     }
+    let judged: Vec<_> = config
+        .memory_cycle_verdicts(&bench.on_globe, web)
+        .into_iter()
+        .map(|(r, n, result)| (config.routes[r].region.name, n, result))
+        .collect();
     let listed = listed.join("; ");
     if judged.is_empty() {
         out.push(format!(
@@ -1757,7 +1827,18 @@ fn finish(
         let worst = judged
             .iter()
             .map(|(name, n, (_, increase))| {
-                if config.routes.len() == 1 {
+                if web {
+                    // What the repeats themselves added, against the memory before them.
+                    let whose = if config.routes.len() == 1 {
+                        String::new()
+                    } else {
+                        format!("{name}: ")
+                    };
+                    format!(
+                        "{whose}visits 2-{n} grew {:+.1}% over the memory before them",
+                        increase * 100.0
+                    )
+                } else if config.routes.len() == 1 {
                     format!(
                         "worst of cycles 2-{n} is {:+.1}% of cycle 1",
                         increase * 100.0
@@ -1774,7 +1855,9 @@ fn finish(
         out.push(format!(
             "journey memory cycles ({}, on the globe after each climb{}): {listed}; {worst} (limit +{:.0}%) -> {}",
             cycle_memory_kind(),
-            if config.routes.len() == 1 {
+            if web {
+                "; each repeat visit's own growth, as the memory only grows"
+            } else if config.routes.len() == 1 {
                 ""
             } else {
                 "; each route against its own first visit"

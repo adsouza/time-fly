@@ -543,7 +543,7 @@ From the main checkout after the merge, `cd crates/timefly && cargo run --profil
   ≤ 250 ms, generation ≤ 8,000 ms, linear memory flat across cycles.
 - `http://127.0.0.1:1334/?journey-bench` (about 5 minutes). Holds are reported against 8 s,
   flight frames are gated, swap frames are reported, and linear memory must stay flat across the
-  hops after the first.
+  hops of a route's repeat visit (the second Andes journey; a route's first visit may grow it).
 - Watch the cloud during the dives and hops: `cloud.wesl` has no GPU or naga test on WebGPU (the
   ledger's Task 7 note). Check that near ground under a gathering cloud is veiled, not sharp in
   front of it (the Chrome side of the near-geometry check above).

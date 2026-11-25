@@ -390,11 +390,17 @@ packages on Vulkan. Record the adapter and backend.
   - the worst frame during a swap (native ≤ 100 ms), reported separately in line with the
     owner's view on one-off hitches
   - peak memory during a hop: native ≤ +40 MiB over the in-region baseline; wasm linear memory
-    flat across hops after the first. *(Raised to +64 MiB natively by the owner, 2026-11-25,
-    on the measured breakdown in `docs/testing/m3/performance.md`, "Hop memory": the first hop
-    of a run reads up to +37.5 MiB, and a hop after the OS reclaimed freed pages +48.0 MiB on
-    the owner's route set.)*
-  - memory returning to its first-cycle level across repeated journeys (as M2's cycles)
+    flat across the hops of a route's repeat visits. *(Raised to +64 MiB natively by the owner,
+    2026-11-25, on the measured breakdown in `docs/testing/m3/performance.md`, "Hop memory": the
+    first hop of a run reads up to +37.5 MiB, and a hop after the OS reclaimed freed pages
+    +48.0 MiB on the owner's route set. On the web, linear memory never shrinks, so a route
+    whose regions are larger than any before it raises it for good: Mt Fuji's lattices, 31–35
+    MiB at the cube corner, against the Andes' 14–16. So each route's first visit may grow it,
+    and only repeat visits, which fly the same regions again, must stay flat; the final
+    review, 2026-11-25.)*
+  - memory returning to its first-cycle level across repeated journeys (as M2's cycles). *(On
+    the web, a repeat visit's own growth, against the memory just before it: after a larger
+    route the memory starts higher than at the route's first visit.)*
 - `--region=LAT,LON,AGE` still starts in a region (with the fly at M2's start pose) for testing.
 
 **Manual checks** (the owner, on the Mac): the dive and climb at a recent and a deep era; a hop

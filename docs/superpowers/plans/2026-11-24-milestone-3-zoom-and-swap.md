@@ -475,7 +475,7 @@ git commit -m "feat(core): flight altitudes, cloud density and chase camera"
     - `hold: <transition> <ms>` for each transition. Native ≤ 3,000 ms is gated. Web ≤ 8,000 ms is reported only.
     - `flight: median/p95/worst`, outside the cloud. M2's region gates.
     - `swap worst frame`. Native ≤ 100 ms.
-    - `hop memory peak`. Native ≤ in-region baseline + 40 MiB (raised to + 64 MiB after Task 11; see the rulings). Web: wasm linear memory flat across hops after the first.
+    - `hop memory peak`. Native ≤ in-region baseline + 40 MiB (raised to + 64 MiB after Task 11; see the rulings). Web: wasm linear memory flat across hops after the first (per route after the final review: flat across the hops of a route's repeat visits; a first visit may grow it).
     - `journey memory cycles`. Every cycle within 10% of cycle 1.
     - `result: PASS|FAIL`, with exit codes as in the region bench.
 
