@@ -49,6 +49,59 @@ impl Node {
     }
 }
 
+/// Nodes per allocation of a lattice's node store ([`NodeStore`]): 64 Ki nodes, 512 KiB.
+pub(super) const NODE_CHUNK: usize = 1 << 16;
+
+/// A block's nodes in order, in allocations of exactly [`NODE_CHUNK`] nodes. A region's lattice
+/// holds 17-31 MiB of nodes, and its size varies with the region. macOS keeps a freed block
+/// resident and reuses it only for a request of the same size, so one allocation per block
+/// left each region's lattice in the process footprint after it was freed. In chunks of one
+/// size, the next region's lattice reuses them (M3 hop memory).
+#[derive(Clone, Debug, Default)]
+pub(super) struct NodeStore {
+    chunks: Vec<Vec<PackedNode>>,
+    len: usize,
+}
+
+impl NodeStore {
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn push(&mut self, node: PackedNode) {
+        if self.len.is_multiple_of(NODE_CHUNK) {
+            self.chunks.push(Vec::with_capacity(NODE_CHUNK));
+        }
+        self.chunks
+            .last_mut()
+            .expect("a chunk was just added")
+            .push(node);
+        self.len += 1;
+    }
+
+    pub(super) fn get(&self, i: usize) -> Option<PackedNode> {
+        self.chunks
+            .get(i / NODE_CHUNK)?
+            .get(i % NODE_CHUNK)
+            .copied()
+    }
+
+    /// Each allocation's size in bytes.
+    pub(super) fn allocation_bytes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.chunks
+            .iter()
+            .map(|c| c.capacity() * std::mem::size_of::<PackedNode>())
+    }
+}
+
+impl std::ops::Index<usize> for NodeStore {
+    type Output = PackedNode;
+
+    fn index(&self, i: usize) -> &PackedNode {
+        &self.chunks[i / NODE_CHUNK][i % NODE_CHUNK]
+    }
+}
+
 /// A stored node: 8 bytes, with the key kind as an index into [`Lattice::kinds`]. A recent
 /// region near a cube corner precomputes about 4 million nodes.
 #[derive(Copy, Clone, Debug)]
@@ -59,6 +112,18 @@ pub(super) struct PackedNode {
     kind: u16,
 }
 
+#[cfg(test)]
+impl PackedNode {
+    pub(super) fn test_node(elevation_m: f32) -> PackedNode {
+        PackedNode {
+            elevation_m,
+            ice: 0,
+            koppen: 0,
+            kind: 0,
+        }
+    }
+}
+
 /// Precomputed nodes of one cube face, over a column/row rectangle, filled row by row.
 #[derive(Clone, Debug)]
 pub(super) struct Block {
@@ -66,14 +131,14 @@ pub(super) struct Block {
     pub(super) r0: u32,
     pub(super) w: u32,
     pub(super) h: u32,
-    pub(super) nodes: Vec<PackedNode>,
+    pub(super) nodes: NodeStore,
 }
 
 impl Block {
     fn get(&self, col: u32, row: u32) -> Option<PackedNode> {
         let (c, r) = (col.wrapping_sub(self.c0), row.wrapping_sub(self.r0));
         if c < self.w && r < self.h {
-            self.nodes.get((r * self.w + c) as usize).copied()
+            self.nodes.get((r * self.w + c) as usize)
         } else {
             None
         }
@@ -169,7 +234,7 @@ impl Lattice {
                     r0,
                     w,
                     h,
-                    nodes: Vec::with_capacity((w * h) as usize),
+                    nodes: NodeStore::default(),
                 });
             }
         }
