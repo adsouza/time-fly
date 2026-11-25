@@ -90,28 +90,28 @@ fn a_journey_names_its_four_transitions() {
 
     // Native gates each hold at 3 s; the web reports against 8 s.
     assert_eq!(
-        hold_line(Transition::Dive, 1_234.4, 1, false),
+        hold_line(Transition::Dive, 1_234.4, "cycle 1", false),
         (
             "hold: dive 1234 ms (cycle 1) -> PASS".to_string(),
             Some(true)
         )
     );
     assert_eq!(
-        hold_line(Transition::Hop(1), 3_000.0, 2, false),
+        hold_line(Transition::Hop(1), 3_000.0, "cycle 2, Japan", false),
         (
-            "hold: hop 1 3000 ms (cycle 2) -> PASS".to_string(),
+            "hold: hop 1 3000 ms (cycle 2, Japan) -> PASS".to_string(),
             Some(true)
         )
     );
     assert_eq!(
-        hold_line(Transition::Hop(2), 3_000.4, 1, false),
+        hold_line(Transition::Hop(2), 3_000.4, "cycle 1", false),
         (
             "hold: hop 2 3000 ms (cycle 1) -> FAIL".to_string(),
             Some(false)
         )
     );
     assert_eq!(
-        hold_line(Transition::Climb, 9_000.0, 3, true),
+        hold_line(Transition::Climb, 9_000.0, "cycle 3", true),
         (
             "hold: climb 9000 ms (cycle 3) -> reported only (web target <= 8000 ms)".to_string(),
             None
@@ -203,7 +203,11 @@ fn the_globe_keys_fly_to_the_region_and_descend_to_the_dive() {
             }
             let frame = dived.unwrap_or_else(|| panic!("{name} at {fps} fps never dived: {f:?}"));
             let arc = f.dir.dot(target).clamp(-1.0, 1.0).acos().to_degrees();
-            assert!(arc <= ARRIVE_DEG, "{name} at {fps} fps dived {arc:.2}° off");
+            // It steers in while it descends, so the dive lands near the route's start.
+            assert!(
+                arc <= DIVE_ACCURACY_DEG,
+                "{name} at {fps} fps dived {arc:.2}° off"
+            );
             assert!(
                 (frame as f64) < 12.0 * fps,
                 "{name} at {fps} fps took {frame} frames"
@@ -238,7 +242,7 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
                     // The descent is straight down: no travel toward the edge yet.
                     assert_eq!((fly.pos_m.x, fly.pos_m.z), (0.0, 0.0), "{yaw} at {fps} fps");
                 }
-                let keys = region_keys(&NavPhase::Flying, fly.yaw, fly.pos_m.y, cruising);
+                let keys = region_keys(&NavPhase::Flying, fly.yaw, fly.pos_m.y, cruising, EAST_YAW);
                 let k = keys_to_input(&held(&keys));
                 let input = FlyInput {
                     move_local: k.move_local,
@@ -278,7 +282,7 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
     ] {
         for yaw in [EAST_YAW, EAST_YAW + 0.04, 0.0] {
             assert_eq!(
-                region_keys(&phase, yaw, CRUISE_AGL_M, true),
+                region_keys(&phase, yaw, CRUISE_AGL_M, true, EAST_YAW),
                 [KeyCode::KeyW],
                 "{phase:?}"
             );
@@ -287,15 +291,15 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
     // Facing east: above the cruise it descends, without flying; once cruising, a valley that
     // puts it higher above the ground does not stop it.
     assert_eq!(
-        region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, false),
+        region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, false, EAST_YAW),
         [KeyCode::ControlLeft]
     );
     assert_eq!(
-        region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, true),
+        region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, true, EAST_YAW),
         [KeyCode::KeyW]
     );
     assert_eq!(
-        region_keys(&NavPhase::Flying, EAST_YAW, CRUISE_AGL_M, false),
+        region_keys(&NavPhase::Flying, EAST_YAW, CRUISE_AGL_M, false, EAST_YAW),
         [KeyCode::KeyW]
     );
     // Nothing while navigation moves the fly.
@@ -311,7 +315,7 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
         NavPhase::Globe,
     ] {
         assert!(
-            region_keys(&phase, 0.0, REGION_EMERGE_TO_M as f32, false).is_empty(),
+            region_keys(&phase, 0.0, REGION_EMERGE_TO_M as f32, false, EAST_YAW).is_empty(),
             "{phase:?}"
         );
     }
@@ -413,4 +417,225 @@ fn a_hop_started_again_keeps_one_record_and_records_its_lift() {
     assert_eq!(hops[0].peak_height_m, Some(60_000.0));
     let holds: Vec<Transition> = bench.holds.iter().map(|h| h.transition).collect();
     assert_eq!(holds, [Transition::Hop(1)]);
+}
+
+/// How far from a route's start the scripted globe flight dives (degrees): a corner or site 250
+/// km away needs the dive within a fraction of the inner field's 150 km half-width.
+const DIVE_ACCURACY_DEG: f64 = 0.5;
+
+/// The neighbours of a route flown straight out from its start: hop `n`'s frame and centre.
+fn hops_of(route: &JourneyRoute, n: u32) -> Vec<(RegionFrame, RenderDir)> {
+    let mut frame = RegionFrame {
+        center: RenderDir(dir(route.region.arg.lat_deg, route.region.arg.lon_deg)),
+    };
+    let heading = Vec2::new(-route.yaw.sin(), -route.yaw.cos());
+    (0..n)
+        .map(|_| {
+            let centre = timefly_core::flight::hop::neighbour_centre(&frame, Vec2::ZERO, heading);
+            frame = RegionFrame { center: centre };
+            (frame, centre)
+        })
+        .collect()
+}
+
+#[test]
+fn the_cube_corners_sit_at_35_degrees_and_odd_multiples_of_45() {
+    for lat in [35.264_389_682_754_654, -35.264_389_682_754_654] {
+        for lon in [45.0, 135.0, -45.0, -135.0] {
+            assert!(corner_km(RenderDir(dir(lat, lon))) < 0.01, "{lat}, {lon}");
+        }
+    }
+    // A face centre is as far from a corner as anything gets: acos(1 / √3) of arc.
+    let far = (1.0 / 3f64.sqrt()).acos() * EARTH_RADIUS_M / 1000.0;
+    for d in [DVec3::X, DVec3::NEG_Y, DVec3::Z] {
+        assert!((corner_km(RenderDir(d)) - far).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn the_routes_reach_what_they_are_chosen_for() {
+    let config = JourneyBenchConfig::new(60, true);
+    // Every route is flown; the Andes first and again last, so its memory compares with itself.
+    let mut flown: Vec<usize> = config.journeys.clone();
+    flown.sort_unstable();
+    flown.dedup();
+    assert_eq!(flown, (0..JOURNEY_ROUTES.len()).collect::<Vec<_>>());
+    let last = config.journeys.len() as u32 - 1;
+    assert_eq!(config.route(0).region.name, "Andes");
+    assert_eq!(config.route(last).region, config.route(0).region);
+    // The Andes route flies along the range, north: both hops stay near 70° W.
+    for (_, centre) in hops_of(config.route(0), HOPS_PER_CYCLE) {
+        let (_, lon) = timefly_core::geo::geo_to_latlon(timefly_core::geo::render_to_geo(centre));
+        assert!((lon + 70.01).abs() < 0.05, "{lon}");
+    }
+    // A deep-time route; a coast and a cube corner, each on one hop.
+    assert!(JOURNEY_ROUTES.iter().any(|r| r.region.arg.years >= 100.0e6));
+    let all: Vec<(u32, Crossing)> = JOURNEY_ROUTES
+        .iter()
+        .flat_map(|r| r.crosses.iter().copied())
+        .collect();
+    assert!(all.iter().any(|&(_, c)| c == Crossing::Coast));
+    assert!(all.iter().any(|&(_, c)| c == Crossing::Corner));
+    // A corner hop centres its neighbour near a cube corner; every other hop's is far from one.
+    for route in &JOURNEY_ROUTES {
+        for (i, (_, centre)) in hops_of(route, HOPS_PER_CYCLE).into_iter().enumerate() {
+            let hop = i as u32 + 1;
+            let km = corner_km(centre);
+            if route.crosses.contains(&(hop, Crossing::Corner)) {
+                assert!(
+                    km <= CORNER_REACH_KM - 30.0,
+                    "{} hop {hop}: {km:.0} km",
+                    route.region.name
+                );
+            } else {
+                assert!(km > 300.0, "{} hop {hop}: {km:.0} km", route.region.name);
+            }
+        }
+    }
+    // A route with a site lands that hop on it: within 30 km of the neighbour's centre.
+    let mut sites = Vec::new();
+    for route in &JOURNEY_ROUTES {
+        let Some(site) = route.site else { continue };
+        let (frame, _) = hops_of(route, site.hop)[site.hop as usize - 1];
+        let (x, z) = frame
+            .dir_to_local(RenderDir(dir(site.lat_deg, site.lon_deg)))
+            .unwrap();
+        assert!(x.hypot(z) < 30_000.0, "{}: {x:.0}, {z:.0}", site.name);
+        sites.push(site.name);
+    }
+    assert_eq!(sites, ["Grand Canyon", "Mt Fuji"]);
+}
+
+#[test]
+fn journeys_are_named_and_their_memory_compared_by_route() {
+    let config = JourneyBenchConfig::new(60, true);
+    assert_eq!(config.tag(0), "cycle 1, Andes");
+    assert_eq!(config.tag(4), "cycle 5, Andes");
+    assert_eq!(config.tag(3), "cycle 4, Mt Fuji");
+    let samples = [10, 20, 30, 40, 11];
+    let grouped = config.by_route(&samples);
+    assert_eq!(grouped[0], (0, vec![10, 11]));
+    assert_eq!(grouped[3], (3, vec![40]));
+    // One route: the old names and every cycle against the first.
+    let single = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    assert_eq!(single.journeys, [0, 0, 0]);
+    assert_eq!(single.tag(1), "cycle 2");
+    assert_eq!(single.by_route(&[1, 2, 3]), vec![(0, vec![1, 2, 3])]);
+    let chosen = JourneyBenchConfig::chosen(
+        60,
+        true,
+        RegionArg {
+            lat_deg: 1.0,
+            lon_deg: 2.0,
+            years: 0.0,
+        },
+    );
+    assert_eq!(chosen.routes.len(), 1);
+    assert_eq!(chosen.routes[0].yaw, EAST_YAW);
+    assert_eq!(chosen.journeys.len(), JOURNEY_CYCLES as usize);
+}
+
+#[test]
+fn route_checks_judge_the_first_hop() {
+    let corner = RenderDir(dir(35.26, 135.0));
+    let near = HopRecord {
+        centre: Some(corner),
+        land_share: Some(0.4),
+        ..default()
+    };
+    assert!(crossing_check(Crossing::Corner, &near).0);
+    assert!(crossing_check(Crossing::Coast, &near).0);
+    let inland = HopRecord {
+        centre: Some(RenderDir(dir(46.5, 10.0))),
+        land_share: Some(1.0),
+        ..default()
+    };
+    let (ok, text) = crossing_check(Crossing::Corner, &inland);
+    assert!(!ok, "{text}");
+    let (ok, text) = crossing_check(Crossing::Coast, &inland);
+    assert!(!ok, "{text}");
+    assert_eq!(
+        text,
+        "coast: land 100% of the neighbour's inner field (5-95%)"
+    );
+    assert!(!crossing_check(Crossing::Coast, &HopRecord::default()).0);
+    assert!(!crossing_check(Crossing::Corner, &HopRecord::default()).0);
+}
+
+/// A grid whose inner field's heights follow `f(x, z)` in local metres.
+fn shaped_grid(f: impl Fn(f64, f64) -> f32) -> (RegionGrid, RegionFrame) {
+    use timefly_core::worldgen::generate::{Field, RegionSpec};
+    use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
+    let field = |res: u32, size_m: f64| {
+        let step = size_m / f64::from(res - 1);
+        let elevation_m = (0..res)
+            .flat_map(|r| (0..res).map(move |c| (c, r)))
+            .map(|(c, r)| {
+                f(
+                    -size_m / 2.0 + f64::from(c) * step,
+                    -size_m / 2.0 + f64::from(r) * step,
+                )
+            })
+            .collect();
+        Field {
+            res,
+            size_m,
+            elevation_m,
+            surface: vec![[0; 4]; (res * res) as usize],
+        }
+    };
+    let centre = RenderDir(dir(36.1, -112.1));
+    let grid = RegionGrid {
+        spec: RegionSpec {
+            inner_res: 601,
+            apron_res: 65,
+            ..RegionSpec::new(centre, timefly_core::deep_time::YearsBp(0.0), 1)
+        },
+        inner: field(601, REGION_SIZE_M),
+        apron: field(65, APRON_SIZE_M),
+    };
+    (grid, RegionFrame { center: centre })
+}
+
+#[test]
+fn sites_read_a_canyon_and_a_peak_from_the_grid() {
+    let canyon = Site {
+        hop: 1,
+        name: "Grand Canyon",
+        lat_deg: 36.1,
+        lon_deg: -112.1,
+        kind: SiteKind::Canyon,
+    };
+    // A 1,000 m trench 8 km wide running east-west through the centre, on a 2,000 m plateau.
+    let (grid, frame) = shaped_grid(|_, z| if z.abs() < 4_000.0 { 1_000.0 } else { 2_000.0 });
+    let text = read_site(&canyon, &grid, &frame).unwrap();
+    assert!(text.contains("floor 1000 m"), "{text}");
+    let deep: f32 = text
+        .rsplit(": ")
+        .next()
+        .and_then(|t| t.strip_suffix(" m deep"))
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!((deep - 1000.0).abs() <= 5.0, "{text}");
+    assert!((land_share(&grid) - 1.0).abs() < 1e-6);
+    // A cone 4,000 m high, 30 km across, in the sea.
+    let peak = Site {
+        kind: SiteKind::Peak,
+        name: "Peak",
+        ..canyon
+    };
+    let (grid, frame) = shaped_grid(|x, z| (4_000.0 - x.hypot(z) / 7.5) as f32);
+    let text = read_site(&peak, &grid, &frame).unwrap();
+    assert!(
+        text.starts_with("4000 m at the site; the highest within 10 km 4000 m"),
+        "{text}"
+    );
+    let share = land_share(&grid);
+    assert!(share > 0.0 && share < 0.05, "{share}");
+    // Outside the inner field: not read.
+    let far = Site {
+        lat_deg: 40.0,
+        ..canyon
+    };
+    assert_eq!(read_site(&far, &grid, &frame), None);
 }

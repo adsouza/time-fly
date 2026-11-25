@@ -249,8 +249,12 @@ mod tests {
         }) else {
             panic!("not the journey bench");
         };
-        assert_eq!((c.region.name, c.region.arg), (CHOSEN_REGION, arg));
-        assert_eq!(c.cycles, JourneyBenchConfig::new(60, true).cycles);
+        assert_eq!(c.routes.len(), 1);
+        assert_eq!(
+            (c.routes[0].region.name, c.routes[0].region.arg),
+            (CHOSEN_REGION, arg)
+        );
+        assert_eq!(c.journeys.len(), bench::journey::JOURNEY_CYCLES as usize);
         assert_eq!(
             chosen(LaunchArgs {
                 region: Some(arg),

@@ -10,11 +10,16 @@ use std::time::{Duration, Instant};
 
 use bevy::asset::AssetMetaCheck;
 use bevy::input::InputPlugin;
+use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::bench::bench_exit;
-use timefly::bench::journey::{CRUISE_AGL_M, JourneyBench, JourneyBenchConfig, JourneyBenchPlugin};
+use timefly::bench::journey::{
+    ALPS_ROUTE, CRUISE_AGL_M, JourneyBench, JourneyBenchConfig, JourneyBenchPlugin, JourneyRoute,
+    WEST_YAW,
+};
+use timefly::bench::region::BenchRegion;
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::fly_camera::FlyCameraPlugin;
 use timefly::globe::GlobeRenderStatus;
@@ -23,6 +28,7 @@ use timefly::region::navigate::RegionNavigationPlugin;
 use timefly::region::{GenMode, RegionPlugin, RegionSettings};
 use timefly::time::TimePlugin;
 use timefly_core::flight::altitudes::HOP_ALTITUDE_M;
+use timefly_core::geo::{geo_to_render, latlon_to_geo};
 
 const STEP: Duration = Duration::from_micros(16_667);
 const WALL_LIMIT: Duration = Duration::from_secs(240);
@@ -81,8 +87,8 @@ fn journey_app(config: JourneyBenchConfig) -> App {
 
 #[test]
 fn a_journey_run_reaches_the_summary() {
-    let mut config = JourneyBenchConfig::new(60, true);
-    config.cycles = 1;
+    let mut config = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    config.journeys.truncate(1);
     let mut app = journey_app(config);
     let deadline = Instant::now() + WALL_LIMIT;
     let mut exit = Vec::new();
@@ -158,7 +164,9 @@ fn a_journey_run_reaches_the_summary() {
     for (i, hop) in hops.iter().enumerate() {
         assert_eq!((hop.cycle, hop.hop), (0, i as u32 + 1), "{hop:?}");
         let from = hop.from_agl_m.expect("the lift began");
-        assert!(from <= CRUISE_AGL_M + 100.0, "{hop:?}");
+        // At the cruise: once down to it the fly holds its height, so ground falling away
+        // along the leg adds a little.
+        assert!(from <= CRUISE_AGL_M + 1_000.0, "{hop:?}");
         assert!(from < HOP_ALTITUDE_M as f32, "{hop:?}");
         let peak = hop.peak_height_m.expect("a height in the hop");
         assert!(peak >= HOP_ALTITUDE_M as f32 - 1.0, "{hop:?}");
@@ -176,6 +184,95 @@ fn a_journey_run_reaches_the_summary() {
     // Reported once.
     app.update();
     assert!(exits(&mut app).is_empty());
+}
+
+/// Runs the bench to its summary.
+fn run_to_summary(app: &mut App) -> (String, Vec<AppExit>) {
+    let deadline = Instant::now() + WALL_LIMIT;
+    let mut exit = Vec::new();
+    while app.world().resource::<JourneyBench>().summary().is_none() {
+        app.update();
+        if *app.world().resource::<State<GlobeLoadState>>().get() == GlobeLoadState::Ready {
+            app.insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 });
+        }
+        exit.extend(exits(app));
+        assert!(Instant::now() < deadline, "the bench did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let summary = app.world().resource::<JourneyBench>().summary().unwrap();
+    (summary.to_string(), exit)
+}
+
+#[test]
+fn a_route_set_flies_each_route_its_own_way_and_compares_like_with_like() {
+    // The Alps east, then a second route west from the same start, then the Alps again.
+    let alps = ALPS_ROUTE;
+    let west = JourneyRoute {
+        region: BenchRegion {
+            name: "Alps west",
+            ..alps.region
+        },
+        yaw: WEST_YAW,
+        heading: "west",
+        ..alps
+    };
+    let config = JourneyBenchConfig {
+        routes: vec![alps, west],
+        journeys: vec![0, 1, 0],
+        ..JourneyBenchConfig::new(60, true)
+    };
+    let mut app = journey_app(config);
+    let (summary, exit) = run_to_summary(&mut app);
+    println!("{summary}");
+    assert!(!summary.contains("result: FAIL ("), "{summary}");
+    assert!(summary.contains("\nroutes: Alps (46.5, 10 at 0 years) east, Alps west (46.5, 10 at 0 years) west; 3 journeys of a dive, 2 hops and a climb: Alps, Alps west, Alps\n"), "{summary}");
+    for tag in ["(cycle 1, Alps)", "(cycle 2, Alps west)", "(cycle 3, Alps)"] {
+        let holds = summary
+            .lines()
+            .filter(|l| l.starts_with("hold: ") && l.contains(tag))
+            .count();
+        assert_eq!(holds, 4, "{tag} in\n{summary}");
+    }
+    // Flight is judged route by route, each on its own frames.
+    for route in ["Alps", "Alps west"] {
+        let line = summary
+            .lines()
+            .find(|l| l.starts_with(&format!("  flight, {route}: frames ")))
+            .unwrap_or_else(|| panic!("{route} in\n{summary}"));
+        assert!(line.ends_with(" rule -> PASS"), "{line}");
+    }
+    assert!(
+        summary.contains("\nflight by route (each route's own pacing rule) -> PASS\n"),
+        "{summary}"
+    );
+    // Memory is compared route by route: the Alps against itself; the west route once.
+    let cycles = summary
+        .lines()
+        .find(|l| l.starts_with("journey memory cycles ("))
+        .unwrap_or_else(|| panic!("{summary}"));
+    assert!(
+        cycles.contains("each route against its own first visit"),
+        "{cycles}"
+    );
+    assert!(cycles.contains("; Alps west 1: "), "{cycles}");
+    assert!(cycles.contains("Alps: worst of visits 2-2 is "), "{cycles}");
+    assert!(!cycles.contains("Alps west: worst"), "{cycles}");
+    // The west route's hops went west, the others east: each hop's neighbour lies on the
+    // route's side of its start.
+    let bench = app.world().resource::<JourneyBench>();
+    let hops = bench.hops();
+    assert_eq!(hops.len(), 6, "{hops:?}");
+    let start = geo_to_render(latlon_to_geo(46.5, 10.0)).0;
+    let east = DVec3::Y.cross(start).normalize();
+    for hop in hops {
+        let centre = hop.centre.expect("the hop's centre").0;
+        let along = centre.dot(east);
+        let westward = hop.cycle == 1;
+        assert_eq!(along < 0.0, westward, "{hop:?}");
+        assert!(hop.land_share.is_some(), "{hop:?}");
+    }
+    assert!(summary.contains("\nresult: PASS\n"), "{summary}");
+    assert_eq!(exit, vec![bench_exit(true)], "{summary}");
 }
 
 #[test]

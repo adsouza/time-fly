@@ -1,13 +1,18 @@
 //! The journey bench (`--journey-bench`, web `?journey-bench`): M3 design §11.
 //!
 //! It plays the player's keys through every M3 transition, so the real dive, hops and climb run
-//! and nothing places the fly. Once the globe is interactive and a short settle has passed, each
-//! journey:
+//! and nothing places the fly. A run flies a set of routes ([`JOURNEY_ROUTES`] in
+//! [`JOURNEY_ORDER`]: the Andes, Pangaea at 250 Ma, the Grand Canyon, Mt Fuji over a coast to a
+//! cube corner, then the Andes again; owner, 2026-11-25), or one route with `--region`. Once the globe
+//! is interactive and a short settle has passed, each journey sets the time to its route's age
+//! and:
 //!
-//! 1. **Flies the globe** to above [`JourneyBenchConfig::region`] (within [`ARRIVE_DEG`]) with the
-//!    turn keys and `W` ([`globe_keys`]), then descends with `Ctrl` until the dive commits below
-//!    `DIVE_ALTITUDE_KM`. It lets go while the dive waits in the cloud and the fly emerges.
-//! 2. **Descends, then flies east** in the region ([`region_keys`]). The fly emerges at 230 km,
+//! 1. **Flies the globe** to above the route's region (within [`ARRIVE_DEG`]) with the turn keys
+//!    and `W` ([`globe_keys`]), then descends with `Ctrl`, still steering in to within
+//!    [`SETTLE_DEG`], until the dive commits below `DIVE_ALTITUDE_KM`. It lets go while the dive
+//!    waits in the cloud and the fly emerges.
+//! 2. **Descends, then flies out** along the route's heading in the region ([`region_keys`]; the
+//!    text below says east, the headless tests' Alps route). The fly emerges at 230 km,
 //!    above `HOP_ALTITUDE_M`, where a hop's lift would do nothing; so before the first hop it
 //!    holds `Ctrl` alone, straight down in place (about 21 s at the 10 km/s cap), to
 //!    [`CRUISE_AGL_M`] above the ground, turning to face east meanwhile. Then it holds `W` to the
@@ -41,7 +46,12 @@
 //!   [`HOP_MEMORY_LIMIT_MIB`]. On the web, the wasm linear memory must not grow across any hop
 //!   after the first ([`hop_memory_gate`]).
 //! - **Journey memory cycles**: memory on the globe after each journey within
-//!   [`CYCLE_MEMORY_TOLERANCE`] of the first's ([`memory_cycles_pass`]).
+//!   [`CYCLE_MEMORY_TOLERANCE`] of the same route's first journey ([`memory_cycles_pass`] per
+//!   route, [`JourneyBenchConfig::by_route`]): a route is compared only with itself.
+//! - **Route checks** (gated): a route's hops cross what the route is chosen for
+//!   ([`Crossing`]: a coast by the neighbour's land share, a cube corner by its centre).
+//! - **Sites** (reported only): the canyon's depth and Fuji's height, read from the grid of the
+//!   hop's neighbour ([`read_site`]).
 //!
 //! A stage that does not finish within [`STAGE_TIMEOUT_SECS`] (the longest, the region's, is
 //! about 21 s of descent, 15 s and 25 s of flight and two holds: about 65 s natively), a dive that comes back out over
@@ -54,13 +64,15 @@ use bevy::prelude::*;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::HOP_ALTITUDE_M;
 use timefly_core::flight::globe::GlobeFlight;
-use timefly_core::geo::{geo_to_render, latlon_to_geo};
+use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
 use timefly_core::terrain::blended_height_m;
+use timefly_core::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
+use timefly_core::worldgen::generate::RegionGrid;
 
 use super::region::{
-    BenchRegion, CHOSEN_REGION, CYCLE_MEMORY_TOLERANCE, Screen, cycle_memory, cycle_memory_kind,
-    dunes_line, emit, gate_word, host_stall_line, memory_cycles_pass, pacing_for, pacing_name,
-    show_mib,
+    BENCH_REGIONS, BenchRegion, CHOSEN_REGION, CYCLE_MEMORY_TOLERANCE, Screen, cycle_memory,
+    cycle_memory_kind, dunes_line, emit, gate_word, host_stall_line, memory_cycles_pass,
+    pacing_for, pacing_name, show_mib,
 };
 use super::{
     MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
@@ -77,7 +89,7 @@ use crate::region::{ActiveRegion, RegionState};
 use crate::terrain::TerrainOptions;
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 
-/// The journey's region: the Alps at the present, high relief and a present-day snapshot.
+/// The Alps at the present: high relief and a present-day snapshot (M3's first journey region).
 pub const JOURNEY_REGION: BenchRegion = BenchRegion {
     name: "Alps",
     arg: RegionArg {
@@ -89,10 +101,157 @@ pub const JOURNEY_REGION: BenchRegion = BenchRegion {
 };
 /// The globe's fly is over the region once within this arc of it (degrees): wider than a frame's
 /// travel at the top of globe flight (the track's 30°/s cap is 1° a frame at 30 fps), so it never
-/// overshoots, and well inside the region's own field of view from the dive altitude.
+/// overshoots, and well inside the region's own field of view from the dive altitude. Inside
+/// it the fly descends.
 pub const ARRIVE_DEG: f64 = 2.0;
-/// The region's fly heads east (yaw about `+y`, positive west).
+/// Inside [`ARRIVE_DEG`] the fly keeps steering toward the region while it descends, until it
+/// is within this arc (degrees): a route's first hop has to reach what the route is chosen for
+/// (a cube corner, a coast, a site), 250 km from wherever the dive lands.
+pub const SETTLE_DEG: f64 = 0.25;
+/// The region fly's headings (yaw about `+y` from north, positive west).
 pub const EAST_YAW: f32 = -std::f32::consts::FRAC_PI_2;
+pub const WEST_YAW: f32 = std::f32::consts::FRAC_PI_2;
+pub const NORTH_YAW: f32 = 0.0;
+/// A corner route's first hop must centre the neighbour within this of a cube-face corner
+/// (km): the inner field's half-width, so the corner lies in or at the edge of the neighbour's
+/// inner field, where the generator's lattice spans three cube faces.
+pub const CORNER_REACH_KM: f64 = 150.0;
+/// A coast route's first hop must give the neighbour's inner field a land share in this range.
+pub const COAST_LAND_SHARE: (f32, f32) = (0.05, 0.95);
+
+/// What a route's hop is chosen to cross, checked at run time (gated).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Crossing {
+    /// Land and sea: the neighbour's inner field has a land share within [`COAST_LAND_SHARE`].
+    Coast,
+    /// A cube-face corner of the terrain's cube sphere: the neighbour's centre within
+    /// [`CORNER_REACH_KM`] of one ([`corner_km`]).
+    Corner,
+}
+
+/// A landform a route's hop lands on, read from the neighbour's grid (reported only).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Site {
+    /// The hop (from 1) whose neighbour holds it.
+    pub hop: u32,
+    pub name: &'static str,
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub kind: SiteKind,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SiteKind {
+    /// A north-south profile: the floor at the site and the highest ground on either side.
+    Canyon,
+    /// The height at the site against the highest ground near it and a ring around it.
+    Peak,
+}
+
+/// One route of the journey bench: where it dives, the heading of its hops, and what its hops
+/// are chosen to cross or land on (owner, 2026-11-25: geographic diversity, a cube corner, a
+/// coastline, the Grand Canyon, the Andes and Mt Fuji).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct JourneyRoute {
+    pub region: BenchRegion,
+    pub yaw: f32,
+    pub heading: &'static str,
+    /// `(hop from 1, what it crosses)`, checked at run time (gated).
+    pub crosses: &'static [(u32, Crossing)],
+    pub site: Option<Site>,
+}
+
+/// The Alps east: M3's first journey route, now only the headless tests' (the tiny fixture).
+pub const ALPS_ROUTE: JourneyRoute = JourneyRoute {
+    region: JOURNEY_REGION,
+    yaw: EAST_YAW,
+    heading: "east",
+    crosses: &[],
+    site: None,
+};
+
+/// The routes, in the order a run flies them ([`JOURNEY_ORDER`]):
+/// - **Andes** north from Aconcagua (32.65° S, 70.01° W; 6,040 m in the 1′ data), present day:
+///   both hops stay over the range (35% and 43% of their inner fields above 3,000 m in the 1′
+///   data, against 11% and 1% flying south).
+/// - **Pangaea interior** north (a bench region): deep time, 250 Ma.
+/// - **Grand Canyon** north from central Arizona, present day: the first hop's neighbour is
+///   centred on the canyon at 36.1° N, 112.1° W (1′ data: floor about 1,030 m, rims 2,150 and
+///   2,450 m).
+/// - **Mt Fuji** west from the Pacific east of the Bōsō peninsula, present day: the first hop
+///   flies from the sea over the Kantō coast onto Fuji (35.36° N, 138.73° E; 3,164 m in the 1′
+///   data, the local high point), and the second lands about 90 km from the cube corner at
+///   35.26° N, 135° E (render direction `(1, 1, 1) / √3`, with geo `(x, y, z)` = render
+///   `(z, x, y)`), where the generator's lattice spans three cube faces.
+pub const JOURNEY_ROUTES: [JourneyRoute; 4] = [
+    JourneyRoute {
+        region: BenchRegion {
+            name: "Andes",
+            arg: RegionArg {
+                lat_deg: -32.65,
+                lon_deg: -70.01,
+                years: 0.0,
+            },
+            pan_from_previous: false,
+        },
+        yaw: NORTH_YAW,
+        heading: "north",
+        crosses: &[],
+        site: None,
+    },
+    JourneyRoute {
+        region: BENCH_REGIONS[0],
+        yaw: NORTH_YAW,
+        heading: "north",
+        crosses: &[],
+        site: None,
+    },
+    JourneyRoute {
+        region: BenchRegion {
+            name: "Grand Canyon",
+            arg: RegionArg {
+                lat_deg: 33.85,
+                lon_deg: -112.1,
+                years: 0.0,
+            },
+            pan_from_previous: false,
+        },
+        yaw: NORTH_YAW,
+        heading: "north",
+        crosses: &[],
+        site: Some(Site {
+            hop: 1,
+            name: "Grand Canyon",
+            lat_deg: 36.1,
+            lon_deg: -112.1,
+            kind: SiteKind::Canyon,
+        }),
+    },
+    JourneyRoute {
+        region: BenchRegion {
+            name: "Mt Fuji",
+            arg: RegionArg {
+                lat_deg: 35.36,
+                lon_deg: 141.48,
+                years: 0.0,
+            },
+            pan_from_previous: false,
+        },
+        yaw: WEST_YAW,
+        heading: "west",
+        crosses: &[(1, Crossing::Coast), (2, Crossing::Corner)],
+        site: Some(Site {
+            hop: 1,
+            name: "Mt Fuji",
+            lat_deg: 35.36,
+            lon_deg: 138.73,
+            kind: SiteKind::Peak,
+        }),
+    },
+];
+/// The journeys of a run, by route: every route once, then the Andes again, so the memory
+/// cycles compare the Andes with itself (about 8 minutes natively).
+pub const JOURNEY_ORDER: [usize; 5] = [0, 1, 2, 3, 0];
 /// Within this of east (degrees) the region's fly flies on: wider than a frame's turn at 30 fps.
 pub const YAW_TOLERANCE_DEG: f32 = 3.0;
 /// The region's fly descends to this height above the ground before it flies east: under
@@ -105,7 +264,7 @@ const TURN_DEADBAND_DEG: f64 = 1.5;
 /// Over the globe, `W` flies only while the heading is within this of the region's bearing
 /// (degrees): a fly facing away turns first.
 const FACE_DEG: f64 = 10.0;
-/// Journeys per run.
+/// Journeys of a single-route run (`--journey-bench --region=…`).
 pub const JOURNEY_CYCLES: u32 = 3;
 /// Hops per journey.
 pub const HOPS_PER_CYCLE: u32 = 2;
@@ -215,11 +374,11 @@ pub fn is_swap(before: &NavPhase, after: &NavPhase) -> bool {
     )
 }
 
-/// A hold's summary line, `hold: <transition> <ms> ms (cycle <n>) -> <verdict>`, and its gate:
-/// natively at most [`HOLD_LIMIT_NATIVE_MS`]; on the web reported against
-/// [`HOLD_TARGET_WEB_MS`] (`None`).
-pub fn hold_line(t: Transition, ms: f64, cycle: u32, web: bool) -> (String, Option<bool>) {
-    let head = format!("hold: {} {ms:.0} ms (cycle {cycle}) -> ", t.label());
+/// A hold's summary line, `hold: <transition> <ms> ms (<tag>) -> <verdict>` (the tag names the
+/// journey, [`JourneyBenchConfig::tag`]), and its gate: natively at most
+/// [`HOLD_LIMIT_NATIVE_MS`]; on the web reported against [`HOLD_TARGET_WEB_MS`] (`None`).
+pub fn hold_line(t: Transition, ms: f64, tag: &str, web: bool) -> (String, Option<bool>) {
+    let head = format!("hold: {} {ms:.0} ms ({tag}) -> ", t.label());
     if web {
         (
             format!("{head}reported only (web target <= {HOLD_TARGET_WEB_MS:.0} ms)"),
@@ -271,7 +430,8 @@ fn region_dir(arg: &RegionArg) -> DVec3 {
 pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
     let up = flight.dir.normalize();
     let target = target.normalize();
-    if up.dot(target).clamp(-1.0, 1.0).acos() <= ARRIVE_DEG.to_radians() {
+    let arc = up.dot(target).clamp(-1.0, 1.0).acos();
+    if arc <= SETTLE_DEG.to_radians() {
         return vec![KeyCode::ControlLeft];
     }
     let toward = (target - up * up.dot(target)).normalize_or_zero();
@@ -279,6 +439,8 @@ pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
         // The antipode: every way leads there.
         return vec![KeyCode::KeyW];
     }
+    // Arrived: descend, still steering in until within `SETTLE_DEG`.
+    let arrived = arc <= ARRIVE_DEG.to_radians();
     let h = flight.heading;
     // Positive when the bearing lies to the left (about up), as the turn's own sign.
     let err = up.dot(h.cross(toward)).atan2(h.dot(toward));
@@ -293,26 +455,35 @@ pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
     if err.abs() < FACE_DEG.to_radians() {
         keys.push(KeyCode::KeyW);
     }
+    if arrived {
+        keys.push(KeyCode::ControlLeft);
+    }
     keys
 }
 
-/// The keys flying the region's fly, heading `yaw`, `agl_m` above the ground, in `phase`:
+/// The keys flying the region's fly, heading `yaw`, `agl_m` above the ground, in `phase`, on a
+/// route heading `want` (a yaw):
 /// - flying, not yet `cruising` and above [`CRUISE_AGL_M`]: descend (`Ctrl`) in place, turning
-///   toward east meanwhile;
-/// - flying otherwise: turn to face east and fly forward within [`YAW_TOLERANCE_DEG`] of it
+///   toward `want` meanwhile;
+/// - flying otherwise: turn to face `want` and fly forward within [`YAW_TOLERANCE_DEG`] of it
 ///   (once cruising, a valley that puts the fly higher above the ground does not stop it);
 /// - through a hop, `W` alone (a turn could point the wish back in, which ends a hop from its
 ///   hold);
 /// - nothing while navigation moves the fly.
 ///
 /// The shell sets `cruising` once the fly has been at or under [`CRUISE_AGL_M`].
-pub fn region_keys(phase: &NavPhase, yaw: f32, agl_m: f32, cruising: bool) -> Vec<KeyCode> {
+pub fn region_keys(
+    phase: &NavPhase,
+    yaw: f32,
+    agl_m: f32,
+    cruising: bool,
+    want: f32,
+) -> Vec<KeyCode> {
     match phase {
         NavPhase::Hopping { .. } => vec![KeyCode::KeyW],
         NavPhase::Flying => {
             let tau = std::f32::consts::TAU;
-            let err =
-                (EAST_YAW - yaw + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
+            let err = (want - yaw + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
             let mut keys = Vec::new();
             if f64::from(err.abs()) > TURN_DEADBAND_DEG.to_radians() {
                 // The right arrow lowers the yaw (positive is west of north).
@@ -333,36 +504,178 @@ pub fn region_keys(phase: &NavPhase, yaw: f32, agl_m: f32, cruising: bool) -> Ve
     }
 }
 
-/// The bench's settings. Tests cut the cycles.
+/// The bench's settings. Tests cut the journeys.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JourneyBenchConfig {
-    pub cycles: u32,
-    pub region: BenchRegion,
+    pub routes: Vec<JourneyRoute>,
+    /// The journeys in order, as indices into `routes`.
+    pub journeys: Vec<usize>,
     pub target_fps: u32,
     pub exit_when_done: bool,
 }
 
 impl JourneyBenchConfig {
+    /// The full route set ([`JOURNEY_ROUTES`] in [`JOURNEY_ORDER`]).
     pub fn new(target_fps: u32, exit_when_done: bool) -> Self {
         JourneyBenchConfig {
-            cycles: JOURNEY_CYCLES,
-            region: JOURNEY_REGION,
+            routes: JOURNEY_ROUTES.to_vec(),
+            journeys: JOURNEY_ORDER.to_vec(),
             target_fps,
             exit_when_done,
         }
     }
 
-    /// The bench over the region at `arg` (`--journey-bench --region=…`).
-    pub fn chosen(target_fps: u32, exit_when_done: bool, arg: RegionArg) -> Self {
+    /// One route, [`JOURNEY_CYCLES`] times.
+    pub fn single(target_fps: u32, exit_when_done: bool, route: JourneyRoute) -> Self {
         JourneyBenchConfig {
-            region: BenchRegion {
-                name: CHOSEN_REGION,
-                arg,
-                pan_from_previous: false,
-            },
-            ..JourneyBenchConfig::new(target_fps, exit_when_done)
+            routes: vec![route],
+            journeys: vec![0; JOURNEY_CYCLES as usize],
+            target_fps,
+            exit_when_done,
         }
     }
+
+    /// The bench over the region at `arg` (`--journey-bench --region=…`): one route east.
+    pub fn chosen(target_fps: u32, exit_when_done: bool, arg: RegionArg) -> Self {
+        JourneyBenchConfig::single(
+            target_fps,
+            exit_when_done,
+            JourneyRoute {
+                region: BenchRegion {
+                    name: CHOSEN_REGION,
+                    arg,
+                    pan_from_previous: false,
+                },
+                yaw: EAST_YAW,
+                heading: "east",
+                crosses: &[],
+                site: None,
+            },
+        )
+    }
+
+    /// Journey `cycle`'s route.
+    pub fn route(&self, cycle: u32) -> &JourneyRoute {
+        &self.routes[self.journeys[cycle as usize]]
+    }
+
+    /// How a summary line names journey `cycle`: `cycle 2`, or with several routes
+    /// `cycle 6, Alps`.
+    pub fn tag(&self, cycle: u32) -> String {
+        if self.routes.len() == 1 {
+            format!("cycle {}", cycle + 1)
+        } else {
+            format!("cycle {}, {}", cycle + 1, self.route(cycle).region.name)
+        }
+    }
+
+    /// The memory samples on the globe after each journey, by route (in route order), each in
+    /// the order the route was flown: a route is compared only with itself.
+    pub fn by_route<T: Copy>(&self, per_journey: &[T]) -> Vec<(usize, Vec<T>)> {
+        (0..self.routes.len())
+            .map(|r| {
+                let samples = per_journey
+                    .iter()
+                    .zip(&self.journeys)
+                    .filter(|&(_, &route)| route == r)
+                    .map(|(&s, _)| s)
+                    .collect();
+                (r, samples)
+            })
+            .collect()
+    }
+}
+
+/// The great-circle distance (km) from an era-frame direction to the nearest corner of the
+/// terrain's cube sphere (the render frame's `(±1, ±1, ±1) / √3`, `crate::cube`'s face planes).
+pub fn corner_km(dir: RenderDir) -> f64 {
+    let d = dir.0.normalize();
+    let cos = (d.x.abs() + d.y.abs() + d.z.abs()) / 3f64.sqrt();
+    cos.clamp(-1.0, 1.0).acos() * EARTH_RADIUS_M / 1000.0
+}
+
+/// The share of a grid's inner field above sea level.
+pub fn land_share(grid: &RegionGrid) -> f32 {
+    let h = &grid.inner.elevation_m;
+    h.iter().filter(|&&e| e > 0.0).count() as f32 / h.len().max(1) as f32
+}
+
+/// A route's check of its first hop: `(pass, text)`. A hop not measured fails.
+pub fn crossing_check(c: Crossing, hop: &HopRecord) -> (bool, String) {
+    match c {
+        Crossing::Corner => match hop.centre {
+            Some(centre) => {
+                let km = corner_km(centre);
+                (
+                    km <= CORNER_REACH_KM,
+                    format!(
+                        "cube corner {km:.0} km from the neighbour's centre (<= {CORNER_REACH_KM:.0} km)"
+                    ),
+                )
+            }
+            None => (false, "cube corner: not measured".to_string()),
+        },
+        Crossing::Coast => match hop.land_share {
+            Some(share) => {
+                let (lo, hi) = COAST_LAND_SHARE;
+                (
+                    (lo..=hi).contains(&share),
+                    format!(
+                        "coast: land {:.0}% of the neighbour's inner field ({:.0}-{:.0}%)",
+                        share * 100.0,
+                        lo * 100.0,
+                        hi * 100.0
+                    ),
+                )
+            }
+            None => (false, "coast: not measured".to_string()),
+        },
+    }
+}
+
+/// A site read from the grid it lies in (`None` outside the inner field): the text of the
+/// summary's site line.
+pub fn read_site(site: &Site, grid: &RegionGrid, frame: &RegionFrame) -> Option<String> {
+    let dir = geo_to_render(latlon_to_geo(site.lat_deg, site.lon_deg));
+    let (x, z) = frame.dir_to_local(dir)?;
+    let half = grid.inner.size_m / 2.0;
+    if x.abs() > half || z.abs() > half {
+        return None;
+    }
+    let h = |dx: f64, dz: f64| blended_height_m(grid, x + dx, z + dz);
+    let at = h(0.0, 0.0);
+    Some(match site.kind {
+        SiteKind::Canyon => {
+            // North-south through the site, 500 m steps: the floor within 3 km, the highest
+            // ground 3-15 km to either side (`-z` is north).
+            let steps = |from: i32, to: i32| (from..=to).map(|k| h(0.0, f64::from(k) * 500.0));
+            let floor = steps(-6, 6).fold(f32::INFINITY, f32::min);
+            let north = steps(-30, -6).fold(f32::NEG_INFINITY, f32::max);
+            let south = steps(6, 30).fold(f32::NEG_INFINITY, f32::max);
+            format!(
+                "floor {floor:.0} m (at the site {at:.0} m), rims {north:.0} m north and {south:.0} m south within 15 km: {:.0} m deep",
+                north.min(south) - floor
+            )
+        }
+        SiteKind::Peak => {
+            let ring = |r: f64| -> Vec<f32> {
+                (0..36)
+                    .map(|k| {
+                        let a = f64::from(k).to_radians() * 10.0;
+                        h(r * a.sin(), r * a.cos())
+                    })
+                    .collect()
+            };
+            let near = (1..=20)
+                .flat_map(|r| ring(f64::from(r) * 500.0))
+                .fold(at, f32::max);
+            let around = ring(20_000.0);
+            let mean = around.iter().sum::<f32>() / around.len() as f32;
+            format!(
+                "{at:.0} m at the site; the highest within 10 km {near:.0} m; the 20 km ring {mean:.0} m on average"
+            )
+        }
+    })
 }
 
 /// Where the run is. Times are `Time<Real>` seconds; `cycle` counts from 0.
@@ -435,7 +748,7 @@ struct SwapRecord {
 
 /// One hop: its lift, and its memory (the in-region baseline before it, its peak, and on return
 /// to flying).
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct HopRecord {
     /// The journey, from 0.
     pub cycle: u32,
@@ -445,6 +758,13 @@ pub struct HopRecord {
     pub from_agl_m: Option<f32>,
     /// The fly's highest height above sea level during the hop.
     pub peak_height_m: Option<f32>,
+    /// The neighbour's centre (era frame), from the hop's phase.
+    pub centre: Option<RenderDir>,
+    /// The share of the region's inner field above sea level once the hop is done (the
+    /// neighbour's, after a swap).
+    pub land_share: Option<f32>,
+    /// The route's site read from the region once the hop is done ([`read_site`]).
+    pub site: Option<String>,
     baseline: Option<u64>,
     peak: Option<u64>,
     end: Option<u64>,
@@ -460,6 +780,8 @@ pub struct JourneyBench {
     prev_phase: NavPhase,
     /// Frames drawn with no cloud (density 0) during the script.
     flight_ms: Vec<f32>,
+    /// The journey of each of `flight_ms`.
+    flight_cycle: Vec<u32>,
     holds: Vec<HoldRecord>,
     swaps: Vec<SwapRecord>,
     hops: Vec<HopRecord>,
@@ -480,6 +802,7 @@ impl JourneyBench {
             stage: Stage::WaitingForGlobe,
             prev_phase: NavPhase::Globe,
             flight_ms: Vec::new(),
+            flight_cycle: Vec::new(),
             holds: Vec::new(),
             swaps: Vec::new(),
             hops: Vec::new(),
@@ -559,7 +882,10 @@ fn drive_journey_keys(
     let phase = nav.map_or(NavPhase::Globe, |n| n.phase);
     let want: Vec<KeyCode> = match bench.stage {
         Stage::Approach { .. } if phase == NavPhase::Globe => flight.map_or(Vec::new(), |f| {
-            globe_keys(&f.0, region_dir(&bench.config.region.arg))
+            globe_keys(
+                &f.0,
+                region_dir(&bench.config.route(cycle_of(bench.stage)).region.arg),
+            )
         }),
         // Tapped: pressed on one frame, let go on the next, until the climb takes.
         Stage::Region { hops, .. } if hops >= HOPS_PER_CYCLE && phase == NavPhase::Flying => {
@@ -587,7 +913,13 @@ fn drive_journey_keys(
                 since,
                 cruising,
             };
-            region_keys(&phase, f.yaw, agl_m, cruising)
+            region_keys(
+                &phase,
+                f.yaw,
+                agl_m,
+                cruising,
+                bench.config.route(cycle).yaw,
+            )
         }),
         _ => Vec::new(),
     };
@@ -615,6 +947,7 @@ struct Game<'w> {
     globe: Option<Res<'w, GlobeData>>,
     options: Option<Res<'w, TerrainOptions>>,
     fly: Option<Res<'w, FlyState>>,
+    region: Option<Res<'w, ActiveRegion>>,
 }
 
 /// What the bench changes.
@@ -662,6 +995,21 @@ fn measure_journey(
             height_m: game.fly.as_ref().map_or(0.0, |f| f.pos_m.y),
         };
         record_frame(bench, cycle, frame);
+        // A hop just done: read the region it left the fly in.
+        let route = *bench.config.route(cycle);
+        if phase == NavPhase::Flying
+            && let Some(hop) = bench.hops.last_mut()
+            && hop.cycle == cycle
+            && !hop.open
+            && hop.land_share.is_none()
+            && let Some(region) = game.region.as_deref()
+        {
+            hop.land_share = Some(land_share(&region.grid));
+            hop.site = route
+                .site
+                .filter(|site| site.hop == hop.hop)
+                .and_then(|site| read_site(&site, &region.grid, &region.frame));
+        }
     }
     let timed_out = |since: f64| now - since > STAGE_TIMEOUT_SECS;
     let fail = match bench.stage {
@@ -677,19 +1025,7 @@ fn measure_journey(
         }
         Stage::Settling { since } => {
             if now - since >= SETTLE_SECS {
-                let region = bench.config.region;
-                if let Some(time) = controls.time.as_mut() {
-                    let (from, to) = (time.years, YearsBp(region.arg.years));
-                    if from != to {
-                        time.years = to;
-                        controls.changes.write(TimeChanged {
-                            from,
-                            to,
-                            cause: TimeChangeCause::Bench,
-                        });
-                    }
-                }
-                start_journey(bench, 0, now);
+                start_journey(bench, 0, now, &mut controls);
             }
             None
         }
@@ -708,7 +1044,8 @@ fn measure_journey(
             NavPhase::Flying => {
                 info!(
                     cycle = cycle + 1,
-                    "journey bench: in the region, flying east"
+                    heading = bench.config.route(cycle).heading,
+                    "journey bench: in the region, flying out"
                 );
                 bench.stage = Stage::Region {
                     cycle,
@@ -785,8 +1122,8 @@ fn measure_journey(
                 let sample = cycle_memory();
                 info!(cycle = cycle + 1, memory = ?sample, "journey bench: journey done");
                 bench.on_globe.push(sample);
-                if cycle + 1 < bench.config.cycles {
-                    start_journey(bench, cycle + 1, now);
+                if (cycle as usize) + 1 < bench.config.journeys.len() {
+                    start_journey(bench, cycle + 1, now, &mut controls);
                 } else {
                     finish(bench, &game, &display, &mut controls, None);
                 }
@@ -801,13 +1138,32 @@ fn measure_journey(
     }
 }
 
-fn start_journey(bench: &mut JourneyBench, cycle: u32, now: f64) {
+/// Starts journey `cycle` on the globe: the time goes to its route's age, then the fly heads
+/// for the route's region.
+fn start_journey(bench: &mut JourneyBench, cycle: u32, now: f64, controls: &mut Controls) {
+    let region = bench.config.route(cycle).region;
+    if let Some(time) = controls.time.as_mut() {
+        let (from, to) = (time.years, YearsBp(region.arg.years));
+        if from != to {
+            time.years = to;
+            controls.changes.write(TimeChanged {
+                from,
+                to,
+                cause: TimeChangeCause::Bench,
+            });
+        }
+    }
     info!(
         cycle = cycle + 1,
-        region = bench.config.region.name,
+        region = region.name,
         "journey bench: flying the globe to the dive"
     );
     bench.stage = Stage::Approach { cycle, since: now };
+}
+
+/// The journey a stage belongs to, or the first.
+fn cycle_of(stage: Stage) -> u32 {
+    stage.cycle().unwrap_or(0)
 }
 
 /// One frame's readings, after navigation.
@@ -837,6 +1193,7 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
     } = frame;
     if density == 0.0 {
         bench.flight_ms.push(frame_ms);
+        bench.flight_cycle.push(cycle);
     }
     // Transitions start on the phase change into them.
     let hops_done = match bench.stage {
@@ -850,7 +1207,7 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
     let entered = std::mem::discriminant(&phase) != std::mem::discriminant(&before);
     match phase {
         NavPhase::Diving { .. } if entered => bench.start_hold(Transition::Dive, cycle),
-        NavPhase::Hopping { .. } if entered => {
+        NavPhase::Hopping { centre, .. } if entered => {
             let hop = hops_done + 1;
             bench.start_hold(Transition::Hop(hop), cycle);
             match bench.hops.last_mut() {
@@ -860,6 +1217,7 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
                 _ => bench.hops.push(HopRecord {
                     cycle,
                     hop,
+                    centre: Some(centre),
                     baseline: bench.in_region,
                     peak: memory,
                     open: true,
@@ -953,16 +1311,37 @@ fn finish(
     if let Some(globe) = game.globe.as_deref() {
         out.push(format!("bake: {}", globe.revision.summary()));
     }
-    let region = bench.config.region;
-    let cycles = bench.config.cycles;
-    out.push(format!(
-        "region: {} ({}, {} at {} years), {cycles} cycle{} of a dive, {HOPS_PER_CYCLE} hops and a climb",
-        region.name,
-        region.arg.lat_deg,
-        region.arg.lon_deg,
-        region.arg.years,
-        if cycles == 1 { "" } else { "s" }
-    ));
+    let config = &bench.config;
+    let cycles = config.journeys.len();
+    let place = |r: &JourneyRoute| {
+        format!(
+            "{} ({}, {} at {} years)",
+            r.region.name, r.region.arg.lat_deg, r.region.arg.lon_deg, r.region.arg.years
+        )
+    };
+    if let [route] = config.routes.as_slice() {
+        out.push(format!(
+            "region: {}, {cycles} cycle{} of a dive, {HOPS_PER_CYCLE} hops and a climb",
+            place(route),
+            if cycles == 1 { "" } else { "s" }
+        ));
+    } else {
+        let routes: Vec<String> = config
+            .routes
+            .iter()
+            .map(|r| format!("{} {}", place(r), r.heading))
+            .collect();
+        let order: Vec<&str> = config
+            .journeys
+            .iter()
+            .map(|&i| config.routes[i].region.name)
+            .collect();
+        out.push(format!(
+            "routes: {}; {cycles} journeys of a dive, {HOPS_PER_CYCLE} hops and a climb: {}",
+            routes.join(", "),
+            order.join(", ")
+        ));
+    }
     let mut pass = failure.is_none();
 
     // Holds.
@@ -977,16 +1356,16 @@ fn finish(
     for hold in &bench.holds {
         match hold.clock.hold_ms() {
             Some(ms) => {
-                let (line, gate) = hold_line(hold.transition, ms, hold.cycle + 1, web);
+                let (line, gate) = hold_line(hold.transition, ms, &config.tag(hold.cycle), web);
                 pass &= gate.unwrap_or(true);
                 out.push(line);
             }
             None => {
                 pass = false;
                 out.push(format!(
-                    "hold: {} not measured (cycle {}) -> FAIL",
+                    "hold: {} not measured ({}) -> FAIL",
                     hold.transition.label(),
-                    hold.cycle + 1
+                    config.tag(hold.cycle)
                 ));
             }
         }
@@ -1022,7 +1401,42 @@ fn finish(
         ),
         Pacing::Uncapped => format!("pass rule (uncapped): p95 <= {interval:.2} ms"),
     });
-    let flight_pass = passes(flight, fps, pacing);
+    // With several routes each is judged on its own frames, with its own pacing (as the region
+    // bench judges each region, R14): routes render very differently (Pangaea's dunes run near
+    // the interval at 2560 x 1440, Fuji's sea far under it), so a pooled rule mixes them.
+    let several = config.routes.len() > 1;
+    let pooled_pass = passes(flight, fps, pacing);
+    let mut route_lines = Vec::new();
+    let mut flight_pass = true;
+    if several {
+        for (r, route) in config.routes.iter().enumerate() {
+            let frames: Vec<f32> = bench
+                .flight_ms
+                .iter()
+                .zip(&bench.flight_cycle)
+                .filter(|&(_, &c)| config.journeys[c as usize] == r)
+                .map(|(&ms, _)| ms)
+                .collect();
+            let p = pacing_for(&info, &frames);
+            let ok = passes(&frames, fps, p);
+            flight_pass &= ok;
+            let rs = frame_time_stats(&frames);
+            route_lines.push(format!(
+                "  flight, {}: frames {}, median {:.2} ms, p95 {:.2} ms, worst {:.2} ms, missed (>{:.1} ms) {} -> {} rule -> {}",
+                route.region.name,
+                rs.frames,
+                rs.median_ms,
+                rs.p95_ms,
+                rs.worst_ms,
+                MISSED_INTERVALS * interval,
+                missed_frames(&frames, fps),
+                pacing_name(p),
+                gate_word(ok)
+            ));
+        }
+    } else {
+        flight_pass = pooled_pass;
+    }
     pass &= flight_pass;
     let missed = missed_frames(flight, fps);
     let share = if s.frames > 0 {
@@ -1038,13 +1452,27 @@ fn finish(
         s.worst_ms,
         STALL_BUDGETS * interval,
         stall_count(flight, fps),
-        gate_word(flight_pass)
+        if several {
+            format!(
+                "{} pooled; judged per route below",
+                if pooled_pass { "pass" } else { "over" }
+            )
+        } else {
+            gate_word(flight_pass).to_string()
+        }
     ));
     out.push(format!(
         "  missed frames (>{:.1} ms = {MISSED_INTERVALS}x interval): {missed} ({share:.2}%)",
         MISSED_INTERVALS * interval,
     ));
     out.push(host_stall_line("flight", flight));
+    if several {
+        out.extend(route_lines);
+        out.push(format!(
+            "flight by route (each route's own pacing rule) -> {}",
+            gate_word(flight_pass)
+        ));
+    }
 
     // Swaps.
     let scope = format!(
@@ -1065,10 +1493,10 @@ fn finish(
             .iter()
             .map(|s| {
                 format!(
-                    "{} {:.2} ms (cycle {})",
+                    "{} {:.2} ms ({})",
                     s.transition.label(),
                     s.worst_ms,
-                    s.cycle + 1
+                    config.tag(s.cycle)
                 )
             })
             .collect();
@@ -1093,11 +1521,11 @@ fn finish(
             let km =
                 |m: Option<f32>| m.map_or("n/a".to_string(), |m| format!("{:.1} km", m / 1000.0));
             format!(
-                "hop {} {} -> {} (cycle {})",
+                "hop {} {} -> {} ({})",
                 h.hop,
                 km(h.from_agl_m),
                 km(h.peak_height_m),
-                h.cycle + 1
+                config.tag(h.cycle)
             )
         })
         .collect();
@@ -1134,7 +1562,7 @@ fn finish(
                 (Some(b), Some(t)) => signed_mib(t as i64 - b as i64),
                 _ => "n/a".to_string(),
             };
-            format!("hop {} {over} (cycle {})", h.hop, h.cycle + 1)
+            format!("hop {} {over} ({})", h.hop, config.tag(h.cycle))
         })
         .collect();
     match hop_memory_gate(&samples, web) {
@@ -1158,27 +1586,95 @@ fn finish(
         )),
     }
 
-    // Journey memory cycles.
-    let listed = bench
-        .on_globe
-        .iter()
-        .enumerate()
-        .map(|(i, m)| format!("{}: {}", i + 1, show_mib(*m)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    match memory_cycles_pass(&bench.on_globe) {
-        Some((ok, increase)) => {
-            pass &= ok;
-            out.push(format!(
-                "journey memory cycles ({}, on the globe after each climb): {listed}; worst of cycles 2-{} is {:+.1}% of cycle 1 (limit +{:.0}%) -> {}",
-                cycle_memory_kind(),
-                bench.on_globe.len(),
-                increase * 100.0,
-                CYCLE_MEMORY_TOLERANCE * 100.0,
+    // Route checks (gated): each route's hops cross what the route is chosen for.
+    let mut checks = Vec::new();
+    let mut checks_pass = true;
+    for h in &bench.hops {
+        for &(hop, c) in config.route(h.cycle).crosses {
+            if hop != h.hop {
+                continue;
+            }
+            let (ok, text) = crossing_check(c, h);
+            checks_pass &= ok;
+            checks.push(format!(
+                "hop {hop} ({}): {text} {}",
+                config.tag(h.cycle),
                 gate_word(ok)
             ));
         }
-        None => out.push(format!(
+    }
+    let wanted_checks: usize = config
+        .journeys
+        .iter()
+        .map(|&r| config.routes[r].crosses.len())
+        .sum();
+    let wanted = config
+        .journeys
+        .iter()
+        .filter(|&&r| !config.routes[r].crosses.is_empty())
+        .count();
+    if wanted > 0 {
+        // Every check measured: a hop that never happened fails its route's check.
+        let ok = checks_pass && checks.len() == wanted_checks;
+        pass &= ok;
+        out.push(format!(
+            "route checks (each route's hops cross what they are chosen for): {} -> {}",
+            if checks.is_empty() {
+                "none measured".to_string()
+            } else {
+                checks.join("; ")
+            },
+            gate_word(ok)
+        ));
+    }
+    // Sites (reported only): the landform a route's hop lands on.
+    let sites: Vec<String> = bench
+        .hops
+        .iter()
+        .filter_map(|h| {
+            let site = config.route(h.cycle).site.filter(|s| s.hop == h.hop)?;
+            Some(format!(
+                "{} ({:.2}, {:.2}) in hop {}'s region ({}): {}",
+                site.name,
+                site.lat_deg,
+                site.lon_deg,
+                site.hop,
+                config.tag(h.cycle),
+                h.site
+                    .as_deref()
+                    .unwrap_or("not read (outside the inner field?)")
+            ))
+        })
+        .collect();
+    if !sites.is_empty() {
+        out.push(format!("sites (reported only): {}", sites.join("; ")));
+    }
+
+    // Journey memory cycles: each route against its own first journey.
+    let mut listed = Vec::new();
+    let mut judged = Vec::new();
+    for (r, samples) in config.by_route(&bench.on_globe) {
+        if samples.is_empty() {
+            continue;
+        }
+        let each = samples
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("{}: {}", i + 1, show_mib(*m)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        listed.push(if config.routes.len() == 1 {
+            each
+        } else {
+            format!("{} {each}", config.routes[r].region.name)
+        });
+        if let Some(result) = memory_cycles_pass(&samples) {
+            judged.push((config.routes[r].region.name, samples.len(), result));
+        }
+    }
+    let listed = listed.join("; ");
+    if judged.is_empty() {
+        out.push(format!(
             "journey memory cycles: not measured ({} cycle{} done{})",
             bench.on_globe.len(),
             if bench.on_globe.len() == 1 { "" } else { "s" },
@@ -1187,7 +1683,38 @@ fn finish(
             } else {
                 format!("; {listed}")
             }
-        )),
+        ));
+    } else {
+        let ok = judged.iter().all(|(_, _, (ok, _))| *ok);
+        pass &= ok;
+        let worst = judged
+            .iter()
+            .map(|(name, n, (_, increase))| {
+                if config.routes.len() == 1 {
+                    format!(
+                        "worst of cycles 2-{n} is {:+.1}% of cycle 1",
+                        increase * 100.0
+                    )
+                } else {
+                    format!(
+                        "{name}: worst of visits 2-{n} is {:+.1}% of its first",
+                        increase * 100.0
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!(
+            "journey memory cycles ({}, on the globe after each climb{}): {listed}; {worst} (limit +{:.0}%) -> {}",
+            cycle_memory_kind(),
+            if config.routes.len() == 1 {
+                ""
+            } else {
+                "; each route against its own first visit"
+            },
+            CYCLE_MEMORY_TOLERANCE * 100.0,
+            gate_word(ok)
+        ));
     }
     out.push(match failure {
         Some(reason) => format!("result: FAIL ({reason})"),
