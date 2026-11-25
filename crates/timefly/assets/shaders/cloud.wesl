@@ -2,12 +2,13 @@
 // and the UI. Not a ray march: a few octaves of the shared gradient noise, each on a sphere
 // around the eye at its own distance, so the layers parallax as the camera moves.
 //
-// - Depth: the clip-space triangle sits at the clip depth of the cloud's view depth (just past
-//   the fly, `crate::cloud::fly_view_depth`). The pipeline depth-tests and never writes depth,
-//   so the fly (nearer) draws over the cloud and everything behind it is covered. Opaque (from
-//   OPAQUE_FROM), the cloud moves to the near plane and covers everything, ground nearer than the
-//   fly included, but for a hole around the fly (`crate::cloud::fly_hole`), where it sits just
-//   past the fly so the fly stays in front (`crate::cloud::cloud_covers` mirrors the rule).
+// - Depth: whenever it draws, the cloud writes the near plane's depth and so draws over
+//   everything, ground nearer than the fly included, but for a hole around the fly
+//   (`crate::cloud::fly_hole`), where it sits just past the fly so the fly's body stays in front
+//   (`crate::cloud::cloud_covers` mirrors the rule). Near ground is veiled from the first wisp
+//   rather than left sharp until the cloud turns opaque. The pipeline depth-tests and never
+//   writes depth. The triangle itself sits at the cloud's view depth (just past the fly,
+//   `crate::cloud::fly_view_depth`), which only orders it before the fly's blended wings.
 // - Field: octave k samples the noise at (dir × distance_k + motion) × (cells_k / distance_k):
 //   cells_k cells per radian of view, offset by the camera's accumulated motion and the wind (in
 //   cloud depths), which moves nearer layers across the view faster.
@@ -45,7 +46,7 @@ struct CloudParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> cloud: CloudParams;
 
 const OCTAVES: u32 = 4u;
-// `OPAQUE_FROM` in cloud.rs: from this density every pixel is opaque.
+// `OPAQUE_FROM` in cloud.rs: from this density every pixel is opaque (alpha only).
 const OPAQUE_FROM: f32 = 0.999;
 // The broad octaves that shape the wisps; the sun lights these.
 const SHAPE_OCTAVES: u32 = 2u;
@@ -122,8 +123,8 @@ fn fragment(in: CloudOut) -> CloudFragment {
     var out: CloudFragment;
     out.color = cloud_color(in);
     out.depth = in.clip.z;
-    if cloud.state.x >= OPAQUE_FROM {
-        // Opaque: the near plane (reverse-Z 1) covers everything but the fly's hole.
+    if cloud.state.x > 0.0 {
+        // The near plane (reverse-Z 1): over everything but the fly's hole.
         let in_hole = cloud.fly.z > 0.0 && length((in.ndc - cloud.fly.xy) * vec2<f32>(cloud.state.w, 1.0)) <= cloud.fly.z;
         out.depth = select(1.0, clip_depth(cloud.fly.w), in_hole);
     }
@@ -179,6 +180,6 @@ fn cloud_color(in: CloudOut) -> vec4<f32> {
     let wisps = smoothstep(threshold - soft, threshold + soft, w);
     let veil = 0.65 * density * density;
     var alpha = 1.0 - (1.0 - wisps) * (1.0 - veil);
-    alpha = max(alpha, step(0.999, density));
+    alpha = max(alpha, step(OPAQUE_FROM, density));
     return vec4<f32>(min(color, vec3<f32>(1.0)), alpha);
 }

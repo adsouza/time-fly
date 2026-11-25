@@ -473,6 +473,10 @@ fn navigate(
         .map(|s| &s.grid)
         .or(region.map(|r| &r.grid));
     let shown_frame = shown_grid.map(|g| g.spec.frame());
+    let p = flies.fly.pos_m;
+    let ground_m = shown_grid.map_or(0.0, |g| {
+        blended_height_m(g, f64::from(p.x), f64::from(p.z)).max(0.0)
+    });
 
     // The slider waits during a transition: a change since last frame is queued and put back.
     let (held, slider) = hold_slider(nav.phase.holds_time(), time.years, nav.slider);
@@ -511,6 +515,7 @@ fn navigate(
         globe_heading: flight.heading,
         region_height_m: flies.fly.pos_m.y,
         shown_density: nav.density,
+        region_ground_m: ground_m,
         region_fly: shown_frame.map(|frame| {
             fly_on_globe(
                 &frame,
@@ -533,13 +538,10 @@ fn navigate(
     let (phase, actions) = step_nav(before, &inputs);
 
     // Apply.
-    let p = flies.fly.pos_m;
     let ease = Ease {
         region_shown: phase.region_shown(),
         dt_s,
-        ground_m: shown_grid.map_or(0.0, |g| {
-            blended_height_m(g, f64::from(p.x), f64::from(p.z)).max(0.0)
-        }),
+        ground_m,
     };
     for action in actions {
         apply_action(action, ease, region, &mut time, &mut flies, &mut out);

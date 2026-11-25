@@ -67,10 +67,10 @@
 //!
 //! A fifth argument `lowclimb` checks the opaque cloud against near ground (M3 Task 7, fix
 //! round 1): after the start shot (give a low `AGL_M`, facing a ridge) it presses `Backspace`,
-//! and as the cloud gathers for the climb out holds its density at 0.995 for [`PIN_FRAMES`] and
-//! saves `<prefix>-climb-0995.png` (below opaque: the cloud sits just past the fly), then at 1.0
-//! and saves `<prefix>-climb-opaque.png` (what the frame before the swap draws: everything but
-//! the fly covered). Then it lets the climb finish onto the globe.
+//! and as the cloud gathers for the climb out holds its density at 0.5 for [`PIN_FRAMES`] and
+//! saves `<prefix>-climb-05.png` (mid-gather: near ground veiled, never sharp in front of the
+//! cloud), then at 0.995 (`<prefix>-climb-0995.png`) and at 1.0 (`<prefix>-climb-opaque.png`,
+//! what the frame before the swap draws: everything but the fly covered). Then it lets the climb finish onto the globe.
 //!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off
@@ -569,12 +569,15 @@ fn tour(
                 error!(phase = ?nav.phase, "region tour: the climb ended before its shots");
                 exit.write(AppExit::error());
             } else if tour.frames == 1 {
+                tour.pin = Some(0.5);
+                shoot(&mut commands, &tour, "climb-05");
+            } else if tour.frames == 1 + PIN_FRAMES {
                 tour.pin = Some(0.995);
                 shoot(&mut commands, &tour, "climb-0995");
-            } else if tour.frames == 1 + PIN_FRAMES {
+            } else if tour.frames == 1 + 2 * PIN_FRAMES {
                 tour.pin = Some(1.0);
                 shoot(&mut commands, &tour, "climb-opaque");
-            } else if tour.frames == 1 + 2 * PIN_FRAMES {
+            } else if tour.frames == 1 + 3 * PIN_FRAMES {
                 tour.pin = None;
                 log_flight("low climb shots", &fly, region.as_deref(), &time);
                 tour.step = Step::LowAfter;

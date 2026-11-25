@@ -321,6 +321,8 @@ pub struct NavInputs {
     pub region_fly: Option<(RenderDir, DVec3)>,
     /// The cloud density navigation raised last frame: what the frame before this one drew.
     pub shown_density: f32,
+    /// The height of `max(ground, sea)` under the region's fly in the terrain drawn.
+    pub region_ground_m: f32,
 }
 
 /// What [`step_nav`] asks the shell to do.
@@ -643,8 +645,9 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
                 }
                 out_over_globe
             } else {
+                // At the M2 speed for its height above the ground drawn.
                 actions.push(NavAction::EaseFly {
-                    vertical_mps: fly_speed(i.region_height_m),
+                    vertical_mps: fly_speed(i.region_height_m - i.region_ground_m),
                 });
                 NavPhase::Climbing { elapsed_s, centre }
             }

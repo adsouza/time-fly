@@ -79,10 +79,10 @@ pub const TILT_SHIFT_EASE: f32 = 0.1;
 /// climbing out) no longer keeps the full-screen pass running. Applied once, in
 /// [`update_cloud`], for every source.
 pub const CLEAR_BELOW: f32 = 1.0 / 1024.0;
-/// From this density the cloud is opaque (`step(0.999, density)` in `cloud.wesl`).
+/// From this density every pixel of the cloud is opaque (its alpha in `cloud.wesl`).
 pub const OPAQUE_FROM: f32 = 0.999;
-/// While opaque, the cloud covers everything but a disc around the fly this many of its body
-/// lengths in radius, where it sits just past the fly so the fly stays in front.
+/// The cloud draws over everything but a disc around the fly this many of its body lengths in
+/// radius, where it sits just past the fly so the fly stays in front.
 pub const HOLE_FLY_LENGTHS: f32 = 1.0;
 /// On the globe the cloud takes the era's sky with no biome haze (temperate broadleaf has none).
 pub const GLOBE_TINT_BIOME: BiomeClass = BiomeClass::TemperateBroadleaf;
@@ -309,28 +309,24 @@ pub fn fly_hole(
     Vec4::new(ndc.x, ndc.y, radius, depth + fly.scale)
 }
 
-/// Whether the cloud draws over ground at `ground_view_depth` seen through `ndc`, at `density`
-/// (the depth rule `cloud.wesl` applies): below [`OPAQUE_FROM`] the cloud sits at
-/// `cloud_view_depth` and covers what lies beyond it; from there on it covers everything but the
-/// fly's `hole` ([`fly_hole`]), where it sits just past the fly. `aspect` is the view's width
-/// over its height.
+/// Whether the cloud draws over ground at `ground_view_depth` seen through `ndc` at `density`
+/// (the depth rule `cloud.wesl` applies): at any visible density ([`CLEAR_BELOW`] up) it draws
+/// over everything but the fly's `hole` ([`fly_hole`]), where it sits just past the fly, so
+/// near ground is veiled from the first wisp, never left sharp in front of the cloud until it
+/// turns opaque (fix round 2). `aspect` is the view's width over its height.
 pub fn cloud_covers(
     ndc: Vec2,
     ground_view_depth: f32,
     density: f32,
-    cloud_view_depth: f32,
     hole: Vec4,
     aspect: f32,
 ) -> bool {
     if density < CLEAR_BELOW {
         return false;
     }
-    if density >= OPAQUE_FROM {
-        let from_fly = (ndc - hole.xy()) * Vec2::new(aspect, 1.0);
-        let in_hole = hole.z > 0.0 && from_fly.length() <= hole.z;
-        return !in_hole || ground_view_depth >= hole.w;
-    }
-    ground_view_depth >= cloud_view_depth
+    let from_fly = (ndc - hole.xy()) * Vec2::new(aspect, 1.0);
+    let in_hole = hole.z > 0.0 && from_fly.length() <= hole.z;
+    !in_hole || ground_view_depth >= hole.w
 }
 
 /// The tilt-shift amount at `density`: 1 between [`TILT_SHIFT_FROM`] and [`TILT_SHIFT_TO`],
@@ -795,14 +791,15 @@ mod tests {
         rays
     }
 
-    /// Fix round 1, important 2: at full density the cloud covers every piece of ground on
-    /// screen except what lies right behind the fly. Before, it sat at 1.2 × the eye-to-fly
-    /// distance, so a ridge nearer than that (a low `Backspace` climb in the mountains) showed
-    /// through the "opaque" cloud on the frames before the swap, then vanished at it. Checked
-    /// for a ridge ahead and a valley wall beside a fly 150 m to 1 km up, and over the globe at
-    /// every swap altitude from 600 to 1,200 km.
+    /// Fix rounds 1 and 2, important 2: at every density the cloud draws over every piece of
+    /// ground on screen except what lies right behind the fly. Before, it sat at 1.2 × the
+    /// eye-to-fly distance, so a ridge nearer than that (a low `Backspace` climb in the
+    /// mountains) stayed sharp in front of the gathering cloud and vanished only when it turned
+    /// opaque: a visible cut. Checked at every frame's density of a 60 fps gather and a few
+    /// more, for a ridge ahead and a valley wall beside a fly 150 m to 1 km up, and over the
+    /// globe at every swap altitude from 600 to 1,200 km.
     #[test]
-    fn an_opaque_cloud_covers_everything_but_the_fly() {
+    fn the_cloud_covers_everything_but_the_fly_at_every_density() {
         use crate::fly_camera::{FlyState, region_chase_pose};
         use bevy::camera::CameraProjection;
         use timefly_core::flight::chase::globe_chase_pose;
@@ -810,6 +807,11 @@ mod tests {
         let aspect = 16.0 / 9.0;
         let mut failures = Vec::new();
         let mut hazard = 0;
+        let mut densities: Vec<f32> = (1..=36)
+            .map(|k| crate::region::navigate::gather_density(k as f32 / 60.0))
+            .collect();
+        densities.extend([0.05, 0.3, 0.5, 0.9]);
+        let densities = &densities;
         let mut check = |what: String,
                          t: Transform,
                          p: PerspectiveProjection,
@@ -830,10 +832,12 @@ mod tests {
                 };
                 let z = (hit - t.translation).dot(forward);
                 hazard += usize::from(z < cloud);
-                if !cloud_covers(ndc, z, 1.0, cloud, hole, aspect) {
-                    failures.push(format!(
-                        "{what}: ground at {z} through {ndc} (cloud {cloud}, hole {hole})"
-                    ));
+                for &density in densities {
+                    if !cloud_covers(ndc, z, density, hole, aspect) {
+                        failures.push(format!(
+                            "{what}, density {density}: ground at {z} through {ndc} (cloud {cloud}, hole {hole})"
+                        ));
+                    }
                 }
             }
         };
@@ -897,7 +901,6 @@ mod tests {
                 ..default()
             };
             let hole = fly_hole(&t, p.get_clip_from_view(), &pose, p.fov, p.near);
-            let cloud = fly_view_depth(eye, &pose, p.fov, p.near);
             for (ndc, dir) in view_rays(&t, &p) {
                 // The near intersection with the sphere.
                 let b = eye.dot(dir);
@@ -906,8 +909,12 @@ mod tests {
                     continue;
                 }
                 let z = (dir * (-b - disc.sqrt())).dot(t.forward().as_vec3());
-                if !cloud_covers(ndc, z, 1.0, cloud, hole, aspect) {
-                    failures.push(format!("globe {alt} km: ground at {z} through {ndc}"));
+                for &density in densities {
+                    if !cloud_covers(ndc, z, density, hole, aspect) {
+                        failures.push(format!(
+                            "globe {alt} km, density {density}: ground at {z} through {ndc}"
+                        ));
+                    }
                 }
             }
         }
@@ -953,13 +960,14 @@ mod tests {
         assert!((hole.w - (z_fly + pose.scale)).abs() < 1e-3, "{hole}");
         // Inside, ground just past the fly is covered and the fly is not; outside, everything is.
         let a = 16.0 / 9.0;
-        assert!(cloud_covers(hole.xy(), hole.w + 1.0, 1.0, 480.0, hole, a));
-        assert!(!cloud_covers(hole.xy(), z_fly, 1.0, 480.0, hole, a));
+        assert!(cloud_covers(hole.xy(), hole.w + 1.0, 1.0, hole, a));
+        assert!(!cloud_covers(hole.xy(), z_fly, 1.0, hole, a));
         let outside = hole.xy() + Vec2::new(0.0, 3.0 * hole.z);
-        assert!(cloud_covers(outside, 2.0, 1.0, 480.0, hole, a));
-        // Below full density, the depth rule is as before: beyond the cloud's depth only.
-        assert!(!cloud_covers(outside, 2.0, 0.9, 480.0, hole, a));
-        assert!(cloud_covers(outside, 481.0, 0.9, 480.0, hole, a));
+        assert!(cloud_covers(outside, 2.0, 1.0, hole, a));
+        // Below full density too: the hole's rule at every density above the floor.
+        assert!(cloud_covers(outside, 2.0, 0.5, hole, a));
+        assert!(!cloud_covers(hole.xy(), z_fly, 0.5, hole, a));
+        assert!(!cloud_covers(outside, 2.0, CLEAR_BELOW * 0.5, hole, a));
         // A pose that is not this camera's: no hole, the opaque cloud covers the fly too.
         let stale = FlyPose {
             translation: Vec3::new(0.0, 0.0, 7_500.0),
@@ -970,17 +978,19 @@ mod tests {
             fly_hole(&eye, p.get_clip_from_view(), &stale, fov, 1.0),
             Vec4::ZERO
         );
-        assert!(cloud_covers(hole.xy(), z_fly, 1.0, 480.0, Vec4::ZERO, a));
+        assert!(cloud_covers(hole.xy(), z_fly, 1.0, Vec4::ZERO, a));
     }
 
     #[test]
     fn the_shader_covers_everything_at_full_density() {
         let wesl = include_str!("../assets/shaders/cloud.wesl");
         // Fully opaque at density 1, whatever the noise says.
-        assert!(wesl.contains("max(alpha, step(0.999, density))"));
+        assert!(wesl.contains("alpha = max(alpha, step(OPAQUE_FROM, density));"));
         // Placed at the fly's view depth, under it; several octaves of the shared noise.
         assert!(wesl.contains("vec4<f32>(0.0, 0.0, -cloud.state.y, 1.0)"));
-        // Opaque, it covers everything (the near plane) but the fly's hole (`cloud_covers`).
+        // At any density, it draws over everything (the near plane) but the fly's hole
+        // (`cloud_covers`).
+        assert!(wesl.contains("if cloud.state.x > 0.0 {"));
         assert!(wesl.contains("@builtin(frag_depth) depth: f32"));
         assert!(wesl.contains("const OPAQUE_FROM: f32 = 0.999;"));
         assert_eq!(OPAQUE_FROM, 0.999);

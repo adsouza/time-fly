@@ -382,6 +382,7 @@ fn inputs() -> NavInputs {
         region_height_m: 8_000.0,
         region_fly: None,
         shown_density: 0.0,
+        region_ground_m: 0.0,
     }
 }
 
@@ -932,6 +933,28 @@ fn climbing_out_never_thins_the_cloud() {
         (i.climb_key, i.time_change) = (false, None);
         climb_out(next, &mut i);
     }
+}
+
+/// Fix round 2: the climb out rises at the M2 speed for the fly's height above the ground
+/// drawn, so over a 4,400 m plateau it climbs as it would 500 m over the sea, not ten times
+/// faster.
+#[test]
+fn the_climb_rises_by_the_height_above_the_ground() {
+    let centre = RenderDir(DVec3::new(0.6, 0.0, 0.8));
+    let climbing = NavPhase::Climbing {
+        elapsed_s: 0.0,
+        centre: Some(centre),
+    };
+    let speed = |ground_m: f32| {
+        let i = NavInputs {
+            region_height_m: ground_m + 500.0,
+            region_ground_m: ground_m,
+            ..region_fly(centre, 0.0)
+        };
+        ease(&step_nav(climbing, &i).1).expect("climbing")
+    };
+    assert_eq!(speed(0.0), fly_speed(500.0));
+    assert_eq!(speed(4_400.0), speed(0.0));
 }
 
 /// Fix round 1, minor 1: the dive swaps only after a frame drawn opaque. A boosted descent that
