@@ -27,8 +27,8 @@
 //!   [`CAPTION_DELAY_S`], or a hop has held at full cover for its neighbour that long
 //!   ([`NavPhase::hop_hold_s`]).
 //! - **"terrain detail unavailable here"** ([`FALLBACK_NOTICE_TEXT`]) shows for
-//!   [`FALLBACK_NOTICE_S`] after a region appears (`RegionEntered` or `RegionSnapshotChanged`)
-//!   whose `RegionGenerated` says it fell back (a tile it needs is missing or corrupt, so part of
+//!   [`FALLBACK_NOTICE_S`] after a region appears (`RegionEntered`, a hop's swap included, or
+//!   `RegionSnapshotChanged`) that fell back (a tile it needs is missing or corrupt, so part of
 //!   it uses globe-resolution data; the job logged a `warn`).
 //!
 //! **Only one world draws at a time**: `TerrainSettings::visible` follows
@@ -523,11 +523,13 @@ fn navigate(
     nav.slider = slider;
 
     // Gather.
-    let entered = events.0.read().count() > 0;
+    // The last region entered, and whether it fell back.
+    let entered_fallback = events.0.read().last().map(|e| e.fallback);
+    let entered = entered_fallback.is_some();
     let generated = events.1.read().last().copied();
     let changed = events.2.read().count() > 0;
     let flight = flies.flight.0;
-    let pending = world.pending.as_deref().and_then(|p| p.0.as_ref());
+    let pending = world.pending.as_deref().and_then(|p| p.region.as_ref());
     let xz = Vec2::new(p.x, p.z);
     let measured = match nav.last_fly_m {
         Some(last) if dt_s > 0.0 => Some((xz - last) / dt_s),
@@ -593,7 +595,10 @@ fn navigate(
         (RegionState::Generating, since) => since,
         _ => None,
     };
-    let appeared = (entered || changed).then(|| generated.is_some_and(|g| g.fallback));
+    // A region that appeared: entered (a hop's swap included, whose `RegionGenerated` came at
+    // the preload) or changed snapshot.
+    let appeared =
+        entered_fallback.or_else(|| changed.then(|| generated.is_some_and(|g| g.fallback)));
     nav.fallback_since = fallback_since(nav.fallback_since, appeared, now_s);
 
     // Decide.

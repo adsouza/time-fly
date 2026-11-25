@@ -391,7 +391,7 @@ fn neighbour(app: &mut App, lat: f64, lon: f64) {
 }
 
 fn pending(app: &App) -> Option<ActiveRegion> {
-    app.world().resource::<PendingRegion>().0.clone()
+    app.world().resource::<PendingRegion>().region.clone()
 }
 
 /// Updates until the neighbour is ready in [`PendingRegion`].

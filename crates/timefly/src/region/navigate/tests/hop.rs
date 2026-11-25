@@ -748,6 +748,8 @@ fn the_lift_takes_the_vertical_controls_and_the_hold_slows_the_fly() {
 struct FakeNeighbours {
     after: u32,
     fail: bool,
+    /// The neighbours it makes fell back (a tile they need missing).
+    fallback: bool,
     pending: Option<(RegionRequested, u32)>,
     made: Vec<std::sync::Weak<RegionGrid>>,
 }
@@ -761,10 +763,10 @@ fn fake_neighbours(
 ) {
     if cancelled.read().count() > 0 {
         job.pending = None;
-        pending.0 = None;
+        pending.region = None;
     }
     for r in requests.read() {
-        pending.0 = None;
+        pending.region = None;
         job.pending = (r.purpose == RequestPurpose::Neighbour).then_some((*r, job.after));
     }
     let fail = job.fail;
@@ -785,12 +787,13 @@ fn fake_neighbours(
     }
     let g = grid(r.era_dir, r.snapshot, HOP_GROUND_M);
     job.made.push(Arc::downgrade(&g));
-    pending.0 = Some(ActiveRegion {
+    pending.region = Some(ActiveRegion {
         frame: RegionFrame {
             center: g.spec.center,
         },
         grid: g,
     });
+    pending.fallback = job.fallback;
 }
 
 /// The worlds app with the stand-in neighbour job, flying in the Alps' region at the present
@@ -801,6 +804,7 @@ fn hop_app(after: u32, fail: bool, x_m: f32) -> (App, std::sync::Weak<RegionGrid
     app.insert_resource(FakeNeighbours {
         after,
         fail,
+        fallback: false,
         pending: None,
         made: Vec::new(),
     })
@@ -873,7 +877,7 @@ fn the_hop_swaps_worlds_under_the_cloud() {
         new,
         YearsBp(0.0)
     ));
-    assert!(app.world().resource::<PendingRegion>().0.is_none());
+    assert!(app.world().resource::<PendingRegion>().region.is_none());
     assert_eq!(app.world().resource::<Seen>().left, 0);
     // Then the cloud clears.
     let flying = first(&frames, swap, |p| *p == NavPhase::Flying);
@@ -945,6 +949,45 @@ fn a_long_hop_hold_shows_the_caption() {
         "{seen:?}"
     );
     assert_eq!(phase(&app), NavPhase::Flying);
+}
+
+/// The final review: a neighbour with missing tiles falls back without a word (only timeouts
+/// fail a neighbour), and its `RegionGenerated` came at the preload, so the fallback notice
+/// never showed after a hop. The swap's `RegionEntered` carries the fallback, and the notice
+/// shows once the neighbour is on screen; a neighbour that did not fall back shows none.
+#[test]
+fn a_fallback_neighbour_shows_the_notice_after_the_swap() {
+    for fallback in [true, false] {
+        let (mut app, _) = hop_app(5, false, EDGE_M - 10_000.0);
+        app.world_mut().resource_mut::<FakeNeighbours>().fallback = fallback;
+        let shown = |app: &mut App| {
+            let world = app.world_mut();
+            let mut q = world.query_filtered::<&Node, With<FallbackNotice>>();
+            q.single(world).unwrap().display == Display::Flex
+        };
+        let mut before_swap = false;
+        for _ in 0..600 {
+            app.update();
+            if swapped(&phase(&app)) {
+                break;
+            }
+            before_swap |= shown(&mut app);
+        }
+        assert!(swapped(&phase(&app)), "never swapped");
+        assert!(!before_swap, "shown before the swap");
+        // Within a frame or two of the swap, and for FALLBACK_NOTICE_S.
+        let mut frames = Vec::new();
+        for _ in 0..((FALLBACK_NOTICE_S + 1.0) / STEP.as_secs_f64()) as usize {
+            app.update();
+            frames.push(shown(&mut app));
+        }
+        if fallback {
+            assert!(frames[..2].iter().any(|&s| s), "{frames:?}");
+            assert!(!frames.last().unwrap(), "{frames:?}");
+        } else {
+            assert!(frames.iter().all(|&s| !s), "{frames:?}");
+        }
+    }
 }
 
 /// Point 6: from the preload to the swap at most two grids live, with the terrain scene drawing;

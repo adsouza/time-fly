@@ -125,7 +125,12 @@ pub struct RegionRequested {
 /// newer neighbour request and any enter or snapshot request, so a stale neighbour is never
 /// promoted and no grid outlives its use.
 #[derive(Resource, Clone, Debug, Default)]
-pub struct PendingRegion(pub Option<ActiveRegion>);
+pub struct PendingRegion {
+    pub region: Option<ActiveRegion>,
+    /// Whether the ready neighbour fell back (its [`RegionGenerated::fallback`]): the swap's
+    /// [`RegionEntered`] carries it, so the notice starts at the swap, not at the preload.
+    pub fallback: bool,
+}
 
 /// Drops the neighbour: the [`RequestPurpose::Neighbour`] job in flight and a ready
 /// [`PendingRegion`]. [`ActiveRegion`] and [`RegionState`] are untouched; an enter or snapshot
@@ -165,10 +170,14 @@ pub struct RegionGenerated {
 }
 
 /// Domain event: the player entered a region from the globe (or from a region at the same
-/// snapshot). Sent with [`RegionGenerated`], when [`ActiveRegion`] is inserted.
+/// snapshot), sent with [`RegionGenerated`] when [`ActiveRegion`] is inserted; or a hop's
+/// neighbour was promoted ([`RegionSwapRequested`]). `fallback` is the region's
+/// [`RegionGenerated::fallback`] (for a neighbour, sent at its preload and carried in
+/// [`PendingRegion`]).
 #[derive(Message, Copy, Clone, Debug, PartialEq)]
 pub struct RegionEntered {
     pub spec: RegionSpec,
+    pub fallback: bool,
 }
 
 /// Leaving the region, written by whoever leaves (Task 9's `Backspace`, once the view is back on

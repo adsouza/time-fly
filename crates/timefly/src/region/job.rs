@@ -244,7 +244,7 @@ pub(super) fn leave_region(
     commands.remove_resource::<ActiveRegion>();
     // Any job: an enter or snapshot one, or a neighbour's. A ready neighbour goes too.
     commands.remove_resource::<RegionJob>();
-    pending.0 = None;
+    pending.region = None;
     next.set_if_different(RegionState::Globe);
 }
 
@@ -262,7 +262,7 @@ pub(super) fn cancel_preload(
     if job.is_some_and(|j| j.purpose == RequestPurpose::Neighbour) {
         commands.remove_resource::<RegionJob>();
     }
-    pending.0 = None;
+    pending.region = None;
 }
 
 /// [`RegionSwapRequested`]: promotes the pending neighbour to the active region in this frame
@@ -277,12 +277,13 @@ pub(super) fn swap_region(
     if swaps.read().count() == 0 {
         return;
     }
-    let Some(region) = pending.0.take() else {
+    let Some(region) = pending.region.take() else {
         warn!("a region swap was requested with no neighbour ready; ignored");
         return;
     };
     entered.write(RegionEntered {
         spec: region.grid.spec,
+        fallback: pending.fallback,
     });
     commands.insert_resource(region);
     next.set_if_different(RegionState::InRegion);
@@ -374,7 +375,7 @@ pub(super) fn start_region_request(
         return;
     };
     // A new job supersedes any ready neighbour, which may be at another snapshot.
-    pending.0 = None;
+    pending.region = None;
     if matches!(index.manifest, ManifestState::Idle) {
         index.manifest = ManifestState::Loading(Loading {
             handle: server.load(TILE_MANIFEST_PATH),
@@ -902,7 +903,8 @@ pub(super) fn poll_generation(
     };
     if purpose == RequestPurpose::Neighbour {
         // The neighbour waits for a `RegionSwapRequested`; the region and state stay.
-        pending.0 = Some(region);
+        pending.region = Some(region);
+        pending.fallback = *fallback;
     } else {
         commands.insert_resource(region);
     }
@@ -927,7 +929,10 @@ pub(super) fn poll_generation(
             });
         }
         None => {
-            entered.write(RegionEntered { spec });
+            entered.write(RegionEntered {
+                spec,
+                fallback: *fallback,
+            });
         }
     }
     commands.remove_resource::<RegionJob>();

@@ -169,7 +169,7 @@ fn sample_frame(
         .filter(|&b| b >= FIELD_BYTES)
         .fold((0usize, 0u64), |(n, sum), b| (n + 1, sum + b));
     let gpu = gpu.0.lock().map(|g| *g).unwrap_or_default();
-    let neighbour = pending.as_ref().and_then(|p| p.0.as_ref());
+    let neighbour = pending.as_ref().and_then(|p| p.region.as_ref());
     trace!(
         target: TARGET,
         frame = frame.0,

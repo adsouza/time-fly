@@ -1826,8 +1826,10 @@ fn enter(app: &mut App, grid: &Arc<RegionGrid>) {
     app.world_mut()
         .resource_mut::<NextState<RegionState>>()
         .set(RegionState::InRegion);
-    app.world_mut()
-        .write_message(RegionEntered { spec: grid.spec });
+    app.world_mut().write_message(RegionEntered {
+        spec: grid.spec,
+        fallback: false,
+    });
     for _ in 0..40 {
         app.update();
         let nav = phase(app);
