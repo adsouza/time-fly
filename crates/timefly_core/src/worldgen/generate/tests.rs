@@ -1141,7 +1141,9 @@ mod water {
     use crate::hydrology::climate::ZonalClimate;
     use crate::hydrology::climate::tests::shipped_table;
     use crate::hydrology::params::{NO_WATER_DROP_M, RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M};
-    use crate::hydrology::{CubeLattice, Down, EraHydrology, HydroPrep, NodeSample, NodeSource};
+    use crate::hydrology::{
+        CubeLattice, Down, EraHydrology, HydroGraph, HydroPrep, NodeSample, NodeSource,
+    };
     use crate::terrain::blended_water;
     use crate::worldgen::frame::EARTH_RADIUS_M;
     use crate::worldgen::generate::rivers::{RegionRivers, chord_point};
@@ -2035,18 +2037,19 @@ mod water {
     #[test]
     fn the_sea_band_covers_every_shoreline() {
         // An east-west coast along the equator at the PosX face centre (land north), with
-        // bays and headlands 10-20 km across reaching 25 km in, on a 66 km lattice: much of
-        // the shoreline is water in cells whose four lattice taps are land.
+        // bays and headlands 2-5 km across reaching 8 km in, on the recent lattice (n = 900,
+        // about 11 km here): much of the shoreline is water in cells whose four lattice taps
+        // are land.
         let coast = RenderDir(DVec3::X);
-        let lattice = CubeLattice { n: 150 };
-        // The mean coast 8 km south of a row of lattice nodes, so bays reach past that row
+        let lattice = CubeLattice { n: 900 };
+        // The mean coast 3 km south of a row of lattice nodes, so bays reach past that row
         // into cells whose four taps are land.
         let row_m = north_m(lattice.dir(lattice.nearest(coast)).0);
         let shore = move |d: RenderDir| {
             let east = along_m(d.0);
-            let wobble = 16_000.0 * (east / 4_000.0).sin() + 9_000.0 * (east / 1_700.0 + 1.0).sin();
+            let wobble = 5_000.0 * (east / 900.0).sin() + 3_000.0 * (east / 430.0 + 1.0).sin();
             // Metres north of the coastline, lightly sloped.
-            let north = north_m(d.0) - (row_m - 8_000.0) - wobble;
+            let north = north_m(d.0) - (row_m - 3_000.0) - wobble;
             if north > 0.0 {
                 0.004 * north + 2.0
             } else {
@@ -2059,7 +2062,7 @@ mod water {
             spacing_m: 1852.0,
             koppen: Some(26),
         };
-        let spec = spec_at(coast, 0.0, 257, 33);
+        let spec = spec_at(coast, 0.0, 513, 33);
         let g = RegionGenerator::new(spec, &field, Some(&hydro));
         let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
         let frame = spec.frame();
@@ -2098,6 +2101,116 @@ mod water {
         assert!(
             mixed > 500 && sub_cell >= 10,
             "{mixed} mixed, {sub_cell} sub-cell"
+        );
+    }
+
+    /// Review fix (round 2): on the deep lattice (n = 180, 51 km spacing) the pass's strait
+    /// reach is one step, so a below-sea basin two steps from the ocean is inland. Texels in the
+    /// cell between the coastal land row and the basin row must not get the sea from the ocean
+    /// node beyond the coastal row.
+    #[test]
+    fn a_basin_two_deep_steps_inland_is_not_sea() {
+        let lattice = CubeLattice { n: 180 };
+        // An island in the dry band (22° N) on the PosX face, rows -1 to 3 and 41 columns: a
+        // coastal land row, the basin row (17 columns at -300 m, two steps from the ocean),
+        // a rim, and rows draining north to the ocean, so the basin's catchment is its own rim
+        // and it stays a terminal (dry or low) basin.
+        let centre = lattice.nearest(dir(22.0, 90.0));
+        let (face, c_col, c_row) = lattice.face_col_row(centre);
+        assert_eq!(face, CubeFace::PosX);
+        let north_row = |r: u32| north_m(lattice.dir(lattice.node(face, c_col, r)).0);
+        let step: i64 = if north_row(c_row + 1) > north_row(c_row) {
+            1
+        } else {
+            -1
+        };
+        let k_of = |v: u32| {
+            let (f, col, row) = lattice.face_col_row(v);
+            (
+                f,
+                (i64::from(row) - i64::from(c_row)) * step,
+                i64::from(col) - i64::from(c_col),
+            )
+        };
+        let node_e = move |v: u32| -> f64 {
+            match k_of(v) {
+                (f, _, _) if f != CubeFace::PosX => -200.0,
+                (_, k, c) if !(-1..=3).contains(&k) || c.abs() > 20 => -200.0,
+                (_, -1, _) => 50.0,
+                (_, 0, c) if c.abs() <= 8 => -300.0,
+                (_, 0, _) | (_, 1, _) => 60.0,
+                (_, 2, _) => 40.0,
+                _ => 20.0,
+            }
+        };
+        let land = move |d: RenderDir| {
+            lattice
+                .taps(d)
+                .iter()
+                .map(|&(v, w)| w * node_e(v))
+                .sum::<f64>()
+        };
+        let hydro = pass_over(lattice.n, land);
+        let basin = centre;
+        let row_node = |k: i64| {
+            lattice.node(
+                face,
+                c_col,
+                u32::try_from(i64::from(c_row) + k * step).unwrap(),
+            )
+        };
+        assert!(!hydro.is_ocean(basin), "the basin is inland");
+        assert!(!hydro.is_ocean(row_node(-1)), "the coastal row is land");
+        assert!(hydro.is_ocean(row_node(-2)), "the ocean row");
+        // The basin's lake, if any, is below sea level: where the sea would outrank it.
+        assert!(
+            hydro.lakes.iter().all(|l| l.level_m < 0.0),
+            "{:?}",
+            hydro.lakes
+        );
+        let field = FnField {
+            f: land,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        // Centred on the cell between the coastal row and the basin.
+        let mid = RenderDir((lattice.dir(row_node(-1)).0 + lattice.dir(basin).0).normalize());
+        let spec = spec_at(mid, 0.0, 129, 513);
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let bare = RegionGenerator::new(spec, &field, None).finish();
+        let frame = spec.frame();
+        let f = &grid.inner;
+        let (mut inland_below, mut old_rule_sea) = (0, 0);
+        for row in 0..f.res {
+            for col in 0..f.res {
+                let (x, z) = f.local_of(row, col);
+                let d = frame.local_to_dir(x, z);
+                if hydro.ocean_tap(d) {
+                    continue;
+                }
+                let i = (row * f.res + col) as usize;
+                if bare.inner.water_level_m[i] != 0.0 {
+                    continue;
+                }
+                inland_below += 1;
+                // The hazard: an ocean node among the taps' neighbours.
+                let near = lattice.taps(d).iter().any(|&(v, _)| {
+                    lattice
+                        .neighbours(v)
+                        .iter()
+                        .flatten()
+                        .any(|&u| hydro.is_ocean(u))
+                });
+                old_rule_sea += usize::from(near);
+                assert_ne!(
+                    f.water_level_m[i], 0.0,
+                    "({row}, {col}) is sea over the basin"
+                );
+            }
+        }
+        assert!(
+            inland_below > 50 && old_rule_sea > 50,
+            "{inland_below} inland texels below sea level, {old_rule_sea} by the taps' neighbours"
         );
     }
 
@@ -2517,6 +2630,57 @@ mod water {
                 .sub_segments()
                 .filter(|(a, b)| len(a.dir, b.dir) > 2.0 * SUBPOINT_M && a.half_width_m >= 91.0)
                 .count();
+            // Where along their segments the long sub-segments sit.
+            {
+                let rr = g.rivers(FieldKind::Inner).unwrap();
+                let mut max_k: std::collections::HashMap<u32, u32> = Default::default();
+                for sp in rr.subpoints() {
+                    let e = max_k.entry(sp.river).or_insert(0);
+                    *e = (*e).max(sp.k);
+                }
+                let (mut near_start, mut near_end, mut middle, mut jumps) = (0, 0, 0, 0);
+                let mut longest_by = [0.0f64; 3];
+                for (a, b) in rr.sub_segments() {
+                    if len(a.dir, b.dir) <= 2.0 * SUBPOINT_M {
+                        continue;
+                    }
+                    let l = len(a.dir, b.dir);
+                    if a.k <= 3 {
+                        near_start += 1;
+                        longest_by[0] = longest_by[0].max(l);
+                    } else if a.k + 3 >= max_k[&a.river] {
+                        near_end += 1;
+                        longest_by[1] = longest_by[1].max(l);
+                    } else {
+                        middle += 1;
+                        longest_by[2] = longest_by[2].max(l);
+                    }
+                    // A middle leg that crosses the chord: the minimum switched sides.
+                    let n = &hydro.rivers.nodes()[a.river as usize];
+                    let (c0, c1) = (
+                        hydro.lattice.dir(n.node).0,
+                        hydro
+                            .lattice
+                            .dir(match n.down {
+                                crate::hydrology::Down::River(j) => {
+                                    hydro.rivers.nodes()[j as usize].node
+                                }
+                                crate::hydrology::Down::Ocean(v)
+                                | crate::hydrology::Down::Lake(_, v)
+                                | crate::hydrology::Down::Ice(v) => v,
+                            })
+                            .0,
+                    );
+                    let nrm = c0.cross(c1).normalize();
+                    jumps += usize::from(a.dir.dot(nrm).signum() != b.dir.dot(nrm).signum());
+                }
+                println!(
+                    "long legs: {near_start} within 3 sub-points of a start, {near_end} of an end, \
+                     {middle} mid-segment (longest {:.0} / {:.0} / {:.0} m); {jumps} cross the \
+                     coarse line",
+                    longest_by[0], longest_by[1], longest_by[2]
+                );
+            }
             let over = subs
                 .iter()
                 .filter(|s| len(s.0, s.1) > 1.5 * SUBPOINT_M)

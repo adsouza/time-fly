@@ -424,7 +424,11 @@ relax: each node → the lowest interior local minimum of floor_at on a 7 × 7 g
   / subpoint)), k = 0..K−1, plus k = K on a terminal segment. Each takes the lowest interior
   local minimum of its 13 samples across the chord between the relaxed nodes (not at either
   edge, strictly lower than both neighbours; ties: smaller |offset|, then the negative side), or
-  offset 0 when there is none; smoothed [1,2,1]/4 with the ends fixed. (Task 6 fix round 1: on
+  offset 0 when there is none. Next to an end whose node did not move (relaxed == lattice
+  direction, or an unrelaxed ocean/lake/ice end) the raw offsets taper linearly to 0 over 3
+  sub-points: sub-point k scaled by k/4 ((K − k)/4 at the far end; the smaller weight where both
+  apply), so a valley beside a pinned node is entered gradually (Task 6 fix round 2). Then
+  smoothed [1,2,1]/4 with the ends fixed. (Task 6 fix round 1: on
   a tilted plain the lowest sample is at the edge, and taking it made hairpins at every node.
   Nodes use row-or-column minima because a valley floor falls downstream, so it is never lower
   than all eight neighbours.)
@@ -502,7 +506,8 @@ lake = hydro.lake_tap(dir)
 h1 = if lake is Data: min(h0, L − 1 − DATA_LAKE_MAX_DEPTH_M × min(1, shore_steps / RAMP)) else h0
 rt = rivers[field].texel(dir, h1, texel_m);  h = rt.h_m   (written to elevation_m; surface uses h)
 candidates (level, ribbon, flow):
-  sea   if any corner < 0 and (no pass, or hydro.ocean_tap(dir)):  (0, RIBBON_NONE_M, 0)
+  sea   if any corner < 0 and (no pass, or hydro.ocean_tap(dir), or an ocean neighbour of a tap
+        within OCEAN_STRAIT_M of dir: Task 6's call and fix round 2):  (0, RIBBON_NONE_M, 0)
   lake  if lake:                                                    (L, RIBBON_NONE_M, 0)
   river if rt.hit with fade > 0:                                    (hit.level, hit.ribbon, hit.flow)
 water = the highest level (ties: lake, sea, river); none: (h − NO_WATER_DROP_M, RIBBON_NONE_M, 0)

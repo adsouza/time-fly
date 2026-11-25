@@ -34,7 +34,11 @@
 //!   Sub-point k (0 < k < K): the 13 samples at offsets ±C across the great circle between the
 //!   relaxed ends; its raw offset is the lowest interior local minimum (|j| ≤ 5, strictly
 //!   lower than samples j ± 1; ties: smaller |offset|, then the negative side, the right
-//!   bank), or 0 when there is none; offsets are smoothed [1, 2, 1] / 4 with the end offsets 0.
+//!   bank), or 0 when there is none. Next to an end whose node did not move (relaxed point ==
+//!   lattice direction, or an unrelaxed ocean, lake or ice end), the raw offsets taper linearly
+//!   to 0: sub-point k of the 3 nearest is scaled by k / 4 ((K − k) / 4 at the far end; the
+//!   smaller weight where both apply). Offsets are then smoothed [1, 2, 1] / 4 with the end
+//!   offsets 0.
 //!   On a plain or a slope the minimum lies at the search's edge, and taking it sent each
 //!   segment sideways out of its pinned node and back (hairpins); a real valley is an
 //!   interior minimum.
@@ -319,6 +323,31 @@ fn raw_offset(c: DVec3, normal: DVec3, corridor: f64, floor_at: &impl Fn(RenderD
     best.3
 }
 
+/// Sub-points next to an end whose node did not move over which the raw offsets taper to 0.
+const TAPER_SUBPOINTS: u32 = 3;
+
+/// Tapers the raw offsets `0..=K` linearly to 0 over the [`TAPER_SUBPOINTS`] sub-points next
+/// to each pinned end (a node that did not move): sub-point `k` of the first `TAPER_SUBPOINTS`
+/// is scaled by `k / (TAPER_SUBPOINTS + 1)`, likewise `K − k` at the far end, the smaller weight
+/// where both apply. A valley beside a pinned node is then entered gradually instead of in one
+/// smoothed sideways leg (Task 6 fix round 2).
+fn taper(raw: &mut [f64], start_pinned: bool, end_pinned: bool) {
+    let k_max = raw.len() - 1;
+    let span = f64::from(TAPER_SUBPOINTS + 1);
+    for (k, r) in raw.iter_mut().enumerate() {
+        let mut w: f64 = 1.0;
+        if start_pinned {
+            w = w.min(k as f64 / span);
+        }
+        if end_pinned {
+            w = w.min((k_max - k) as f64 / span);
+        }
+        if w < 1.0 {
+            *r *= w;
+        }
+    }
+}
+
 /// The relaxed points `0..=K` from the raw offsets (ends 0): smoothed [1, 2, 1] / 4.
 fn smoothed_points(p0: DVec3, p1: DVec3, normal: DVec3, raw: &[f64]) -> Vec<DVec3> {
     let k_max = (raw.len() - 1) as u32;
@@ -363,7 +392,7 @@ pub fn relaxed_centreline(
     let k_max = sub_count(lattice.distance_m(n.node, end), subpoint_m);
     let normal = chord_normal(p0, p1, c0, c1);
     let corridor = corridor_m(&lattice);
-    let raw: Vec<f64> = (0..=k_max)
+    let mut raw: Vec<f64> = (0..=k_max)
         .map(|k| {
             if k == 0 || k == k_max {
                 0.0
@@ -377,6 +406,7 @@ pub fn relaxed_centreline(
             }
         })
         .collect();
+    taper(&mut raw, p0 == c0, p1 == c1);
     smoothed_points(p0, p1, normal, &raw)
 }
 
@@ -884,6 +914,12 @@ impl<'a> RiverBuilder<'a> {
         if k + 1 < k_max {
             return false;
         }
+        let lattice = &self.hydro.lattice;
+        let (c0, c1) = (
+            lattice.dir(self.segs[s].start).0,
+            lattice.dir(self.segs[s].end).0,
+        );
+        taper(&mut self.segs[s].raw, p0 == c0, p1 == c1);
         let points = smoothed_points(p0, p1, normal, &self.segs[s].raw);
         let seg = &self.segs[s];
         let floor: Vec<f64> = (0..=seg.last_k())
@@ -1814,6 +1850,96 @@ mod tests {
             old_longest > 3.0 * SUBPOINT_M,
             "the old rule's longest leg {old_longest:.0} m"
         );
+    }
+
+    /// Fix round 2: a valley 3.6 km beside the coarse line, where sub-points find an interior
+    /// minimum (corridor reach 5C/6 = 3.4 km) but the nodes do not (2C/3 = 2.7 km, the border
+    /// sample at 4.1 km is lower). Without a taper the smoothed k = 1 point jumps 2.6 km out of
+    /// the pinned node; tapered over 3 sub-points, the river bends into the valley gradually.
+    #[test]
+    fn a_valley_beside_a_pinned_node_is_entered_gradually() {
+        let lat = CubeLattice { n: 900 };
+        let at = |col: u32| lat.node(CubeFace::PosX, col, 450);
+        let row_north = north_m(lat.dir(at(450)).0);
+        let cols: Vec<u32> = (420..=480).collect();
+        let hydro = river_hydro(
+            lat,
+            &[RiverChain {
+                nodes: cols.iter().map(|&c| at(c)).collect(),
+                q: vec![100.0; cols.len()],
+                bed: cols
+                    .iter()
+                    .map(|&c| (500.0 - 1e-3 * along_m(lat.dir(at(c)).0)) as f32)
+                    .collect(),
+                end: Down::Ocean(at(481)),
+            }],
+            vec![],
+        );
+        let axis = row_north + 3600.0;
+        let floor =
+            move |d: RenderDir| 400.0 - 1e-3 * along_m(d.0) + 0.05 * (north_m(d.0) - axis).abs();
+        // The hazard: the nodes stay put, and the untapered smoothing leaves them sideways.
+        for &c in &cols[..cols.len() - 1] {
+            assert_eq!(
+                relax_node(&lat, at(c), &floor),
+                lat.dir(at(c)).0,
+                "node {c} moved"
+            );
+        }
+        let rr = build_at(&hydro, lat.dir(at(450)), &floor, 997);
+        let rivers = by_river(&rr);
+        let (mut longest, mut old_longest, mut in_valley) = (0.0f64, 0.0f64, 0);
+        let mut same = 0;
+        for (&river, sps) in &rivers {
+            let pts = relaxed_centreline(&hydro, river, SUBPOINT_M, &floor);
+            // The builder's centreline is the published one, bit for bit (no meanders at 50 m).
+            for sp in sps {
+                assert_eq!(
+                    sp.dir.to_array().map(f64::to_bits),
+                    pts[sp.k as usize].to_array().map(f64::to_bits)
+                );
+                same += 1;
+            }
+            for w in pts.windows(2) {
+                longest = longest.max(metres_between(w[0], w[1]));
+            }
+            in_valley += pts
+                .iter()
+                .filter(|p| (north_m(**p) - axis).abs() < 300.0)
+                .count();
+            // The same corridor without the taper.
+            let n = &hydro.rivers.nodes()[river as usize];
+            let (c0, c1) = (
+                lat.dir(n.node).0,
+                lat.dir(end_node(n, hydro.rivers.nodes())).0,
+            );
+            let k_max = (pts.len() - 1) as u32;
+            let normal = chord_normal(c0, c1, c0, c1);
+            let raw: Vec<f64> = (0..=k_max)
+                .map(|k| {
+                    if k == 0 || k == k_max {
+                        0.0
+                    } else {
+                        raw_offset(
+                            chord_point(c0, c1, t_of(k, k_max)),
+                            normal,
+                            corridor_m(&lat),
+                            &floor,
+                        )
+                    }
+                })
+                .collect();
+            for w in smoothed_points(c0, c1, normal, &raw).windows(2) {
+                old_longest = old_longest.max(metres_between(w[0], w[1]));
+            }
+        }
+        assert!(
+            old_longest > 4.0 * SUBPOINT_M,
+            "untapered leg {old_longest:.0} m"
+        );
+        assert!(longest < 2.2 * SUBPOINT_M, "tapered leg {longest:.0} m");
+        assert!(in_valley > 300, "{in_valley} points on the valley axis");
+        assert!(same > 300, "{same} sub-points compared");
     }
 
     #[test]

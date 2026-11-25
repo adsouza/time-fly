@@ -11,8 +11,8 @@
 //!         (= min(h0, cap) wherever shore_steps ≥ 1; the depth fades in over the shore cell)
 //! rt    = rivers[field].texel(dir, h1, texel_m); h = rt.h_m   (the stored height)
 //! candidates (level, river texel):
-//!   sea   if any corner < 0 and (no pass, or an ocean node among the hydro taps and their
-//!         neighbours):                                   (0, RIVER_NONE)
+//!   sea   if any corner < 0 and (no pass, or an ocean node among the hydro taps, or a tap's
+//!         neighbour within OCEAN_STRAIT_M of dir):        (0, RIVER_NONE)
 //!   lake  if lake:                                       (L, RIVER_NONE)
 //!   river if rt.hit with fade > 0:                       (hit.level, [ribbon, flow_e, flow_n, offset])
 //! water = the highest level (ties: lake, sea, river), except that a river whose ribbon is ≤ 0
@@ -34,10 +34,10 @@ use super::rivers::{RegionRivers, RiverHit, across, chord_point, offset_point};
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
     BOULDER_RADIUS_M, BOULDERS_PER_SUBPOINT_MAX, DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M,
-    MAX_BOULDERS, NO_WATER_DROP_M, RIBBON_NONE_M,
+    MAX_BOULDERS, NO_WATER_DROP_M, OCEAN_STRAIT_M, RIBBON_NONE_M,
 };
 use crate::hydrology::{EraHydrology, HydroGraph, LakeKind, LakeTap};
-use crate::worldgen::frame::FrameBasis;
+use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis};
 use crate::worldgen::noise::hash3;
 
 /// The river texel of water that is not a river: `[RIBBON_NONE_M, 0, 0, 0]` as f16 bits.
@@ -85,23 +85,30 @@ pub(super) fn lake_bed_m(h0: f64, lake: Option<&LakeTap>) -> f64 {
     h0 - steps.min(1.0) * (h0 - cap).max(0.0)
 }
 
-/// Whether an ocean node is among the hydro lattice's four taps at `dir` or their neighbours.
-/// The taps alone miss coastal water narrower than a lattice cell (a bay, an estuary) whose
-/// cell has no ocean corner; inland basins below sea level lie farther from the ocean than one
-/// step, since below-sea water within [`OCEAN_STRAIT_M`] of it is ocean already.
+/// Whether an ocean node is among the hydro lattice's four taps at `dir`, or is a neighbour of
+/// one within [`OCEAN_STRAIT_M`] of `dir`. The taps alone miss coastal water narrower than a
+/// lattice cell (a bay, an estuary) whose cell has no ocean corner. The distance bound mirrors
+/// the pass's strait rule (below-sea water within `OCEAN_STRAIT_M` of the ocean is ocean), so it
+/// never reaches an inland basin the pass left inland: on the deep lattice (51 km spacing, a
+/// strait reach of one step) every neighbour of a tap is farther than that, and only the taps
+/// count; on the recent one (10 km) neighbours within 25 km do.
 ///
 /// [`OCEAN_STRAIT_M`]: crate::hydrology::params::OCEAN_STRAIT_M
 pub(super) fn ocean_near(hydro: &EraHydrology, dir: RenderDir) -> bool {
     let taps = hydro.lattice.taps(dir);
-    taps.iter().any(|&(v, _)| hydro.is_ocean(v))
-        || taps.iter().any(|&(v, _)| {
-            hydro
-                .lattice
-                .neighbours(v)
-                .iter()
-                .flatten()
-                .any(|&u| hydro.is_ocean(u))
-        })
+    if taps.iter().any(|&(v, _)| hydro.is_ocean(v)) {
+        return true;
+    }
+    let p = dir.0.normalize();
+    let reach = OCEAN_STRAIT_M / EARTH_RADIUS_M;
+    taps.iter().any(|&(v, _)| {
+        hydro
+            .lattice
+            .neighbours(v)
+            .iter()
+            .flatten()
+            .any(|&u| hydro.is_ocean(u) && p.angle_between(hydro.lattice.dir(u).0) <= reach)
+    })
 }
 
 /// A texel's water: its level and river texel.
