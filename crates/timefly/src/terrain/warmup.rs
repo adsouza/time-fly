@@ -30,11 +30,16 @@
 //! - **The cloud.** The transition cloud (`crate::cloud`) draws in the region camera too, at
 //!   density 0 here (it outputs nothing), so a snapshot change never waits on its pipeline
 //!   while the views must be covered.
+//! - **The dragonfly.** The region camera draws the fly (`crate::creature`), so a stand-in fly
+//!   (one `dragonfly_mesh`, drawn with the body's opaque material and the wings' blended one)
+//!   warms both of its pipelines; in Chrome they would otherwise compile through Tint on the
+//!   first region frame (the final review).
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::ecs::system::SystemParam;
+use bevy::light::NotShadowCaster;
 use bevy::math::DVec3;
 use bevy::mesh::MeshTag;
 use bevy::prelude::*;
@@ -50,12 +55,13 @@ use super::material::{TerrainMaterial, TerrainParams, palette_image, patch_insta
 use super::view::{REGION_SKY, region_camera_parts, region_sun, region_sun_parts};
 use super::{TerrainOptions, grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
 use crate::cloud::{CloudMaterial, CloudParams};
+use crate::creature::{DragonflyMaterial, body_material, dragonfly_mesh, wing_material};
 use crate::globe::{GlobeRenderStatus, RenderProbe};
 use crate::sky::{SkyMaterial, distance_fog, region_look, sky_params};
 use crate::water::{WaterMaterial, water_look, water_material};
 use tracing::instrument;
 
-/// The warm-up's render layer: its camera, sun, patch, sea and sky only.
+/// The warm-up's render layer: its camera, sun, patch, sea, sky, cloud and dragonfly only.
 pub const WARMUP_LAYER: usize = 5;
 /// Its camera's order: below every other camera (no other camera shares it).
 pub const WARMUP_CAMERA_ORDER: isize = -10;
@@ -187,6 +193,7 @@ struct WarmupAssets<'w> {
     water: ResMut<'w, Assets<WaterMaterial>>,
     sky: ResMut<'w, Assets<SkyMaterial>>,
     cloud: ResMut<'w, Assets<CloudMaterial>>,
+    fly: ResMut<'w, Assets<DragonflyMaterial>>,
 }
 
 /// Gathers the globe's status and the render probe, decides with [`warmup_action`], and
@@ -257,6 +264,7 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         water: water_m,
         sky: sky_m,
         cloud: cloud_m,
+        fly: fly_m,
     } = assets;
     let grid = warmup_grid();
     let settings = LodSettings::region();
@@ -295,6 +303,19 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
     let cloud = cloud_m.add(CloudMaterial {
         params: CloudParams::default(),
     });
+    // The fly's vertex layout (with the wing attribute) for both of its materials.
+    let fly_mesh = meshes.add(dragonfly_mesh());
+    let fly = |name: &'static str, material: Handle<DragonflyMaterial>| {
+        (
+            Name::new(name),
+            Mesh3d(fly_mesh.clone()),
+            MeshMaterial3d(material),
+            Transform::IDENTITY,
+            NoFrustumCulling,
+            NotShadowCaster,
+            layer.clone(),
+        )
+    };
     let drawn = |name: &'static str| {
         (
             Name::new(name),
@@ -344,6 +365,12 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         commands
             .spawn((drawn("Warm-up cloud"), MeshMaterial3d(cloud)))
             .id(),
+        commands
+            .spawn(fly("Warm-up dragonfly body", fly_m.add(body_material())))
+            .id(),
+        commands
+            .spawn(fly("Warm-up dragonfly wings", fly_m.add(wing_material())))
+            .id(),
         camera,
         sun,
     ];
@@ -361,6 +388,7 @@ mod tests {
 
     use super::*;
     use crate::cloud::CloudMaterial;
+    use crate::creature::{ATTRIBUTE_WING, DragonflyMaterial};
     use crate::terrain::view::RegionCamera;
 
     #[test]
@@ -445,12 +473,13 @@ mod tests {
             .init_asset::<WaterMaterial>()
             .init_asset::<SkyMaterial>()
             .init_asset::<CloudMaterial>()
+            .init_asset::<DragonflyMaterial>()
             .insert_resource(GlobeRenderStatus::LoadingData)
             .add_plugins(RegionWarmupPlugin);
         app
     }
 
-    fn asset_counts(app: &App) -> [usize; 7] {
+    fn asset_counts(app: &App) -> [usize; 8] {
         let w = app.world();
         [
             w.resource::<Assets<Image>>().len(),
@@ -460,6 +489,7 @@ mod tests {
             w.resource::<Assets<WaterMaterial>>().len(),
             w.resource::<Assets<SkyMaterial>>().len(),
             w.resource::<Assets<CloudMaterial>>().len(),
+            w.resource::<Assets<DragonflyMaterial>>().len(),
         ]
     }
 
@@ -469,17 +499,18 @@ mod tests {
         let mut app = warmup_app();
         app.update();
         assert!(app.world().get_resource::<RegionWarmup>().is_none());
-        assert_eq!(asset_counts(&app), [0; 7]);
+        assert_eq!(asset_counts(&app), [0; 8]);
 
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();
         let entities = app.world().resource::<RegionWarmup>().entities.clone();
-        assert_eq!(entities.len(), 6);
+        assert_eq!(entities.len(), 8);
         // Its camera has no clusters (ruling R28), without the app-wide observer.
         crate::clusters::assert_no_clusters(app.world_mut());
-        // Six textures (four fields, the palette, the 1 x 1 target), one mesh, one buffer, one
-        // of each material, the transition cloud's included (M3 Task 5).
-        assert_eq!(asset_counts(&app), [6, 1, 1, 1, 1, 1, 1]);
+        // Six textures (four fields, the palette, the 1 x 1 target), two meshes (the quad and
+        // the dragonfly), one buffer, one of each material, the transition cloud's included (M3
+        // Task 5), and the dragonfly's body and wing materials (final review).
+        assert_eq!(asset_counts(&app), [6, 2, 1, 1, 1, 1, 1, 2]);
         {
             let world = app.world_mut();
             // Everything on its own layer, none of it the region's camera or sun.
@@ -543,10 +574,44 @@ mod tests {
         for e in entities {
             assert!(app.world().get_entity(e).is_err());
         }
-        assert_eq!(asset_counts(&app), [0; 7]);
+        assert_eq!(asset_counts(&app), [0; 8]);
         // Never again.
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();
         assert!(app.world().get_resource::<RegionWarmup>().is_none());
+    }
+
+    /// The region camera draws the dragonfly too: its body (opaque) and wings (blended) must
+    /// not compile on the first region frame (final review).
+    #[test]
+    fn the_warm_up_draws_the_dragonfly() {
+        let mut app = warmup_app();
+        *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
+        app.update();
+        let entities = app.world().resource::<RegionWarmup>().entities.clone();
+        let world = app.world_mut();
+        let mut flies = world.query::<(Entity, &Mesh3d, &MeshMaterial3d<DragonflyMaterial>)>();
+        let flies: Vec<_> = flies
+            .iter(world)
+            .map(|(e, m, mat)| (e, m.0.clone(), mat.0.clone()))
+            .collect();
+        assert_eq!(flies.len(), 2, "a body and wings");
+        let materials = world.resource::<Assets<DragonflyMaterial>>();
+        let mut modes: Vec<_> = flies
+            .iter()
+            .map(|(_, _, mat)| materials.get(mat).unwrap().base.alpha_mode)
+            .collect();
+        modes.sort_by_key(|m| format!("{m:?}"));
+        assert_eq!(modes, [AlphaMode::Blend, AlphaMode::Opaque]);
+        let meshes = world.resource::<Assets<Mesh>>();
+        for (e, mesh, _) in &flies {
+            assert!(entities.contains(e));
+            // The real fly's vertex layout: the wing attribute the flap reads.
+            assert!(meshes.get(mesh).unwrap().contains_attribute(ATTRIBUTE_WING));
+            assert_eq!(
+                *world.get::<RenderLayers>(*e).unwrap(),
+                RenderLayers::layer(WARMUP_LAYER)
+            );
+        }
     }
 }
