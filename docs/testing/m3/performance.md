@@ -29,7 +29,7 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
 | `--region-bench` | PASS (exit 0) | **PASS** (exit 0) |
 | `--journey-bench` | FAIL (exit 3), hop memory only | **FAIL** (exit 3), **hop memory only** |
 | `--journey-bench` after the hop-memory work (`ec9293e`, gate +64 MiB; the Alps; 2560 × 1440 uncapped) | PASS (exit 0): hop memory worst +34.1 MiB | PASS (exit 0): hop memory worst +29.5 MiB |
-| `--journey-bench`, the owner's route set (`d3b38ff`; 2560 × 1440) | FAIL (exit 3): Pangaea's flight, uncapped p95 18.40 ms; hop memory worst **+48.0 MiB** | **PASS** (exit 0, display-paced): hop memory worst +30.2 MiB; every gate passes |
+| `--journey-bench`, the owner's route set (`d3b38ff`; 2560 × 1440) | FAIL (exit 3) as run: Pangaea's flight, uncapped p95 18.40 ms; hop memory worst **+48.0 MiB**. Re-judged under the fix-round rules (one pacing per run; Pangaea's flight reported only, owner 2026-11-25): **PASS** | **PASS** (exit 0, display-paced): hop memory worst +30.2 MiB; every gate passes; unchanged when re-judged |
 | Cloud pass cost (offscreen, 2560 × 1440; budget ≤ 1 ms) | about 1.8 ms with the tilt-shift | about 2.0–2.2 ms without it: over the 1 ms budget, **accepted by the owner** (2026-11-25) |
 
 **Hop memory: fixed in part, gate raised.** A per-frame memory trace found that most of the hop
@@ -193,7 +193,7 @@ result: FAIL
 | Hold per transition (native ≤ 3,000 ms) | dives 721, 540, 538 ms; hops and climbs 31–35 ms | dives 725, 538, 537 ms; hops and climbs 31–36 ms | PASS |
 | Flight outside the cloud (R14, display-paced) | 11,442 frames, 16.68 / 18.33 / 36.80 ms, 1 stall, 1 missed (0.01%) | 10,980 frames, 16.66 / 18.69 / 23.78 ms, 0 stalls, 0 missed | PASS |
 | Swap worst frame (native ≤ 100 ms) | worst 36.15 ms | worst 34.66 ms | PASS |
-| Hop memory peak (≤ baseline + 40 MiB) | worst **+43.3 MiB** | worst **+48.9 MiB** | **FAIL** at `4b79f08`; **PASS** after the lattice fix (`ec9293e`): worst +34.5 MiB judged, see below |
+| Hop memory peak (≤ baseline + 40 MiB) | worst **+43.3 MiB** | worst **+48.9 MiB** | **FAIL** at `4b79f08`; **PASS** after the lattice fix (`ec9293e`) and the +64 MiB gate: worst +29.5 MiB in the judged run, see below |
 | Journey memory cycles (≤ +10%) | 675.5, 719.9, 670.3 MiB: +6.6% | 666.1, 657.0, 657.5 MiB: −1.3% | PASS |
 
 - **Holds.** A dive holds 0.54–0.73 s at full cover natively: the region generates in about
@@ -409,8 +409,16 @@ reuse at all at the corner the parts would add up to about +77 MiB (lattice 35, 
 data 10, staging 10, textures net 12), over even +64; that needs the OS to reclaim the pages
 between the corner region's dive and its hop, which no run showed.
 
-**Flight is judged per route** (each route's frames under its own pacing rule, as the region
-bench judges each region, R14). Pooled, the route set's frames failed the uncapped p95 rule in
+**Flight is judged per route, under one pacing per run** (each route's frames, as the region
+bench judges each region, R14; the pacing rule is the run's, classified once from every flight
+frame pooled, so a heavy route whose own median sits near the interval can't flip itself into
+the lenient display-paced rule). **Pangaea's flight is reported, not gated** (owner, 2026-11-25:
+"Accept it"): its line still prints with its would-be verdict, marked "reported only", and
+the exit code ignores it; every other route's flight gates, and Pangaea's holds, swaps, hop
+memory and route checks stay gated. The runs below were judged by the first version, which
+classified each route on its own frames; re-judged under the final rules (exact: every input is
+in the summary), `o1` passes (its pooled pacing was uncapped and so was each route's; only
+Pangaea failed) and `o2` is unchanged (paced pooled and per route). Pooled, the route set's frames failed the uncapped p95 rule in
 `n1` and `n2` (16.96 and 16.87 ms) though the routes render very differently: from `n1`'s
 trace, Pangaea's median was 16.56 ms (p95 18.00), the Andes' 13.4–13.8, the Grand Canyon's 12.5,
 Fuji's 8.4. Per route, `o2` passed everywhere (display-paced, medians 16.67–16.68 ms); `o1`,
@@ -418,7 +426,10 @@ uncapped, failed on **Pangaea alone: p95 18.40 ms** (median 14.16), the other ro
 Pangaea's sand seas (the dunes) are the heaviest terrain at 2560 × 1440; the region bench passes
 it display-paced (p95 20.64 ms in `r1`), and Task 11's 1920 × 951 runs passed it. Whether the
 display paced a run changed between runs on this 4K monitor, so an uncapped run can fail on
-Pangaea. Not changed here: it's the terrain's cost, not the transitions'.
+Pangaea. Not changed here: it's the terrain's cost, not the transitions', and the owner accepted
+it (Pangaea's flight is reported only). The gate is judged under whatever pacing the run shows:
+display-paced, every route's missed frames ≤ 1% and median ≤ 17.50 ms; uncapped, every route's
+p95 ≤ 16.67 ms.
 
 Other gates, `o1` / `o2`: holds (dives 404–724 ms, hops 20–35 ms, climbs 27–40 ms) and swap
 frames (worst 31.98 / 36.61 ms) pass; route checks pass in all four runs; memory cycles: the

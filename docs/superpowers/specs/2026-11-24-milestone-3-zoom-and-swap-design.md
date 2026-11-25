@@ -380,7 +380,9 @@ packages on Vulkan. Record the adapter and backend.
   along the range from Aconcagua, a deep-time bench region (Pangaea), the Grand Canyon, and Mt
   Fuji, whose hops cross a coastline and reach a cube-face corner of the terrain's cube sphere,
   where the generator's lattice is largest; then the Andes again, so memory compares a route
-  with itself. `--region` still flies one place.)*
+  with itself. `--region` still flies one place. Flight frames are judged per route under the
+  run's one pacing rule; Pangaea's flight is reported only (owner, 2026-11-25), since its dunes
+  fail the uncapped rule at 2560 × 1440 whenever the display doesn't pace the run.)*
   Gates *(call; the owner sets final numbers in the plan)*:
   - time spent holding in the cloud per transition: native ≤ 3 s (gated); web ≤ 8 s (reported
     only, §8)
