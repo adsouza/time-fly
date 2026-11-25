@@ -642,13 +642,24 @@ water = the highest level (ties: lake, sea, river); none: (h − NO_WATER_DROP_M
     - It reads `HydroPassFinished` and adds summary lines.
   - `bench/journey/mod.rs`: the same pass lines.
   - `bench/mod.rs`: `pass_line(..)` is shared.
-- Test: `bench/region` tests, `tests/region_bench.rs`, `tests/journey_bench.rs`
+  - Create `crates/timefly/src/diagnostics/gpu_time.rs`: GPU frame time from pass-level timestamps *(owner, 2026-11-25)*.
+- Test: `bench/region` tests, `tests/region_bench.rs`, `tests/journey_bench.rs`, `gpu_time.rs` inline, `tests/region_gpu.rs` (ignored GPU test)
 
 **Interfaces:**
 - Consumes: Task 4's `HydroPassFinished` and `RegionGenerated.hydro_wait_ms`.
 - Produces:
   - Summary lines `continental pass (<age>): <wall_ms> ms wall, <cpu_ms> ms CPU, <slices> slices on <native|web> (target <= 1000|5000 ms, reported)`.
   - `generation_ms(g: &RegionGenerated) -> u32`, which the warm-generation and first-entry gates now use.
+  - **GPU frame time** *(owner, 2026-11-25)*.
+    - **Why Bevy's plugin can't do it.** `RenderDiagnosticsPlugin` writes timestamps inside encoders, which needs `TIMESTAMP_QUERY_INSIDE_ENCODERS`. Apple-silicon Metal and WebGPU don't offer that, so the plugin records CPU time only there.
+    - **What this task adds instead.** `GpuTimePlugin` adds two empty render-graph nodes: `GpuTimeBegin`, first in the graph, and `GpuTimeEnd`, last. Each opens a render pass with no attachments' work, or a trivial clear of a 1 × 1 target, whose `timestamp_writes` write the frame's begin and end timestamps into a 2-entry `QuerySet`.
+    - **Readback.** The plugin resolves the set into a buffer and maps it asynchronously. It reads the result a few frames later, ring-buffered over 4 frames, and never stalls the frame.
+    - **When it runs.** Only when the device has `Features::TIMESTAMP_QUERY`; it requests that feature only if the adapter offers it. Otherwise it is a no-op, and the summaries say `gpu time: unavailable`.
+    - **The resource.** `GpuFrameTime { last_ms: Option<f32>, period_ns: f32 }` (`Resource`, main world).
+    - **Convention.** The frame's GPU time is `(end − begin) × period`, because WebGPU timestamps are in ns. A frame whose end precedes its begin, or whose value is not finite, is dropped and counted.
+    - **Benches.** Both benches report median, p95 and worst GPU frame time per segment or route next to the CPU frame times, reported only and not gated. For example: `gpu frame time (Indus tributaries): median 4.12 / p95 5.80 / worst 9.31 ms over 1,820 frames (timestamp-query)`.
+    - **Chrome.** Chrome exposes `timestamp-query` but rounds it to 100 µs unless the "WebGPU Developer Features" flag is on. Note in the docs which applies to a run.
+    - **Measurements to make.** With it, measure the cloud's and the river water's GPU cost by differencing scenes (`region_tour`: cloud off, at 0.5 and at 1.0; water on the Indus with and without rivers). Record them in `docs/testing/rivers/performance.md`, replacing M3's ioreg estimate of the cloud with a measured one.
 
 - [ ] **Step 1: Write the failing tests:**
   - `bench_regions_include_the_indus_tributaries`.
@@ -656,6 +667,11 @@ water = the highest level (ties: lake, sea, river); none: (h − NO_WATER_DROP_M
   - `the_region_bench_reports_the_continental_pass` (`region_bench`, headless on the tiny assets): the summary has a `continental pass (0 ka)` line.
   - `a_journey_run_reports_the_continental_pass` (`journey_bench`).
   - The existing `the_region_bench_path_never_triggers_a_hop` covers the new region.
+  - `gpu_time` units:
+    - `frame_ms_from_timestamps` converts with the period and drops reversed or non-finite pairs.
+    - The readback ring never hands out a slot still being mapped.
+    - Without `TIMESTAMP_QUERY`, the plugin adds no nodes and reports `unavailable`.
+  - `the_gpu_frame_time_is_measured_on_this_gpu` (`region_gpu`, ignored): on a headless device with the feature, a frame that draws a known number of full-screen passes reads a positive GPU time, which grows with the number of passes.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p timefly --test region_bench --test journey_bench`.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run the tests to check they pass.**
