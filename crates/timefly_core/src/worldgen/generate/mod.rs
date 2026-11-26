@@ -57,6 +57,7 @@ use crate::worldgen::tiles::SourceLevel;
 use crate::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
 
 mod detail;
+mod join;
 mod lattice;
 pub mod rivers;
 pub mod water;

@@ -34,7 +34,12 @@
 //!   A node on one of today's burnt courses relaxes to its anchor instead
 //!   ([`EraHydrology::anchor`], Task 11b fix round 2): the nearest point on its course, within
 //!   [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`] spacings, so a canyon narrower than the lattice keeps
-//!   its river. The gather's relaxation reach is max(C√2, that bound) + C.
+//!   its river. The gather's relaxation reach is max(C√2, that bound) + max(C, H), H the
+//!   joining paths' half-width.
+//! Joining segment (Task 11e): a segment whose down node is a river node on one of today's
+//!   courses (anchored) and whose own node is not follows the least-cost path over floor_at
+//!   from its relaxed start to that anchor ([`super::join`]) in place of the corridor below;
+//!   K counts the path's length, and m, B, τ and the rest follow as for any segment.
 //!   Sub-point k (0 < k < K): the 13 samples at offsets ±C across the great circle between the
 //!   relaxed ends; its raw offset is the lowest interior local minimum (|j| ≤ 5, strictly
 //!   lower than samples j ± 1; ties: smaller |offset|, then the negative side, the right
@@ -89,11 +94,12 @@ use std::f64::consts::SQRT_2;
 use bevy_math::DVec3;
 
 use super::detail::smoothstep;
+use super::join::JoinGrid;
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
     BANK_FREEBOARD_M, CHANNEL_MIN_TEXELS, CORRIDOR_FRACTION, CORRIDOR_SAMPLES, DEPTH_COEFF,
-    DEPTH_EXP, INCISION_WINDOW_M, LEVEL_BELOW_BED, LOWLAND_SPEED_MS, MANNING_N,
-    MAX_CHANNEL_DISCHARGE_M3S, MEANDER_AMPLITUDE_PER_WIDTH, MEANDER_FLAT_SLOPE,
+    DEPTH_EXP, INCISION_WINDOW_M, JOIN_PATH_HALF_WIDTH_FRACTION, LEVEL_BELOW_BED, LOWLAND_SPEED_MS,
+    MANNING_N, MAX_CHANNEL_DISCHARGE_M3S, MEANDER_AMPLITUDE_PER_WIDTH, MEANDER_FLAT_SLOPE,
     MEANDER_MIN_WAVELENGTH_M, MEANDER_WAVELENGTH_PER_WIDTH, NODE_SEARCH_GRID, RAPID_SLOPE,
     RAPID_SPEED_BASE_MS, RAPID_SPEED_GAIN_MS, TODAY_RIVER_ANCHOR_MAX_SPACINGS,
     VALLEY_HALF_WIDTH_PER_WIDTH, VALLEY_WALL_SLOPE, WIDTH_COEFF, WIDTH_EXP,
@@ -116,6 +122,9 @@ const GATHER_SAMPLE_M: f64 = 1000.0;
 const LOCAL_SLACK: f64 = 1.02;
 /// Units a node's relaxation costs (49 reads, about four sub-points' 13).
 const NODE_UNITS: u32 = 4;
+/// A joining path's search costs a unit per this many lattice points, beyond the unit per
+/// column its floors take.
+const JOIN_SEARCH_POINTS_PER_UNIT: usize = 16;
 const MEANDER_SALT: u32 = 0x27D4_EB2F;
 
 /// A channel's `(width, depth)` in metres for a discharge in m³/s: `w = 5·Q^0.5`,
@@ -199,11 +208,31 @@ pub fn river_read_reach_m(lattice: &CubeLattice, subpoint_m: f64) -> f64 {
 
 /// How far a relaxed point can lie from its coarse chord: a node moves at most `C√2` (the
 /// search grid's corner) or, on one of today's burnt courses, to its anchor (at most
-/// [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`] spacings), and a sub-point's offset adds up to `C`.
+/// [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`] spacings), and a sub-point's offset adds up to `C`, or
+/// on a joining segment ([`super::join`]) up to the path's half-width `H`.
 fn relax_reach_m(lattice: &CubeLattice) -> f64 {
     let corridor = corridor_m(lattice);
     let node = (corridor * SQRT_2).max(TODAY_RIVER_ANCHOR_MAX_SPACINGS * lattice.mean_spacing_m());
-    node + corridor
+    node + corridor.max(join_half_m(lattice))
+}
+
+/// A joining path's half-width `H` on a lattice.
+fn join_half_m(lattice: &CubeLattice) -> f64 {
+    JOIN_PATH_HALF_WIDTH_FRACTION * lattice.mean_spacing_m()
+}
+
+/// Whether river node `n`'s segment joins a burnt course: its down node is a river node on one
+/// of today's courses (anchored) and its own node is not (Task 11e).
+fn is_joining(hydro: &EraHydrology, n: &RiverNode) -> bool {
+    match n.down {
+        Down::River(j) => {
+            hydro
+                .anchor(hydro.rivers.nodes()[j as usize].node)
+                .is_some()
+                && hydro.anchor(n.node).is_none()
+        }
+        _ => false,
+    }
 }
 
 /// A river node relaxed for the refinement: to its anchor on one of today's burnt courses
@@ -396,6 +425,8 @@ fn smoothed_points(p0: DVec3, p1: DVec3, normal: DVec3, raw: &[f64]) -> Vec<DVec
 /// The relaxed, pre-meander centreline of river segment `river` (river node `river` to its down
 /// node): `K + 1` points for `K = ceil(length / subpoint_m)`, both ends included. The start is
 /// [`relax_node`]; the end too when it is a river node (an ocean, lake or ice node stays put).
+/// A joining segment follows its least-cost path instead ([`super::join`]; `K` then counts the
+/// path's length).
 /// A pure function of the graph and `floor_at`: what [`RiverBuilder`] refines, before
 /// meanders, for any caller with its own terrain (Task 11's reality check).
 pub fn relaxed_centreline(
@@ -415,8 +446,12 @@ pub fn relaxed_centreline(
     } else {
         c1
     };
-    let k_max = sub_count(lattice.distance_m(n.node, end), subpoint_m);
     let normal = chord_normal(p0, p1, c0, c1);
+    if is_joining(hydro, n) {
+        let grid = JoinGrid::new(p0, p1, normal, subpoint_m, join_half_m(&lattice));
+        return grid.centreline(&grid.read_all(floor_at), subpoint_m);
+    }
+    let k_max = sub_count(lattice.distance_m(n.node, end), subpoint_m);
     let corridor = corridor_m(&lattice);
     let mut raw: Vec<f64> = (0..=k_max)
         .map(|k| {
@@ -581,6 +616,11 @@ struct Seg {
     m_down: f64,
     m_start: f64,
     k_max: u32,
+    /// The segment joins a burnt course: it follows its least-cost path ([`super::join`]); its
+    /// lattice once the ends are relaxed, and its floors read so far.
+    join: bool,
+    grid: Option<JoinGrid>,
+    join_floors: Vec<f64>,
     raw: Vec<f64>,
     points: Vec<DVec3>,
     floor: Vec<f64>,
@@ -780,6 +820,9 @@ impl<'a> RiverBuilder<'a> {
                     m_down: path.m_down(i),
                     m_start: path.m_start(i),
                     k_max: sub_count(len, subpoint_m),
+                    join: is_joining(hydro, n),
+                    grid: None,
+                    join_floors: Vec::new(),
                     raw: Vec::new(),
                     points: Vec::new(),
                     floor: Vec::new(),
@@ -871,8 +914,9 @@ impl<'a> RiverBuilder<'a> {
                         self.phase = Phase::Points(0, 0);
                         continue;
                     }
-                    used += 1;
-                    self.phase = if self.corridor_step(s, k, floor_at) {
+                    let (done, extra) = self.corridor_step(s, k, floor_at);
+                    used = used.saturating_add(1 + extra);
+                    self.phase = if done {
                         Phase::Corridor(s + 1, 0)
                     } else {
                         Phase::Corridor(s, k + 1)
@@ -926,27 +970,52 @@ impl<'a> RiverBuilder<'a> {
         (p0, p1, chord_normal(p0, p1, c0, c1))
     }
 
-    /// One unit of segment `s`'s corridor: raw offset `k` (the ends are 0). Returns `true`
-    /// when the segment is complete (points, floors and τ filled).
-    fn corridor_step(&mut self, s: usize, k: u32, floor_at: &impl Fn(RenderDir) -> f64) -> bool {
+    /// One unit of segment `s`'s corridor: raw offset `k` (the ends are 0), or on a joining
+    /// segment its lattice's column `k`. Returns whether the segment is complete (points,
+    /// floors and τ filled), and the units beyond this one it took (a joining path's search:
+    /// one per [`JOIN_SEARCH_POINTS_PER_UNIT`] lattice points).
+    fn corridor_step(
+        &mut self,
+        s: usize,
+        k: u32,
+        floor_at: &impl Fn(RenderDir) -> f64,
+    ) -> (bool, u32) {
         let (p0, p1, normal) = self.ends(s);
-        let k_max = self.segs[s].k_max;
-        if k == 0 {
-            self.segs[s].raw = vec![0.0; k_max as usize + 1];
-        } else if k < k_max {
-            let c = chord_point(p0, p1, t_of(k, k_max));
-            self.segs[s].raw[k as usize] = raw_offset(c, normal, self.corridor, floor_at);
-        }
-        if k + 1 < k_max {
-            return false;
-        }
-        let lattice = &self.hydro.lattice;
-        let (c0, c1) = (
-            lattice.dir(self.segs[s].start).0,
-            lattice.dir(self.segs[s].end).0,
-        );
-        taper(&mut self.segs[s].raw, p0 == c0, p1 == c1);
-        let points = smoothed_points(p0, p1, normal, &self.segs[s].raw);
+        let (points, extra) = if self.segs[s].join {
+            let lattice = &self.hydro.lattice;
+            let seg = &mut self.segs[s];
+            let grid = seg.grid.get_or_insert_with(|| {
+                JoinGrid::new(p0, p1, normal, self.subpoint_m, join_half_m(lattice))
+            });
+            grid.read_column(k, floor_at, &mut seg.join_floors);
+            if k + 1 < grid.columns() {
+                return (false, 0);
+            }
+            let grid = seg.grid.take().expect("a joining segment's lattice");
+            let floors = std::mem::take(&mut seg.join_floors);
+            let points = grid.centreline(&floors, self.subpoint_m);
+            seg.k_max = (points.len() - 1) as u32;
+            let extra = u32::try_from(grid.len() / JOIN_SEARCH_POINTS_PER_UNIT).unwrap_or(u32::MAX);
+            (points, extra)
+        } else {
+            let k_max = self.segs[s].k_max;
+            if k == 0 {
+                self.segs[s].raw = vec![0.0; k_max as usize + 1];
+            } else if k < k_max {
+                let c = chord_point(p0, p1, t_of(k, k_max));
+                self.segs[s].raw[k as usize] = raw_offset(c, normal, self.corridor, floor_at);
+            }
+            if k + 1 < k_max {
+                return (false, 0);
+            }
+            let lattice = &self.hydro.lattice;
+            let (c0, c1) = (
+                lattice.dir(self.segs[s].start).0,
+                lattice.dir(self.segs[s].end).0,
+            );
+            taper(&mut self.segs[s].raw, p0 == c0, p1 == c1);
+            (smoothed_points(p0, p1, normal, &self.segs[s].raw), 0)
+        };
         let seg = &self.segs[s];
         let floor: Vec<f64> = (0..=seg.last_k())
             .map(|k| clean(floor_at(RenderDir(points[k as usize]))))
@@ -964,7 +1033,7 @@ impl<'a> RiverBuilder<'a> {
         seg.floor = floor;
         seg.tau = tau;
         seg.raw = Vec::new();
-        true
+        (true, extra)
     }
 
     /// The smallest τ over the sub-points in the window of the point at `m_x` on segment `s`.
@@ -2314,8 +2383,9 @@ mod tests {
             }
         }
         assert!(shared > 20, "{shared}");
-        // The confluence at column 400; the one at 420 lies past the region's reach.
-        assert_eq!(confluences, 1);
+        // The confluences at columns 400 and 420 (Task 11e: the relaxation reach widened for the
+        // joining paths takes in 420's, which lay just past it).
+        assert_eq!(confluences, 2);
         assert!(swung > 10, "the shared nodes meander: {swung}");
     }
 
@@ -2883,6 +2953,190 @@ mod tests {
         assert_eq!(
             a.values().map(|s| bits(s)).collect::<Vec<_>>(),
             again.values().map(|s| bits(s)).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- Joining paths (Task 11e). ----
+
+    /// A burnt canyon along the equator row (the main chain, every node anchored at its own
+    /// centre, the canyon floor 600 m and falling gently east) under a 1,500 m plateau, and a
+    /// tributary T2 → T1 → the canyon node at column 410, T1 one row north. A 3,000 m ridge runs
+    /// east–west between T1 and the canyon (4–7 km north), from 30 km west of column 410 to 3 km
+    /// east of it. A side valley leaves T1 east for 6 km, then turns south into the canyon, its
+    /// floor falling evenly from 1,000 m to the canyon's 600 m. Returns the pass, the floor, T1's
+    /// river index and the canyon node.
+    fn side_valley() -> (EraHydrology, impl Fn(RenderDir) -> f64, u32, u32) {
+        let a410 = col_along(410);
+        let s = north_m(LAT.dir(LAT.node(CubeFace::PosX, 410, ROW - 1)).0);
+        let main = main_chain(|_| 3000.0, |a| 600.0 - 1e-4 * (a - a410));
+        let t2 = LAT.node(CubeFace::PosX, 410, ROW - 2);
+        let t1 = LAT.node(CubeFace::PosX, 410, ROW - 1);
+        let trib = RiverChain {
+            nodes: vec![t2, t1],
+            q: vec![100.0, 100.0],
+            bed: vec![950.0, 900.0],
+            end: Down::River(eq(410)),
+        };
+        let anchors: Vec<(u32, DVec3)> = main.nodes.iter().map(|&v| (v, LAT.dir(v).0)).collect();
+        let hydro = river_hydro(LAT, &[main, trib], vec![]).with_anchors(&anchors);
+        let valley_len = 6000.0 + s;
+        let floor = move |d: RenderDir| {
+            let (a, n) = (along_m(d.0), north_m(d.0));
+            let canyon = 600.0 - 1e-4 * (a - a410);
+            if n.abs() < 1000.0 {
+                return canyon;
+            }
+            // The valley: east along n = s, then south along a = a410 + 6 km.
+            let east = (a - a410).clamp(0.0, 6000.0);
+            let leg1 = ((a - (a410 + east)).powi(2) + (n - s).powi(2)).sqrt();
+            let south = n.clamp(0.0, s);
+            let leg2 = ((a - (a410 + 6000.0)).powi(2) + (n - south).powi(2)).sqrt();
+            let along_valley = if leg1 <= leg2 {
+                east
+            } else {
+                6000.0 + (s - south)
+            };
+            if leg1.min(leg2) < 800.0 {
+                return 1000.0 - 400.0 * along_valley / valley_len;
+            }
+            if (4000.0..7000.0).contains(&n) && (a410 - 30_000.0..a410 + 3000.0).contains(&a) {
+                return 3000.0;
+            }
+            1500.0
+        };
+        let river = hydro.rivers.index_of(t1).expect("T1 is a river node");
+        (hydro, floor, river, eq(410))
+    }
+
+    /// Task 11e: the tributary behind the ridge is refined down its side valley, never more than
+    /// 50 m above its water, and ends at the canyon. Its chord would cross the ridge.
+    #[test]
+    fn a_tributary_joins_down_its_side_valley() {
+        let (hydro, floor, river, canyon) = side_valley();
+        let rr = build_at(&hydro, LAT.dir(canyon), &floor, 997);
+        let points = &by_river(&rr)[&river];
+        let p0 = points[0].dir;
+        let p1 = hydro.anchor(canyon).expect("the canyon is burnt");
+        // The hazard: the chord between the relaxed ends crosses the ridge.
+        let chord_top = (0..=100)
+            .map(|k| floor(RenderDir(chord_point(p0, p1, f64::from(k) / 100.0))))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(chord_top > 2500.0, "{chord_top}");
+        let above = points
+            .iter()
+            .map(|sp| floor(RenderDir(sp.dir)) - f64::from(sp.level_m))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(above < 50.0, "the path stands {above:.0} m above its water");
+        // It ends a sub-point spacing (and a smoothing's stretch) short of the canyon node's
+        // anchor, where its down segment starts.
+        let last = points.last().unwrap().dir;
+        assert!(metres_between(last, p1) <= 1.5 * SUBPOINT_M);
+    }
+
+    /// Task 11e: two regions whose edges cut the joining corridor differently refine the joining
+    /// path bit for bit the same, and the path leaves its chord by more than a texel inside both.
+    #[test]
+    fn joining_paths_agree_bit_for_bit_across_regions() {
+        let (hydro, floor, river, canyon) = side_valley();
+        let a_centre = LAT.dir(canyon);
+        // B's south edge runs 5 km north of the canyon, through the corridor and the valley.
+        let b_centre = RegionFrame { center: a_centre }.local_to_dir(2_000.0, -(HALF + 5_000.0));
+        let a = by_river(&build_at(&hydro, a_centre, &floor, 997));
+        let b = by_river(&build_at(&hydro, b_centre, &floor, u32::MAX));
+        let (pa, pb) = (&a[&river], &b[&river]);
+        assert_eq!(bits(pa), bits(pb));
+        // The hazard: a sub-point more than a texel off the chord lies inside both squares.
+        let (p0, p1) = (pa[0].dir, hydro.anchor(canyon).unwrap());
+        let inside = |c: RenderDir, d: DVec3| {
+            RegionFrame { center: c }
+                .dir_to_local(RenderDir(d))
+                .is_some_and(|(x, z)| x.abs() <= HALF && z.abs() <= HALF)
+        };
+        let off_chord = |d: DVec3| {
+            let n = p0.cross(p1).normalize();
+            d.dot(n).abs().asin() * EARTH_RADIUS_M
+        };
+        let far = pa
+            .iter()
+            .filter(|sp| inside(a_centre, sp.dir) && inside(b_centre, sp.dir))
+            .map(|sp| off_chord(sp.dir))
+            .fold(0.0f64, f64::max);
+        assert!(far > INNER_TEXEL_M, "{far:.0} m");
+        // And inside both it runs round the ridge's east end, down the valley's southward leg.
+        let a410 = col_along(410);
+        assert!(pa.iter().any(|sp| {
+            let (along, north) = (along_m(sp.dir), north_m(sp.dir));
+            inside(a_centre, sp.dir)
+                && inside(b_centre, sp.dir)
+                && (along - (a410 + 6000.0)).abs() < 800.0
+                && (4000.0..7000.0).contains(&north)
+        }));
+    }
+
+    /// FNV-1a over every bit of every sub-point of a region's rivers inside its square (centred
+    /// on `centre`): a set the gather's reach does not change.
+    fn rivers_hash(rr: &RegionRivers, centre: RenderDir) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut eat = |x: u64| {
+            for b in x.to_le_bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        let inside: Vec<SubPoint> = rr
+            .subpoints()
+            .iter()
+            .filter(|sp| {
+                RegionFrame { center: centre }
+                    .dir_to_local(RenderDir(sp.dir))
+                    .is_some_and(|(x, z)| x.abs() <= HALF && z.abs() <= HALF)
+            })
+            .copied()
+            .collect();
+        for (k, dir, coarse, bed, level, hw, depth, speed, rapid, tangent) in bits(&inside) {
+            eat(u64::from(k));
+            dir.iter().for_each(|&d| eat(d));
+            eat(coarse);
+            for v in [bed, level, hw, depth, speed, rapid] {
+                eat(u64::from(v));
+            }
+            tangent.iter().for_each(|&t| eat(t));
+        }
+        h
+    }
+
+    /// Task 11e: a network with no burnt course (so no joining segment) refines exactly as it
+    /// did before the joining paths, over the sub-points inside the region's square (the gather's
+    /// widened reach adds segments outside it): the hashes are 8a8a2be's. The hand-built tree with
+    /// its notched floor, and a real pass over the synthetic continent.
+    #[test]
+    fn links_that_do_not_join_a_course_are_unchanged() {
+        let hydro = tree(3e-4);
+        let floor = |d: RenderDir| {
+            let (a, n) = (along_m(d.0), north_m(d.0));
+            let notch = if (a - col_along(380)).rem_euclid(35_000.0) < 1000.0 {
+                100.0
+            } else {
+                0.0
+            };
+            2030.0 - 3e-4 * (a - col_along(380)) + 0.02 * n.abs() - notch
+        };
+        let tree_hash = rivers_hash(&build_at(&hydro, centre(), &floor, 997), centre());
+        let hydro = pass(75);
+        let floor =
+            |d: RenderDir| continent(d) + 40.0 * (d.0.y * 3000.0).sin() * (d.0.z * 2100.0).cos();
+        let big = hydro
+            .rivers
+            .nodes()
+            .iter()
+            .filter(|n| hydro.lattice.dir(n.node).0.x > 0.995)
+            .max_by(|a, b| a.discharge_m3s.total_cmp(&b.discharge_m3s))
+            .expect("rivers on the continent");
+        let at = hydro.lattice.dir(big.node);
+        let pass_hash = rivers_hash(&build_at(&hydro, at, &floor, 997), at);
+        println!("hashes: tree {tree_hash:#018x}, pass {pass_hash:#018x}");
+        assert_eq!(
+            (tree_hash, pass_hash),
+            (0x00bd_9c86_9150_bb4c, 0xfbb4_3919_e357_0e49)
         );
     }
 

@@ -109,6 +109,21 @@ pub const CORRIDOR_SAMPLES: u32 = 13;
 /// The search grid around a node is `NODE_SEARCH_GRID x NODE_SEARCH_GRID`.
 pub const NODE_SEARCH_GRID: u32 = 7;
 
+/// A joining segment (a node off today's burnt courses into a burnt course node) is refined
+/// along the least-cost path over the field's terrain, searched this many mean lattice spacings
+/// either side of the chord between its relaxed ends (rivers Task 11e). Chosen from the 0 ka
+/// census of the 687 joining links whose region chord cut more than 50 m after Task 11g: a path
+/// within 0.5 spacings brings 420 of them under 50 m, 0.75 spacings 442, 1 spacing 457 and 1.5
+/// spacings 465 (at [`JOIN_PATH_CLIMB_WEIGHT`] = 0.1). Past 1 spacing the gain is small while the
+/// regions' relaxation reach, gather and tile margin keep growing with it.
+pub const JOIN_PATH_HALF_WIDTH_FRACTION: f64 = 1.0;
+/// A joining path's step costs its length × (1 + this × how far (m) the step stands above the
+/// straight line between its ends' floors) (Task 11e). From the same census, at 1 spacing: 0.01
+/// brings 311 of the 687 under 50 m, 0.03 428, 0.1 457 and 0.3 464; the median path is 1.09,
+/// 1.17, 1.23 and 1.26 times its chord (p90 1.23, 1.46, 1.64, 1.72). 0.1 takes nearly all the
+/// gain without the longest detours.
+pub const JOIN_PATH_CLIMB_WEIGHT: f64 = 0.1;
+
 // Sampling. The apron uses `max(SUBPOINT_M, apron texel / 2)`.
 
 pub const SUBPOINT_M: f64 = 500.0;

@@ -25,6 +25,78 @@ checkout's real data.
 Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (1620 × 1920 nodes).
 `indus.json` is 95,668 bytes and `amazon.json` 503,031 bytes.
 
+## Result, 2026-11-26 (Task 11e: tributaries join their canyons down their own valleys)
+
+After Task 11g, 687 of the 4,714 joining links (a river node off today's courses draining into a
+burnt course node) still had a region chord, between the relaxed start and the course node's
+anchor, cutting more than 50 m above the straight line between its ends' floors. A region now
+refines each joining segment along the least-cost path over its own terrain
+(`worldgen/generate/join.rs`): a lattice every sub-point spacing along and across the chord,
+`JOIN_PATH_HALF_WIDTH_FRACTION` = 1 mean spacing either side, each step costing its length ×
+(1 + `JOIN_PATH_CLIMB_WEIGHT` = 0.1/m × its height above that line), the path resampled and
+smoothed once. A lattice is held to about 4,096 points by coarsening its spacing; on the recent
+lattice no link needs it (the first version, uncapped, spent minutes on a test bake's 100 km
+links). The lattice is a function of the link's relaxed ends alone, so every region (and
+the inner field and apron, each at its own sub-point spacing) finds the same path.
+
+**Choosing the constants** (the census on the 11g pass, the regions' inner floor, the lattice
+path's highest point above the end line; of the 687):
+
+| Half-width | Climb weight | ≤ 50 m | > 200 m | > 500 m | Path / chord length, median (p90) |
+|---|---|---|---|---|---|
+| 0.5 spacing | 0.01 | 308 | 32 | 3 | 1.09 (1.22) |
+| 0.5 | 0.1 | 420 | 27 | 2 | 1.21 (1.46) |
+| 0.75 | 0.03 | 418 | 29 | 2 | 1.16 (1.43) |
+| 0.75 | 0.1 | 442 | 28 | 2 | 1.22 (1.56) |
+| 1 | 0.01 | 311 | 32 | 2 | 1.09 (1.23) |
+| 1 | 0.03 | 428 | 28 | 1 | 1.17 (1.46) |
+| **1** | **0.1** | **457** | **27** | **1** | **1.23 (1.64)** |
+| 1 | 0.3 | 464 | 27 | 1 | 1.26 (1.72) |
+| 1.5 | 0.1 | 465 | 21 | 1 | 1.23 (1.71) |
+
+Past 1 spacing the gain is small while the relaxation reach (and with it the gather and the tile
+margin) keeps growing; past 0.1 the paths lengthen for 7 more joins.
+
+**After, the real refinement** (`relaxed_centreline` on the same floor, the centreline's highest
+point above its end line): of the 687, **453 stand at most 50 m above it, 28 more than 200 m and
+1 more than 500 m**; the centrelines run a median 1.20 times their chord (p90 1.60, at most 2.66).
+Over all 4,714 joins, 235 still stand more than 50 m above their end line. 16 stand a little higher
+than their chord did: the line is taken by sub-point index along a longer path, and the smoothing
+can cut a corner.
+
+**The biggest gains** (chord → centreline above the end line): a tributary at (29.38, 101.10)
+into its course at (29.51, 101.14), 1,163 → 167 m; (28.97, 99.03), 894 → 155 m; (30.93, 101.95),
+755 → 18 m; (27.21, 88.31), 689 → 6 m; (30.48, 79.46), 576 → 10 m.
+
+**Costs.**
+- The relaxation reach grows from max(C√2, 0.75 s) + C to max(C√2, 0.75 s) + max(C, H): 1.15 →
+  1.75 spacings. The tile margin at n = 900 grows from 119.9 to 132.6 km.
+- Region generation (native, release, the web's 256-unit prep steps), before (8a8a2be) → after:
+  Hells Canyon prep 403–408 → 410–411 ms, longest step 1.06–1.09 → 1.16–1.18 ms, rows 561–567 →
+  576–584 ms; Indus tributaries prep 210 → 216–217 ms, longest step 1.47–1.48 → 1.63–1.67 ms. The
+  native parallel run logs prep 425 ms and rows 212 ms at Hells Canyon. Well inside 3 s native,
+  8 s web and the 6 ms slice.
+- A joining segment's search costs a unit per lattice column read and one per 16 lattice points
+  searched.
+
+**The reality check** (release, against the 11g run): the Indus box's relaxed share 82.8 → 82.7%
+(74/84 links as before; the box uses `relaxed_centreline`), one Amazon missed link 48 → 47%
+within; every other bar, the lakes and the outlets digit for digit the same (the pass is
+untouched).
+
+**Frames** (`region_tour <out> 1920x1080 LAT,LON,0 <name> high 6000`, looking 45° down):
+- Hells Canyon ([joins-hells-after.jpg](joins-hells-after.jpg)): as after Task 11g; its joins
+  stood at most 29 m above their water already (now 31 m, with a fourth join gathered).
+- The Indus tributaries region ([joins-indus-after.jpg](joins-indus-after.jpg)): unchanged in
+  kind; its four joins stand at most 1 m above their water.
+- The biggest gain, at (29.44, 101.12) in the Hengduan ranges: before
+  ([joins-sichuan-before.jpg](joins-sichuan-before.jpg), 8a8a2be) and after
+  ([joins-sichuan-after.jpg](joins-sichuan-after.jpg)). At this height the change is small: the
+  brown tributary channel that ran along the canyon wall beside the course is gone. The census
+  measures against the straight chord; the old corridor relaxation's own height at this join was
+  not measured, so part of the 1,163 m may have been avoided already. The course's own water in
+  that canyon is broken in both frames (not this task's).
+
 ## Result, 2026-11-26 (Task 11g: no tributary drains into a burnt course across a ridge)
 
 The burn makes a course the lowest ground for a lattice spacing around, so steepest descent
