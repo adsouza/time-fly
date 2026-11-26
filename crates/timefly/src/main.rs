@@ -26,6 +26,9 @@ fn main() -> AppExit {
     if let Some(check) = session.args().check_data.clone() {
         return timefly::check_data::run_data_check(session, &check);
     }
+    if let Some(check) = session.args().hydro_check.clone() {
+        return timefly::hydro_check::run_hydro_check(session, &check);
+    }
     let gpu = timefly::gpu::probe_native();
     if !gpu.can_start() {
         return timefly::gpu::stop_without_gpu(session, &gpu);

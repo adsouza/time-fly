@@ -49,6 +49,7 @@ pub fn remembers_window(args: &LaunchArgs) -> bool {
         && !args.journey_bench
         && args.diagnostics_probe.is_none()
         && args.check_data.is_none()
+        && args.hydro_check.is_none()
 }
 
 /// The game's state folder, beside the log folder's rules (`resolve_log_root`): macOS
@@ -360,6 +361,10 @@ mod tests {
             },
             LaunchArgs {
                 check_data: Some(crate::args::DataCheck::default()),
+                ..default()
+            },
+            LaunchArgs {
+                hydro_check: Some(crate::args::HydroCheck::default()),
                 ..default()
             },
         ] {

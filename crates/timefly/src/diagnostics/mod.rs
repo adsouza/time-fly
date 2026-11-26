@@ -392,8 +392,12 @@ fn start_session(
     let home = home();
 
     #[cfg(not(target_arch = "wasm32"))]
-    let (findings, log_writer, guard) =
-        session::store::open(&record, &started, &home, args.check_data.is_some());
+    let (findings, log_writer, guard) = session::store::open(
+        &record,
+        &started,
+        &home,
+        args.check_data.is_some() || args.hydro_check.is_some(),
+    );
     #[cfg(target_arch = "wasm32")]
     let findings = session::web::open(&record, held);
 

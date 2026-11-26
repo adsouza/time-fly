@@ -1,11 +1,12 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
-//! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
+//! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden),
+//! `--hydro-check[=OUT_DIR]` (hidden), `--scrub-bench`,
 //! `--region-bench`, `--journey-bench`, `--no-dunes`, `--target-fps N`, `--window WxH` and
 //! `--region LAT,LON,AGE_YEARS`. A value
 //! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
 //! with `--` is the next flag, never a value.
-//! `--check-data` takes its optional value only as `--check-data=DIR`.
+//! `--check-data` and `--hydro-check` take their optional values only as `--flag=VALUE`.
 
 use timefly_core::deep_time::MAX_YEARS_BP;
 
@@ -35,6 +36,9 @@ pub struct LaunchArgs {
     pub window: Option<(u32, u32)>,
     /// Hidden `--check-data[=DIR]` (native only): load the globe data headlessly and exit.
     pub check_data: Option<DataCheck>,
+    /// Hidden `--hydro-check[=OUT_DIR]` (native only): the rivers' reality check, headless
+    /// ([`crate::hydro_check`]).
+    pub hydro_check: Option<HydroCheck>,
     /// `--region=LAT,LON,AGE_YEARS` (web: `?region=LAT,LON,AGE_YEARS`): enter the region centred
     /// there once the globe data is ready.
     pub region: Option<RegionArg>,
@@ -51,7 +55,15 @@ pub struct DataCheck {
     pub dir: Option<String>,
 }
 
+/// What `--hydro-check[=OUT_DIR]` asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HydroCheck {
+    /// Where the SVGs go, relative to the working directory; `None` for the working directory.
+    pub out_dir: Option<String>,
+}
+
 const CHECK_DATA_FLAG: &str = "--check-data";
+const HYDRO_CHECK_FLAG: &str = "--hydro-check";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const REGION_BENCH_FLAG: &str = "--region-bench";
@@ -131,6 +143,23 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
         }
         if arg == CHECK_DATA_FLAG {
             parsed.check_data = Some(DataCheck::default());
+            continue;
+        }
+        if arg == HYDRO_CHECK_FLAG {
+            parsed.hydro_check = Some(HydroCheck::default());
+            continue;
+        }
+        if let Some(dir) = arg
+            .strip_prefix(HYDRO_CHECK_FLAG)
+            .and_then(|r| r.strip_prefix('='))
+        {
+            if dir.is_empty() {
+                parsed.unknown.push(arg);
+            } else {
+                parsed.hydro_check = Some(HydroCheck {
+                    out_dir: Some(dir.to_string()),
+                });
+            }
             continue;
         }
         if let Some(dir) = arg
@@ -447,6 +476,29 @@ mod tests {
         assert!(parsed.scrub_bench);
         assert_eq!(parsed.target_fps, Some(30));
         assert!(parsed.unknown.is_empty());
+    }
+
+    #[test]
+    fn hydro_check_flag() {
+        let parsed = parse_launch_args(args(&["--hydro-check"]));
+        assert_eq!(parsed.hydro_check, Some(HydroCheck { out_dir: None }));
+        assert!(parsed.unknown.is_empty());
+        let parsed = parse_launch_args(args(&["--hydro-check=/tmp/rc"]));
+        assert_eq!(
+            parsed.hydro_check,
+            Some(HydroCheck {
+                out_dir: Some("/tmp/rc".into())
+            })
+        );
+        // The value only follows an `=`: a next argument is never taken.
+        let parsed = parse_launch_args(args(&["--hydro-check", "out"]));
+        assert_eq!(parsed.hydro_check, Some(HydroCheck { out_dir: None }));
+        assert_eq!(parsed.unknown, args(&["out"]));
+        for bad in ["--hydro-check=", "--hydro-checks"] {
+            let parsed = parse_launch_args(args(&[bad]));
+            assert_eq!(parsed.hydro_check, None);
+            assert_eq!(parsed.unknown, args(&[bad]));
+        }
     }
 
     #[test]

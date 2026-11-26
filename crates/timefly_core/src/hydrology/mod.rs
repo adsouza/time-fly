@@ -9,6 +9,7 @@
 //! the tie rules and the float formats are part of the contract, not implementation details.
 
 pub mod climate;
+pub mod compare;
 mod graph;
 pub mod lakemap;
 mod lakes;

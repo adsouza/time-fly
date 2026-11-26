@@ -30,8 +30,8 @@ pub enum Down {
     Lake(u16, u32),
     /// An ice node.
     Ice(u32),
-    /// A closed basin's lowest node with no lake on it (a dry sink), where the river ends: the
-    /// river node itself, or the node it drains to.
+    /// A closed basin's lowest node with no lake on it (a dry sink), where the river ends: always
+    /// the river node itself (the present day only), which keeps its water.
     Sink(u32),
 }
 

@@ -21,6 +21,8 @@ pub mod globe;
 pub mod globe_flight;
 pub mod gpu;
 pub mod hydro;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hydro_check;
 pub mod region;
 pub mod scatter;
 pub mod sky;

@@ -19,7 +19,7 @@ use super::params::{
     HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, PRESENT_FRAME_MAX_MYR,
     RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M,
 };
-use super::straits::{Strait, shipped_straits, strait_nodes};
+use super::straits::{Strait, shipped_straits, strait_levels};
 use super::{CubeLattice, EraHydrology, HydroGraph, NO_BASIN, Routed, Routing, receiver_of};
 use crate::deep_time::YearsBp;
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
@@ -633,7 +633,8 @@ impl HydroPrep {
         self.data_lakes && self.age.0 <= 0.0
     }
 
-    /// Lowers each strait's nodes to its sill, moved by the era's shift, with data lakes only.
+    /// Lowers each strait's and gorge's nodes to its level ([`strait_levels`]), moved by the
+    /// era's shift, with data lakes only.
     /// Returns the units used (the nodes visited, at least 1).
     fn burn_straits<S: NodeSource>(&mut self, source: &S) -> u32 {
         let mut used = 1;
@@ -641,11 +642,11 @@ impl HydroPrep {
             return used;
         }
         for strait in &self.straits {
-            for v in strait_nodes(&self.lattice, strait) {
+            for (v, level) in strait_levels(&self.lattice, strait) {
                 used += 1;
                 if let Some(shift) = source.present_shift_m(self.lattice.dir(v)) {
                     let e = &mut self.elevation[v as usize];
-                    *e = e.min(strait.sill_m + shift);
+                    *e = e.min(level + shift);
                 }
             }
         }
@@ -2235,6 +2236,7 @@ mod tests {
             name: "test".into(),
             points: vec![(43.0, 34.0), (38.0, 34.5), (30.0, 35.0)],
             sill_m: -35.0,
+            levels: Vec::new(),
         };
         let sea = lattice.nearest(dir(43.0, 34.0));
         let pass = |source: &InlandSea, straits: &[Strait]| {
