@@ -633,11 +633,17 @@ Grand Canyon, Mt Fuji, then the Andes again.
   - `dragonfly.wesl` flaps at a fixed 25 Hz of virtual time.
   - Sampled at the frame rate, that aliases: about 1 Hz at 26 fps, 5 Hz at 30, and a slow
     shimmer near 50 fps.
-  - Fix queued on this branch.
+  - Fixed in Task 13: the flap now steps 0.4 of a cycle every frame (`globals.frame_count`),
+    so it reads fast at any frame rate.
 - **Sometimes no wings at all during descents.**
-  - Not yet reproduced. Hypotheses:
-    - the flat wings are seen edge-on when the fly's pitch matches the chase camera's;
-    - or the blended cloud paints over the blended wings.
+  - Reproduced in Task 13 (`region_tour … descent 20000`). A full-speed descent pitches the fly
+    20° nose down, and the chase eye sits 20° above its horizon, so the camera looks straight
+    along the body axis. The flap turns the wings about that axis, so the flat wings stayed
+    edge-on: 0.05° to the view, and only the body's end showed, clear or in the cloud
+    (`wings-before-descent.jpg`, `wings-before-descent-cloud.jpg`). The cloud was not the cause.
+  - Fixed: each wing is pitched 20° leading edge up, so it shows at least 20° to that view
+    (`wings-after-descent.jpg`, `wings-after-descent-cloud.jpg`) and 40° in level flight
+    (`wings-after-level.jpg`).
   - Fix queued on this branch, after a render that shows which.
 - **The cloud over near geometry** (the Chrome side of the check above): not reported. Still to
   check in Chrome.

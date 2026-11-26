@@ -5,7 +5,8 @@
 //!   code. The two parts are separate entities under the [`Dragonfly`] root so the body draws
 //!   in the opaque pass and the wings blend at [`WING_ALPHA`].
 //! - **Flap and rim** (`dragonfly.wesl`): the vertex stage rotates the wings about the body
-//!   axis by `sin(t × 2π × FLAP_HZ) × FLAP_AMPLITUDE_RAD`; the fragment stage lights the fly
+//!   axis by `sin(2π × phase) × FLAP_AMPLITUDE_RAD`, the phase stepping
+//!   [`FLAP_CYCLES_PER_FRAME`] each frame ([`flap_phase`]); the fragment stage lights the fly
 //!   with Bevy's PBR and adds a subtle rim light ([`RIM_COLOR`], [`RIM_STRENGTH`],
 //!   [`RIM_POWER`]) so it reads over dark ground.
 //! - **Pose** ([`FlyPose`]): whichever world is active writes it (the region's
@@ -48,8 +49,16 @@ pub const FLY_LAYER: usize = 6;
 /// `dragonfly.wesl`: the wing flap.
 pub const DRAGONFLY_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e41");
 
-/// The wing beat's frequency (Hz): fast enough to alias into a blur at any frame rate.
-pub const FLAP_HZ: f32 = 25.0;
+/// How far the wing beat steps each frame (cycles) *(call)*: locked to frames, so it never aliases.
+/// A beat in time (25 Hz in M3 Task 4) folds around the frame rate: about 1 Hz at 26 fps, 5 Hz
+/// at 30, and held near one place at 50. A step just under half a cycle sweeps the stroke from
+/// one side to the other every frame, a fast flutter at any frame rate (12 beats a second at
+/// 30 fps, 24 at 60).
+pub const FLAP_CYCLES_PER_FRAME: f32 = 0.4;
+/// The frame count wraps every this many frames in the flap (`dragonfly.wesl`), a whole number
+/// of cycles at [`FLAP_CYCLES_PER_FRAME`], so the stroke runs on across the wrap and `f32` keeps
+/// the phase exact.
+pub const FLAP_WRAP_FRAMES: u32 = 1_000;
 /// The wing beat's amplitude about the body axis (radians).
 pub const FLAP_AMPLITUDE_RAD: f32 = 0.6;
 /// The wings' opacity.
@@ -153,6 +162,13 @@ pub fn pitch_step(pitch_rad: f32, climb: f32, dt_s: f32) -> f32 {
     pitch_rad + (want - pitch_rad) * (1.0 - (-dt / PITCH_SMOOTHING_S).exp())
 }
 
+/// The wing beat's phase (cycles, `0..1`) on frame `frame_count` (Bevy's `FrameCount`, the
+/// shader's `globals.frame_count`): [`FLAP_CYCLES_PER_FRAME`] a frame, as `dragonfly.wesl`
+/// reckons it.
+pub fn flap_phase(frame_count: u32) -> f32 {
+    ((frame_count % FLAP_WRAP_FRAMES) as f32 * FLAP_CYCLES_PER_FRAME).fract()
+}
+
 /// The idle bob's height at `t_s` for a fly drawn at `scale`: [`HOVER_AMPLITUDE`] × `scale` at
 /// [`HOVER_HZ`].
 pub fn hover_offset(t_s: f32, scale: f32) -> f32 {
@@ -165,7 +181,7 @@ pub type DragonflyMaterial = ExtendedMaterial<StandardMaterial, DragonflyExtensi
 /// The flap and rim parameters, as `dragonfly.wesl`'s `DragonflyLook`.
 #[derive(Clone, Copy, Debug, ShaderType, Reflect)]
 pub struct DragonflyLook {
-    /// x: frequency (Hz); y: amplitude (radians).
+    /// x: the beat's step (cycles per frame); y: amplitude (radians).
     pub flap: Vec4,
     /// rgb: the rim colour; w: its strength.
     pub rim: Vec4,
@@ -176,7 +192,7 @@ pub struct DragonflyLook {
 impl Default for DragonflyLook {
     fn default() -> Self {
         DragonflyLook {
-            flap: Vec4::new(FLAP_HZ, FLAP_AMPLITUDE_RAD, 0.0, 0.0),
+            flap: Vec4::new(FLAP_CYCLES_PER_FRAME, FLAP_AMPLITUDE_RAD, 0.0, 0.0),
             rim: RIM_COLOR.extend(RIM_STRENGTH),
             rim_shape: Vec4::new(RIM_POWER, 0.0, 0.0, 0.0),
         }
@@ -483,14 +499,196 @@ mod tests {
     #[test]
     fn the_flap_and_wing_constants_reach_the_shader() {
         let look = DragonflyLook::default();
-        assert_eq!(look.flap.x, 25.0);
+        assert_eq!(look.flap.x, 0.4);
         assert_eq!(look.flap.y, 0.6);
         assert_eq!(wing_material().base.alpha_mode, AlphaMode::Blend);
         assert_eq!(wing_material().base.base_color.alpha(), 0.45);
         assert_eq!(body_material().base.alpha_mode, AlphaMode::Opaque);
         let wesl = include_str!("../../assets/shaders/dragonfly.wesl");
-        assert!(wesl.contains("sin(globals.time * TAU * look.flap.x) * look.flap.y"));
+        // The phase is `flap_phase`'s: the frame count, wrapped, times the step.
+        assert!(wesl.contains(&format!(
+            "fract(f32(globals.frame_count % {FLAP_WRAP_FRAMES}u) * look.flap.x)"
+        )));
+        assert!(wesl.contains("sin(TAU * flap_phase()) * look.flap.y"));
+        // Never on time, which aliases (`the_flap_reads_fast_at_every_frame_rate`).
+        assert!(!wesl.contains("globals.time"), "the flap reads the clock");
         assert!(wesl.contains("@location(8) wing: f32"));
+        // The wrap falls on a whole number of cycles, so the stroke runs on across it.
+        let cycles = f64::from(FLAP_WRAP_FRAMES) * f64::from(FLAP_CYCLES_PER_FRAME);
+        assert!((cycles - cycles.round()).abs() < 1e-4, "{cycles}");
+        let step = flap_phase(0) + 1.0 - flap_phase(FLAP_WRAP_FRAMES - 1);
+        assert!((step - FLAP_CYCLES_PER_FRAME).abs() < 1e-4, "{step}");
+        assert_eq!(flap_phase(FLAP_WRAP_FRAMES), flap_phase(0));
+    }
+
+    /// The beat as seen on screen at `fps`, for a phase rule `phase_at(frame, seconds)`: the
+    /// apparent beat (Hz: the median frame-to-frame step, wrapped to the nearest half cycle, ×
+    /// `fps`) and the narrowest sweep any five consecutive frames show (the peak-to-peak flap,
+    /// in amplitudes, 0 to 2).
+    fn seen_beat(phase_at: impl Fn(u32, f32) -> f32, fps: f32) -> (f32, f32) {
+        let frames: Vec<f32> = (0..400u32).map(|k| phase_at(k, k as f32 / fps)).collect();
+        let mut steps: Vec<f32> = frames
+            .windows(2)
+            .map(|w| {
+                let d = w[1] - w[0];
+                (d - d.round()).abs()
+            })
+            .collect();
+        steps.sort_by(f32::total_cmp);
+        let apparent_hz = steps[steps.len() / 2] * fps;
+        let flaps: Vec<f32> = frames
+            .iter()
+            .map(|p| (core::f32::consts::TAU * p).sin())
+            .collect();
+        let sweep = flaps
+            .windows(5)
+            .map(|w| {
+                let max = w.iter().copied().fold(f32::MIN, f32::max);
+                let min = w.iter().copied().fold(f32::MAX, f32::min);
+                max - min
+            })
+            .fold(f32::MAX, f32::min);
+        (apparent_hz, sweep)
+    }
+
+    #[test]
+    fn the_flap_reads_fast_at_every_frame_rate() {
+        // A real dragonfly's beat, which the M3 Task 4 shader drew in time.
+        const REAL_BEAT_HZ: f32 = 25.0;
+        let in_time = |_: u32, t: f32| (t * REAL_BEAT_HZ).fract();
+        // The measure sees the owner's report in the beat drawn in time: a slow flutter near
+        // 26 fps, and the stroke held still at 50.
+        let (slow, _) = seen_beat(in_time, 26.0);
+        assert!((slow - 1.0).abs() < 0.05, "{slow}");
+        let (_, held) = seen_beat(in_time, 50.0);
+        assert!(held < 0.01, "{held}");
+        // The shader's beat: at every frame rate from 20 to 144 (and the video rates), at least
+        // three quarters as fast as the real beat or the fastest the frame rate can show (half
+        // the frame rate), whichever is slower, and every five frames sweep most of the stroke.
+        let rates = (20..=144)
+            .map(|f| f as f32)
+            .chain([23.976, 29.97, 47.952, 59.94, 119.88]);
+        for fps in rates {
+            let (hz, sweep) = seen_beat(|frame, _| flap_phase(frame), fps);
+            let fastest = REAL_BEAT_HZ.min(fps / 2.0);
+            assert!(
+                hz >= 0.75 * fastest,
+                "{fps} fps: the beat reads at {hz} Hz, want at least {}",
+                0.75 * fastest
+            );
+            assert!(
+                sweep >= 1.2,
+                "{fps} fps: five frames sweep only {sweep} amplitudes"
+            );
+        }
+    }
+
+    /// The wings' triangles in the model frame: which side each is on (`±1`, the shader's
+    /// `side`) and its plane's unit normal, from the mesh's positions.
+    fn wing_faces() -> Vec<(f32, Vec3)> {
+        let mesh = dragonfly_wings_mesh();
+        let p = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|a| a.as_float3())
+            .expect("positions")
+            .to_vec();
+        let indices: Vec<usize> = mesh.indices().expect("indices").iter().collect();
+        indices
+            .chunks(3)
+            .map(|t| {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(p[i]));
+                (a.x.signum(), (b - a).cross(c - a).normalize())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_wings_never_lie_edge_on_to_the_chase_view() {
+        use bevy::math::DVec3;
+        use timefly_core::flight::altitudes::CHASE_MIN_DISTANCE_M;
+        use timefly_core::flight::chase::{CHASE_START_LOOK_DEG, chase_pose};
+        // The fly heading −z from the origin; the region's chase eye behind it, raised
+        // CHASE_ELEVATION_DEG above its horizon (the look pitch moves only the target).
+        let chase = chase_pose(
+            DVec3::ZERO,
+            DVec3::NEG_Z,
+            DVec3::Y,
+            1_000.0,
+            CHASE_START_LOOK_DEG,
+            CHASE_MIN_DISTANCE_M,
+        );
+        let behind = chase.eye.normalize().as_vec3();
+        // At least this angle between a wing's plane and the view.
+        const MIN_VIEW_DEG: f32 = 10.0;
+        // The chase eye glides, so in turns it swings a little to either side of behind.
+        const SWING_DEG: i32 = 10;
+        const STROKE_SAMPLES: usize = 40;
+        let least = MIN_VIEW_DEG.to_radians().sin();
+        let faces = wing_faces();
+        assert_eq!(faces.len(), 8, "four quads");
+        let degrees = |limit: f32, step: usize| {
+            let limit = limit.round() as i32;
+            (-limit..=limit)
+                .step_by(step)
+                .map(|d| (d as f32).to_radians())
+        };
+        // Every pitch (a full-speed descent is the steepest, nose down MAX_PITCH_DEG), bank and
+        // swing of the eye, at every point of the stroke.
+        for pitch_rad in degrees(MAX_PITCH_DEG, 2) {
+            for bank_rad in degrees(MAX_BANK_DEG, 4) {
+                for swing in degrees(SWING_DEG as f32, 5) {
+                    let eye = Quat::from_rotation_y(swing) * behind;
+                    let drawn = FlyPose {
+                        pitch_rad,
+                        bank_rad,
+                        ..default()
+                    }
+                    .transform()
+                    .rotation;
+                    let mut mean = vec![0.0; faces.len()];
+                    for k in 0..STROKE_SAMPLES {
+                        // `dragonfly.wesl`: each wing turns about the body axis by the flap,
+                        // mirrored between the sides.
+                        let flap = (core::f32::consts::TAU * k as f32 / STROKE_SAMPLES as f32)
+                            .sin()
+                            * FLAP_AMPLITUDE_RAD;
+                        let seen: Vec<f32> = faces
+                            .iter()
+                            .map(|&(side, n)| {
+                                (drawn * Quat::from_rotation_z(side * flap) * n)
+                                    .dot(eye)
+                                    .abs()
+                            })
+                            .collect();
+                        let best = seen.iter().copied().fold(0.0, f32::max);
+                        assert!(
+                            best >= least,
+                            "every wing edge-on: pitch {:.0}°, bank {:.0}°, swing {:.0}°, \
+                             flap {flap:.2}: best {:.1}°",
+                            pitch_rad.to_degrees(),
+                            bank_rad.to_degrees(),
+                            swing.to_degrees(),
+                            best.asin().to_degrees()
+                        );
+                        for (m, s) in mean.iter_mut().zip(&seen) {
+                            *m += s / STROKE_SAMPLES as f32;
+                        }
+                    }
+                    // No wing stays edge-on through its stroke either.
+                    for (i, m) in mean.iter().enumerate() {
+                        assert!(
+                            *m >= least,
+                            "wing face {i} edge-on through the stroke: pitch {:.0}°, bank \
+                             {:.0}°, swing {:.0}°: {:.1}°",
+                            pitch_rad.to_degrees(),
+                            bank_rad.to_degrees(),
+                            swing.to_degrees(),
+                            m.asin().to_degrees()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

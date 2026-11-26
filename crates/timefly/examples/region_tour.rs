@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|high|fly|cruise|cloud|time|cloudtime|cloudtime1] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
 //! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
@@ -52,6 +52,16 @@
 //! offscreen image as the other modes do: a window the compositor is not showing (behind
 //! others, on another Space) gets no main pass at all, only the shadow and compute passes, so
 //! GPU costs read from a trace (Metal System Trace) are only real offscreen.
+//!
+//! A fifth argument `descent` checks the wings in a descent (M3 Task 13; give a high `AGL_M`,
+//! say 20000, so the fly is still well up when the shots are done): after the start shot (level
+//! flight) it holds `Q` (straight down at the climb keys' full speed, which pitches the fly
+//! `MAX_PITCH_DEG` nose down) for [`DESCENT_SECS`] and saves `<prefix>-descent.png`, then
+//! `<prefix>-descent-b.png` [`DESCENT_SHOT_GAP`] frames later (another point of the flap);
+//! then, still descending, holds the cloud at [`DESCENT_CLOUD_DENSITY`] and saves
+//! `<prefix>-descent-cloud.png`. Each shot logs a `region tour wings` line: the fly's drawn
+//! pitch, the chase eye's elevation above the fly's horizon, and the angles between the view
+//! and the body's plane and the resting wings' plane (0° is edge-on).
 //!
 //! A fifth argument `dive` checks the dive and the climb through the cloud (M3 Task 7). The game
 //! starts on the globe (no launch region), the globe camera renders into the offscreen image
@@ -105,6 +115,7 @@
 use std::path::PathBuf;
 
 use bevy::camera::RenderTarget;
+use bevy::mesh::VertexAttributeValues;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
@@ -112,6 +123,7 @@ use bevy::window::{PresentMode, PrimaryWindow};
 use timefly::args::{LaunchArgs, parse_region, parse_window_size};
 use timefly::bench::frame_time_stats;
 use timefly::cloud::CloudDensity;
+use timefly::creature::{FlyPose, dragonfly_wings_mesh};
 use timefly::diagnostics;
 use timefly::fly_camera::{
     CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems, MIN_PITCH_DEG,
@@ -157,6 +169,14 @@ const FLIGHT_SHOT_SECS: f32 = 2.0;
 /// (two or three frames), and the change goes on underneath, so the hold at full cover is still
 /// to come when the half shot is done.
 const PIN_FRAMES: u32 = 8;
+/// Seconds the `descent` mode descends before its first shot: the drawn pitch settles (its time
+/// constant is 0.25 s) at the full nose-down pitch.
+const DESCENT_SECS: f32 = 1.5;
+/// Frames between the `descent` mode's two clear shots, so they catch different points of the
+/// flap.
+const DESCENT_SHOT_GAP: u32 = 2;
+/// The density the `descent` mode holds the cloud at for its cloudy shot.
+const DESCENT_CLOUD_DENSITY: f32 = 0.5;
 /// The density `cloudtime` holds the cloud at.
 const TIMED_CLOUD_DENSITY: f32 = 0.5;
 /// The density `cloudtime1` holds the cloud at: opaque.
@@ -194,6 +214,8 @@ enum Step {
     Wire,
     /// The steepest look is set (`high`); its shot follows once the chase camera has glided.
     Down,
+    /// Descending at full speed (`descent`): the clear shots, then the cloudy one.
+    Descend,
     /// The scripted flight (`fly`): diving, then cruising.
     Dive,
     Cruise,
@@ -231,6 +253,8 @@ enum Mode {
     Fly,
     Cruise,
     Cloud,
+    /// A full-speed descent, clear and in the cloud (`descent`).
+    Descent,
     Time,
     /// `Backspace` from low, the cloud held just below opaque and opaque (`lowclimb`).
     LowClimb,
@@ -356,6 +380,28 @@ fn log_flight(label: &str, fly: &FlyState, region: Option<&ActiveRegion>, time: 
     );
 }
 
+/// Logs how the chase camera sees the fly's wings (`descent`): the fly's drawn pitch, the eye's
+/// elevation above the fly's horizon, and the angles (degrees, 0 edge-on) between the view and
+/// the body's plane and the resting wings' plane (the wing mesh's own normal).
+fn log_wings(label: &str, pose: &FlyPose, camera: &Transform) {
+    let to_eye = (camera.translation - pose.translation).normalize();
+    let rotation = pose.transform().rotation;
+    let wing_normal = match dragonfly_wings_mesh().attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(VertexAttributeValues::Float32x3(n)) => Vec3::from(n[0]),
+        _ => Vec3::NAN,
+    };
+    let seen = |n: Vec3| (rotation * n).dot(to_eye).abs().asin().to_degrees();
+    info!(
+        label,
+        pitch_deg = pose.pitch_rad.to_degrees(),
+        bank_deg = pose.bank_rad.to_degrees(),
+        eye_elevation_deg = to_eye.y.asin().to_degrees(),
+        body_plane_view_deg = seen(Vec3::Y),
+        wing_plane_view_deg = seen(wing_normal),
+        "region tour wings"
+    );
+}
+
 /// Logs where the fly sits in the chase camera's view: degrees below the view's centre
 /// (negative is above) and sideways.
 fn log_chase_view(label: &str, camera: &Transform, fly: &FlyState) {
@@ -388,6 +434,7 @@ fn tour(
         Option<Res<ActiveRegion>>,
         Res<GlobeTime>,
     ),
+    pose: Res<FlyPose>,
     cameras: Query<&Transform, With<RegionCamera>>,
     last_shot: Res<LastShot>,
     mut commands: Commands,
@@ -493,6 +540,14 @@ fn tour(
                     tour.step = Step::LowGather;
                     tour.frames = 0;
                 }
+            } else if tour.mode == Mode::Descent && tour.frames >= WIRE_FRAMES {
+                if let Ok(camera) = cameras.single() {
+                    log_wings("level", &pose, camera);
+                }
+                tour.step = Step::Descend;
+                tour.since = now;
+                tour.shot_taken = false;
+                tour.frames = 0;
             } else if tour.mode == Mode::High && tour.frames >= WIRE_FRAMES {
                 fly.pitch = MIN_PITCH_DEG.to_radians();
                 tour.step = Step::Down;
@@ -537,6 +592,41 @@ fn tour(
             if tour.frames == 2 * WIRE_FRAMES {
                 shoot(&mut commands, &tour, "down");
             } else if tour.frames > 3 * WIRE_FRAMES {
+                tour.step = Step::Done;
+                tour.frames = 0;
+            }
+        }
+        Step::Descend => {
+            // Straight down at the climb keys' full speed.
+            keys.press(KeyCode::KeyQ);
+            let wings = |label: &str| {
+                if let Ok(camera) = cameras.single() {
+                    log_wings(label, &pose, camera);
+                    log_chase_view(label, camera, &fly);
+                }
+            };
+            if !tour.shot_taken {
+                if now - tour.since >= DESCENT_SECS {
+                    wings("descent");
+                    log_flight("descent", &fly, region.as_deref(), &time);
+                    shoot(&mut commands, &tour, "descent");
+                    tour.shot_taken = true;
+                    tour.frames = 0;
+                }
+            } else if tour.frames == DESCENT_SHOT_GAP {
+                wings("descent-b");
+                shoot(&mut commands, &tour, "descent-b");
+            } else if tour.frames == 2 * WIRE_FRAMES {
+                tour.pin = Some(DESCENT_CLOUD_DENSITY);
+            } else if tour.frames == 2 * WIRE_FRAMES + PIN_FRAMES {
+                info!(pin = ?tour.pin, "region tour: cloudy descent shot");
+                wings("descent-cloud");
+                log_flight("descent-cloud", &fly, region.as_deref(), &time);
+                shoot(&mut commands, &tour, "descent-cloud");
+            } else if tour.frames >= 4 * WIRE_FRAMES {
+                // The shot has resolved under the held cloud.
+                keys.release(KeyCode::KeyQ);
+                tour.pin = None;
                 tour.step = Step::Done;
                 tour.frames = 0;
             }
@@ -1329,7 +1419,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|fly|cruise|cloud|time|cloudtime|cloudtime1|dive|divekey|lowclimb|hop|hop1|bugshot|globebug] [AGL_M] [LATER_S] \
+             [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1|dive|divekey|lowclimb|hop|hop1|bugshot|globebug] [AGL_M] [LATER_S] \
              [--from-shot <json>]"
         );
         return AppExit::error();
@@ -1362,6 +1452,7 @@ fn main() -> AppExit {
         Some("fly") => Mode::Fly,
         Some("cruise") => Mode::Cruise,
         Some("cloud") => Mode::Cloud,
+        Some("descent") => Mode::Descent,
         Some("time" | "cloudtime" | "cloudtime1") => Mode::Time,
         Some("lowclimb") => Mode::LowClimb,
         Some("dive") => Mode::Dive { backspace: false },
@@ -1512,6 +1603,7 @@ mod tests {
             .init_resource::<GlobeTime>()
             .init_resource::<FlyState>()
             .init_resource::<LastShot>()
+            .init_resource::<FlyPose>()
             .insert_resource(Navigation {
                 phase: NavPhase::Flying,
                 ..default()
