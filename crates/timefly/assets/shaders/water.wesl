@@ -99,6 +99,8 @@ struct WaterVertexOutput {
     @location(1) @interpolate(flat) instance_index: u32,
 }
 
+// `DRY_SINK_M` in water.rs: dry vertices sit this far (m) under the ground, unpulled.
+const DRY_SINK_M: f32 = 4.0;
 // `RIBBON_NONE_M` in timefly_core::hydrology::params: the ribbon of water that is not a river.
 const RIBBON_NONE_M: f32 = 1000.0;
 // `RAPID_SPEED_BASE_MS`, `RAPID_SPEED_GAIN_MS` in timefly_core::hydrology::params.
@@ -170,11 +172,15 @@ fn vertex(in: Vertex) -> WaterVertexOutput {
     let rel = in.position.xz * (reach / look.mesh.w);
     let xz = params.camera.xz + rel;
     let drop = dot(rel, rel) / (2.0 * params.lattice.z);
-    // The drawn surface: the water's level, or the ground where that is higher. Dry vertices sit
-    // on the ground rather than at their texels' level (NO_WATER_DROP_M below it), so between a
-    // river's vertex and a dry one the mesh never dips under the river's banks.
+    // The surface: the water's level, or DRY_SINK_M under the ground where that is higher. Dry
+    // vertices then sit just under the ground, not at their texels' level (NO_WATER_DROP_M below
+    // it), so the terrain hides the mesh over dry land (the water draws after the terrain, and
+    // its fragments there are rejected before they shade), while between a river's vertex and a
+    // bank's the mesh never dips under the river's level.
     let w = water_at(params, xz);
-    let level = w.level - min(w.thickness, 0.0);
+    let level = max(w.level, w.level - w.thickness - DRY_SINK_M);
+    // How much of the depth pull applies: all of it on water, none on dry ground.
+    let wet = smoothstep(-DRY_SINK_M, 0.0, w.thickness);
     // Low down, on standing water: the swell's height, and the swash's amplitude for the depth
     // lift below. Higher up, and on rivers, neither shows.
     // `water_vertex_spacing_m`: the ring step or the arc between segments.
@@ -201,7 +207,7 @@ fn vertex(in: Vertex) -> WaterVertexOutput {
     // The pull of water `lift` metres higher (along the ray, `lift / sin` of its slope), so water
     // the swash lays over the beach still wins depth ties with the terrain beneath it.
     let lifted = lift * distance / max(abs(ray.y), 1e-3);
-    let pull = min(look.pull.x + look.sky_horizon.w * distance + lifted, 0.5 * distance);
+    let pull = min((look.pull.x + look.sky_horizon.w * distance + lifted) * wet, 0.5 * distance);
     let pulled = surface - ray * (pull / max(distance, 1e-3));
     var out: WaterVertexOutput;
     out.position = position_world_to_clip(pulled);

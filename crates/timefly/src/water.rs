@@ -108,6 +108,12 @@ pub fn water_radius_m(camera_height_m: f32) -> f32 {
 pub const WATER_RING_M: f32 = 25.0;
 pub const WATER_RING_GROWTH: f32 = 0.04;
 
+/// Where the water's thickness is below `−DRY_SINK_M` (dry ground), the mesh sits this far (m)
+/// under the ground and isn't pulled toward the camera, so the terrain hides it there and its
+/// fragments are rejected before they shade. Elsewhere it sits at the water's level, or at
+/// `ground − DRY_SINK_M` where that is higher, so near water it never dips under the level.
+/// A `water.wesl` constant.
+pub const DRY_SINK_M: f32 = 4.0;
 /// The flow map's period (s): each of the two phases scrolls the ripples downstream for this
 /// long, then restarts while the other shows. Divides [`crate::art::TIME_WRAP_S`].
 pub const FLOW_PERIOD_S: f32 = 2.0;
@@ -501,10 +507,10 @@ pub fn water_material(
             perceptual_roughness: 0.12,
             // f0 = 0.16 × reflectance² = 0.02 (WATER_F0).
             reflectance: (WATER_F0 / 0.16).sqrt(),
-            // The mesh follows the drawn surface (the ground beside the water), so far out, at a
-            // grazing angle, a triangle stepping down to a river faces away from the camera:
-            // culled, it cut distant water into dashes, one per mesh segment.
-            cull_mode: None,
+            // Drawn after the opaque terrain (the alpha-mask phase; no fragment's alpha is under
+            // 0), so the depth test rejects the mesh where it lies under dry ground
+            // ([`DRY_SINK_M`]) before the fragment shader runs.
+            alpha_mode: AlphaMode::Mask(0.0),
             ..default()
         },
         extension: WaterExtension {
@@ -1116,19 +1122,49 @@ mod tests {
         assert!((got - want).abs().max_element() < 5e-4, "{got} vs {want}");
     }
 
-    /// The mesh follows the ground beside the water, so it has slopes that face away from a
-    /// distant camera: the water draws both faces (culled, far rivers broke into dashes, one per
-    /// mesh segment), and its normal is its own, never flipped for the back face.
+    /// The water is drawn after the opaque terrain (the alpha-mask phase, with a cutoff no
+    /// fragment fails) so the depth test rejects its fragments under the ground before they
+    /// shade (review fix round 1), and it culls back faces as an opaque surface should.
     #[test]
-    fn the_water_draws_both_faces() {
+    fn the_water_draws_after_the_terrain() {
         let m = water_material(
             &Handle::default(),
             &Handle::default(),
             &Handle::default(),
             water_look(&look_grid()),
         );
-        assert_eq!(m.base.cull_mode, None);
+        assert_eq!(m.base.alpha_mode, AlphaMode::Mask(0.0));
+        assert_eq!(
+            m.base.cull_mode,
+            Some(bevy::render::render_resource::Face::Back)
+        );
         assert!(!m.base.double_sided);
+        // The terrain stays opaque, so it is drawn first.
+        assert_eq!(StandardMaterial::default().alpha_mode, AlphaMode::Opaque);
+    }
+
+    /// Dry vertices sit `DRY_SINK_M` under the ground, unpulled, so the terrain hides the mesh
+    /// over dry land; near water the mesh never dips under the water's level (review fix round 1).
+    #[test]
+    fn dry_vertices_sink_under_the_ground() {
+        assert_eq!(wesl_const_f32(WATER_WESL, "DRY_SINK_M"), DRY_SINK_M);
+        assert!(
+            WATER_WESL.contains("let level = max(w.level, w.level - w.thickness - DRY_SINK_M);")
+        );
+        assert!(WATER_WESL.contains("let wet = smoothstep(-DRY_SINK_M, 0.0, w.thickness);"));
+        assert!(WATER_WESL.contains("* wet, 0.5 * distance);"));
+        // The rule, modelled: water level `l`, ground `l − t`.
+        let surface = |l: f32, t: f32| l.max(l - t - DRY_SINK_M);
+        // Wet: at the level. A bank lower than the sink: at the level. A higher bank: sunk, yet
+        // still above the water beside it.
+        assert_eq!(surface(10.0, 2.0), 10.0);
+        assert_eq!(surface(10.0, -0.5 * DRY_SINK_M), 10.0);
+        assert_eq!(surface(10.0, -20.0), 30.0 - DRY_SINK_M);
+        for t in [-1000.0f32, -64.0, -5.0, -4.0, -1.0, 0.0, 3.0] {
+            let y = surface(10.0, t);
+            assert!(y >= 10.0, "{t}: under the water");
+            assert!(y <= (10.0 - t).max(10.0), "{t}: over the ground");
+        }
     }
 
     /// The sea bound the terrain's two height textures; the water binds the two water textures
