@@ -786,6 +786,17 @@ The test below pins the result.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p timefly --test region_bench --test journey_bench`.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run the tests to check they pass.**
+**Carried from earlier tasks (controller rulings, 2026-11-25):** record each of these in `docs/testing/rivers/performance.md`, with its pacing (median frame time):
+- **Native hop memory, display-paced, two runs.** Judge run 2 against `HOP_MEMORY_LIMIT_MIB` (64). Task 7 measured +60.7 MiB with a 3.3 MiB margin. Task 8's fix round ran unpaced only (+48.7). Include a hop from a boulder-free region into a rapids region: Task 9's boulder pool only grows, by about 14 MiB from empty to full (estimated). If the gate fails, trim the pool on a replace or stage it like the water.
+- **Web costs, from the owner's Chrome run:**
+  - boulder placement on the swap frame (0.52 ms native for 2,058; up to 16,384);
+  - the continental pass's wall time (0.89 → 1.40 s native dev after Task 8b);
+  - the largest present-day overlay unit (`Today::place`) against `WEB_HYDRO_BUDGET_MS`;
+  - the 2.7 ms apron prep step (Task 6) against the 6 ms slice.
+  Time-slice whatever overruns.
+- **The water's GPU cost** on WebGPU over dry land and over rivers (Task 8 measured native only). Check that distant thin rivers stay visible (Task 8 minor).
+- **Tile-count growth** from the river read margin (Task 5), and the region CPU footprint (+15 MiB per region, Task 6).
+
 - [ ] **Step 5: Run the gate and commit** `feat: benches report the continental pass and fly the Indus tributaries`.
 
 ### Task 11: The reality check
