@@ -22,9 +22,10 @@ pub const GLOBE_MAX_TURN_DEG_PER_S: f64 = 30.0;
 pub const CHASE_DISTANCE_PER_AGL: f64 = 0.5;
 pub const CHASE_MIN_DISTANCE_M: f64 = 60.0;
 pub const CHASE_ELEVATION_DEG: f64 = 20.0;
-/// The globe chase's look-down pitch at `GLOBE_MAX_ALTITUDE_KM` (Task 4 fix round 1: was 70°;
-/// 85° puts the eye straight over the fly and the globe centred in the view).
-pub const CHASE_GLOBE_TOP_PITCH_DEG: f64 = 85.0;
+/// The globe chase's look-down pitch at `GLOBE_MAX_ALTITUDE_KM` (M3 Task 14, owner's "A: globe
+/// centred": with the eye 70° up behind the fly, 83.8° puts the globe's centre just below the
+/// view's centre and its whole outline in a 16:9 or 9:16 view, the fly over its upper part).
+pub const CHASE_GLOBE_TOP_PITCH_DEG: f64 = 83.8;
 pub const FLY_SCREEN_FRACTION: f64 = 0.05;
 pub const CLOUD_GATHER_S: f64 = 0.6;
 pub const CLOUD_CLEAR_S: f64 = 1.2;

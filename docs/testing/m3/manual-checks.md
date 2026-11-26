@@ -42,6 +42,13 @@ tree):
   mode).
 - `himalayas-region-below.png`: the region below the cloud base after that dive, at 230 km (for
   check 9).
+- `globe-framing-top.jpg`, `globe-framing-top-portrait.jpg`, `globe-framing-mid.jpg` and
+  `globe-framing-above-cloud.jpg`: the globe chase over 30° N 15° E at the start altitude
+  (8,282 km, 16:9 and 9:16), mid-way (3,150 km) and just above the cloud (2,600 km), Task 14's
+  tree (`globebug` mode, 1280 × 720 scaled down). At the dive altitude the cloud is a
+  white-out.
+- `wings-after-globe-descent.jpg`: the wings in a full-speed descent over the globe with the
+  view dragged fully up (the eye at its 20° floor; `globedescent` mode, a 4K crop).
 
 ## Design §10 checks
 
@@ -97,7 +104,9 @@ tree):
 
 Look for the fly, without hunting for it, at each of these:
 
-- [ ] the globe's top altitude (just after launch);
+- [ ] the globe's top altitude (just after launch). The camera is behind the fly, not over it,
+      and the whole globe is in view, nearly centred, with the fly over its upper part (your
+      "A: globe centred", Task 14; `globe-framing-top.jpg`, `globe-framing-top-portrait.jpg`);
 - [ ] just above the cloud top (2,500 km) and at the dive altitude (1,200 km);
 - [ ] in a region just below the cloud base (about 290 km) and at 230 km where you emerge;
 - [ ] in a region near the ground (300 m to a few km), over dark forest and over snow.

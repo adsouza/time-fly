@@ -21,11 +21,22 @@ pub const GLOBE_CHASE_DIVE_LOOK_DEG: f64 = 50.0;
 /// start look. Lower, a fly descending nose down shows the eye its wings edge-on (M3 Task 14:
 /// below about 15°; 2° of wing at the old floor of 5°, `creature`'s edge-on test).
 pub const GLOBE_CHASE_MIN_ELEVATION_DEG: f64 = CHASE_ELEVATION_DEG;
-/// The highest the globe's chase eye may climb above the fly (degrees): straight overhead,
-/// where it sits at the top altitude so the globe's centre is as near the view's centre as the
-/// fly's place [`CHASE_FLY_BELOW_CENTRE_DEG`] below it allows. The look stays 5° short of
-/// straight down, so the camera's up stays defined.
-pub const GLOBE_CHASE_MAX_ELEVATION_DEG: f64 = 90.0;
+/// The globe chase eye's elevation above the fly's horizon at and below [`DIVE_ALTITUDE_KM`]
+/// (degrees): [`CHASE_FLY_BELOW_CENTRE_DEG`] above [`GLOBE_CHASE_DIVE_LOOK_DEG`], so at the dive
+/// the fly sits that far below the view's centre, as in a region.
+pub const GLOBE_CHASE_DIVE_ELEVATION_DEG: f64 =
+    GLOBE_CHASE_DIVE_LOOK_DEG + CHASE_FLY_BELOW_CENTRE_DEG;
+/// The globe chase eye's elevation at [`GLOBE_MAX_ALTITUDE_KM`] (degrees), owner's choice
+/// "A: globe centred" (M3 Task 14): behind the fly, never overhead, and high enough that the
+/// globe is behind the fly. From an eye at elevation `E` behind a fly at radius `r` the fly is
+/// seen over the globe only when `r·cos E < R`, 64° at the top; at 70° the fly sits over the
+/// globe's upper part, and the look ([`CHASE_GLOBE_TOP_PITCH_DEG`]) centres the whole globe.
+pub const GLOBE_CHASE_TOP_ELEVATION_DEG: f64 = 70.0;
+/// The highest a drag may raise the globe's chase eye (degrees): still behind the fly.
+pub const GLOBE_CHASE_MAX_ELEVATION_DEG: f64 = 75.0;
+/// The steepest the globe's chase may look (degrees below the fly's horizon): 5° short of
+/// straight down, so the camera's up (the fly's) stays well defined.
+pub const GLOBE_CHASE_MAX_LOOK_DEG: f64 = 85.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChasePose {
@@ -83,32 +94,48 @@ pub fn chase_pose_with_elevation(
     let elev = elevation_deg.to_radians();
     let eye = fly - fwd * (d * elev.cos()) + up * (d * elev.sin());
     // The target is on the fly's vertical line while the eye is well back from it; nearer
-    // overhead (the globe's top) that point closes on the eye, so the target stays at least a
-    // quarter of the chase distance out along the same view ray.
+    // overhead (a steep eye on the globe) that point closes on the eye, so the target stays at
+    // least a quarter of the chase distance out along the same view ray.
     let reach = (d * elev.cos()).max(0.25 * d);
     let look = look_pitch_deg.to_radians();
     let target = eye + fwd * reach - up * (reach * look.tan());
     ChasePose { eye, target, up }
 }
 
-/// The globe chase's look-down pitch (degrees) at `altitude_km`: [`GLOBE_CHASE_DIVE_LOOK_DEG`]
-/// at and below [`DIVE_ALTITUDE_KM`], rising to [`CHASE_GLOBE_TOP_PITCH_DEG`] at
-/// [`GLOBE_MAX_ALTITUDE_KM`] (the eye then straight over the fly and the globe centred under
-/// it), smoothstep in `ln(altitude)` between (controller rulings, Task 4).
-pub fn globe_look_pitch_deg(altitude_km: f64) -> f64 {
-    let t = smoothstep(
+/// How far the globe chase's framing has gone from the dive's to the top's at `altitude_km`: 0
+/// at and below [`DIVE_ALTITUDE_KM`], 1 at [`GLOBE_MAX_ALTITUDE_KM`], smoothstep in
+/// `ln(altitude)` between (controller rulings, Task 4).
+fn globe_framing(altitude_km: f64) -> f64 {
+    smoothstep(
         DIVE_ALTITUDE_KM.ln(),
         GLOBE_MAX_ALTITUDE_KM.ln(),
         altitude_km.max(f64::MIN_POSITIVE).ln(),
-    );
+    )
+}
+
+/// The globe chase's look-down pitch (degrees) at `altitude_km`: [`GLOBE_CHASE_DIVE_LOOK_DEG`]
+/// at and below [`DIVE_ALTITUDE_KM`], rising to [`CHASE_GLOBE_TOP_PITCH_DEG`] at
+/// [`GLOBE_MAX_ALTITUDE_KM`], where it centres the whole globe ([`globe_framing`]).
+pub fn globe_look_pitch_deg(altitude_km: f64) -> f64 {
+    let t = globe_framing(altitude_km);
     GLOBE_CHASE_DIVE_LOOK_DEG + (CHASE_GLOBE_TOP_PITCH_DEG - GLOBE_CHASE_DIVE_LOOK_DEG) * t
 }
 
 /// The globe chase eye's elevation above the fly's horizon (degrees) at `altitude_km`:
-/// [`CHASE_FLY_BELOW_CENTRE_DEG`] above the look pitch, so the fly sits that far below the
-/// view's centre at every altitude, as in a region.
+/// [`GLOBE_CHASE_DIVE_ELEVATION_DEG`] at and below the dive (the fly
+/// [`CHASE_FLY_BELOW_CENTRE_DEG`] below the view's centre, as in a region), rising on the look's
+/// curve to [`GLOBE_CHASE_TOP_ELEVATION_DEG`] at the top (behind the fly, the globe behind it;
+/// the fly then over the globe's upper part, [`globe_fly_below_centre_deg`]).
 pub fn globe_chase_elevation_deg(altitude_km: f64) -> f64 {
-    globe_look_pitch_deg(altitude_km) + CHASE_FLY_BELOW_CENTRE_DEG
+    let t = globe_framing(altitude_km);
+    GLOBE_CHASE_DIVE_ELEVATION_DEG
+        + (GLOBE_CHASE_TOP_ELEVATION_DEG - GLOBE_CHASE_DIVE_ELEVATION_DEG) * t
+}
+
+/// How far below the view's centre the globe chase shows the fly at `altitude_km` (degrees,
+/// negative above): the eye's elevation less the look's pitch, which a drag moves together.
+pub fn globe_fly_below_centre_deg(altitude_km: f64) -> f64 {
+    globe_chase_elevation_deg(altitude_km) - globe_look_pitch_deg(altitude_km)
 }
 
 /// The globe chase distance (km) at `altitude_km`: as [`chase_pose`] reckons it, with the
@@ -120,7 +147,9 @@ pub fn globe_chase_distance_km(altitude_km: f64) -> f64 {
 /// The range of the view drag's offset (degrees, added to both the look pitch and the eye's
 /// elevation; positive looks further down) at `altitude_km`: the eye stays between
 /// [`GLOBE_CHASE_MIN_ELEVATION_DEG`] and [`GLOBE_CHASE_MAX_ELEVATION_DEG`] above the fly's
-/// horizon and within [`GLOBE_MAX_CAMERA_DISTANCE_KM`] of the centre.
+/// horizon and within [`GLOBE_MAX_CAMERA_DISTANCE_KM`] of the centre, and the look no steeper
+/// than [`GLOBE_CHASE_MAX_LOOK_DEG`] (at the top, where the look centres the globe, that leaves
+/// a drag down little room).
 pub fn globe_look_offset_range(altitude_km: f64) -> (f64, f64) {
     // |eye|² = r² + 2·r·d·sin(e) + d² for the eye at elevation e, distance d behind a fly at
     // radius r: the 3R cap bounds sin(e).
@@ -130,7 +159,11 @@ pub fn globe_look_offset_range(altitude_km: f64) -> (f64, f64) {
     let sin_cap = ((cap * cap - r * r - d * d) / (2.0 * r * d)).clamp(-1.0, 1.0);
     let top = GLOBE_CHASE_MAX_ELEVATION_DEG.min(sin_cap.asin().to_degrees());
     let base = globe_chase_elevation_deg(altitude_km);
-    (GLOBE_CHASE_MIN_ELEVATION_DEG - base, top - base)
+    let steepest = GLOBE_CHASE_MAX_LOOK_DEG - globe_look_pitch_deg(altitude_km);
+    (
+        GLOBE_CHASE_MIN_ELEVATION_DEG - base,
+        (top - base).min(steepest),
+    )
 }
 
 /// The globe chase pose for `flight` (km, render frame) with the view drag's `look_offset_deg`
@@ -346,12 +379,66 @@ mod tests {
         let mid = ((lo + hi) / 2.0).exp();
         let half = (dive + CHASE_GLOBE_TOP_PITCH_DEG) / 2.0;
         assert!((globe_look_pitch_deg(mid) - half).abs() < 1e-9);
-        // At the top the eye is straight over the fly.
+        // The eye rises from the dive's 55° to the top's 70° on the same curve: behind the fly
+        // at every altitude, never overhead.
+        let elevation = globe_chase_elevation_deg;
+        assert!((elevation(GLOBE_MIN_ALTITUDE_KM) - GLOBE_CHASE_DIVE_ELEVATION_DEG).abs() < 1e-12);
+        assert!((elevation(DIVE_ALTITUDE_KM) - 55.0).abs() < 1e-12);
+        assert!((elevation(GLOBE_MAX_ALTITUDE_KM) - GLOBE_CHASE_TOP_ELEVATION_DEG).abs() < 1e-12);
+        assert!((elevation(mid) - (55.0 + GLOBE_CHASE_TOP_ELEVATION_DEG) / 2.0).abs() < 1e-9);
+        // At the dive the fly sits 5° below the centre, as in a region; at the top above it,
+        // where the look centres the globe.
         assert!(
-            (globe_chase_elevation_deg(GLOBE_MAX_ALTITUDE_KM) - GLOBE_CHASE_MAX_ELEVATION_DEG)
-                .abs()
+            (globe_fly_below_centre_deg(DIVE_ALTITUDE_KM) - CHASE_FLY_BELOW_CENTRE_DEG).abs()
                 < 1e-12
         );
+        assert!(globe_fly_below_centre_deg(GLOBE_MAX_ALTITUDE_KM) < -10.0);
+    }
+
+    #[test]
+    fn the_globe_chase_stays_behind_the_fly() {
+        // Owner, M3 Task 14 ("A: globe centred"): at every altitude, heading and drag offset
+        // (past its range too, which the pose clamps) the eye is behind the fly, at most
+        // GLOBE_CHASE_MAX_ELEVATION_DEG up (never overhead), and the look stays short of
+        // straight down.
+        const { assert!(GLOBE_CHASE_MAX_ELEVATION_DEG <= 80.0) };
+        let (lo, hi) = (GLOBE_MIN_ALTITUDE_KM.ln(), GLOBE_MAX_ALTITUDE_KM.ln());
+        for i in 0..=24 {
+            let alt = (lo + (hi - lo) * f64::from(i) / 24.0).exp();
+            let (low, high) = globe_look_offset_range(alt);
+            assert!(low < 0.0 && high >= 0.0, "{alt} km: {low}..{high}");
+            let base = globe_chase_elevation_deg(alt);
+            assert!(
+                (55.0..=GLOBE_CHASE_TOP_ELEVATION_DEG).contains(&base),
+                "{alt}: {base}"
+            );
+            for mut f in flights() {
+                f.altitude_km = alt;
+                for k in 0..=16 {
+                    let offset = -100.0 + 200.0 * f64::from(k) / 16.0;
+                    let p = globe_chase_pose(&f, offset);
+                    let back = p.eye - f.position_km();
+                    let d = back.length();
+                    let rise = back.dot(f.up()).atan2(-back.dot(f.heading)).to_degrees();
+                    assert!(
+                        rise <= GLOBE_CHASE_MAX_ELEVATION_DEG + 1e-6,
+                        "{alt} km, offset {offset}: eye {rise}° up"
+                    );
+                    // Behind along the heading by at least the steepest eye's share.
+                    let behind = -back.dot(f.heading);
+                    assert!(
+                        behind >= d * GLOBE_CHASE_MAX_ELEVATION_DEG.to_radians().cos() - 1e-6,
+                        "{alt} km, offset {offset}: {behind} of {d} km behind"
+                    );
+                    let v = (p.target - p.eye).normalize();
+                    let look = -v.dot(f.up()).asin().to_degrees();
+                    assert!(
+                        look <= GLOBE_CHASE_MAX_LOOK_DEG + 1e-6,
+                        "{alt} km, offset {offset}: looking {look}° down"
+                    );
+                }
+            }
+        }
     }
 
     fn flights() -> Vec<GlobeFlight> {
@@ -411,7 +498,13 @@ mod tests {
                 "{alt}"
             );
             assert!(base + hi <= GLOBE_CHASE_MAX_ELEVATION_DEG + 1e-9, "{alt}");
-            // At the limits the fly still sits CHASE_FLY_BELOW_CENTRE_DEG below the centre.
+            assert!(
+                globe_look_pitch_deg(alt) + hi <= GLOBE_CHASE_MAX_LOOK_DEG + 1e-9,
+                "{alt}"
+            );
+            // At the limits the fly still sits where the altitude puts it in the view (the drag
+            // moves the eye and the look together).
+            let fly_below = globe_fly_below_centre_deg(alt);
             let f = GlobeFlight {
                 altitude_km: alt,
                 ..GlobeFlight::start(10.0, 20.0)
@@ -421,10 +514,8 @@ mod tests {
                 let v = (p.target - p.eye).normalize();
                 let to_fly = (f.position_km() - p.eye).normalize();
                 let below = v.angle_between(to_fly).to_degrees();
-                assert!(
-                    (below - CHASE_FLY_BELOW_CENTRE_DEG).abs() < 1e-6,
-                    "{alt}: {below}"
-                );
+                // The view angle is unsigned: the fly may sit above the centre.
+                assert!((below - fly_below.abs()).abs() < 1e-6, "{alt}: {below}");
                 let back = p.eye - f.position_km();
                 let rise = back.dot(f.up()).atan2(-back.dot(f.heading)).to_degrees();
                 assert!((rise - (base + offset)).abs() < 1e-6, "{alt}: {rise}");
@@ -437,8 +528,7 @@ mod tests {
 
     #[test]
     fn at_the_top_the_globe_fills_the_view_ahead() {
-        // The centre is in front of the camera, below the view's centre, and the eye sits
-        // behind the fly.
+        // The view looks (nearly) at the globe's centre, and the eye sits behind the fly.
         for f in flights() {
             let f = GlobeFlight {
                 altitude_km: GLOBE_MAX_ALTITUDE_KM,
@@ -447,8 +537,9 @@ mod tests {
             let p = globe_chase_pose(&f, 0.0);
             let look = (p.target - p.eye).normalize();
             assert!(look.dot(-p.eye.normalize()) > 0.99, "{p:?}");
-            // Straight over the fly (not ahead of it), looking a little ahead.
-            assert!((p.eye - f.position_km()).dot(f.heading) <= 1e-9);
+            // Behind the fly, looking ahead and down past it.
+            let back = p.eye - f.position_km();
+            assert!(-back.dot(f.heading) > 0.3 * back.length(), "{p:?}");
             assert!(look.dot(f.heading) > 0.0);
         }
     }
