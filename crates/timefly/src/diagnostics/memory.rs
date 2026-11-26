@@ -230,11 +230,12 @@ fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
     })
 }
 
-#[cfg(test)]
+// The only test reads the macOS kernel's ledger, so the module is macOS-only: on Linux its
+// `use super::*` would be unused and CI's `clippy -D warnings` fails.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_memory_split_reads_the_kernels_footprint() {
         // The packed struct is rev 7's 93 natural_t words.
