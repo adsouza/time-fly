@@ -11,8 +11,9 @@
 //!   bed height could float or vanish underground. So each boulder is placed against what is
 //!   drawn ([`boulder_instance`]): in drawn water, as deep under the drawn level as under its
 //!   own; elsewhere, set [`BOULDER_EMBED`] of its height into the drawn ground
-//!   ([`drawn_ground_m`], the terrain's finest triangles, which draw everything within
-//!   [`BOULDER_VISIBLE_M`]); never more than half under the drawn ground. Its tag's wetness is
+//!   ([`drawn_ground_m`], the terrain's finest triangles, unmorphed, which draw every boulder
+//!   within [`BOULDER_VISIBLE_M`] below [`BOULDER_MAX_ELEVATION_M`]; higher ones aren't
+//!   drawn); never more than half under the drawn ground. Its tag's wetness is
 //!   the share under the drawn water, so the waterline the shader darkens is where the water
 //!   meets it.
 //! - **How it looks.** [`boulder_meshes`]: four jittered icospheres, one subdivision (80
@@ -58,6 +59,12 @@ pub const BOULDER_VALUE_JITTER: f32 = 0.15;
 pub const BOULDER_WET_DARKEN: f32 = 0.45;
 /// ...fading out over this share of its height above it (the splash).
 pub const BOULDER_WET_BAND: f32 = 0.2;
+/// Boulders farther than this from sea level (m) aren't drawn: within it, every drawn
+/// boulder lies in the terrain's finest LOD, unmorphed, which [`drawn_ground_m`] assumes (the
+/// CDLOD measures distance as `√(h² + camera_y²)`, so a high boulder seen from
+/// [`BOULDER_VISIBLE_M`] away can reach LOD 0's morph at 13,945 m). No river has rapids this
+/// high on today's Earth.
+pub const BOULDER_MAX_ELEVATION_M: f32 = 7_500.0;
 /// The least light a boulder's face shows, as a share of full sun: the terrain light ramp's
 /// shade band, so a face turned from the sun reads as the terrain's shade, never black.
 pub const BOULDER_SHADE_FLOOR: f32 = 0.16;
@@ -222,7 +229,8 @@ pub fn drawn_ground_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
 }
 
 /// Where boulder `b` is drawn in a region with `basis` and fields `grid` (see the module docs):
-/// its mesh's centre, radius, yaw and tag, or `None` at the region's antipode.
+/// its mesh's centre, radius, yaw and tag; `None` at the region's antipode, or with its centre
+/// farther than [`BOULDER_MAX_ELEVATION_M`] from sea level.
 pub fn boulder_instance(
     grid: &RegionGrid,
     basis: &FrameBasis,
@@ -247,6 +255,9 @@ pub fn boulder_instance(
             - BOULDER_EMBED * height
     }
     .max(ground - r);
+    if (bottom + r).abs() > BOULDER_MAX_ELEVATION_M {
+        return None;
+    }
     let wet = if in_water {
         (level - bottom) / height
     } else {
@@ -650,6 +661,75 @@ mod tests {
         let other = boulder_instance(&shallow, &basis, &Boulder { seed: 6, ..b }).unwrap();
         assert_ne!(other.yaw, i.yaw);
         assert!((0.0..std::f32::consts::TAU).contains(&i.yaw));
+    }
+
+    /// `drawn_ground_m` is the finest grid, unmorphed: true wherever a boulder can be drawn.
+    /// The CDLOD's selection and morph both measure `D = √(h² + camera_y²)` on the sea-level
+    /// plane. A boulder at elevation `e` is drawn within BOULDER_VISIBLE_M of the camera, so
+    /// the corners of its quad lie within `D ≤ BOULDER_VISIBLE_M + |e| + r + quad·√2`, which
+    /// must stay under LOD 0's morph start; boulders above BOULDER_MAX_ELEVATION_M aren't drawn.
+    #[test]
+    fn boulders_draw_inside_the_unmorphed_finest_lod() {
+        use timefly_core::terrain::{morph_factor, select_patches};
+        let settings = LodSettings::region();
+        let quad = settings.finest_quad_m();
+        let morph = settings.morph_range_m(0);
+        let reach = f64::from(BOULDER_VISIBLE_M)
+            + f64::from(BOULDER_MAX_ELEVATION_M)
+            + timefly_core::hydrology::params::BOULDER_RADIUS_M[1]
+            + quad * std::f64::consts::SQRT_2;
+        assert!(
+            reach < f64::from(morph[0]),
+            "boulders reach D = {reach} m; LOD 0 morphs from {} m",
+            morph[0]
+        );
+        // The real selection and morph at the extreme cameras: on the visibility sphere around
+        // a boulder at the lowest and highest drawn elevations.
+        let (bx, bz) = (123.4, -56.7);
+        let root = -settings.extent_m() / 2.0;
+        let (i, j) = (((bx - root) / quad).floor(), ((bz - root) / quad).floor());
+        for e in [
+            -f64::from(BOULDER_MAX_ELEVATION_M),
+            0.0,
+            f64::from(BOULDER_MAX_ELEVATION_M),
+        ] {
+            for k in 0..=12 {
+                let a = (k as f64 / 12.0 - 0.5) * std::f64::consts::PI;
+                let r = f64::from(BOULDER_VISIBLE_M);
+                let camera = bevy::math::DVec3::new(bx + r * a.cos(), e + r * a.sin(), bz);
+                let patches = select_patches(camera, &settings);
+                let covering = patches
+                    .iter()
+                    .find(|p| {
+                        (p.origin_m[0]..p.origin_m[0] + p.size_m).contains(&bx)
+                            && (p.origin_m[1]..p.origin_m[1] + p.size_m).contains(&bz)
+                    })
+                    .expect("a patch over the boulder");
+                assert_eq!(covering.lod, 0, "camera {camera}");
+                for (di, dj) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+                    let (x, z) = (root + (i + di) * quad, root + (j + dj) * quad);
+                    let d =
+                        ((x - camera.x).powi(2) + camera.y.powi(2) + (z - camera.z).powi(2)).sqrt();
+                    assert_eq!(morph_factor(d as f32, morph), 0.0, "camera {camera}, d {d}");
+                }
+            }
+        }
+        // A boulder above the highest drawn elevation isn't drawn; one just below it is.
+        let lifted = |lift: f32| {
+            let mut g = plane_grid(0.0, Vec::new());
+            for f in [&mut g.inner, &mut g.apron] {
+                f.elevation_m.iter_mut().for_each(|h| *h += lift);
+                f.water_level_m.iter_mut().for_each(|h| *h += lift);
+            }
+            g
+        };
+        let high = lifted(BOULDER_MAX_ELEVATION_M - 1_000.0 + 10.0);
+        let low = lifted(BOULDER_MAX_ELEVATION_M - 1_000.0 - 10.0);
+        let basis = high.spec.frame().basis();
+        let b = boulder_at(&high, 0.0, 0.0, 1.0, 0.0, 3);
+        // The plane is 1,000 m at the centre.
+        assert!(boulder_instance(&high, &basis, &b).is_none());
+        assert!(boulder_instance(&low, &basis, &b).is_some());
     }
 
     #[test]

@@ -37,6 +37,7 @@ use bevy::pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
 use bevy::shader::ShaderRef;
+use bevy::transform::TransformSystems;
 
 use crate::terrain::TERRAIN_LAYER;
 
@@ -335,10 +336,14 @@ impl Plugin for ScatterPlugin {
 }
 
 /// The systems without the render plugin and shader, for headless tests.
+/// The rewrite runs before transform propagation, so a slot written (or spawned: the commands
+/// apply at the sync point before it) in the frame its set shows is drawn at its new place, and
+/// before visibility propagation, so the set's hidden state applies that frame too.
 pub(crate) fn add_scatter_systems(app: &mut App) {
     app.add_systems(
         PostUpdate,
         update_scatter_pools
+            .before(TransformSystems::Propagate)
             .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
     );
 }
@@ -659,6 +664,44 @@ mod tests {
             writes.iter().all(|&n| n <= SCATTER_UPDATE_PER_FRAME),
             "{writes:?}"
         );
+    }
+
+    /// Every slot drawn in the frame the set shows has its instance's world transform: the
+    /// rewrite runs before transform propagation (and its spawns are applied before it), so no
+    /// slot shows a stale `GlobalTransform` (the old set's place, or the origin for a new slot).
+    #[test]
+    fn a_shown_set_is_propagated_in_the_frame_it_shows() {
+        let (mut app, set) = scatter_app();
+        app.add_plugins(bevy::transform::TransformPlugin);
+        let check = |app: &mut App, want: &Arc<[ScatterInstance]>| {
+            let world = app.world_mut();
+            let mut q = world.query::<(&ScatterSlot, &GlobalTransform, &Visibility)>();
+            let mut shown = 0;
+            for (slot, global, vis) in q.iter(world) {
+                if *vis == Visibility::Hidden {
+                    continue;
+                }
+                let want = GlobalTransform::from(want[slot.slot as usize].transform());
+                assert!(
+                    global.affine().abs_diff_eq(want.affine(), 1e-4),
+                    "slot {}: {global:?}, want {want:?}",
+                    slot.slot
+                );
+                shown += 1;
+            }
+            assert_eq!(shown, want.len());
+        };
+        // Fresh slots (the last chunk spawns in the frame the set shows), then a replace.
+        for (n, salt) in [(3_000, 21), (2_500, 22)] {
+            let want = instances(n, salt);
+            show(&mut app, set, &want);
+            settle(&mut app, set, 8);
+            assert_eq!(
+                *app.world().get::<Visibility>(set).unwrap(),
+                Visibility::Inherited
+            );
+            check(&mut app, &want);
+        }
     }
 
     #[test]
