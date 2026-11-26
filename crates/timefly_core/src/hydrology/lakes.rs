@@ -241,6 +241,8 @@ pub(crate) struct Accumulation {
     own: Option<(Vec<f32>, Vec<f32>)>,
     /// Present mode: the overlay, once the walk is done.
     today: Option<Box<Today>>,
+    /// A large basin being gathered ([`GATHER_AT_ONCE`]); the walk waits for it.
+    gathering: Option<Box<BasinInputs>>,
 }
 
 /// Places lake level table points `(nearest node, level)`: each point whose node lies in a
@@ -547,6 +549,59 @@ impl Flats {
     }
 }
 
+/// A basin's neighbours inside it, by local index: `NOT_IN` outside the basin, `ABSENT` where
+/// the graph has no neighbour (a cube corner's duplicate, a grid's edge).
+const NOT_IN: u32 = u32::MAX;
+const ABSENT: u32 = u32::MAX - 1;
+
+/// Basins larger than this many nodes gather their inputs over several walk steps: resolving
+/// a 13,459-node basin at once took 2.6 ms natively (rivers and lakes Task 10, fix round 1).
+pub(crate) const GATHER_AT_ONCE: usize = 1024;
+/// Units a gathered node costs: about 150 ns natively (its area, its climate and eight
+/// in-basin neighbour searches), four times a typical walk unit.
+const GATHER_NODE_UNITS: u32 = 4;
+
+/// A basin's per-node inputs to [`Accumulation::resolve_with`], gathered in node order (so
+/// `q_in` sums in the same order as at once).
+#[derive(Clone, Debug)]
+struct BasinInputs {
+    b: usize,
+    e: Vec<f32>,
+    iced: Vec<bool>,
+    area: Vec<f64>,
+    cap: Vec<f64>,
+    inside: Vec<[u32; 8]>,
+    mapped: Vec<Option<MappedLake>>,
+    q_in: f64,
+}
+
+impl BasinInputs {
+    fn new(b: usize, m: usize) -> BasinInputs {
+        BasinInputs {
+            b,
+            e: Vec::with_capacity(m),
+            iced: Vec::with_capacity(m),
+            area: Vec::with_capacity(m),
+            cap: Vec::with_capacity(m),
+            inside: Vec::with_capacity(m),
+            mapped: Vec::with_capacity(m),
+            q_in: 0.0,
+        }
+    }
+
+    fn complete(&self, routed: &Routed) -> bool {
+        self.e.len() == routed.basins[self.b].nodes.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.e.capacity() * 4
+            + self.iced.capacity()
+            + 16 * self.area.capacity()
+            + 32 * self.inside.capacity()
+            + self.mapped.capacity() * std::mem::size_of::<Option<MappedLake>>()
+    }
+}
+
 impl Accumulation {
     /// `first_flat` is the index of the first basin [`Flats::register`] added, or the basin
     /// count when there are none.
@@ -558,6 +613,7 @@ impl Accumulation {
             present: false,
             own: None,
             today: None,
+            gathering: None,
             q: vec![0.0; len as usize],
             area_km2: vec![0.0; len as usize],
             lakes: Vec::new(),
@@ -601,6 +657,7 @@ impl Accumulation {
                 .as_ref()
                 .map_or(0, |(q, a)| 4 * (q.capacity() + a.capacity()))
             + self.today.as_ref().map_or(0, |t| t.working_bytes())
+            + self.gathering.as_ref().map_or(0, |i| i.bytes())
             + 4 * (self.q.capacity() + self.area_km2.capacity())
             + self.lakes.capacity() * std::mem::size_of::<Lake>()
             + self.lake_nodes.capacity() * std::mem::size_of::<LakeNode>()
@@ -648,7 +705,17 @@ impl Accumulation {
     ) -> (bool, u32) {
         let mut used = 0;
         let len = routed.order.len() as u32;
-        while used < budget && self.next_walk < len {
+        while used < budget && (self.next_walk < len || self.gathering.is_some()) {
+            if let Some(mut inputs) = self.gathering.take() {
+                let left = budget - used;
+                used += self.gather(g, routed, &mut inputs, ice, &mut capacity, data_lakes, left);
+                if inputs.complete(routed) {
+                    used += self.resolve_with(g, routed, *inputs, data_lakes);
+                } else {
+                    self.gathering = Some(inputs);
+                }
+                continue;
+            }
             let i = routed.order[(len - 1 - self.next_walk) as usize];
             self.next_walk += 1;
             let b = routed.basin_of[i as usize];
@@ -663,12 +730,17 @@ impl Accumulation {
                     self.area_km2[j as usize] += self.area_km2[i as usize];
                 }
             } else if routed.basins[b as usize].exit == i {
-                used += self.resolve(g, routed, b as usize, ice, &mut capacity, data_lakes);
+                let m = routed.basins[b as usize].nodes.len();
+                if m <= GATHER_AT_ONCE {
+                    used += self.resolve(g, routed, b as usize, ice, &mut capacity, data_lakes);
+                } else {
+                    self.gathering = Some(Box::new(BasinInputs::new(b as usize, m)));
+                }
             } else {
                 used += 1;
             }
         }
-        let walked = self.next_walk == len;
+        let walked = self.next_walk == len && self.gathering.is_none();
         if walked {
             self.lake_nodes.sort_unstable_by_key(|n| n.node);
         }
@@ -698,6 +770,8 @@ impl Accumulation {
         (done, used.saturating_add(u))
     }
 
+    /// Resolves basin `b` at once ([`Accumulation::gather`] to the end, then
+    /// [`Accumulation::resolve_with`]); returns its size in units.
     fn resolve(
         &mut self,
         g: &impl HydroGraph,
@@ -707,8 +781,73 @@ impl Accumulation {
         capacity: &mut impl FnMut(u32, f32, f64) -> f64,
         data_lakes: bool,
     ) -> u32 {
+        let mut inputs = BasinInputs::new(b, routed.basins[b].nodes.len());
+        let used = self.gather(g, routed, &mut inputs, ice, capacity, data_lakes, u32::MAX);
+        self.resolve_with(g, routed, inputs, data_lakes);
+        used
+    }
+
+    /// Gathers about `budget` units more of a basin's per-node inputs ([`BasinInputs`]), in node
+    /// order, at [`GATHER_NODE_UNITS`] a node. Returns the units used (at least 1); the inputs
+    /// are complete once [`BasinInputs::complete`].
+    #[expect(clippy::too_many_arguments, reason = "resolve's own inputs, in steps")]
+    fn gather(
+        &self,
+        g: &impl HydroGraph,
+        routed: &Routed,
+        inputs: &mut BasinInputs,
+        ice: &impl Fn(u32) -> bool,
+        capacity: &mut impl FnMut(u32, f32, f64) -> f64,
+        data_lakes: bool,
+        budget: u32,
+    ) -> u32 {
+        let nodes = &routed.basins[inputs.b].nodes;
+        let start = inputs.e.len();
+        let count = (budget / GATHER_NODE_UNITS).max(1) as usize;
+        let end = nodes.len().min(start.saturating_add(count));
+        for &v in &nodes[start..end] {
+            let e = routed.elevation_m[v as usize];
+            let iced = ice(v);
+            let area = g.area_m2(v);
+            inputs.e.push(e);
+            inputs.iced.push(iced);
+            inputs.area.push(area);
+            inputs
+                .cap
+                .push(if iced { 0.0 } else { capacity(v, e, area) });
+            inputs.q_in += f64::from(self.q[v as usize]);
+            inputs.inside.push(g.neighbours(v).map(|j| match j {
+                None => ABSENT,
+                Some(j) => nodes.binary_search(&j).map_or(NOT_IN, |k| k as u32),
+            }));
+            inputs
+                .mapped
+                .push(if data_lakes { self.mapped_at(v) } else { None });
+        }
+        ((end - start) as u32 * GATHER_NODE_UNITS).max(1)
+    }
+
+    /// Resolves basin `inputs.b` from its gathered inputs. Returns the units it adds (1: the
+    /// gathering counted the nodes).
+    fn resolve_with(
+        &mut self,
+        g: &impl HydroGraph,
+        routed: &mut Routed,
+        inputs: BasinInputs,
+        data_lakes: bool,
+    ) -> u32 {
+        debug_assert!(inputs.complete(routed));
+        let BasinInputs {
+            b,
+            e,
+            iced,
+            area,
+            cap,
+            inside,
+            mapped,
+            q_in,
+        } = inputs;
         let Routed {
-            elevation_m,
             ocean,
             receiver,
             basins,
@@ -719,32 +858,6 @@ impl Accumulation {
         let m = nodes.len();
         let local = |v: u32| nodes.binary_search(&v).ok();
         let exit_k = local(basin.exit).expect("the exit is a basin node");
-        let e: Vec<f32> = nodes.iter().map(|&v| elevation_m[v as usize]).collect();
-        let iced: Vec<bool> = nodes.iter().map(|&v| ice(v)).collect();
-        let area: Vec<f64> = nodes.iter().map(|&v| g.area_m2(v)).collect();
-        let cap: Vec<f64> = (0..m)
-            .map(|k| {
-                if iced[k] {
-                    0.0
-                } else {
-                    capacity(nodes[k], e[k], area[k])
-                }
-            })
-            .collect();
-        let q_in: f64 = nodes.iter().map(|&v| f64::from(self.q[v as usize])).sum();
-        // Each node's neighbours inside the basin, by local index (`NOT_IN` outside).
-        // ABSENT where the graph has no neighbour (a cube corner's duplicate, a grid's edge).
-        const NOT_IN: u32 = u32::MAX;
-        const ABSENT: u32 = u32::MAX - 1;
-        let inside: Vec<[u32; 8]> = nodes
-            .iter()
-            .map(|&v| {
-                g.neighbours(v).map(|j| match j {
-                    None => ABSENT,
-                    Some(j) => nodes.binary_search(&j).map_or(NOT_IN, |k| k as u32),
-                })
-            })
-            .collect();
         let neighbours_in = |k: usize| inside[k].map(|j| (j < ABSENT).then_some(j as usize));
         let mut kmin = 0;
         for k in 1..m {
@@ -758,11 +871,6 @@ impl Accumulation {
         let is_flat = b as u32 >= self.first_flat;
         // The present-day map, only where the terrain is today's.
         let present = self.present && data_lakes;
-        let mapped: Vec<Option<MappedLake>> = if data_lakes {
-            nodes.iter().map(|&v| self.mapped_at(v)).collect()
-        } else {
-            vec![None; m]
-        };
         let mapped_in = |set: &[bool]| (0..m).filter(|&k| set[k] && mapped[k].is_some()).count();
         let on_map = |set: &[bool]| mapped_in(set) >= DATA_LAKE_MIN_NODES as usize;
         // The mapped lake holding the most basin nodes (ties: the lowest id): its surface (the
@@ -1149,7 +1257,7 @@ impl Accumulation {
             }
             self.lakes.push(lake);
         }
-        m as u32
+        1
     }
 }
 
@@ -1260,6 +1368,73 @@ mod tests {
         out.sort_by_key(|&(n, _)| n);
         out.dedup_by_key(|m| m.0);
         out
+    }
+
+    /// A 60 × 60 grid: the sea along row 0, a rim around a bumpy bowl of 56 × 56 nodes that
+    /// spills through a notch to the sea. The bowl is one basin of 3,136 nodes.
+    fn big_bowl() -> (GridGraph, Vec<f32>) {
+        let g = GridGraph {
+            rows: 60,
+            cols: 60,
+            spacing_m: 1_000.0,
+        };
+        let elevation = (0..g.len())
+            .map(|i| {
+                let (r, c) = g.row_col(i);
+                if r == 0 {
+                    -10.0
+                } else if r == 1 && c == 30 {
+                    60.0
+                } else if r == 1 || r == 59 || c == 0 || c == 59 {
+                    100.0
+                } else {
+                    50.0 + ((r * 7 + c * 13) % 5) as f32
+                }
+            })
+            .collect();
+        (g, elevation)
+    }
+
+    /// Rivers and lakes Task 10, fix round 1: a basin larger than [`GATHER_AT_ONCE`] gathers
+    /// its inputs over several walk steps, each within its budget, with the same result as at
+    /// once. (Resolving a 13,459-node basin at once took 2.6 ms natively.)
+    #[test]
+    fn a_large_basin_is_gathered_within_each_walk_steps_budget() {
+        let (g, elevation) = big_bowl();
+        let at_once = {
+            let mut r = route(&g, elevation.clone());
+            let acc = accumulate(&g, &mut r, |_| 1.0, |_| 0.5, |_| false, false, u32::MAX);
+            (acc.q, acc.area_km2, acc.lakes, acc.lake_nodes, r.receiver)
+        };
+        let mut r = route(&g, elevation);
+        let largest = r.basins.iter().map(|b| b.nodes.len()).max().unwrap();
+        assert!(
+            largest > GATHER_AT_ONCE,
+            "the fixture's largest basin: {largest}"
+        );
+        let mut acc = Accumulation::new(g.len(), r.basins.len() as u32);
+        while !acc.init_step(&g, &r, |_, _| 1.0, u32::MAX).0 {}
+        let budget = 64;
+        let mut steps = 0;
+        loop {
+            let (done, used) = acc.walk_step(&g, &mut r, &|_| false, |_, _, _| 0.5, false, budget);
+            assert!(
+                used <= budget + GATHER_NODE_UNITS + 1,
+                "a walk step used {used} units of {budget}"
+            );
+            steps += 1;
+            if done {
+                break;
+            }
+        }
+        assert!(
+            steps * budget as usize >= GATHER_NODE_UNITS as usize * largest,
+            "{steps}"
+        );
+        assert_eq!(
+            (acc.q, acc.area_km2, acc.lakes, acc.lake_nodes, r.receiver),
+            at_once
+        );
     }
 
     fn golden_grid(fx: &Value) -> (GridGraph, Vec<f32>) {

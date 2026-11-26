@@ -2254,45 +2254,62 @@ fn real_continental_pass_timing() {
         .unwrap();
     let climate =
         ClimateManifest::parse(&fs::read(root.join(CLIMATE_MANIFEST_PATH)).unwrap()).unwrap();
-    let ([y, o], w) = climate.bracket(YearsBp(0.0)).unwrap();
-    let inputs = HydroInputs {
-        age: YearsBp(0.0),
-        sizes: LatticeSizes::default(),
-        timeline: data.timeline.clone(),
-        crust: data.crust.clone(),
-        tiles,
-        frames,
-        climate: Some(([read(&y.path()), read(&o.path())], w)),
-        table: climate_table(),
-    };
-    let t = Instant::now();
-    let parallel = run_parallel(&inputs, &AtomicBool::new(false)).unwrap();
-    println!(
-        "run_parallel again: {:?} (sampling {:?}, longest step {:?}, peak {:.1} MiB, result {:.1} MiB)",
-        t.elapsed(),
-        parallel.sampling,
-        parallel.longest_step,
-        parallel.peak_bytes as f64 / 1048576.0,
-        parallel.hydrology.bytes() as f64 / 1048576.0
-    );
-    for budget_ms in [6u64, 12] {
-        let mut run = HydroRun::new(inputs.clone(), Duration::from_millis(budget_ms));
-        let t = Instant::now();
-        let out = loop {
-            if let Some(r) = run.poll_slice() {
-                break r.unwrap();
-            }
+    for age in [YearsBp(0.0), YearsBp(21_000.0)] {
+        let ([y, o], w) = climate.bracket(age).unwrap();
+        let inputs = HydroInputs {
+            age,
+            sizes: LatticeSizes::default(),
+            timeline: data.timeline.clone(),
+            crust: data.crust.clone(),
+            tiles: tiles.clone(),
+            frames: frames.clone(),
+            climate: Some(([read(&y.path()), read(&o.path())], w)),
+            table: climate_table(),
         };
-        assert_eq!(out.hydrology, parallel.hydrology);
+        println!("== {} years", age.0);
+        let t = Instant::now();
+        let parallel = run_parallel(&inputs, &AtomicBool::new(false)).unwrap();
         println!(
-            "time-boxed at {budget_ms} ms: {:?} wall, {} slices, cpu {:?}, longest slice {:?}, \
-             longest step {:?}; at 60 Hz ≈ {:.1} s",
+            "run_parallel again: {:?} (sampling {:?}, longest step {:?} ({}), peak {:.1} MiB, result {:.1} MiB)",
             t.elapsed(),
-            out.slices,
-            out.cpu,
-            out.longest_slice,
-            out.longest_step,
-            f64::from(out.slices) * 16.7e-3
+            parallel.sampling,
+            parallel.longest_step,
+            parallel.longest_step_stage,
+            parallel.peak_bytes as f64 / 1048576.0,
+            parallel.hydrology.bytes() as f64 / 1048576.0
         );
+        for budget_ms in [6u64, 12] {
+            let mut run = HydroRun::new(inputs.clone(), Duration::from_millis(budget_ms));
+            let t = Instant::now();
+            let out = loop {
+                if let Some(r) = run.poll_slice() {
+                    break r.unwrap();
+                }
+            };
+            assert_eq!(out.hydrology, parallel.hydrology);
+            println!(
+                "time-boxed at {budget_ms} ms: {:?} wall, {} slices, cpu {:?}, longest slice {:?}, \
+                 longest step {:?} ({}); at 60 Hz ≈ {:.1} s",
+                t.elapsed(),
+                out.slices,
+                out.cpu,
+                out.longest_slice,
+                out.longest_step,
+                out.longest_step_stage,
+                f64::from(out.slices) * 16.7e-3
+            );
+            // Rivers and lakes Task 10, fix round 1: on the web a slice overruns its budget by
+            // up to one step, so no step may be long (release builds only: a debug build is
+            // several times slower).
+            if budget_ms == 6 && !cfg!(debug_assertions) {
+                assert!(
+                    out.longest_step <= Duration::from_millis(2),
+                    "{} years: longest step {:?} in {}",
+                    age.0,
+                    out.longest_step,
+                    out.longest_step_stage
+                );
+            }
+        }
     }
 }

@@ -102,11 +102,24 @@ fn back_index(g: &impl HydroGraph, at: u32, of: u32) -> u8 {
     k.expect("hydrology graphs have symmetric neighbours") as u8
 }
 
+/// Nodes per unit call in [`Phase::Steps`] and [`Phase::Ocean`].
+const BLOCK_UNITS: u32 = 1024;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Phase {
     /// Labelling below-zero components; `next` is the next id to scan.
     Label {
         next: u32,
+    },
+    /// Filling the dilation's step counts, then making component `c` (the largest) ocean from
+    /// its `k`-th node on, in blocks: in one unit they took 6.8 ms at n = 900 (rivers and
+    /// lakes Task 10, fix round 1).
+    Steps {
+        c: u32,
+    },
+    Ocean {
+        c: u32,
+        k: u32,
     },
     /// Dilating the ocean across straits.
     Dilate,
@@ -275,6 +288,8 @@ impl Routing {
     fn unit(&mut self, g: &impl HydroGraph) -> u32 {
         match self.phase {
             Phase::Label { next } => self.label(g, next),
+            Phase::Steps { c } => self.fill_steps(c),
+            Phase::Ocean { c, k } => self.add_largest(c, k),
             Phase::Dilate => self.dilate(g),
             Phase::Seed { next } => self.seed(g, next),
             Phase::Flood => self.flood(g),
@@ -331,12 +346,48 @@ impl Routing {
         match largest {
             Some(c) => {
                 self.reach = (self.strait_m / g.mean_spacing_m()).ceil() as u32;
-                self.steps = vec![u32::MAX; self.elevation.len()];
-                self.add_component(c);
-                self.phase = Phase::Dilate;
+                self.steps = Vec::with_capacity(self.elevation.len());
+                self.phase = Phase::Steps { c: c as u32 };
             }
             None => self.end_ocean(),
         }
+    }
+
+    /// Up to [`BLOCK_UNITS`] more step counts, all `u32::MAX`; then component `c` turns ocean.
+    fn fill_steps(&mut self, c: u32) -> u32 {
+        let len = self.elevation.len();
+        let n = (len - self.steps.len()).min(BLOCK_UNITS as usize);
+        self.steps.resize(self.steps.len() + n, u32::MAX);
+        if self.steps.len() == len {
+            let c = c as usize;
+            self.component_ocean[c] = true;
+            self.any_ocean = true;
+            self.ocean_count += self.component_start[c + 1] - self.component_start[c];
+            self.phase = Phase::Ocean {
+                c: c as u32,
+                k: self.component_start[c],
+            };
+        }
+        (n as u32).max(1)
+    }
+
+    /// [`Routing::add_component`]'s nodes for the largest component, from its `k`-th node, up
+    /// to [`BLOCK_UNITS`] of them; then the dilation.
+    fn add_largest(&mut self, c: u32, k: u32) -> u32 {
+        let end = self.component_start[c as usize + 1];
+        let stop = end.min(k.saturating_add(BLOCK_UNITS));
+        for i in k..stop {
+            let v = self.component_nodes[i as usize];
+            self.ocean[v as usize] = true;
+            self.steps[v as usize] = 0;
+            self.queue.push_back(v);
+        }
+        self.phase = if stop == end {
+            Phase::Dilate
+        } else {
+            Phase::Ocean { c, k: stop }
+        };
+        (stop - k).max(1)
     }
 
     /// Makes component `c` ocean, at step 0. Returns the nodes visited.
@@ -565,6 +616,41 @@ mod tests {
         let mut routing = Routing::new(elevation);
         while !routing.step(g, budget) {}
         routing.finish()
+    }
+
+    /// Rivers and lakes Task 10, fix round 1: the largest ocean component turns ocean (and the
+    /// dilation's step counts fill) over several steps, not in one unit (6.8 ms natively at
+    /// n = 900), with the same result.
+    #[test]
+    fn the_largest_ocean_is_marked_over_several_steps() {
+        // An 80 × 80 grid, its western half sea (3,200 nodes, one component).
+        let g = GridGraph {
+            rows: 80,
+            cols: 80,
+            spacing_m: 1_000.0,
+        };
+        let elevation: Vec<f32> = (0..g.len())
+            .map(|i| {
+                let (r, c) = g.row_col(i);
+                if c < 40 {
+                    -10.0
+                } else {
+                    (c as f32 - 39.0) * 5.0 + (r % 3) as f32
+                }
+            })
+            .collect();
+        let at_once = route(&g, elevation.clone(), u32::MAX);
+        let mut routing = Routing::new(elevation);
+        let (mut filling, mut marking) = (0, 0);
+        while !routing.step(&g, 64) {
+            match routing.phase {
+                Phase::Steps { .. } => filling += 1,
+                Phase::Ocean { .. } => marking += 1,
+                _ => {}
+            }
+        }
+        assert!(filling >= 2 && marking >= 2, "{filling} {marking}");
+        assert_eq!(routing.finish(), at_once);
     }
 
     fn cell(g: &GridGraph, v: &Value) -> u32 {

@@ -20,7 +20,7 @@ by the Task 10 implementer; the Chrome (WebGPU) numbers are the owner's run and 
 | Cloud pass, GPU timestamps, offscreen 2560 × 1440 | **+2.68 ms** at density 0.5, **+2.87 ms** at 1.0 (M3's ioreg estimate: 1.8 ms) |
 | The water on the Indus, GPU timestamps | about +0.1 ms over dry land, the rivers under +0.1 ms: within noise |
 | The continental pass, native release | 0.93–1.05 s wall in the 0 ka and 21 ka eras, 0.40–0.62 s deep: at or just over the 1,000 ms native target (reported) |
-| The pass's longest single step, native | **28–31 ms** at 0 ka and 21 ka: likely to hitch on the web (see "Concerns") |
+| The pass's longest single step, time-boxed at the web's 6 ms slice (native release, real data) | was 28 ms (the step sizing), 12.8 ms (`rivers→done`, the graph build), 6.8 ms (routing's largest ocean) and 2.6 ms (one basin's resolve); **now 1.1–1.3 ms** at 0 ka and 21 ka after fix round 1, the same result, the same total time |
 | Tiles per region (the river read margin) | 2–4× in six of nine bench regions (Beringia 2 → 8) |
 | Boulder placement on the swap frame, native | 0.05–0.86 ms for 37–5,897 boulders |
 | Everything on the web | **pending: the owner's Chrome run** (steps at the end) |
@@ -32,11 +32,11 @@ by the Task 10 implementer; the Chrome (WebGPU) numbers are the owner's run and 
    run 2's first hop read +31.4 MiB. The judged run passes; whether first launches need work
    (trim the boulder pool on a replace, or stage the river grids like the water) is the
    controller's call.
-2. **The continental pass's longest step is 28–31 ms natively** at 0 ka and 21 ka. A web slice
-   overruns its budget by up to one step, so in Chrome that step could block a frame for tens of
-   milliseconds while a pass runs (on the globe, or behind the cloud during a dive). The owner's
-   Chrome log (`longest_step_ms`) decides; if it hitches, the step needs splitting (which step it
-   is isn't logged; `Today::place` and the present-day overlay are candidates).
+2. **The continental pass's long steps: fixed in fix round 1.** A web slice overruns its 6 ms
+   budget by up to one step, and on real data the time-boxed run's longest step was 28 ms. The
+   log now names the stage (`longest_step_stage=`), which found four causes; each is now
+   metered (see "The continental pass's steps" below). The time-boxed longest step is 1.1–1.3 ms
+   natively at 0 ka and 21 ka; Chrome's `longest_step_ms` gives the web figure.
 3. **The region bench's first-entry line double-counted the pass wait** in these native runs
    (`generation_ms` subtracted `hydro_wait_ms` from a `millis` that already excludes it): four
    regions read 0 ms and Japan 1,477 instead of 1,911. Natively those lines are reported only, so
@@ -59,10 +59,12 @@ needs `TIMESTAMP_QUERY_INSIDE_ENCODERS`, which Apple-silicon Metal and WebGPU do
 **How.** A one-pixel pass first in the render graph writes the begin timestamp; after the last
 pass, one one-pixel pass per output target (the window's swap-chain texture, or a camera's
 image) loads that target and writes an end timestamp. A frame's span is
-`max(ends) − max(begin, previous frame's end)`. The queries are resolved once the queue reports
-the frame's work done, and read back through a ring of four buffers, so nothing waits on the GPU
-and a reading arrives a few frames after its frame. Readings with a zero, reversed or non-finite
-pair are dropped and counted.
+`max(ends) − max(begin, previous frame's end)`, so a frame is timed only when the frame before
+it was read: after a frame that found no free slot (or whose reading was dropped), the begin may
+have run inside that frame, so that reading is dropped and counted (fix round 1). The queries
+are resolved once the queue reports the frame's work done, and read back through a ring of eight
+buffers, so nothing waits on the GPU and a reading arrives a few frames after its frame.
+Readings with a zero, reversed or non-finite pair are dropped and counted too.
 
 **Why it is built that way: measured on the M4.** Apple-silicon GPUs run render passes that
 don't depend on each other at the same time, so naive marker passes don't bracket a frame:
@@ -82,8 +84,14 @@ passes draw one pixel.
 
 **The test.** `tests/region_gpu.rs`, `the_gpu_frame_time_is_measured_on_this_gpu` (ignored;
 `cargo test -p timefly --test region_gpu -- --ignored`): frames of 0, 1, 4 and 16 busy passes
-read 0.05, 1.54, 6.54 and 26.15 ms (medians); four passes back to back read 6.53 ms. Mutating
-either rule (the end pass on its own target; the span from the begin alone) fails it.
+read 0.05, 1.54, 6.54 and 26.15 ms (medians). Since fix round 1 it also submits 20 frames of
+four passes back to back, all at once, so 12–13 of 26 frames find no free slot: the 9–10
+readings read a median of 6.52–6.71 ms and a worst within 7% of it (three runs). Mutating either
+rule (the end pass on its own target; the span from the begin alone) fails it, and so does
+timing a frame whose predecessor wasn't read (`read_frame`'s unit test pins that rule; on the M4
+the readings after an untimed frame didn't come out doubled in this test, so the back-to-back
+check is a guard). Waited frames can read slower than packed ones (8.5 vs 6.9 ms in one run):
+the GPU idles between waited frames and clocks down.
 
 **Caveats.**
 - GPU time is busy time at whatever clock the GPU chose. A display-paced run idles the GPU
@@ -187,12 +195,35 @@ pass ran once per session (a cold cache), so each region waited for it.
   1,000 ms native target** (reported, not gated). Its own session: the 0 ka pass at the Indus
   read 950 ms wall, 927 ms CPU, 200 ms of sampling, 4,860,000 nodes, 121,257 river nodes, 861
   lakes, 170 MiB working set, 5.7 MiB result.
-- **The pass's longest step: 28–31 ms natively in the 0 ka and 21 ka eras** (6–9 ms in the deep
-  eras). A web slice can overrun its 6 ms budget by one step, so on the web, where code runs
-  about 2–3 times slower, this step blocks a frame for something like 60–90 ms, while the pass
-  runs on the globe or behind the cloud. This is where `Today::place` and the other present-day
-  and 21 ka steps sit; the owner's Chrome run will give the real number (`longest_step_ms`), and
-  the step will need splitting if it shows as a hitch. See "Concerns".
+- **The pass's longest step in these tour sessions: 28–31 ms at 0 ka and 21 ka** (6–9 ms in the
+  deep eras). This is the native task's step, `NATIVE_STEP_UNITS` (2¹⁸) units at a time on a
+  background thread, which never holds a frame. The web runs the time-boxed path, whose steps
+  were as long (28 ms) and are now 1.1–1.3 ms: see "The continental pass's steps".
+
+### The continental pass's steps (fix round 1)
+
+A web slice (6 ms, `WEB_HYDRO_BUDGET_MS`) runs steps until its budget is spent, so it overruns
+by up to one step. The time-boxed path, measured natively on real data
+(`TIMEFLY_REAL_ASSET_ROOT=<root>/assets cargo test -p timefly --release --test region_loading
+real_continental_pass_timing -- --ignored --nocapture`), with the stage now named in
+`PassOutput::longest_step_stage` and the `continental pass done` line (`longest_step_stage=`):
+
+| Fix, in order | Longest step at 0 ka (6 ms slices) | Its stage |
+|---|---|---|
+| Before (Task 10 as committed) | 27.9 ms | `runoff→walk` |
+| Steps at most double and are capped (2¹⁴ units): a unit costs 3–110 ns inside one stage, so steps sized on cheap units overran when they turned costly | 12.8 ms | `rivers→done` |
+| The river graph and the ocean bits built in steps (`GraphBuild`, a `build` stage) | 6.8 ms | `route` |
+| Routing's largest ocean component marked in blocks (it was one unit) | 2.5 ms | `walk` |
+| A basin over 1,024 nodes gathers its inputs over several walk steps, 4 units a node (a 13,459-node basin took 2.6 ms) | 1.9 ms | `sample` |
+| Steps aim at an eighth of the slice, with a 2¹³ cap | **1.10–1.21 ms** (21 ka: 1.09–1.30 ms) | `runoff→walk`, `sample`, `sample→route` |
+
+The result is unchanged: the test asserts the time-boxed hydrology equals `run_parallel`'s at
+0 ka and 21 ka, the core's any-step-size test runs every step size from 1 up, and the golden
+fixtures are untouched. Total time-boxed CPU is unchanged too (1.22 s at 0 ka, 1.36 s at 21 ka;
+194 and 217 slices of 6 ms; longest slice 6.8–7.0 ms). The remaining long steps hold a stage
+change (routing's finish, the lake-level placement, new full-length buffers: about 0.5–0.7 ms).
+On the web, about 2–3 times slower, that is 3–4 ms at most, inside a 6 ms slice. `Today::place`
+(the present-day overlay) was never the long step: the walk's `today` steps stay under the cap.
 - **Boulder placement on the swap frame:** 0.05–0.79 ms natively for 37–5,897 boulders (about
   0.13 ms per thousand), so about 2 ms at the 16,384 cap natively.
 - **The region CPU footprint** (Task 6's +15 MiB per region) is read from the region bench's
@@ -379,7 +410,7 @@ time-sliced, as the plan says):
 | Region bench, journey bench: every gate | the summaries | below | M3's gates, unchanged |
 | GPU frame time per region and route | `gpu frame time (<name>): median … / p95 … / worst … ms over N frames (timestamp-query)`, and the summary's `gpu time:` line (readings dropped) | below | reported only |
 | The continental pass's wall time per era | `continental pass (<age>): … ms wall, … ms CPU, … slices on web (target <= 5000 ms, reported)` | 950–1,050 ms wall (0 ka and 21 ka, release); 0.89 → 1.40 s (dev, Task 8b) | ≤ 5,000 ms, reported |
-| The largest present-day overlay unit (`Today::place`) and every other pass step | `continental pass done … longest_step_ms=… longest_slice_ms=…` | 28–31 ms (0 ka and 21 ka), 6–9 ms (deep eras), release | each step within `WEB_HYDRO_BUDGET_MS` (6 ms): a step longer than that overruns its slice |
+| The largest present-day overlay unit (`Today::place`) and every other pass step | `continental pass done … longest_step_ms=… longest_step_stage=… longest_slice_ms=…` (the stage names which part of the pass the step was in) | time-boxed at 6 ms: 1.1–1.3 ms at 0 ka and 21 ka (`runoff→walk`, `sample`), release, fix round 1 | each step within `WEB_HYDRO_BUDGET_MS` (6 ms): a step longer than that overruns its slice |
 | The apron prep step (Task 6: 2.7 ms native) | `region generated in time-boxed slices … longest_ms=…` (one per region) | — | within the 6 ms slice |
 | Boulder placement on the swap frame | `region boulders placed boulders=N ms="…"` (on each region change; the Indus tributaries and the journey routes' rapids) | 0.27 ms for 1,089 (Indus tributaries), 0.79 ms for 5,897 (Himalayas), release | inside the swap frame's budget; M3's swap worst frame is reported on the web (≤ 100 ms natively). Up to 16,384 boulders: about 4 ms natively |
 | The water's GPU cost over rivers and over dry land | the GPU frame times of step 3 and of the Indus tributaries stop | below | reported |

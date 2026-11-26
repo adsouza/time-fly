@@ -57,11 +57,18 @@ pub const NATIVE_STEP_UNITS: u32 = 1 << 18;
 /// The native task measures [`HydroPrep::working_bytes`] (which walks the basins) every this
 /// many steps, and at the end.
 pub const NATIVE_BYTES_EVERY: u32 = 4;
-/// A time-boxed run's first step, in units; later steps aim at a quarter of the slice budget
-/// from the measured rate, between [`SLICED_MIN_UNITS`] and [`SLICED_MAX_UNITS`].
+/// A time-boxed run's first step, in units; later steps aim at an eighth of the slice budget
+/// (0.75 ms of a 6 ms slice, leaving room for a stage change's own work, about 0.7 ms
+/// natively) from the measured rate, at most doubling from one step to the next, between
+/// [`SLICED_MIN_UNITS`] and [`SLICED_MAX_UNITS`].
 pub const SLICED_FIRST_UNITS: u32 = 1024;
 pub const SLICED_MIN_UNITS: u32 = 64;
-pub const SLICED_MAX_UNITS: u32 = 1 << 20;
+/// The cap: a unit's cost varies about 25× inside one stage (3–110 ns natively on the M4, real
+/// data at 0 ka; sampling about 107 ns), so a step sized from cheap units overran when they
+/// turned costly (20–30 ms steps). At 110 ns a unit this cap is about 0.9 ms natively; with
+/// a stage change in the step the longest steps on real data read 1.1–1.3 ms (0 ka and 21 ka,
+/// release; the run's total time is unchanged).
+pub const SLICED_MAX_UNITS: u32 = 1 << 13;
 
 /// Everything a pass needs, owned.
 #[derive(Clone)]
@@ -130,6 +137,9 @@ pub struct PassOutput {
     pub longest_slice: Duration,
     /// The longest single [`HydroPrep::step`]: what a slice may overshoot its budget by.
     pub longest_step: Duration,
+    /// Where that step went: the stage it started in, or `from→to` when it crossed stages
+    /// ([`HydroPrep::stage_name`]).
+    pub longest_step_stage: String,
     /// The largest [`HydroPrep::working_bytes`] seen between steps.
     pub peak_bytes: usize,
     pub units: u64,
@@ -165,6 +175,28 @@ impl std::fmt::Display for PassError {
     }
 }
 
+/// The longest step so far and the stage (or stages) it ran in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LongestStep {
+    pub time: Duration,
+    /// `stage`, or `from→to` for a step that crossed stages.
+    pub stage: String,
+}
+
+impl LongestStep {
+    /// A step from stage `from` to stage `to` that took `spent`.
+    pub fn observe(&mut self, from: &'static str, to: &'static str, spent: Duration) {
+        if spent > self.time || self.stage.is_empty() {
+            self.time = spent;
+            self.stage = if from == to {
+                from.to_string()
+            } else {
+                format!("{from}→{to}")
+            };
+        }
+    }
+}
+
 /// Steps the pass to the end in [`NATIVE_STEP_UNITS`] steps; `false` if cancelled.
 #[cfg(not(target_arch = "wasm32"))]
 fn step_native<S: NodeSource, C: ClimateSource>(
@@ -174,16 +206,17 @@ fn step_native<S: NodeSource, C: ClimateSource>(
     table: &ClimateTable,
     cancel: &AtomicBool,
     peak: &mut usize,
-    longest: &mut Duration,
+    longest: &mut LongestStep,
 ) -> bool {
     let mut steps = 0u32;
     loop {
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
+        let from = prep.stage_name();
         let t = Instant::now();
         let done = prep.step(source, climate, table, NATIVE_STEP_UNITS);
-        *longest = (*longest).max(t.elapsed());
+        longest.observe(from, prep.stage_name(), t.elapsed());
         steps += 1;
         if done || steps.is_multiple_of(NATIVE_BYTES_EVERY) {
             *peak = (*peak).max(prep.working_bytes());
@@ -243,7 +276,7 @@ pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOut
     }
     let sampling = started.elapsed();
     let mut peak = prep.working_bytes();
-    let mut longest = Duration::ZERO;
+    let mut longest = LongestStep::default();
     let zonal = inputs.zonal();
     let beyer = inputs.beyer();
     let done = match &beyer {
@@ -280,7 +313,8 @@ pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOut
         sampling,
         slices: 1,
         longest_slice: cpu,
-        longest_step: longest,
+        longest_step: longest.time,
+        longest_step_stage: longest.stage,
         peak_bytes: peak,
         units,
         beyer: beyer.is_some(),
@@ -291,19 +325,19 @@ pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOut
 struct Stepper {
     budget: SharedBudget,
     units: u32,
-    longest: Duration,
+    longest: LongestStep,
     steps: u32,
     peak: usize,
 }
 
 impl Stepper {
     fn observe(&mut self, units: u64, spent: Duration) {
-        self.longest = self.longest.max(spent);
-        let target = self.budget.get().as_secs_f64() / 4.0;
+        let target = self.budget.get().as_secs_f64() / 8.0;
+        let grown = f64::from(self.units) * 2.0;
         let next = if spent.is_zero() {
-            f64::from(self.units) * 2.0
+            grown
         } else {
-            units as f64 * target / spent.as_secs_f64()
+            (units as f64 * target / spent.as_secs_f64()).min(grown)
         };
         self.units = next.clamp(f64::from(SLICED_MIN_UNITS), f64::from(SLICED_MAX_UNITS)) as u32;
     }
@@ -320,9 +354,12 @@ async fn step_sliced<S: NodeSource, C: ClimateSource>(
 ) {
     loop {
         let before = prep.units_done();
+        let from = prep.stage_name();
         let t = Instant::now();
         let done = prep.step(source, climate, table, stepper.units);
-        stepper.observe(prep.units_done() - before, t.elapsed());
+        let spent = t.elapsed();
+        stepper.longest.observe(from, prep.stage_name(), spent);
+        stepper.observe(prep.units_done() - before, spent);
         stepper.steps += 1;
         // The working bytes walk the basins: measured every 16th step and at the end.
         if done || stepper.steps.is_multiple_of(16) {
@@ -350,7 +387,7 @@ async fn run_sliced(inputs: HydroInputs, budget: SharedBudget) -> Result<PassOut
     let mut stepper = Stepper {
         budget,
         units: SLICED_FIRST_UNITS,
-        longest: Duration::ZERO,
+        longest: LongestStep::default(),
         steps: 0,
         peak: 0,
     };
@@ -389,7 +426,8 @@ async fn run_sliced(inputs: HydroInputs, budget: SharedBudget) -> Result<PassOut
         sampling: Duration::ZERO,
         slices: slice.count,
         longest_slice: slice.longest,
-        longest_step: stepper.longest,
+        longest_step: stepper.longest.time,
+        longest_step_stage: stepper.longest.stage,
         peak_bytes: stepper.peak,
         units,
         beyer: beyer.is_some(),
@@ -968,6 +1006,7 @@ pub(super) fn poll_hydro_run(
         slices = event.slices,
         longest_slice_ms = format!("{:.1}", out.longest_slice.as_secs_f64() * 1e3),
         longest_step_ms = format!("{:.1}", out.longest_step.as_secs_f64() * 1e3),
+        longest_step_stage = out.longest_step_stage.as_str(),
         nodes = event.nodes,
         river_nodes = event.river_nodes,
         lakes = event.lakes,
@@ -1151,5 +1190,38 @@ mod tests {
             }
         );
         assert_eq!(err.to_string(), "cancelled");
+    }
+
+    /// Rivers and lakes Task 10, fix round 1: on real data a unit's cost varies about 25×
+    /// inside one stage (3–110 ns natively), so a step sized from cheap units ran 20–30 ms
+    /// when they turned costly. The step may at most double, and never passes the cap.
+    #[test]
+    fn a_time_boxed_step_stays_short_when_units_turn_costly() {
+        let mut s = Stepper {
+            budget: SharedBudget::new(Duration::from_millis(6)),
+            units: SLICED_FIRST_UNITS,
+            longest: LongestStep::default(),
+            steps: 0,
+            peak: 0,
+        };
+        // Cheap units, 1 ns each: each step at most doubles the last, up to the cap.
+        for _ in 0..40 {
+            let before = s.units;
+            s.observe(u64::from(before), Duration::from_nanos(u64::from(before)));
+            assert!(s.units <= 2 * before, "{before} -> {}", s.units);
+        }
+        assert_eq!(s.units, SLICED_MAX_UNITS);
+        // At the costliest units measured (about 110 ns), the cap's step is under 1 ms.
+        assert!(
+            f64::from(SLICED_MAX_UNITS) * 110e-9 <= 1.0e-3,
+            "{SLICED_MAX_UNITS}"
+        );
+        // A slow step shrinks the next to an eighth of the budget at its rate.
+        s.observe(u64::from(s.units), Duration::from_micros(1_500));
+        assert_eq!(s.units, SLICED_MAX_UNITS / 2);
+        // An empty step (nothing measured) doubles, within the cap.
+        let before = s.units;
+        s.observe(u64::from(before), Duration::ZERO);
+        assert_eq!(s.units, (2 * before).min(SLICED_MAX_UNITS));
     }
 }

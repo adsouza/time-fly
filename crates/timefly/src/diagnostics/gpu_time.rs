@@ -28,7 +28,8 @@
 //!
 //! **Convention.** A frame's GPU time is `(end − begin) × period` ([`frame_ms_from_timestamps`];
 //! the queue's timestamp period is in ns, 1 on WebGPU), where `begin` is
-//! [`frame_start`]`(begin, previous end)`. A frame whose end precedes its begin,
+//! [`frame_start`]`(begin, previous end)`; a frame whose predecessor wasn't read is dropped
+//! ([`read_frame`]). A frame whose end precedes its begin,
 //! whose value is not finite, or that has a zero timestamp (a query the GPU never wrote resolves
 //! to 0) is dropped and counted in [`GpuFrameTime::dropped`].
 //!
@@ -51,7 +52,7 @@ use bevy::render::{RenderApp, RenderStartup};
 
 /// Readback buffers in flight at most (a frame's reading arrives within this many frames, or
 /// that frame goes untimed).
-pub const RING: usize = 4;
+pub const RING: usize = 8;
 
 /// The GPU frame time, in the main world.
 #[derive(Resource, Clone, Debug, PartialEq)]
@@ -568,16 +569,14 @@ impl GpuTimer {
                 buffer.unmap();
                 let begin = words.first().copied().unwrap_or(0);
                 let end = words.iter().skip(1).copied().max().unwrap_or(0);
-                let frame = self.frame_of[slot];
-                let previous = self
-                    .last_end
-                    .filter(|(f, _)| *f + 1 == frame)
-                    .map(|(_, e)| e);
-                let ms =
-                    frame_ms_from_timestamps(frame_start(begin, previous), end, self.period_ns);
-                if ms.is_some() {
-                    self.last_end = Some((frame, end));
-                }
+                let (ms, last) = read_frame(
+                    begin,
+                    end,
+                    self.frame_of[slot],
+                    self.last_end,
+                    self.period_ns,
+                );
+                self.last_end = last;
                 ms
             });
             self.ring.release(slot);
@@ -585,6 +584,31 @@ impl GpuTimer {
         }
         out
     }
+}
+
+/// One frame's reading from its begin and latest end timestamps, frame number `frame`, and the
+/// last reading's `(frame, end)`: the frame's GPU time (ms), and the `(frame, end)` to keep for
+/// the next frame.
+///
+/// The span starts at [`frame_start`]`(begin, previous end)`, so only a frame whose predecessor
+/// was read can be timed: after a frame that found no free slot, or whose reading was dropped,
+/// the begin may have run inside that frame (a span read up to double; review, fix round 1),
+/// so the reading is dropped. Its end is still kept, when it is valid, to link the next frame.
+pub fn read_frame(
+    begin: u64,
+    end: u64,
+    frame: u64,
+    last_end: Option<(u64, u64)>,
+    period_ns: f32,
+) -> (Option<f32>, Option<(u64, u64)>) {
+    let previous = last_end.filter(|(f, _)| *f + 1 == frame).map(|(_, e)| e);
+    // Also checks the pair itself: a zero or reversed pair keeps nothing to link.
+    if frame_ms_from_timestamps(begin, end, period_ns).is_none() {
+        return (None, None);
+    }
+    let ms = previous
+        .and_then(|p| frame_ms_from_timestamps(frame_start(begin, Some(p)), end, period_ns));
+    (ms, Some((frame, end)))
 }
 
 /// When a frame's GPU span starts: its begin timestamp, or the previous frame's end when that is
@@ -814,11 +838,35 @@ mod tests {
         assert_eq!(frame_start(1_000, None), 1_000);
     }
 
+    /// Review finding (fix round 1): a frame whose predecessor wasn't read (it found no free
+    /// slot, or its reading was dropped) can't tell whether its begin ran inside that frame,
+    /// so its reading is dropped; its end still links the next frame.
+    #[test]
+    fn a_frame_after_an_unread_frame_is_dropped_but_links_the_next() {
+        // Frame 7 read, frame 8 untimed (no slot), frame 9's begin ran inside frame 8.
+        let last = Some((7, 10_000_000));
+        let (ms, last) = read_frame(11_000_000, 19_000_000, 9, last, 1.0);
+        assert_eq!(ms, None, "8 ms of frames 8 and 9 together, not frame 9's");
+        assert_eq!(last, Some((9, 19_000_000)));
+        // Frame 10 follows frame 9: it starts at 9's end.
+        let (ms, last) = read_frame(18_000_000, 23_000_000, 10, last, 1.0);
+        assert_eq!(ms, Some(4.0));
+        assert_eq!(last, Some((10, 23_000_000)));
+        // The first frame of a session has no predecessor either.
+        assert_eq!(read_frame(1_000, 2_000_000, 1, None, 1.0).0, None);
+        // An unwritten end breaks the chain.
+        let (ms, last) = read_frame(24_000_000, 0, 11, last, 1.0);
+        assert_eq!((ms, last), (None, None));
+        // A reversed pair is dropped too, and keeps nothing to link.
+        let (ms, last) = read_frame(30, 20, 12, Some((11, 10)), 1.0);
+        assert_eq!((ms, last), (None, None));
+    }
+
     #[test]
     fn the_readback_ring_never_hands_out_a_slot_still_being_mapped() {
         let mut ring = ReadbackRing::default();
         let slots: Vec<usize> = (0..RING).filter_map(|_| ring.acquire()).collect();
-        assert_eq!(slots, [0, 1, 2, 3]);
+        assert_eq!(slots, (0..RING).collect::<Vec<_>>());
         assert_eq!(ring.acquire(), None, "every slot is recording");
         // Submitted: each waits for its frame's work.
         let mut work_done: Vec<_> = slots.iter().map(|&s| Some(ring.running(s))).collect();

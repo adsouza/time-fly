@@ -11,7 +11,7 @@
 use std::ops::Range;
 
 use super::climate::{Climate, ClimateSource, ClimateTable, SECONDS_PER_YEAR};
-use super::graph::{Down, RiverGraph};
+use super::graph::{Down, GraphBuild, RiverGraph};
 use super::lakemap::shipped_lake_map;
 use super::lakes::{Accumulation, Flats, place_levels};
 use super::levels::{LakeLevel, shipped_lake_levels};
@@ -330,6 +330,8 @@ enum Stage {
     Runoff(Box<Routed>, Vec<u16>, Accumulation),
     Walk(Box<Routed>, Vec<u16>, Accumulation),
     Rivers(Box<Routed>, Accumulation, u32, Vec<u32>),
+    /// The river graph in steps, then the ocean bits, packed from this node on.
+    Build(Box<Routed>, Accumulation, Box<GraphBuild>, Vec<u64>, u32),
     Done(Box<EraHydrology>),
     /// Only while a step moves between stages.
     Moving,
@@ -546,10 +548,34 @@ impl HydroPrep {
                     }
                     used += (end - next).max(1);
                     if end == len {
-                        used = used.saturating_add(list.len() as u32);
-                        Stage::Done(Box::new(self.build(&routed, acc, list)))
+                        let ocean = vec![0u64; len.div_ceil(64) as usize];
+                        Stage::Build(routed, acc, Box::new(GraphBuild::new(list)), ocean, 0)
                     } else {
                         Stage::Rivers(routed, acc, end, list)
+                    }
+                }
+                Stage::Build(routed, acc, mut graph, mut ocean, next) => {
+                    if !graph.done() {
+                        let down_of = |v: u32| self.down_of(&routed, &acc, v);
+                        let info = |v: u32| {
+                            let i = v as usize;
+                            (acc.q[i], acc.area_km2[i], routed.elevation_m[i])
+                        };
+                        let (_, u) = graph.step(&lattice, &down_of, &info, &acc.lakes, left);
+                        used += u.max(1);
+                        Stage::Build(routed, acc, graph, ocean, next)
+                    } else if next < len {
+                        let end = next.saturating_add(left).min(len);
+                        for i in next..end {
+                            if routed.ocean[i as usize] {
+                                ocean[(i / 64) as usize] |= 1 << (i % 64);
+                            }
+                        }
+                        used += (end - next).max(1);
+                        Stage::Build(routed, acc, graph, ocean, end)
+                    } else {
+                        used += 1;
+                        Stage::Done(Box::new(self.assemble(acc, graph.finish(), ocean)))
                     }
                 }
                 done @ Stage::Done(_) => {
@@ -626,6 +652,24 @@ impl HydroPrep {
         used
     }
 
+    /// The stage the pass is in, by name: `sample`, `straits`, `route`, `flats`, `coast`,
+    /// `runoff`, `walk`, `rivers` or `done` (for logs that say where a long step went).
+    pub fn stage_name(&self) -> &'static str {
+        match &self.stage {
+            Stage::Sample => "sample",
+            Stage::Straits => "straits",
+            Stage::Route(_) => "route",
+            Stage::Flats(..) => "flats",
+            Stage::Coast(..) => "coast",
+            Stage::Runoff(..) => "runoff",
+            Stage::Walk(..) => "walk",
+            Stage::Rivers(..) => "rivers",
+            Stage::Build(..) => "build",
+            Stage::Done(_) => "done",
+            Stage::Moving => "moving",
+        }
+    }
+
     /// The pass with other lake level and strait tables (tests).
     #[cfg(test)]
     pub(crate) fn with_tables(
@@ -646,40 +690,34 @@ impl HydroPrep {
         }
     }
 
-    fn build(&self, routed: &Routed, acc: Accumulation, list: Vec<u32>) -> EraHydrology {
+    /// Where river node `v` drains ([`RiverGraph::build`]'s `down_of`).
+    fn down_of(&self, routed: &Routed, acc: &Accumulation, v: u32) -> Down {
         let lattice = self.lattice;
-        let down_of = |v: u32| {
-            let Some(j) = receiver_of(&lattice, routed, v) else {
-                // A closed basin's sink with no lake on it; otherwise only a graph with no ocean
-                // at all has a land node with no receiver: its lowest node.
-                return if routed.basin_of[v as usize] == NO_BASIN {
-                    Down::Ocean(v)
-                } else {
-                    Down::Sink(v)
-                };
-            };
-            if routed.ocean[j as usize] {
-                Down::Ocean(j)
-            } else if let Some(l) = lake_at(&acc, j) {
-                Down::Lake(l, j)
-            } else if bit(&self.ice, j) {
-                Down::Ice(j)
+        let Some(j) = receiver_of(&lattice, routed, v) else {
+            // A closed basin's sink with no lake on it; otherwise only a graph with no ocean
+            // at all has a land node with no receiver: its lowest node.
+            return if routed.basin_of[v as usize] == NO_BASIN {
+                Down::Ocean(v)
             } else {
-                Down::River(j)
-            }
+                Down::Sink(v)
+            };
         };
-        let info = |v: u32| {
-            let i = v as usize;
-            (acc.q[i], acc.area_km2[i], routed.elevation_m[i])
-        };
-        let rivers = RiverGraph::build(&lattice, list, down_of, info, &acc.lakes);
-        let mut ocean = vec![0u64; lattice.len().div_ceil(64) as usize];
-        for (i, _) in routed.ocean.iter().enumerate().filter(|(_, o)| **o) {
-            ocean[i / 64] |= 1 << (i % 64);
+        if routed.ocean[j as usize] {
+            Down::Ocean(j)
+        } else if let Some(l) = lake_at(acc, j) {
+            Down::Lake(l, j)
+        } else if bit(&self.ice, j) {
+            Down::Ice(j)
+        } else {
+            Down::River(j)
         }
+    }
+
+    /// The pass's result from the finished graph and the packed ocean bits.
+    fn assemble(&self, acc: Accumulation, rivers: RiverGraph, ocean: Vec<u64>) -> EraHydrology {
         EraHydrology {
             age: self.age,
-            lattice,
+            lattice: self.lattice,
             lakes: acc.lakes,
             rivers,
             data_lakes: self.data_lakes,
@@ -757,6 +795,9 @@ impl HydroPrep {
             Stage::Coast(r, c) => routed_bytes(r) + c.bytes(),
             Stage::Runoff(r, c, a) | Stage::Walk(r, c, a) => {
                 routed_bytes(r) + 2 * c.capacity() + a.working_bytes()
+            }
+            Stage::Build(r, a, g, ocean, _) => {
+                routed_bytes(r) + a.working_bytes() + g.working_bytes() + 8 * ocean.capacity()
             }
             Stage::Rivers(r, a, _, list) => {
                 routed_bytes(r) + a.working_bytes() + 4 * list.capacity()
@@ -2267,6 +2308,34 @@ mod tests {
         while !b.step(&world, &world, &table, 3) {}
         assert_eq!(a.units_done(), b.units_done());
         assert!(a.units_done() >= u64::from(len));
+    }
+
+    /// Rivers and lakes Task 10, fix round 1: the river graph and the ocean bits are built
+    /// over several steps (in one go they took 12.8 ms natively at n = 900), and the stage is
+    /// named for the logs.
+    #[test]
+    fn the_river_graph_is_built_over_several_steps() {
+        let lattice = CubeLattice { n: 75 };
+        let mut world = World::new();
+        world.coast_scale = Some(400.0);
+        let table = shipped_table();
+        let whole = run_at(lattice, PAST, &world, &world, &table, u32::MAX);
+        let mut prep = HydroPrep::new(lattice, PAST);
+        let mut building = 0;
+        let mut stages = Vec::new();
+        while !prep.step(&world, &world, &table, 64) {
+            if stages.last() != Some(&prep.stage_name()) {
+                stages.push(prep.stage_name());
+            }
+            building += usize::from(prep.stage_name() == "build");
+        }
+        assert!(
+            building >= 4,
+            "{building} steps ended in the build; stages {stages:?}"
+        );
+        assert_eq!(stages.last(), Some(&"build"), "{stages:?}");
+        assert_eq!(prep.stage_name(), "done");
+        assert_eq!(prep.finish(), whole);
     }
 
     #[test]

@@ -2009,92 +2009,120 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// One frame of `passes` busy passes between `timer`'s marker passes, submitted; `wait` waits
+/// for the GPU after it. Returns the readings that came in.
+fn submit_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    timer: &mut timefly::diagnostics::gpu_time::GpuTimer,
+    pipeline: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+    passes: u32,
+    wait: bool,
+) -> (bool, Vec<Option<f32>>) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    let timed = timer.begin(&mut encoder);
+    for _ in 0..passes {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("busy"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.draw(0..3, 0..1);
+    }
+    timer.end(
+        &mut encoder,
+        device,
+        &[(view, wgpu::TextureFormat::Rgba8Unorm)],
+    );
+    queue.submit([encoder.finish()]);
+    timer.submitted(queue);
+    let poll = if wait {
+        wgpu::PollType::wait_indefinitely()
+    } else {
+        wgpu::PollType::Poll
+    };
+    device.poll(poll).expect("poll");
+    (timed, timer.harvest())
+}
+
 /// Frames timed by a fresh [`GpuTimer`](timefly::diagnostics::gpu_time::GpuTimer), each with
-/// `passes` busy passes between its begin and end timestamps, the busy target as the frame's
-/// output; then empty frames until every reading is in. With `wait`, each frame waits for its
-/// work before the next is submitted; without, they go back to back, as when GPU-bound. The
-/// readings, in frame order.
+/// `passes` busy passes, the busy target as the frame's output, each waiting for its work.
+/// A primer frame comes first (a frame with no read predecessor is dropped), and empty frames
+/// after until every reading is in. The readings, in frame order.
 fn timed_frames(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipeline: &wgpu::RenderPipeline,
     view: &wgpu::TextureView,
     passes: &[u32],
-    wait: bool,
 ) -> Vec<f32> {
     let mut timer =
         timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
     let mut readings = Vec::new();
     // A frame's reading arrives with the frame after it (its resolve waits for its work).
-    let flush = [0u32; 2];
-    for (i, &n) in passes.iter().chain(&flush).enumerate() {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let timed = timer.begin(&mut encoder);
-        // The flush frames may find every slot in flight (back to back).
-        assert!(timed || i >= passes.len(), "a free slot for frame {i}");
-        for _ in 0..n {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("busy"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.draw(0..3, 0..1);
-        }
-        timer.end(
-            &mut encoder,
-            device,
-            &[(view, wgpu::TextureFormat::Rgba8Unorm)],
-        );
-        queue.submit([encoder.finish()]);
-        timer.submitted(queue);
-        let poll = if wait {
-            wgpu::PollType::wait_indefinitely()
-        } else {
-            wgpu::PollType::Poll
-        };
-        device.poll(poll).expect("poll");
-        readings.extend(timer.harvest());
+    let frames = std::iter::once(0)
+        .chain(passes.iter().copied())
+        .chain([0, 0]);
+    for (i, n) in frames.enumerate() {
+        let (timed, got) = submit_frame(device, queue, &mut timer, pipeline, view, n, true);
+        assert!(timed, "a free slot for frame {i}");
+        readings.extend(got);
     }
-    // Back to back, the last frames' readings are still on their way.
-    for _ in 0..4 {
-        if readings.len() >= passes.len() {
-            break;
-        }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        timer.begin(&mut encoder);
-        timer.end(
-            &mut encoder,
-            device,
-            &[(view, wgpu::TextureFormat::Rgba8Unorm)],
-        );
-        queue.submit([encoder.finish()]);
-        timer.submitted(queue);
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll");
-        readings.extend(timer.harvest());
-    }
-    assert!(
-        readings.len() >= passes.len(),
-        "a reading per frame: {readings:?}"
+    assert_eq!(
+        readings.first(),
+        Some(&None),
+        "the primer has no predecessor"
     );
     readings
         .into_iter()
+        .skip(1)
         .take(passes.len())
         .map(|r| r.expect("a valid reading: begin and end written, end after begin"))
         .collect()
+}
+
+/// `frames` frames of `passes` busy passes each, back to back (no wait), as when GPU-bound:
+/// frames that find no free slot go untimed. Then more of the same, waiting, until the readings
+/// are in. Every valid reading.
+fn back_to_back(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+    passes: u32,
+    frames: usize,
+) -> (Vec<f32>, usize) {
+    let mut timer =
+        timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
+    let mut readings = Vec::new();
+    let mut untimed = 0;
+    for i in 0..frames + 6 {
+        let (timed, got) = submit_frame(
+            device,
+            queue,
+            &mut timer,
+            pipeline,
+            view,
+            passes,
+            i >= frames,
+        );
+        untimed += usize::from(!timed);
+        readings.extend(got);
+    }
+    (readings.into_iter().flatten().collect(), untimed)
 }
 
 /// Rivers and lakes Task 10: the GPU frame time read from pass-level timestamps (one-pixel
@@ -2169,23 +2197,15 @@ fn the_gpu_frame_time_is_measured_on_this_gpu() {
         "timestamp period {} ns",
         GpuTimer::new(&device, queue.get_timestamp_period()).period_ns()
     );
-    // Warm up (pipeline compile, clocks), then the median of five frames per pass count.
-    timed_frames(&device, &queue, &pipeline, &view, &[4; 3], true);
-    let median = |passes: u32, wait: bool| {
-        let mut ms = timed_frames(&device, &queue, &pipeline, &view, &[passes; 3], wait);
+    // Warm up (pipeline compile, clocks), then the median of three frames per pass count.
+    timed_frames(&device, &queue, &pipeline, &view, &[4; 3]);
+    let median = |passes: u32| {
+        let mut ms = timed_frames(&device, &queue, &pipeline, &view, &[passes; 3]);
         ms.sort_by(f32::total_cmp);
-        println!(
-            "{passes} busy passes, {}: {ms:?} ms",
-            if wait { "waited" } else { "back to back" }
-        );
+        println!("{passes} busy passes, waited: {ms:?} ms");
         ms[1]
     };
-    let (none, one, four, sixteen) = (
-        median(0, true),
-        median(1, true),
-        median(4, true),
-        median(16, true),
-    );
+    let (none, one, four, sixteen) = (median(0), median(1), median(4), median(16));
     println!("medians: 0 {none} ms, 1 {one} ms, 4 {four} ms, 16 {sixteen} ms");
     assert!(
         (0.0..1.0).contains(&none),
@@ -2198,10 +2218,31 @@ fn the_gpu_frame_time_is_measured_on_this_gpu() {
         sixteen > 3.0 * four,
         "16 passes {sixteen} ms vs 4 passes {four} ms"
     );
-    // Back to back: each frame's span starts after the previous frame's end, not inside it.
-    let packed = median(4, false);
+    // Twenty frames back to back (review, fix round 1): when the ring runs out some frames go
+    // untimed, and a frame after an untimed one could start inside it and read up to double.
+    // Those are dropped, so no reading is: the worst stays with the median (a doubled reading
+    // is about 2×), and the median with the waited figure. That one only loosely: waited, the
+    // GPU idles between frames and may clock down (one run read 8.5 ms waited, 6.9 packed).
+    let (mut packed, untimed) = back_to_back(&device, &queue, &pipeline, &view, 4, 20);
+    packed.sort_by(f32::total_cmp);
+    let (mid, worst) = (packed[packed.len() / 2], packed[packed.len() - 1]);
+    println!(
+        "4 busy passes back to back: {} readings, {untimed} frames untimed, median {mid} ms, worst {worst} ms: {packed:?}",
+        packed.len()
+    );
+    // The test submits every frame at once (Bevy keeps a frame or two in flight), so most go
+    // untimed: the case under test, which must happen here.
     assert!(
-        (packed - four).abs() < 0.25 * four,
-        "back to back {packed} ms vs waited {four} ms"
+        untimed > 0,
+        "every frame found a slot: no chain break was exercised"
+    );
+    assert!(packed.len() >= 6, "{} readings of 26 frames", packed.len());
+    assert!(
+        (mid - four).abs() <= 0.35 * four,
+        "back-to-back median {mid} ms vs waited {four} ms"
+    );
+    assert!(
+        worst <= 1.3 * mid,
+        "back-to-back worst {worst} ms vs their median {mid} ms"
     );
 }
