@@ -52,6 +52,7 @@ use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, 
 use timefly_core::hydrology::climate::{BeyerClimate, ClimateSource, ZonalClimate};
 use timefly_core::hydrology::compare::{
     Agreement, OutletTrace, Reference, centreline_agreement, parse_reference, trace_outlet,
+    trace_outlet_path,
 };
 use timefly_core::hydrology::lakemap::shipped_lake_map;
 use timefly_core::hydrology::levels::shipped_lake_levels;
@@ -414,9 +415,10 @@ impl CheckSpec {
                     "Orinoco",
                     (7.65, -66.16666667),
                     &[("Ciudad Bolívar", (8.13793, -63.548266))],
-                    (8.61666667, -62.25),
-                    "from \"Caicara del Orinoco\"; via \"Ciudad Bolívar\"; mouth \"Orinoco\" \
-                     (infobox)",
+                    (8.60722222, -60.41083333),
+                    "from \"Caicara del Orinoco\"; via \"Ciudad Bolívar\"; mouth \"Barima Point\" on the \
+                     Boca Grande, the Rio Grande's mouth (fix round 1, the owner's ruling; \
+                     Britannica places the Boca Grande at Barima Point)",
                 ),
                 outlet(
                     "Paraná",
@@ -1011,9 +1013,27 @@ pub fn judge_arid(game: &[(u16, f64, f64)], references: &[(String, Reference)]) 
     }
 }
 
-/// The box's SVG: reference blue, game red, equirectangular, with a scale bar.
-pub fn box_svg(name: &str, reference: &Reference, game: &[Vec<DVec3>], line: &str) -> String {
-    let (n, w, s, e) = reference.bbox;
+/// One set of polylines on a map SVG: `(lat, lon)` points, a colour and a stroke width (px).
+pub struct SvgLayer {
+    pub colour: &'static str,
+    pub width_px: f64,
+    pub lines: Vec<Vec<(f64, f64)>>,
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;")
+}
+
+/// An equirectangular map of `bbox` (n, w, s, e) at [`SVG_PX_PER_DEG`]: the layers in order,
+/// labelled points, a [`SCALE_BAR_KM`] scale bar and `line` as a caption.
+pub fn map_svg(
+    title: &str,
+    bbox: (f64, f64, f64, f64),
+    layers: &[SvgLayer],
+    marks: &[(String, (f64, f64))],
+    line: &str,
+) -> String {
+    let (n, w, s, e) = bbox;
     let k = SVG_PX_PER_DEG;
     let (width, height) = ((e - w) * k, (n - s) * k);
     let xy = |lat: f64, lon: f64| ((lon - w) * k, (n - lat) * k);
@@ -1023,51 +1043,41 @@ pub fn box_svg(name: &str, reference: &Reference, game: &[Vec<DVec3>], line: &st
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width:.0}\" height=\"{height:.0}\" \
          viewBox=\"0 0 {width:.0} {height:.0}\">"
     );
-    let _ = writeln!(
-        out,
-        "<title>hydro check {name}: reference blue, game red</title>"
-    );
+    let _ = writeln!(out, "<title>{}</title>", escape(title));
     let _ = writeln!(
         out,
         "<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>"
     );
-    let mut path = |points: &mut dyn Iterator<Item = (f64, f64)>, colour: &str, px: f64| {
-        let d: Vec<String> = points
-            .map(|(lat, lon)| {
-                let (x, y) = xy(lat, lon);
-                format!("{x:.1},{y:.1}")
-            })
-            .collect();
-        if d.len() >= 2 {
-            let _ = writeln!(
-                out,
-                "<polyline fill=\"none\" stroke=\"{colour}\" stroke-width=\"{px}\" \
-                 points=\"{}\"/>",
-                d.join(" ")
-            );
-        }
-    };
-    for link in &reference.links {
-        path(
-            &mut link.points.iter().map(|p| (p.lat_deg, p.lon_deg)),
-            "#1f6feb",
-            2.0,
-        );
-    }
-    for line in game {
-        // Thinned to points about SVG_STEP_KM apart: the relaxed lines' 500 m sub-points would
-        // make the Amazon's file megabytes.
-        let mut kept: Vec<DVec3> = Vec::new();
-        for (k, &d) in line.iter().enumerate() {
-            let last = k + 1 == line.len();
-            if kept
-                .last()
-                .is_none_or(|&p| last || km_between(p, d) >= SVG_STEP_KM)
-            {
-                kept.push(d);
+    for layer in layers {
+        for points in &layer.lines {
+            let d: Vec<String> = points
+                .iter()
+                .map(|&(lat, lon)| {
+                    let (x, y) = xy(lat, lon);
+                    format!("{x:.1},{y:.1}")
+                })
+                .collect();
+            if d.len() >= 2 {
+                let _ = writeln!(
+                    out,
+                    "<polyline fill=\"none\" stroke=\"{}\" stroke-width=\"{}\" points=\"{}\"/>",
+                    layer.colour,
+                    layer.width_px,
+                    d.join(" ")
+                );
             }
         }
-        path(&mut kept.iter().map(|&d| latlon(d)), "#d1242f", 1.2);
+    }
+    for (label, (lat, lon)) in marks {
+        let (x, y) = xy(*lat, *lon);
+        let _ = writeln!(
+            out,
+            "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"4\" fill=\"#000000\"/>\n<text x=\"{:.1}\" \
+             y=\"{:.1}\" font-family=\"sans-serif\" font-size=\"12\">{}</text>",
+            x + 6.0,
+            y - 6.0,
+            escape(label)
+        );
     }
     let lat_mid = 0.5 * (n + s);
     let bar_px = SCALE_BAR_KM / (EARTH_RADIUS_M * 1e-3 * lat_mid.to_radians().cos()) * 180.0
@@ -1089,10 +1099,133 @@ pub fn box_svg(name: &str, reference: &Reference, game: &[Vec<DVec3>], line: &st
     let _ = writeln!(
         out,
         "<text x=\"20\" y=\"24\" font-family=\"sans-serif\" font-size=\"14\">{}</text>",
-        line.replace('&', "&amp;").replace('<', "&lt;")
+        escape(line)
     );
     out.push_str("</svg>\n");
     out
+}
+
+/// Points about [`SVG_STEP_KM`] apart along `line` (the last kept), as `(lat, lon)`.
+fn thinned(line: &[DVec3]) -> Vec<(f64, f64)> {
+    let mut kept: Vec<DVec3> = Vec::new();
+    for (k, &d) in line.iter().enumerate() {
+        let last = k + 1 == line.len();
+        if kept
+            .last()
+            .is_none_or(|&p| last || km_between(p, d) >= SVG_STEP_KM)
+        {
+            kept.push(d);
+        }
+    }
+    kept.iter().map(|&d| latlon(d)).collect()
+}
+
+/// The box's SVG: reference blue, game red, equirectangular, with a scale bar.
+pub fn box_svg(name: &str, reference: &Reference, game: &[Vec<DVec3>], line: &str) -> String {
+    let reference_lines = reference
+        .links
+        .iter()
+        .map(|link| link.points.iter().map(|p| (p.lat_deg, p.lon_deg)).collect())
+        .collect();
+    // Thinned: the relaxed lines' 500 m sub-points would make the Amazon's file megabytes.
+    let game_lines = game.iter().map(|l| thinned(l)).collect();
+    map_svg(
+        &format!("hydro check {name}: reference blue, game red"),
+        reference.bbox,
+        &[
+            SvgLayer {
+                colour: "#1f6feb",
+                width_px: 2.0,
+                lines: reference_lines,
+            },
+            SvgLayer {
+                colour: "#d1242f",
+                width_px: 1.2,
+                lines: game_lines,
+            },
+        ],
+        &[],
+        line,
+    )
+}
+
+/// An outlet's SVG (Task 11d fix round 1): the trace's path through the lattice's node centres
+/// (red), today's burnt courses near it (green, clipped to the map) and the bar's cited start,
+/// vias and mouth (black), with a scale bar.
+pub fn outlet_svg(
+    outlet: &OutletBar,
+    path: &[DVec3],
+    courses: &[Vec<(f64, f64)>],
+    line: &str,
+) -> String {
+    let path: Vec<(f64, f64)> = path.iter().map(|&d| latlon(d)).collect();
+    let mut marks = vec![(format!("{} start", outlet.name), outlet.from)];
+    marks.extend(outlet.vias.iter().map(|(name, at)| (name.clone(), *at)));
+    marks.push((format!("{} mouth", outlet.name), outlet.sea));
+    let all = path.iter().chain(marks.iter().map(|(_, p)| p));
+    let (mut n, mut w, mut s, mut e) = (f64::MIN, f64::MAX, f64::MAX, f64::MIN);
+    for &(lat, lon) in all {
+        n = n.max(lat);
+        s = s.min(lat);
+        w = w.min(lon);
+        e = e.max(lon);
+    }
+    let pad = 0.5;
+    let bbox = (n + pad, w - pad, s - pad, e + pad);
+    let inside = |&(lat, lon): &(f64, f64)| {
+        (bbox.2..=bbox.0).contains(&lat) && (bbox.1..=bbox.3).contains(&lon)
+    };
+    // Each course cut to its runs inside the map.
+    let mut clipped: Vec<Vec<(f64, f64)>> = Vec::new();
+    for course in courses {
+        let mut run: Vec<(f64, f64)> = Vec::new();
+        for p in course {
+            if inside(p) {
+                run.push(*p);
+            } else if !run.is_empty() {
+                clipped.push(std::mem::take(&mut run));
+            }
+        }
+        if !run.is_empty() {
+            clipped.push(run);
+        }
+    }
+    map_svg(
+        &format!(
+            "hydro check outlet {}: the trace red, burnt courses green, cited points black",
+            outlet.name
+        ),
+        bbox,
+        &[
+            SvgLayer {
+                colour: "#2da44e",
+                width_px: 1.2,
+                lines: clipped,
+            },
+            SvgLayer {
+                colour: "#d1242f",
+                width_px: 2.0,
+                lines: vec![path],
+            },
+        ],
+        &marks,
+        line,
+    )
+}
+
+/// A file-name slug: lower-case ASCII letters and digits, the rest `-`.
+pub fn slug(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            'á' | 'à' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' => 'o',
+            _ => '-',
+        })
+        .collect()
 }
 
 /// The reference folder: [`REFERENCE_ENV`] or [`REFERENCE_DIR`].
@@ -1272,9 +1405,20 @@ pub fn hydro_check(
         pass &= result.pass;
         lines.push(result.line);
     }
+    let courses: Vec<Vec<(f64, f64)>> = shipped_today_rivers()
+        .iter()
+        .map(|r| r.points.clone())
+        .collect();
     for outlet in &spec.outlets {
         let result = judge_outlet(hydro, outlet);
         pass &= result.pass;
+        let from = dir(outlet.from.0, outlet.from.1);
+        if let Some(path) = trace_outlet_path(hydro, from, OUTLET_START_KM) {
+            let svg = out_dir.join(format!("hydro-check-outlet-{}.svg", slug(&outlet.name)));
+            fs::write(&svg, outlet_svg(outlet, &path, &courses, &result.line))
+                .map_err(|e| format!("{}: {e}", svg.display()))?;
+            svgs.push(svg);
+        }
         lines.push(result.line);
     }
     // Informative (Task 11d): the game's discharge at a gauge per river against its published
@@ -1669,6 +1813,44 @@ mod tests {
             );
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// Task 11d fix round 1: the misroute pictures for the owner.
+    #[test]
+    fn an_outlet_svg_draws_the_trace_the_courses_and_the_cited_points() {
+        let bar = OutletBar {
+            name: "R".into(),
+            from: (1.0, 1.0),
+            vias: vec![("V & W".into(), (0.5, 1.5))],
+            sea: (0.0, 2.0),
+            sea_km: None,
+            ends_in: OutletEnd::Ocean,
+            source: "s".into(),
+        };
+        let path = vec![dir(1.0, 1.0), dir(0.5, 1.5), dir(0.0, 2.0)];
+        // A course leaving the map and coming back: two runs.
+        let courses = vec![vec![
+            (1.0, 1.0),
+            (0.5, 1.5),
+            (10.0, 10.0),
+            (0.2, 1.8),
+            (0.1, 1.9),
+        ]];
+        let svg = outlet_svg(&bar, &path, &courses, "a < b");
+        assert!(svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"));
+        // The points and half a degree around them: 2 x 2 degrees at 60 px.
+        assert!(svg.contains("width=\"120\" height=\"120\""), "{svg}");
+        assert_eq!(svg.matches("stroke=\"#2da44e\"").count(), 2, "{svg}");
+        assert_eq!(svg.matches("stroke=\"#d1242f\"").count(), 1, "{svg}");
+        assert!(
+            svg.contains("points=\"30.0,30.0 60.0,60.0 90.0,90.0\""),
+            "{svg}"
+        );
+        assert_eq!(svg.matches("<circle").count(), 3);
+        for label in ["R start", "V &amp; W", "R mouth", "100 km", "a &lt; b"] {
+            assert!(svg.contains(label), "{label}: {svg}");
+        }
+        assert_eq!(slug("Paraná River"), "parana-river");
     }
 
     #[test]

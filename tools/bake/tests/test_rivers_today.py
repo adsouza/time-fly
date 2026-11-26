@@ -54,6 +54,78 @@ def test_select_drops_canals():
         assert not {n for n in names if "canal" in n.lower() or "csatorna" in n.lower()}
 
 
+def test_select_keeps_lake_centrelines_no_mapped_lake_covers():
+    # Owner, 2026-11-26 (Task 11d fix round 1): burn the reservoirs. A lake centreline is kept
+    # unless a mapped lake covers it; without a cover test none is kept (as before).
+    features = [
+        _feature("Lake Centerline", 4, [[(82.0, 54.0), (83.0, 54.8)]], "Ob"),
+        _feature("Lake Centerline", 1, [[(32.2, 1.7), (31.8, -0.9)]], "Victoria Nile"),
+        _feature("Lake Centerline", 8, [[(10, 1), (11, 2)]], "minor"),
+        _feature("Lake Centerline", 6, [[(32.3, 31.2), (32.5, 30.0)]], "Suez Canal"),
+        _feature("River", 3, [[(10, 1), (11, 2)]], "kept"),
+    ]
+    assert [p.name for p in rivers_today.select(features)] == ["kept"]
+    cover = {"Ob": 0.0, "Victoria Nile": 0.9, "minor": 0.0, "Suez Canal": 0.0}
+    got = rivers_today.select(features, cover=lambda name, points: cover[name])
+    assert [p.name for p in got] == ["Ob", "kept"]
+    assert got[0].points.tolist() == [[54.0, 82.0], [54.8, 83.0]]
+
+
+def test_lake_cover_is_the_share_of_length_in_mapped_lakes():
+    # A 0.05-degree map with one lake over 10..10.5 N, 20..20.5 E.
+    ids = np.zeros((3600, 7200), dtype=np.uint16)
+    ids[1590:1600, 4000:4010] = 7
+    inside = np.array([[10.1, 20.0], [10.1, 20.5]])
+    half = np.array([[10.1, 20.0], [10.1, 21.0]])
+    outside = np.array([[12.0, 20.0], [12.0, 21.0]])
+    assert rivers_today.lake_cover(inside, ids) == 1.0
+    assert abs(rivers_today.lake_cover(half, ids) - 0.5) < 0.05
+    assert rivers_today.lake_cover(outside, ids) == 0.0
+    assert rivers_today.LAKE_CENTRELINE_MAX_COVER == 0.5
+
+
+EXTRA = SHIPPED.parent / "rivers_extra.json"
+
+
+def _km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (*a, *b))
+    c = math.sin(la1) * math.sin(la2) + math.cos(la1) * math.cos(la2) * math.cos(lo1 - lo2)
+    return 6371.0 * math.acos(min(1.0, c))
+
+
+def test_the_hand_added_channels_are_cited_and_reach_their_mouths():
+    # Owner, 2026-11-26 (Task 11d fix round 1): "Hand-add delta channels".
+    text = EXTRA.read_text(encoding="utf-8")
+    extras = rivers_today.read_extras(text)
+    names = [p.name for p in extras]
+    assert names == ["Yangtze estuary", "Hau (Bassac)", "Tien", "Rio Grande (Orinoco)"]
+    table = json.loads(text)["rivers"]
+    for entry, line in zip(table, extras):
+        assert "read 2026-11-26" in entry["source"], entry["name"]
+        assert _km(line.points[-1], entry["mouth"]) < 2.0, entry["name"]
+        assert 0 <= line.scalerank <= 7
+    # Three continue a Natural Earth course from its last point.
+    shipped = json.loads(SHIPPED.read_bytes())["rivers"]
+    ends = {tuple(r["points"][-1]) for r in shipped}
+    for line in extras[:3]:
+        assert tuple(line.points[0]) in ends, line.name
+    # The committed table carries each, unchanged.
+    for line in extras:
+        assert any(
+            r["name"] == line.name and r["points"] == line.points.tolist() for r in shipped
+        ), line.name
+
+
+def test_read_extras_refuses_an_uncited_entry():
+    bad = {"rivers": [{"name": "x", "scalerank": 1, "mouth": [0, 0], "points": [[0, 0], [1, 1]]}]}
+    try:
+        rivers_today.read_extras(json.dumps(bad))
+    except ValueError as e:
+        assert "source" in str(e)
+    else:
+        raise AssertionError("an entry without a source was read")
+
+
 def test_orient_puts_the_higher_end_first():
     # A 1' grid over 10..12 N, 20..22 E (rows from the south), rising to the north and east.
     rows, cols = 120, 120

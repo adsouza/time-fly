@@ -27,6 +27,196 @@ Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (162
 
 ## Result, 2026-11-26 (Task 11d: the world's major river systems)
 
+### Fix round 1 (2026-11-26)
+
+One review finding, one controller ruling and three owner decisions:
+- **Misroute pictures** (review). The check writes `hydro-check-outlet-<river>.svg` for every
+  outlet (`outlet_svg`). Each shows the trace through the lattice's node centres (red), today's
+  burnt courses near it (green) and the bar's cited start, vias and mouth (black), with a 100 km
+  scale bar. The pictures of the rivers that still fail are linked below.
+- **The Caspian's overflow** (controller): not applied. The ruling's own guard fails on the real
+  bake (below).
+- **Burn the reservoirs** (owner): done.
+- **Hand-add delta channels** (owner): done for the Yangtze, the Mekong's two arms and the
+  Orinoco's Río Grande (the owner's "Yes, add it"). Not done for the Mississippi, whose course
+  already runs to its mouth (below).
+
+Run: `dev` profile. Pass time at 0 ka 1.32 s (0.20 s sampling), against 1.46 and 1.44 s
+before the round. 118,753 river nodes (118,759), 861 lakes (861).
+
+**hydro check: FAIL.** 19 of 22 outlets pass (16 before). The Yangtze fails on its tolerance only,
+the Mississippi and the Volga on their route.
+
+| Bar | Before this round | After | Verdict |
+|---|---|---|---|
+| Indus box, relaxed | 81.6%, 73/84 links, worst 77.5 km | 81.3%, 73/84, worst 77.5 km | FAIL (links only) |
+| Indus box, coarse | 80.5%, 72/84, worst 77.7 km | 80.1%, 72/84, worst 77.7 km | |
+| Amazon flats | 91.6%, 458/482, worst 145.9 km | 91.6%, 458/482, worst 145.9 km | PASS |
+| The five lakes | at their levels | at their levels (unchanged) | PASS |
+| Arid basins | game 0 of 3, reference 0 of 2 | the same | PASS |
+| Danube, Jhelum, Indus, Amazon, Ganges, Brahmaputra, Yellow, Pearl, Nile, Congo, Niger, Hudson, Yenisei, Paraná, Lena, Mackenzie | PASS | the same margins, digit for digit | PASS |
+| Yangtze | 341 km from its mouth, by the old Yellow River mouth | 162 km: the estuary's ocean begins at (32.05, 120.35) | **FAIL** (12 km over) |
+| Mekong | 193 km, the Gulf of Thailand | 91 km, at (9.51, 106.29); Phnom Penh 7.8 km | PASS |
+| Mississippi | 170 km; 51.8 km from New Orleans | unchanged | **FAIL** |
+| Ob | Novosibirsk 168.9 km off; ends 87 km | Novosibirsk 9.1 km; ends 87 km | PASS |
+| Orinoco | 174 km from the delta's head | 27 km from Barima Point, its new mouth, at (8.75, −60.61) | PASS |
+| Volga | Volgograd 157.3 km off; ends at the Sea of Azov | unchanged (157.3 km, 689 km) | **FAIL** |
+| Burnt nodes (informative) | 30,738; max 1,362 m, p99 439 m, 4,452 over 50 m | 31,987; max 1,362 m, p99 434 m, 4,622 over 50 m | |
+
+The Indus box moved by 0.3–0.4 points: the reservoirs now burnt include two in or near it, the
+Indus's Tarbela and the Sutlej's Bhakra. The discharge table changed only where reservoirs or
+channels joined a river:
+- Paraná at Corrientes: 24,539 → 25,644 m³/s (1.29 → 1.35).
+- Mackenzie at Tsiigehtchic: 8,835 → 10,896 (0.96 → 1.18).
+- Ganges at Farakka: 10,314 → 10,310.
+- Mississippi at St. Louis: 9,704 → 9,703.
+
+The same two are flagged: the Nile, 5.11 (the owner chose to add channel losses after this
+milestone), and the Volga at Volgograd, no river.
+
+Pictures of the rivers that still fail:
+- [hydro-check-outlet-yangtze.svg](hydro-check-outlet-yangtze.svg), and before this round:
+  [hydro-check-outlet-yangtze-before.svg](hydro-check-outlet-yangtze-before.svg).
+- [hydro-check-outlet-mississippi.svg](hydro-check-outlet-mississippi.svg).
+- [hydro-check-outlet-volga.svg](hydro-check-outlet-volga.svg), and before this round:
+  [hydro-check-outlet-volga-before.svg](hydro-check-outlet-volga-before.svg). The Caspian was not
+  changed, so there is no after-the-Caspian picture.
+
+#### The reservoirs burnt
+
+The bake now also keeps Natural Earth's `Lake Centerline` parts of rank ≤ 7 that the lake map
+does not cover. A part is covered when at least half its length lies in mapped lake cells
+(`LAKE_CENTRELINE_MAX_COVER` = 0.5, `lake_cover`), sampled at the midpoints of 1 km steps on the
+lake map's 0.05° grid. `test_select_keeps_lake_centrelines_no_mapped_lake_covers` and
+`test_lake_cover_is_the_share_of_length_in_mapped_lakes` pin it.
+
+The table is now 964,421 bytes (≤ 1 MB): 1,428 courses, 1,241 before. That is 183 lake-centreline
+parts and the four channels. Added (183 parts, by name):
+
+(unnamed) (3), Al Furat, Alabama (2), Albany, Albert Nile, Angara (2), Atbara, Back (2), Balsas
+(2), Bandama (2), Bell, Caniapiscau (2), Caroní, Cauvery (2), Chambal, Chattahoochee (3),
+Churchill (2), Colorado (3), Columbia (5), Conchos, Cunene, Dalälven (2), Dnipro (4), Don, El Bahr
+el Azraq, Ertis, Firat (3), Fuchun, Grande (5), Green, Grijalva (2), Guadiana, Han, Hudi, Ile,
+Indus, Kabalebo, Kama (6), Kemijoki, Krishna, La Grande, Lachlan, Lempa, Lotta, Madison, Mae Klong,
+Mahäna Nadï, Manicouagan, Missouri (4), Mouhoun, Murray (2), Nakanbé, Naryn, Negro, Nelson, Niger,
+Nile (Lake Nasser), North Platte (4), Nottaway, Ob (the Novosibirsk Reservoir), Orange (2), Ord,
+Paranapanema (3), Paranaíba (3), Paraná (4), Peace, Pecos (2), Ping, Pit, Pripyat, Péribonka (3),
+R. des Outaouais (2), Red, Rhein, Rio Grande (4), Ro Grande de Santiago (2), Roanoke (3),
+Sacramento, San Joaquin, Sanggan, Saskatchewan (2), Sassandra, Savannah, Snake (2), South
+Saskatchewan, Stora Lule lv, Suda, Sukhona, Sutlej, Syr Darya (2), São Francisco (2), Tajo (2),
+Tana (2), Tennessee (2), Tocantins, Tugaloo, Vaal (2), Verkhniy Yenisey (the Krasnoyarsk
+Reservoir), Vilyuy, Volga (9), Volta, Wisconsin (2), Yom, Yuan, Zambezi (2), Zeya.
+
+Left out as covered (136 parts, by name):
+
+(unnamed) (15), Abay, Albany (4), Amazonas, Amur (2), Angara (Lake Baikal), Athabasca (2), Back
+(2), Bell (3), Biya, Caniapiscau, Chambal, Churchill (12), Clark Fork, Colorado (2), Coppermine
+(2), Dalälven (2), Dniester, Dnipro, Gan, Huang (2), Hudi, Jhelum (2), Jordan (2), Klamath, La
+Grande (2), Lempa, Mackenzie (Great Slave Lake), Manicouagan, Mississippi (2), Missouri, Narva (2),
+Nelson (4), Neva, Ångermanälven (2), Niger (the inner delta's lakes), Nizhnyaya Taymyra, Nottaway,
+Ottawa, Ouémé, Pangani, Peace, R. des Outaouais (2), Rainy (2), Red, Rhein, Rhône (Lake Geneva),
+Ro Grande de Santiago, Rupert (2), Rusizi, San Juan, Saskatchewan (2), Semliki (2), Severn (3),
+Shire, Shishhid Gol, Snake, Sutlej, Svir, Syr Darya, Teslin, Thelon (4), Trombetas, Ural, Victoria
+Nile (3), Vistula, Vorma (2), Vuoksi (2), Waikato, Winnipeg (3), Wujia (2), Yellowstone, Yuan.
+
+The full lists with each part's cover and ends are in the bake's summary (`lake_centrelines_added`,
+`lake_centrelines_covered`). The Krasnoyarsk gorge entry stays: the burn now also carries the same
+reservoir's course.
+
+One concern: orientation by the ends' lowest nearby cells works poorly on a flat reservoir. The
+bake reversed 224 parts against 136 before. An example of a wrongly oriented part that matters:
+Natural Earth's River part of the Volga between Saratov and Balakovo, where the lowest cells
+are 14.54 and 14.49 m.
+
+#### The hand-added delta channels
+
+`data/hydrology/rivers_extra.json` holds four cited channels. The bake appends them after Natural
+Earth's courses (`read_extras` refuses an uncited entry). Each course is the least-cost path over
+ETOPO 2022 60″ cells between the cited points, a step costing its length × (1 + max(0, the cell's
+elevation in m)) so the path keeps to the water, simplified to 1 km.
+
+| Channel | From | To (cited) | Source for the course |
+|---|---|---|---|
+| Yangtze estuary | Natural Earth's Yangtze end at Zhenjiang (32.197, 119.606) | the Yangtze's infobox mouth (31.39361, 121.98306) | "Yangtze". It passes 12 km from Jiangyin's and 16 km from Nantong's article points (city centres off the banks). |
+| Hậu (Bassac) | Natural Earth's Bassac end at Cần Thơ (10.005, 105.838) | "Bassac River", the article's coordinates (9.51667, 106.21667) | "Bassac River": mouth in Sóc Trăng province. |
+| Tiền | Natural Earth's Tiền arm end (10.238, 106.119) | the Mekong's infobox mouth (10.19, 106.75) | "Mekong"; "Tiền River" lists its distributaries. |
+| Río Grande (Orinoco) | "Barrancas del Orinoco" (8.70194, −62.19944), the delta's head | "Barima Point" (8.60722, −60.41083) on the Boca Grande; via "Curiapo" (8.58, −60.9975), 0.8 km from the course | "Orinoco Delta": "The main distributary is called the Rio Grande, which empties south-southeast through the southern portion of the delta". Britannica places the Boca Grande at Barima Point, but its page refused an automated read: that point rests on a search engine's summary of it, 2026-11-26. |
+
+All are English Wikipedia articles, read 2026-11-26. The Orinoco outlet's mouth moved to Barima
+Point; its allowance stays 150 km. `test_the_hand_added_channels_are_cited_and_reach_their_mouths`
+(Python) and `the_hand_added_delta_channels_reach_their_mouths` (Rust) check each channel. Each
+must:
+- run node to node (as every course does);
+- end within 10 km of its cited mouth;
+- for the three that continue Natural Earth, start on that course's last point.
+
+#### Why the Mississippi got no channel, and why the Yangtze ran north (a rule problem)
+
+Natural Earth's Mississippi already runs from Baton Rouge past New Orleans to (28.94, −89.41) by
+Southwest Pass, so a hand-added channel would only repeat it. The slip comes from the burn's
+rule:
+- A burnt node at or above sea level routes at max(level − 10 m, 0 m).
+- Every course node whose running-minimum level is within 10 m of the sea therefore routes at
+  exactly 0 m, so the lower course is a flat with no direction.
+- A flat drains toward whichever ocean contact the flood reaches first.
+
+The probe of the trace's nodes shows it. The levels fall from 7.6 m at Baton Rouge (30.63, −91.34)
+to 0.7 m at LaPlace (30.06, −90.70), all routing at 0 m. LaPlace's node neighbours an ocean node
+of the Maurepas–Pontchartrain water at (30.16, −90.57), which the flood reaches before the Gulf.
+
+The Yangtze ran north along the burnt Hudi for the same reason:
+- The Hudi's nodes (levels about 3 m) also route at 0 m.
+- They joined the Yangtze's 0 m end into one flat, which drained across the northern Jiangsu
+  lowland.
+- The course was never followed against its direction as such: the clamp removed its direction.
+
+With the estuary channel the flat now reaches the estuary's ocean first, and the Yangtze stays on
+it. The Mississippi needs a rule change, which this round does not make. One way: keep a burnt
+course's own order on its 0 m flats, the bed falling a little toward its end.
+
+#### Why the Volga still misses Volgograd
+
+The Volga reservoirs are burnt now, and the trace follows the burnt Volga from Nizhny Novgorod to
+Saratov. Below Saratov it leaves its course at (50.85, 46.00) and runs straight south through Lake
+Elton into the Caspian (the picture).
+- The whole lower Volga lies inside the Caspian's depression basin. Its filled level is the
+  basin's spill, 41.2 m on the Kuma–Manych.
+- Inside a basin, routing is a breadth-first search toward the basin's sources (its lake's
+  footprint, and its exit while the lake overflows), not by elevation.
+- So the course's levels (16–20 m there) never steer it, and the straight red runs in the
+  picture are those search steps.
+- The Caspian still overflows over the Manych to the Don (2,119 m³/s).
+
+#### The Caspian ruling was not applied: its guard fails
+
+The ruling made a lake whose level comes from the lake map or the level table, standing below
+its basin's spill, terminal whatever its balance. I implemented it, with a tolerance of
+`OPEN_LAKE_MAP_TOL_M` = 10 m so a lake at its spill still flows. The Caspian then turned terminal
+with a 2,142 m³/s surplus, and the Don/Manych river went away.
+
+On the real bake it also stopped lakes that really drain:
+- **Table lakes:** Baikal (455.5 m, surplus 4,124 m³/s; it drains by the Angara), Superior (183
+  m, 2,775 m³/s; the St. Marys) and Ontario (74 m, 7,562 m³/s; the St. Lawrence).
+- **Mapped lakes at the present day:** 313 in all. Among them:
+  - Kyoga, which ended the Nile there ("ends in a lake at (1.45, 32.75)").
+  - Tanganyika, Malawi and Titicaca (a surplus of 496 m³/s against its real Desaguadero
+    outflow).
+  - A 14,439 m³/s lake on the lower Amur.
+- The Ob's and the Volga's traces then ended in Kulunda's and Elton's lakes.
+
+The lattice's spill is the level at which the 10 km lattice would overflow. For a lake drained
+through a narrow pass (the Angara, the St. Lawrence, the Victoria Nile before its gorge) that
+spill stands above the real outlet. So "below its basin's spill" does not mean "below its real
+sill". Everything was reverted. The table and lake rules are as before the round.
+
+Options for the controller:
+1. A cited "endorheic" flag per level-table lake (only the Caspian among the seven), leaving
+   mapped lakes as they are.
+2. The rule for table lakes only, with cited gorges for the Angara, the St. Marys and the St.
+   Lawrence.
+3. Another criterion.
+
+
 Owner, 2026-11-26: "We should do sanity checks on other major river systems of the world". The
 check now follows 18 more rivers from a cited start through cited places to a cited mouth, with
 the tolerances unchanged (start 30 km, each via 15 km, mouth 150 km). It also compares the

@@ -3,12 +3,20 @@ v5.1.2 centrelines, upstream first and simplified, which the continental pass bu
 routing wherever the terrain is today's (``timefly_core::hydrology::today_rivers``).
 
 - **Select:** features whose ``featurecla`` is ``River`` with ``scalerank`` at most
-  :data:`TODAY_RIVER_MAX_SCALERANK`; each part of a MultiLineString is its own polyline. Lake
-  centrelines are left out: today's lakes are the lake map's (Task 8b). Artificial channels are
+  :data:`TODAY_RIVER_MAX_SCALERANK`; each part of a MultiLineString is its own polyline. A
+  ``Lake Centerline`` of the same ranks is kept when today's lake map does not cover it (Task 11d
+  fix round 1, the owner: "Burn them"): the lake map drops reservoirs, so the river through a
+  reservoir (Novosibirsk, Krasnoyarsk, the Volga's chain) had neither a lake nor a course.
+  Covered means at least :data:`LAKE_CENTRELINE_MAX_COVER` of the part's length lies in mapped
+  lake cells (:func:`lake_cover`); those lakes are the lake map's (Task 8b). Artificial channels are
   left out too (Task 11d): Natural Earth files canals as ``River``, so a feature whose name holds
   a word of :data:`ARTIFICIAL_NAME_WORDS` is dropped (the Suez, Panama, Ismailiya and Gharraf
   canals and the Ferenc Csatorna, the Danube-Tisa-Danube Canal; the Hindiyah Channel, a natural
   branch of the Euphrates, stays).
+- **Hand-added channels** (Task 11d fix round 1, the owner: "Hand-add delta channels"):
+  ``data/hydrology/rivers_extra.json`` holds a delta's main channel where Natural Earth's course
+  stops above it, each entry cited (:func:`read_extras`). They are appended after Natural
+  Earth's courses as given: already upstream first and simplified.
 - **Orient:** upstream first. Each end's height is the lowest ETOPO 2022 60″ surface cell whose
   centre lies within :data:`ORIENT_CELLS` cells (2′) of the end's cell, in both rows and columns;
   the higher end goes first. Ties keep Natural Earth's order.
@@ -36,6 +44,13 @@ TODAY_RIVER_MAX_SCALERANK = 7
 #: Name words of an artificial channel, matched whole and ignoring case: "canal", and the
 #: Hungarian "csatorna" (canal) of the Ferenc Csatorna.
 ARTIFICIAL_NAME_WORDS = ("canal", "csatorna")
+#: A lake centreline part with at least this share of its length in mapped lake cells is covered
+#: by today's lake map and left out.
+LAKE_CENTRELINE_MAX_COVER = 0.5
+#: The step along a part at which :func:`lake_cover` samples the map (m).
+LAKE_COVER_STEP_M = 1000.0
+LAKE_MAP_PATH = Path(__file__).resolve().parents[3] / "data" / "hydrology" / "lake_map.bin"
+EXTRA_PATH = Path(__file__).resolve().parents[3] / "data" / "hydrology" / "rivers_extra.json"
 SIMPLIFY_M = 1000.0
 ORIENT_CELLS = 2
 ROUND_DIGITS = 3
@@ -48,8 +63,9 @@ SOURCE = (
     "NOAA NCEI, doi:10.25921/fd45-gt74."
 )
 COMMENT = (
-    "Today's major river courses (rivers Task 11b): Natural Earth rivers of scalerank <= 7 (lake "
-    "centrelines and canals left out), one entry per line part, upstream first (the end with the higher "
+    "Today's major river courses (rivers Task 11b): Natural Earth rivers of scalerank <= 7, and lake "
+    "centrelines of those ranks that today's lake map does not cover (reservoirs; canals left out), then the "
+    "cited hand-added delta channels of data/hydrology/rivers_extra.json, one entry per line part, upstream first (the end with the higher "
     "lowest ETOPO 60-second cell within 2 arc-minutes goes first), simplified to 1 km, points "
     "[lat, lon] rounded to 0.001 degrees. Where the terrain is today's, the continental pass burns "
     "each course into its routing: the running minimum of the era's node elevations along it, "
@@ -104,14 +120,42 @@ def is_artificial(name: str) -> bool:
 
 
 @traced
-def select(features) -> list[Polyline]:
+def lake_cover(points: np.ndarray, ids: np.ndarray) -> float:
+    """The share of the (lat, lon) polyline's length whose sample points (the midpoints of
+    :data:`LAKE_COVER_STEP_M` steps along each segment) lie in a lake map cell (``ids`` from
+    :func:`timefly_bake.lakemap.decode`, 0 for no lake). 0 for a polyline of no length."""
+    from timefly_bake.lakemap import cell_of
+
+    height, width = ids.shape
+    xyz = _unit(points)
+    inside = total = 0.0
+    for k in range(len(points) - 1):
+        length = float(_angle(xyz[k : k + 1], xyz[k + 1])[0]) * EARTH_RADIUS_M
+        steps = max(1, math.ceil(length / LAKE_COVER_STEP_M))
+        for i in range(steps):
+            t = (i + 0.5) / steps
+            lat, lon = points[k] + t * (points[k + 1] - points[k])
+            row, col = cell_of(float(lat), float(lon), width, height)
+            if ids[row, col] != 0:
+                inside += length / steps
+            total += length / steps
+    return inside / total if total > 0.0 else 0.0
+
+
+@traced
+def select(features, cover=None) -> list[Polyline]:
     """Each part of every ``River`` feature with ``scalerank <= TODAY_RIVER_MAX_SCALERANK`` that
     is not an artificial channel (:func:`is_artificial`), as a polyline of (lat, lon), in file
-    order."""
+    order; with ``cover(name, points)`` (the share of a part's length in mapped lakes), also each
+    such ``Lake Centerline`` part whose cover is under :data:`LAKE_CENTRELINE_MAX_COVER`."""
     out = []
     for f in features:
         p = f["properties"]
-        if p.get("featurecla") != "River" or _rank(p) > TODAY_RIVER_MAX_SCALERANK:
+        cla = p.get("featurecla")
+        lake = cla == "Lake Centerline"
+        if (cla != "River" and not (lake and cover is not None)) or (
+            _rank(p) > TODAY_RIVER_MAX_SCALERANK
+        ):
             continue
         name = (p.get("name") or p.get("name_en") or "").strip()
         if is_artificial(name):
@@ -120,7 +164,30 @@ def select(features) -> list[Polyline]:
         parts = g["coordinates"] if g["type"] == "MultiLineString" else [g["coordinates"]]
         for part in parts:
             lonlat = np.asarray(part, dtype=np.float64)[:, :2]
-            out.append(Polyline(name, _rank(p), lonlat[:, ::-1].copy()))
+            points = lonlat[:, ::-1].copy()
+            if lake and cover(name, points) >= LAKE_CENTRELINE_MAX_COVER:
+                continue
+            out.append(Polyline(name, _rank(p), points))
+    return out
+
+
+@traced
+def read_extras(text: str) -> list[Polyline]:
+    """The hand-added channels' polylines from ``rivers_extra.json``'s text. Each entry needs a
+    ``name``, a ``scalerank`` in 0..7, a cited ``source``, a ``mouth`` and at least two
+    ``points`` [lat, lon]; anything else is a ``ValueError``."""
+    out = []
+    for entry in json.loads(text)["rivers"]:
+        name = entry.get("name", "?")
+        if not str(entry.get("source", "")).strip():
+            raise ValueError(f"{name}: no source")
+        points = np.asarray(entry.get("points", []), dtype=np.float64)
+        rank = int(entry.get("scalerank", -1))
+        if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 2:
+            raise ValueError(f"{name}: needs at least two [lat, lon] points")
+        if not 0 <= rank <= TODAY_RIVER_MAX_SCALERANK or len(entry.get("mouth", [])) != 2:
+            raise ValueError(f"{name}: needs a scalerank in 0..7 and a mouth")
+        out.append(Polyline(name, rank, points))
     return out
 
 
@@ -218,11 +285,27 @@ def table_text(polylines) -> str:
 
 
 @traced
-def bake(geojson_path, etopo_path, out_path) -> dict:
+def bake(
+    geojson_path, etopo_path, out_path, lake_map_path=LAKE_MAP_PATH, extra_path=EXTRA_PATH
+) -> dict:
     """Bakes the table to ``out_path`` and returns a summary; refuses a table over
     :data:`MAX_TABLE_BYTES`."""
     features = json.loads(Path(geojson_path).read_text(encoding="utf-8"))["features"]
-    selected = select(features)
+    from timefly_bake import lakemap
+
+    ids, _ = lakemap.decode(Path(lake_map_path).read_bytes())
+    lake_parts: dict[str, list] = {"added": [], "covered": []}
+
+    def cover(name, points):
+        share = lake_cover(points, ids)
+        key = "covered" if share >= LAKE_CENTRELINE_MAX_COVER else "added"
+        lake_parts[key].append(
+            [name, round(share, 3), [round(float(x), 2) for x in points[0]],
+             [round(float(x), 2) for x in points[-1]]]
+        )
+        return share
+
+    selected = select(features, cover=cover)
     raw_points = sum(len(p.points) for p in selected)
     with netCDF4.Dataset(Path(etopo_path)) as ds:
         z = ds.variables["z"]
@@ -238,6 +321,8 @@ def bake(geojson_path, etopo_path, out_path) -> dict:
         1 for a, b in zip(selected, oriented) if a.points[0].tolist() != b.points[0].tolist()
     )
     simple = [simplify(p, SIMPLIFY_M) for p in oriented]
+    extras = read_extras(Path(extra_path).read_text(encoding="utf-8"))
+    simple += extras
     text = table_text(simple)
     size = len(text.encode("utf-8"))
     if size > MAX_TABLE_BYTES:
@@ -252,6 +337,9 @@ def bake(geojson_path, etopo_path, out_path) -> dict:
         "points_in": raw_points,
         "points_out": sum(len(r["points"]) for r in table["rivers"]),
         "bytes": size,
+        "extras": [p.name for p in extras],
+        "lake_centrelines_added": lake_parts["added"],
+        "lake_centrelines_covered": lake_parts["covered"],
     }
     _log.info("rivers today: %s", summary)
     return summary
@@ -290,8 +378,10 @@ __all__ = [
     "Polyline",
     "bake",
     "is_artificial",
+    "lake_cover",
     "main",
     "orient",
+    "read_extras",
     "select",
     "simplify",
     "table_text",

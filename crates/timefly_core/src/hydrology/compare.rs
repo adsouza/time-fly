@@ -398,6 +398,39 @@ pub fn trace_outlet(
     reach_km: f64,
     via: Option<DVec3>,
 ) -> Option<OutletTrace> {
+    let via = via.map(DVec3::normalize);
+    let mut via_angle: Option<f64> = None;
+    let mut t = walk_outlet(hydro, from, reach_km, |a, b| {
+        if let Some(v) = via {
+            let best = via_angle.get_or_insert_with(|| angle(v, a));
+            *best = best.min(angle_to_arc(v, a, b));
+        }
+    })?;
+    t.via_km = via_angle.map(|a| a * EARTH_RADIUS_M * 1e-3);
+    Some(t)
+}
+
+/// The path [`trace_outlet`] follows, as lattice-centre directions: the start node, then the end
+/// of each step (a lake crossed from where the river enters it to the river leaving it).
+pub fn trace_outlet_path(hydro: &EraHydrology, from: DVec3, reach_km: f64) -> Option<Vec<DVec3>> {
+    let mut path: Vec<DVec3> = Vec::new();
+    walk_outlet(hydro, from, reach_km, |a, b| {
+        if path.is_empty() {
+            path.push(a);
+        }
+        path.push(b);
+    })?;
+    Some(path)
+}
+
+/// The walk under [`trace_outlet`]: `see(a, b)` gets each stretch in order; `via_km` is left
+/// `None`.
+fn walk_outlet(
+    hydro: &EraHydrology,
+    from: DVec3,
+    reach_km: f64,
+    mut see: impl FnMut(DVec3, DVec3),
+) -> Option<OutletTrace> {
     let lattice = &hydro.lattice;
     let nodes = hydro.rivers.nodes();
     let mut near = Vec::new();
@@ -411,13 +444,6 @@ pub fn trace_outlet(
             best
         }
     })?;
-    let via = via.map(DVec3::normalize);
-    let mut via_angle = via.map(|v| angle(v, lattice.dir(nodes[start as usize].node).0));
-    let mut see = |a: DVec3, b: DVec3| {
-        if let (Some(v), Some(best)) = (via, via_angle.as_mut()) {
-            *best = best.min(angle_to_arc(v, a, b));
-        }
-    };
     let (mut at, mut count, mut lakes) = (start, 1u32, 0u32);
     loop {
         let n = &nodes[at as usize];
@@ -443,7 +469,7 @@ pub fn trace_outlet(
                     start,
                     nodes: count,
                     lakes,
-                    via_km: via_angle.map(|a| a * EARTH_RADIUS_M * 1e-3),
+                    via_km: None,
                     end: n.down,
                     end_dir: to,
                 });
@@ -694,6 +720,13 @@ mod tests {
             (13, 1, Down::Ocean(sea)),
             "{t:?}"
         );
+        // The path: the start, each step's end, and the lake's crossing to the river leaving it.
+        let path = trace_outlet_path(&hydro, from, 1.0).unwrap();
+        assert_eq!(path.len(), 15);
+        assert_eq!(path[0], lattice.dir(start).0);
+        assert_eq!(path[6], lattice.dir(lake[0]).0);
+        assert_eq!(path[7], lattice.dir(outflow[0]).0);
+        assert_eq!(path[14], lattice.dir(sea).0);
         let closed = river_hydro(lattice, &chains, vec![lake_with(0.0)]);
         let t = trace_outlet(&closed, from, 1.0, None).unwrap();
         assert_eq!(

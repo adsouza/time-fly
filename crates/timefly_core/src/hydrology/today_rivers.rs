@@ -818,6 +818,37 @@ mod tests {
         assert!(today_river_nodes(&lattice, jhelum).contains(&apex));
     }
 
+    /// Task 11d fix round 1 (the owner: "Hand-add delta channels"): each cited channel runs node
+    /// to node (as every course, above) to within 10 km of its cited mouth, and the three that
+    /// continue a Natural Earth course start on its last point.
+    #[test]
+    fn the_hand_added_delta_channels_reach_their_mouths() {
+        let lattice = CubeLattice { n: 900 };
+        let rivers = shipped_today_rivers();
+        let km = |a: DVec3, b: DVec3| a.angle_between(b) * 6_371.0;
+        let at = |lat: f64, lon: f64| geo_to_render(latlon_to_geo(lat, lon)).0;
+        for (name, mouth, continues) in [
+            ("Yangtze estuary", (31.39361, 121.98306), true),
+            ("Hau (Bassac)", (9.51667, 106.21667), true),
+            ("Tien", (10.19, 106.75), true),
+            ("Rio Grande (Orinoco)", (8.60722, -60.41083), false),
+        ] {
+            let river = rivers
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("no {name}"));
+            let nodes = today_river_nodes(&lattice, river);
+            assert!(nodes.len() >= 5, "{name}: {nodes:?}");
+            let last = lattice.dir(nodes[nodes.len() - 1]).0;
+            assert!(km(last, at(mouth.0, mouth.1)) < 10.0, "{name}");
+            let first = river.points[0];
+            let joins = rivers
+                .iter()
+                .any(|r| r.name != name && r.points[r.points.len() - 1] == first);
+            assert_eq!(joins, continues, "{name}");
+        }
+    }
+
     #[test]
     fn the_lower_indus_runs_upstream_first() {
         // The Indus's longest part reaches the sea.
