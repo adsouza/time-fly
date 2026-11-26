@@ -1,8 +1,8 @@
 //! The whole continental pass for one era, resumable: sample the era's field on the lattice,
 //! burn the straits and (where the terrain is today's) today's river courses into the routing
-//! elevation, route, set the burnt courses' beds back to their levels, measure the distance to
-//! the coast (only for a climate that needs it), accumulate discharge with the lake hook, and
-//! build the river graph.
+//! elevation, route, measure the distance to the coast (only for a climate that needs it),
+//! accumulate discharge with the lake hook, and build the river graph (its beds along today's
+//! courses at their levels, not the burnt surface).
 //!
 //! - **Coast distance** is a chamfer distance on the lattice: 2 per straight step, 3 per diagonal,
 //!   from the ocean, so `km = cost / 2 × mean spacing`. Exact integers, so any visit order agrees.
@@ -24,7 +24,7 @@ use super::params::{
 use super::straits::{Strait, shipped_straits, strait_levels};
 #[cfg(test)]
 use super::today_rivers::TodayRiver;
-use super::today_rivers::{TodayBurn, TodayTable};
+use super::today_rivers::{BurntNodes, TodayBurn, TodayTable};
 use super::{CubeLattice, EraHydrology, HydroGraph, NO_BASIN, Routed, Routing, receiver_of};
 use crate::deep_time::YearsBp;
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
@@ -349,8 +349,6 @@ enum Stage {
     /// Today's river courses are burnt into the routing elevation ([`TodayBurn`]).
     TodayRivers(Box<TodayBurn>),
     Route(Box<Routing>),
-    /// The burnt nodes' beds are set to their levels ([`HydroPrep::beds`]), from this one on.
-    Beds(Box<Routed>, u32),
     Flats(Box<Routed>, Flats),
     Coast(Box<Routed>, Coast),
     Runoff(Box<Routed>, Vec<u16>, Accumulation),
@@ -387,8 +385,11 @@ pub struct HydroPrep {
     straits: Vec<Strait>,
     /// Today's river courses, burnt with data lakes ([`super::today_rivers`]).
     today: TodayTable,
-    /// The burnt nodes and their levels, from the burn until their beds are set after routing.
-    beds: Vec<(u32, f32)>,
+    /// The burnt nodes and their levels, from the burn until the river graph is built: its beds
+    /// there are the levels, while routing, the flats, the climate and the lakes read the burnt
+    /// surface (Task 11b, fix round 1: raising the elevation back after routing put basin nodes
+    /// above their own spill).
+    beds: BurntNodes,
     stage: Stage,
 }
 
@@ -438,7 +439,7 @@ impl HydroPrep {
             mapped: Vec::new(),
             straits: shipped_straits().to_vec(),
             today: TodayTable::Shipped,
-            beds: Vec::new(),
+            beds: BurntNodes::default(),
             stage: Stage::Sample,
         }
     }
@@ -515,28 +516,9 @@ impl HydroPrep {
                     if done {
                         let mut routed = Box::new(routing.finish());
                         routed.filled_m = Vec::new();
-                        if self.beds.is_empty() {
-                            self.after_route(routed, climate.needs_coast_km())
-                        } else {
-                            Stage::Beds(routed, 0)
-                        }
-                    } else {
-                        Stage::Route(routing)
-                    }
-                }
-                Stage::Beds(mut routed, next) => {
-                    let end = (next as usize)
-                        .saturating_add(left as usize)
-                        .min(self.beds.len());
-                    for &(v, level) in &self.beds[next as usize..end] {
-                        routed.elevation_m[v as usize] = level;
-                    }
-                    used += (end - next as usize).max(1) as u32;
-                    if end == self.beds.len() {
-                        self.beds = Vec::new();
                         self.after_route(routed, climate.needs_coast_km())
                     } else {
-                        Stage::Beds(routed, end as u32)
+                        Stage::Route(routing)
                     }
                 }
                 Stage::Flats(mut routed, mut flats) => {
@@ -624,9 +606,11 @@ impl HydroPrep {
                 Stage::Build(routed, acc, mut graph, mut ocean, next) => {
                     if !graph.done() {
                         let down_of = |v: u32| self.down_of(&routed, &acc, v);
+                        let beds = &self.beds;
                         let info = |v: u32| {
                             let i = v as usize;
-                            (acc.q[i], acc.area_km2[i], routed.elevation_m[i])
+                            let bed = beds.get(v).unwrap_or(routed.elevation_m[i]);
+                            (acc.q[i], acc.area_km2[i], bed)
                         };
                         let (_, u) = graph.step(&lattice, &down_of, &info, &acc.lakes, left);
                         used += u.max(1);
@@ -642,6 +626,7 @@ impl HydroPrep {
                         Stage::Build(routed, acc, graph, ocean, end)
                     } else {
                         used += 1;
+                        self.beds = BurntNodes::default();
                         Stage::Done(Box::new(self.assemble(acc, graph.finish(), ocean)))
                     }
                 }
@@ -664,7 +649,7 @@ impl HydroPrep {
         Stage::Route(Box::new(Routing::new(std::mem::take(&mut self.elevation))))
     }
 
-    /// The stage after routing (and the beds): the data's flats, unless the map decides every
+    /// The stage after routing: the data's flats, unless the map decides every
     /// lake (the present day), else what follows them.
     fn after_route(&mut self, routed: Box<Routed>, needs_coast_km: bool) -> Stage {
         self.first_flat = routed.basins.len() as u32;
@@ -736,16 +721,15 @@ impl HydroPrep {
         used
     }
 
-    /// The stage the pass is in, by name: `sample`, `straits`, `today_rivers`, `route`, `beds`,
-    /// `flats`, `coast`, `runoff`, `walk`, `rivers`, `build` or `done` (for logs that say where a
-    /// long step went).
+    /// The stage the pass is in, by name: `sample`, `straits`, `today_rivers`, `route`, `flats`,
+    /// `coast`, `runoff`, `walk`, `rivers`, `build` or `done` (for logs that say where a long step
+    /// went).
     pub fn stage_name(&self) -> &'static str {
         match &self.stage {
             Stage::Sample => "sample",
             Stage::Straits => "straits",
             Stage::TodayRivers(_) => "today_rivers",
             Stage::Route(_) => "route",
-            Stage::Beds(..) => "beds",
             Stage::Flats(..) => "flats",
             Stage::Coast(..) => "coast",
             Stage::Runoff(..) => "runoff",
@@ -881,12 +865,12 @@ impl HydroPrep {
     /// The bytes the pass holds now, by capacity.
     pub fn working_bytes(&self) -> usize {
         let own = 4 * self.elevation.capacity()
-            + 8 * (self.ice.capacity() + self.mapped.capacity() + self.beds.capacity());
+            + 8 * (self.ice.capacity() + self.mapped.capacity())
+            + self.beds.bytes();
         own + match &self.stage {
             Stage::Sample | Stage::Straits | Stage::Moving => 0,
             Stage::TodayRivers(b) => b.bytes(),
             Stage::Route(r) => r.working_bytes(),
-            Stage::Beds(r, _) => routed_bytes(r),
             Stage::Flats(r, f) => routed_bytes(r) + f.working_bytes(),
             Stage::Coast(r, c) => routed_bytes(r) + c.bytes(),
             Stage::Runoff(r, c, a) | Stage::Walk(r, c, a) => {
@@ -2440,7 +2424,7 @@ mod tests {
             while prep.stage_name() != "route" {
                 assert!(!prep.step(self, self, &table, 4096), "the pass ended");
             }
-            prep.beds.clone()
+            prep.beds.list().to_vec()
         }
 
         fn ice(&self, node: u32) -> bool {
@@ -2594,6 +2578,63 @@ mod tests {
         }
     }
 
+    /// Task 11b, fix round 1: a course ending inland leaves a pit at its end, a basin on the
+    /// burnt surface. Its lakes must agree with that basin: no level above the basin's spill,
+    /// a finite, non-empty footprint.
+    #[test]
+    fn a_course_ending_inland_keeps_its_lakes_within_their_basins() {
+        let mut plain = ridge_plain();
+        // The course stops mid-plain on its 3 m ridge, in a semi-arid climate, so the pit at its
+        // end is a closed basin.
+        plain.line = [(18.5, 1.5), (9.0, 10.0)];
+        plain.course_nodes = plain.nodes().into_iter().collect();
+        plain.climate = Climate {
+            precip_mm: 300.0,
+            temp_c: 20.0,
+        };
+        let nodes = plain.nodes();
+        let end = *nodes.last().unwrap();
+        for age in [PAST, YearsBp(21_000.0)] {
+            let h = plain.pass(age, true);
+            // The fixture makes the hazard: a lake at the course's end.
+            let lake = h.lake_of(end).map(|l| &h.lakes[l as usize]);
+            assert!(lake.is_some(), "no lake at the course's end: {:?}", h.lakes);
+            for (k, l) in h.lakes.iter().enumerate() {
+                assert!(
+                    l.level_m.is_finite() && l.level_m <= l.spill_m,
+                    "lake {k}: {l:?}"
+                );
+                assert!(
+                    l.area_km2.is_finite() && l.area_km2 > 0.0,
+                    "lake {k}: {l:?}"
+                );
+                assert!(
+                    (0..PLAIN_LATTICE.len()).any(|v| h.lake_of(v) == Some(k as u16)),
+                    "lake {k} has no footprint"
+                );
+            }
+        }
+    }
+
+    /// The reality check's measurement of the burn (`course_beds`) gives the pass's own levels.
+    #[test]
+    fn course_beds_measure_the_pass_burn() {
+        use crate::hydrology::today_rivers::course_beds;
+        let mut valley = hump_valley();
+        valley.ice_north_of = 16.0;
+        let burnt = valley.burnt(PAST);
+        let beds = course_beds(&PLAIN_LATTICE, &[valley.course()], &valley);
+        let got: Vec<(u32, f32)> = beds.iter().map(|b| (b.node, b.bed_m)).collect();
+        assert_eq!(got, burnt);
+        assert!(
+            beds.iter()
+                .all(|b| b.course == 0 && b.elevation_m >= b.bed_m)
+        );
+        // The hump stands above its held level; the sea's nodes come after the coast.
+        assert!(beds.iter().any(|b| b.elevation_m - b.bed_m > 10.0));
+        assert!(!beds.iter().any(|b| b.pinned_at_sea_level));
+    }
+
     #[test]
     fn a_burnt_coastal_plain_stays_land() {
         // A coastal plain 2 m above the sea, the course due south to the coast.
@@ -2678,7 +2719,7 @@ mod tests {
                 today_steps += 1;
             }
             if prep.stage_name() == "route" {
-                burnt = burnt.max(prep.beds.len());
+                burnt = burnt.max(prep.beds.list().len());
             }
         }
         assert!(
@@ -2980,7 +3021,7 @@ mod tests {
                 }
                 None => stats.push((name, spent, units, 1)),
             }
-            if done || from == "beds" && prep.stage_name() != "beds" {
+            if done || from == "route" && prep.stage_name() != "route" {
                 break;
             }
         }

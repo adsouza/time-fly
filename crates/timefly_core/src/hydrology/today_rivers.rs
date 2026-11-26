@@ -7,7 +7,8 @@
 //! ([`today_river_nodes`]), upstream first, the level is the running minimum of the era's own
 //! node elevations, and the node routes at `level − TODAY_RIVER_BURN_M`
 //! ([`TODAY_RIVER_BURN_M`](super::params::TODAY_RIVER_BURN_M)). The river graph's bed there is
-//! the level itself, so the regions carve no trench. Without it the lattice routes rivers across
+//! the level itself, so the regions carve no trench; the flats, the climate and the lakes read the
+//! burnt surface, as routing did, so every basin agrees with its own spill. Without it the lattice routes rivers across
 //! flat plains by its own lines: the lower Indus ran about 90 km east of its course through the
 //! Sindh (Task 11's reality check).
 //!
@@ -278,15 +279,128 @@ pub fn today_river_nodes(lattice: &CubeLattice, river: &TodayRiver) -> Vec<u32> 
     nodes.finish()
 }
 
+/// The levels along one course's nodes (upstream first): the running minimum of `elevation`,
+/// never below 0 m on a node at or above sea level. `add(node, level)` gets each node that
+/// `burnable` allows; the others still feed the running minimum.
+fn course_levels(
+    nodes: &[u32],
+    elevation: impl Fn(u32) -> f32,
+    burnable: impl Fn(u32) -> bool,
+    mut add: impl FnMut(u32, f32),
+) {
+    let mut level = f32::INFINITY;
+    for &v in nodes {
+        let e = elevation(v);
+        level = level.min(e);
+        if burnable(v) {
+            add(v, if e >= 0.0 { level.max(0.0) } else { level });
+        }
+    }
+}
+
+/// One burnt node as the pass leaves it, for measuring the burn (the reality check).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CourseBed {
+    pub node: u32,
+    /// The course (index into the table) that gave the node its level.
+    pub course: usize,
+    /// The era's own elevation there, before any burn.
+    pub elevation_m: f32,
+    /// The river graph's bed there: the lowest level any course gave it.
+    pub bed_m: f32,
+    /// Whether the course had passed a node below sea level upstream while this node stands
+    /// above it, so its bed is pinned at 0 m.
+    pub pinned_at_sea_level: bool,
+}
+
+/// The beds the pass gives `rivers` over `source` (a present-day era: data lakes), the straits
+/// burnt first as the pass does ([`super::straits`]). Not time-boxed: for checks.
+pub fn course_beds<S: NodeSource>(
+    lattice: &CubeLattice,
+    rivers: &[TodayRiver],
+    source: &S,
+) -> Vec<CourseBed> {
+    use super::params::ICE_NODE_FRACTION;
+    use super::straits::{shipped_straits, strait_levels};
+    let mut sample: HashMap<u32, (f32, bool)> = HashMap::new();
+    let mut sampled = |v: u32| {
+        *sample.entry(v).or_insert_with(|| {
+            let s = source.node(lattice.dir(v));
+            (s.elevation_m, f64::from(s.ice) >= ICE_NODE_FRACTION)
+        })
+    };
+    // The straits' burn, as the pass's.
+    let mut strait: HashMap<u32, f32> = HashMap::new();
+    for s in shipped_straits() {
+        for (v, level) in strait_levels(lattice, s) {
+            if let Some(shift) = source.present_shift_m(lattice.dir(v)) {
+                let l = strait.entry(v).or_insert(f32::INFINITY);
+                *l = l.min(level + shift);
+            }
+        }
+    }
+    let mut out: Vec<CourseBed> = Vec::new();
+    let mut at: HashMap<u32, usize> = HashMap::new();
+    for (k, river) in rivers.iter().enumerate() {
+        let nodes = today_river_nodes(lattice, river);
+        let own: Vec<(f32, bool)> = nodes.iter().map(|&v| sampled(v)).collect();
+        let routed = |v: u32, e: f32| strait.get(&v).map_or(e, |&l| e.min(l));
+        let index: HashMap<u32, usize> = nodes.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+        let mut below_sea = false;
+        let mut levels: Vec<(u32, f32, bool)> = Vec::new();
+        for (i, &v) in nodes.iter().enumerate() {
+            let e = routed(v, own[i].0);
+            let pinned = below_sea && e >= 0.0;
+            below_sea |= e < 0.0;
+            levels.push((v, e, pinned));
+        }
+        course_levels(
+            &nodes,
+            |v| levels[index[&v]].1,
+            |v| !own[index[&v]].1 && source.todays_terrain(lattice.dir(v)),
+            |v, level| {
+                let i = index[&v];
+                let bed = CourseBed {
+                    node: v,
+                    course: k,
+                    elevation_m: own[i].0,
+                    bed_m: level,
+                    pinned_at_sea_level: levels[i].2,
+                };
+                match at.get(&v) {
+                    Some(&j) if out[j].bed_m <= level => {}
+                    Some(&j) => out[j] = bed,
+                    None => {
+                        at.insert(v, out.len());
+                        out.push(bed);
+                    }
+                }
+            },
+        );
+    }
+    out
+}
+
 /// Per-node bed levels gathered from many courses: each node once, in the order first burnt, at
 /// the lowest level any course gave it.
 #[derive(Default)]
-struct BurntNodes {
+pub(crate) struct BurntNodes {
     list: Vec<(u32, f32)>,
     at: HashMap<u32, u32>,
 }
 
 impl BurntNodes {
+    /// The level burnt at `v`, if any course burnt it.
+    pub(crate) fn get(&self, v: u32) -> Option<f32> {
+        self.at.get(&v).map(|&k| self.list[k as usize].1)
+    }
+
+    /// The burnt nodes and their levels, in the order first burnt.
+    #[cfg(test)]
+    pub(crate) fn list(&self) -> &[(u32, f32)] {
+        &self.list
+    }
+
     fn add(&mut self, v: u32, level: f32) {
         match self.at.entry(v) {
             Entry::Occupied(o) => {
@@ -300,7 +414,7 @@ impl BurntNodes {
         }
     }
 
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         8 * self.list.capacity() + 12 * self.at.capacity()
     }
 }
@@ -352,9 +466,9 @@ impl TodayBurn {
         self.burnt.bytes() + self.course.as_ref().map_or(0, RiverNodes::bytes)
     }
 
-    /// The burnt nodes and their levels, for the beds after routing.
-    pub(crate) fn into_beds(self) -> Vec<(u32, f32)> {
-        self.burnt.list
+    /// The burnt nodes and their levels, for the river graph's beds.
+    pub(crate) fn into_beds(self) -> BurntNodes {
+        self.burnt
     }
 
     /// Up to about `budget` units (a course's reading and its levels are not split); returns
@@ -402,16 +516,14 @@ impl TodayBurn {
                 }
                 let nodes = self.course.take().expect("a course").finish();
                 used += LEVEL_UNITS * nodes.len() as u32;
-                let mut level = f32::INFINITY;
-                for v in nodes {
-                    let e = elevation[v as usize];
-                    level = level.min(e);
-                    if is_ice(v) || !source.todays_terrain(lattice.dir(v)) {
-                        continue;
-                    }
-                    self.burnt
-                        .add(v, if e >= 0.0 { level.max(0.0) } else { level });
-                }
+                let burnable = |v: u32| !is_ice(v) && source.todays_terrain(lattice.dir(v));
+                let burnt = &mut self.burnt;
+                course_levels(
+                    &nodes,
+                    |v| elevation[v as usize],
+                    burnable,
+                    |v, level| burnt.add(v, level),
+                );
                 continue;
             }
             let river = match table {

@@ -49,7 +49,10 @@ use timefly_core::hydrology::compare::{
 use timefly_core::hydrology::lakemap::shipped_lake_map;
 use timefly_core::hydrology::levels::shipped_lake_levels;
 use timefly_core::hydrology::params::{HYDRO_RECENT_N, LARGE_LAKE_KM2, SUBPOINT_M};
-use timefly_core::hydrology::{Down, EraHydrology, HydroGraph, LatticeSizes};
+use timefly_core::hydrology::today_rivers::{CourseBed, course_beds, shipped_today_rivers};
+use timefly_core::hydrology::{
+    CubeLattice, Down, EraHydrology, HydroGraph, LatticeSizes, SnapshotSource, hydro_lattice_for,
+};
 use timefly_core::worldgen::coarse::{
     CoarseField, frames_needed, snapshot_field, snapshot_sea_level_anomaly_m,
 };
@@ -180,25 +183,31 @@ impl CheckSpec {
                 lake("Great Salt Lake", 41.1, -112.5),
                 lake("Lake Victoria", -1.0, 33.0),
             ],
+            // Every point is an English Wikipedia article's coordinates, read 2026-11-26 (the
+            // owner's ruling: cited outlet points); docs/testing/rivers/reality-check.md lists
+            // them with the values they replaced.
             outlets: vec![
-                // From Budapest, through the Iron Gate, to the delta.
+                // From Budapest ("Budapest"), through the Iron Gate ("Iron Gates"), to the
+                // delta ("Danube", infobox mouth).
                 outlet(
                     "Danube",
-                    (47.50, 19.05),
-                    Some(("the Iron Gate", (44.67, 22.5))),
-                    (45.2, 29.7),
+                    (47.49250, 19.05139),
+                    Some(("the Iron Gate", (44.67111, 22.52972))),
+                    (45.21750, 29.76139),
                 ),
-                // From Srinagar, out of the Kashmir valley at Baramulla, to the Indus delta.
+                // From Srinagar ("Srinagar"), out of the Kashmir valley at Baramulla
+                // ("Baramulla"), to the Indus delta ("Indus River", infobox mouth).
                 outlet(
                     "Jhelum",
-                    (34.08, 74.80),
-                    Some(("Baramulla", (34.2, 74.35))),
-                    (24.0, 67.4),
+                    (34.09000, 74.79000),
+                    Some(("Baramulla", (34.20869, 74.34350))),
+                    (23.99500, 67.43500),
                 ),
-                // From Skardu to the Arabian Sea.
-                outlet("Indus", (35.3, 75.6), None, (24.0, 67.4)),
-                // From Iquitos to the Atlantic.
-                outlet("Amazon", (-3.75, -73.25), None, (-0.5, -49.5)),
+                // From Skardu ("Skardu") to the Arabian Sea ("Indus River", infobox mouth).
+                outlet("Indus", (35.29028, 75.64444), None, (23.99500, 67.43500)),
+                // From Iquitos ("Iquitos") to the Atlantic by the North Channel, north of Marajó
+                // past Macapá ("Amazon River", infobox mouth).
+                outlet("Amazon", (-3.750, -73.250), None, (0.70778, -50.08944)),
             ],
         }
     }
@@ -791,8 +800,73 @@ pub fn hydro_check(
     let arid = judge_arid(&large_lakes(hydro, &boxes, &precip_at), &references);
     pass &= arid.pass;
     lines.push(arid.line);
+    // Informative (Task 11b, fix round 1): how far today's burnt courses' beds lie below the
+    // era's own terrain.
+    let (_, mode) = hydro_lattice_for(&timeline, 0.0, sizes);
+    let source = SnapshotSource::new(&field, &tiles, &timeline, 0.0, mode);
+    let rivers = shipped_today_rivers();
+    let names: Vec<&str> = rivers.iter().map(|r| r.name.as_str()).collect();
+    let beds = course_beds(&hydro.lattice, rivers, &source);
+    lines.extend(burn_depth_lines(&hydro.lattice, &beds, &names));
     lines.push(format!("hydro check {}", verdict(pass)));
     Ok(HydroCheckReport { lines, pass, svgs })
+}
+
+/// The burn's depth below the terrain over `beds` (`e − bed`): its maximum, 99th percentile and
+/// worst five nodes with their courses, and the nodes pinned at 0 m below a course's passage
+/// through a node below sea level.
+pub fn burn_depth_lines(lattice: &CubeLattice, beds: &[CourseBed], names: &[&str]) -> Vec<String> {
+    let mut depth: Vec<(f32, &CourseBed)> =
+        beds.iter().map(|b| (b.elevation_m - b.bed_m, b)).collect();
+    depth.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.node.cmp(&b.1.node)));
+    let Some(&(max, _)) = depth.first() else {
+        return vec!["today's courses: nothing burnt".into()];
+    };
+    let p99 = depth[(depth.len() - 1) / 100].0;
+    let name = |b: &CourseBed| match names.get(b.course) {
+        Some(n) if !n.is_empty() => (*n).to_string(),
+        _ => format!("course {}", b.course),
+    };
+    let mut lines = vec![format!(
+        "today's courses (informative): {} burnt nodes, terrain above the bed max {max:.0} m, \
+         p99 {p99:.0} m; {} over 50 m",
+        beds.len(),
+        depth.iter().filter(|d| d.0 > 50.0).count()
+    )];
+    for &(d, b) in depth.iter().take(5) {
+        let (lat, lon) = latlon(lattice.dir(b.node).0);
+        lines.push(format!(
+            "  {d:.0} m below the terrain: {} at ({lat:.2}, {lon:.2}), node {}, terrain {:.0} m, \
+             bed {:.0} m",
+            name(b),
+            b.node,
+            b.elevation_m,
+            b.bed_m
+        ));
+    }
+    let pinned: Vec<&CourseBed> = beds.iter().filter(|b| b.pinned_at_sea_level).collect();
+    let mut courses: Vec<String> = pinned.iter().map(|b| name(b)).collect();
+    courses.sort();
+    courses.dedup();
+    lines.push(format!(
+        "  pinned at 0 m after a node below sea level: {} nodes on {} courses{}",
+        pinned.len(),
+        courses.len(),
+        if courses.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                courses
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    ));
+    lines
 }
 
 /// Runs `--hydro-check`: prints the lines (stdout on PASS, stderr on FAIL), logs them, and exits
@@ -899,5 +973,44 @@ mod tests {
         assert!(svg.contains("100 km") && svg.contains("a &lt; b &amp; c"));
         // 100 km at 0.5 degrees of latitude is 0.8994 degrees of longitude: 54.0 px from x = 20.
         assert!(svg.contains("x2=\"74.0\""), "{svg}");
+    }
+
+    #[test]
+    fn burn_depth_lines_report_the_deepest_beds() {
+        let lattice = CubeLattice { n: 30 };
+        let bed = |node, course, e: f32, b: f32, pinned| CourseBed {
+            node,
+            course,
+            elevation_m: e,
+            bed_m: b,
+            pinned_at_sea_level: pinned,
+        };
+        let beds: Vec<CourseBed> = (0..200)
+            .map(|k| bed(k, 0, 10.0 + k as f32, 10.0, false))
+            .chain([
+                bed(500, 1, 900.0, 100.0, false),
+                bed(501, 2, 5.0, 0.0, true),
+            ])
+            .collect();
+        let lines = burn_depth_lines(&lattice, &beds, &["a", "Deep", ""]);
+        assert!(lines[0].contains("202 burnt nodes"), "{}", lines[0]);
+        assert!(lines[0].contains("max 800 m"), "{}", lines[0]);
+        assert!(lines[0].contains("p99 198 m"), "{}", lines[0]);
+        assert!(lines[0].contains("150 over 50 m"), "{}", lines[0]);
+        assert!(
+            lines[1].starts_with("  800 m below the terrain: Deep at"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(lines.len(), 7);
+        assert!(
+            lines[6].contains("1 nodes on 1 courses (course 2)"),
+            "{}",
+            lines[6]
+        );
+        assert_eq!(
+            burn_depth_lines(&lattice, &[], &[]),
+            ["today's courses: nothing burnt"]
+        );
     }
 }
