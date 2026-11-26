@@ -3,9 +3,15 @@
 //! The rules, which the golden fixture (`tests/fixtures/hydro_golden.json`) and the Python
 //! reference (Task 11) pin. `e` is a node's elevation, `c` its evaporation capacity (net
 //! evaporation × area, m³/s; 0 on ice), "tol" is `DATA_LAKE_FLAT_TOL_M`. "Mapped" nodes are
-//! those today's lake map holds ([`super::lakemap`]), each with its lake's baked surface; only
-//! with data lakes (the terrain is today's): without, no node is mapped and the map rules below
-//! never apply.
+//! those today's lake map holds ([`super::lakemap`]), each with its lake's id and baked
+//! surface; only with data lakes (the terrain is today's): without, no node is mapped and the
+//! map rules below never apply.
+//!
+//! Present mode (data lakes at the present-day snapshot, round 2 of Task 8b): the map decides
+//! every lake. No data flats are looked for; table lakes are as below; every other basin makes
+//! no lake: Open by the balance, it passes Q_in through its spill (as a breached basin); else
+//! it ends at its lowest node (its only sink, a dry one; ties: the lowest id), which keeps the
+//! water. The map's lakes then come after the walk ([`super::today`]'s rules).
 //!
 //! ```text
 //! Data flats (only if data_lakes), before discharge, after routing:
@@ -52,14 +58,15 @@
 //!     footprint = candidate minus ice; outflow = max(0, Q_in − Σ_footprint c) if level ≥
 //!     spill − tol, else 0.
 //!   - Otherwise the balance: group basin nodes by distinct e, ascending; C_g = Σc through g.
-//!     C_last < Q_in: Open. S = the highest mapped surface among the basin's nodes (any node,
-//!       ice included), if any.
+//!     C_last < Q_in: Open. The main mapped lake is the map id holding the most basin nodes
+//!       (any node, ice included; ties: the lowest id); S = the highest surface among its nodes.
 //!       - Data lakes and no mapped node: no lake (breached: the lattice dammed a valley that
 //!         holds no lake today; Q_in passes through the spill).
-//!       - spill > S + OPEN_LAKE_MAP_TOL_M: Data lake at level = S, footprint = non-ice basin
-//!         nodes with e < S (no lake if none), evaporation = Σ_footprint c, outflow = Q_in −
-//!         evaporation (the real outlet is a gorge below the lattice; the exit is not added to
-//!         the footprint).
+//!       - spill > S + OPEN_LAKE_MAP_TOL_M: Data lake at level = S, footprint = the main mapped
+//!         lake's non-ice nodes (round 2: never every basin node below S, which flooded plains
+//!         between lakes), evaporation = Σ_footprint c, outflow = Q_in − evaporation (the real
+//!         outlet is a gorge below the lattice; the exit then joins the footprint as its outlet
+//!         unless ice, while the evaporation stays that of the mapped nodes).
 //!       - Otherwise: level = spill, evaporation = C_last, outflow = Q_in − C_last, footprint =
 //!         all non-ice basin nodes; no lake if spill − min e < MIN_LAKE_DEPTH_M.
 //!     Else Terminal: g = first group with C_g ≥ Q_in, level = e_g + (Q_in − C_{g−1}) /
@@ -90,7 +97,8 @@ use super::params::{
     DATA_LAKE_MAX_BALANCE, DATA_LAKE_MIN_BALANCE, DATA_LAKE_MIN_NODES, MIN_LAKE_DEPTH_M,
     OPEN_LAKE_MAP_TOL_M, RIVER_MIN_DISCHARGE_M3S,
 };
-use super::{HydroGraph, NO_BASIN, RECEIVER_EXIT, RECEIVER_NONE, Routed};
+use super::today::Today;
+use super::{HydroGraph, MappedLake, NO_BASIN, RECEIVER_EXIT, RECEIVER_NONE, Routed};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LakeKind {
@@ -210,9 +218,16 @@ pub(crate) struct Accumulation {
     first_flat: u32,
     /// `(basin, level)` from the lake level table, sorted by basin ([`place_levels`]).
     levels: Vec<(u32, f32)>,
-    /// `(node, surface m)` of the nodes a present-day mapped lake holds, sorted by node
-    /// ([`Accumulation::set_mapped`]). Empty without data lakes.
-    mapped: Vec<(u32, f32)>,
+    /// The nodes a present-day mapped lake holds, sorted by node ([`Accumulation::set_mapped`]).
+    /// Empty without data lakes.
+    mapped: Vec<(u32, MappedLake)>,
+    /// The present-day snapshot with today's terrain: the map decides every lake
+    /// ([`super::today`]).
+    present: bool,
+    /// Present mode: each land node's own runoff and area, kept for the overlay.
+    own: Option<(Vec<f32>, Vec<f32>)>,
+    /// Present mode: the overlay, once the walk is done.
+    today: Option<Box<Today>>,
 }
 
 /// Places lake level table points `(nearest node, level)`: each point whose node lies in a
@@ -527,6 +542,9 @@ impl Accumulation {
             first_flat,
             levels: Vec::new(),
             mapped: Vec::new(),
+            present: false,
+            own: None,
+            today: None,
             q: vec![0.0; len as usize],
             area_km2: vec![0.0; len as usize],
             lakes: Vec::new(),
@@ -542,15 +560,21 @@ impl Accumulation {
         self.levels = levels;
     }
 
-    /// Sets the nodes the present-day lake map holds, `(node, mapped surface m)` sorted by
-    /// node (only used with data lakes).
-    pub fn set_mapped(&mut self, mapped: Vec<(u32, f32)>) {
+    /// Sets the nodes the present-day lake map holds, sorted by node (only used with data
+    /// lakes).
+    pub fn set_mapped(&mut self, mapped: Vec<(u32, MappedLake)>) {
         debug_assert!(mapped.windows(2).all(|w| w[0].0 < w[1].0));
         self.mapped = mapped;
     }
 
-    /// The mapped surface at `node`, if the map holds it.
-    fn mapped_at(&self, node: u32) -> Option<f32> {
+    /// Present mode, with data lakes at the present-day snapshot: the walk makes no lake but
+    /// the table's, and the map's lakes come after it ([`super::today`]).
+    pub fn set_present(&mut self, present: bool) {
+        self.present = present;
+    }
+
+    /// The mapped lake at `node`, if the map holds it.
+    fn mapped_at(&self, node: u32) -> Option<MappedLake> {
         self.mapped
             .binary_search_by_key(&node, |&(n, _)| n)
             .ok()
@@ -558,7 +582,12 @@ impl Accumulation {
     }
 
     pub fn working_bytes(&self) -> usize {
-        8 * self.mapped.capacity()
+        12 * self.mapped.capacity()
+            + self
+                .own
+                .as_ref()
+                .map_or(0, |(q, a)| 4 * (q.capacity() + a.capacity()))
+            + self.today.as_ref().map_or(0, |t| t.working_bytes())
             + 4 * (self.q.capacity() + self.area_km2.capacity())
             + self.lakes.capacity() * std::mem::size_of::<Lake>()
             + self.lake_nodes.capacity() * std::mem::size_of::<LakeNode>()
@@ -584,7 +613,11 @@ impl Accumulation {
             self.next_init += 1;
             used += 1;
         }
-        (self.next_init == g.len(), used)
+        let done = self.next_init == g.len();
+        if done && self.present && self.own.is_none() {
+            self.own = Some((self.q.clone(), self.area_km2.clone()));
+        }
+        (done, used)
     }
 
     /// Walks the nodes upstream first, resolving each basin at its exit. `capacity(i, e, area)`
@@ -622,11 +655,34 @@ impl Accumulation {
                 used += 1;
             }
         }
-        let done = self.next_walk == len;
-        if done {
+        let walked = self.next_walk == len;
+        if walked {
             self.lake_nodes.sort_unstable_by_key(|n| n.node);
         }
-        (done, used)
+        if !walked || !(self.present && data_lakes) {
+            return (walked, used);
+        }
+        // Present mode: the map's lakes, after the walk.
+        let mut today = match self.today.take() {
+            Some(t) => t,
+            None => {
+                let (q, area) = self.own.take().expect("init_step kept the own runoff");
+                Box::new(Today::new(q, area))
+            }
+        };
+        let mapped = std::mem::take(&mut self.mapped);
+        let (done, u) = today.step(
+            self,
+            &mapped,
+            g,
+            routed,
+            ice,
+            &mut capacity,
+            budget.saturating_sub(used).max(1),
+        );
+        self.mapped = mapped;
+        self.today = Some(today);
+        (done, used.saturating_add(u))
     }
 
     fn resolve(
@@ -688,14 +744,31 @@ impl Accumulation {
         let lake_id = self.lakes.len();
         let is_flat = b as u32 >= self.first_flat;
         // The present-day map, only where the terrain is today's.
-        let mapped: Vec<Option<f32>> = if data_lakes {
+        let present = self.present && data_lakes;
+        let mapped: Vec<Option<MappedLake>> = if data_lakes {
             nodes.iter().map(|&v| self.mapped_at(v)).collect()
         } else {
             vec![None; m]
         };
         let mapped_in = |set: &[bool]| (0..m).filter(|&k| set[k] && mapped[k].is_some()).count();
         let on_map = |set: &[bool]| mapped_in(set) >= DATA_LAKE_MIN_NODES as usize;
-        let mapped_surface = mapped.iter().flatten().copied().reduce(f32::max);
+        // The mapped lake holding the most basin nodes (ties: the lowest id): its surface (the
+        // highest of its nodes') and its nodes.
+        let main_lake: Option<(f32, Vec<bool>)> = {
+            let mut ids: Vec<u16> = mapped.iter().flatten().map(|l| l.id).collect();
+            ids.sort_unstable();
+            ids.chunk_by(|a, b| a == b)
+                .max_by(|a, b| a.len().cmp(&b.len()).then(b[0].cmp(&a[0])))
+                .map(|best| {
+                    let id = best[0];
+                    let of = |k: usize| mapped[k].filter(|l| l.id == id);
+                    let surface = (0..m)
+                        .filter_map(of)
+                        .map(|l| l.surface_m)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    (surface, (0..m).map(|k| of(k).is_some()).collect())
+                })
+        };
         let make_lake = |kind, level: f64, evaporation, outflow, footprint: &[bool]| {
             let area: f64 = (0..m)
                 .filter(|&k| footprint[k])
@@ -715,7 +788,7 @@ impl Accumulation {
 
         // The data's own lake surface.
         let mut data: Option<(f64, Vec<bool>)> = None;
-        if data_lakes && !iced[kmin] && !is_flat {
+        if data_lakes && !present && !iced[kmin] && !is_flat {
             let mut flat = vec![false; m];
             let mut queue = VecDeque::from([kmin]);
             flat[kmin] = true;
@@ -787,6 +860,21 @@ impl Accumulation {
         });
         let outcome = if let Some(table) = table {
             table
+        } else if present {
+            // The map decides every lake (super::today): an open basin passes its water through
+            // its spill; a closed one ends at its lowest node, a dry sink.
+            match balance(&e, &cap, spill, q_in).kind {
+                LakeKind::Open => Outcome::Spill { lake: None },
+                _ => {
+                    let mut sinks = vec![false; m];
+                    sinks[kmin] = true;
+                    Outcome::Sink {
+                        lake: None,
+                        sinks,
+                        evaporation_m3s: q_in,
+                    }
+                }
+            }
         } else if is_flat {
             // The data's flat: a lake at its lowest level that passes its inflow on, less what
             // its surface evaporates, if the inflow meets the veto. Its nodes are never ice.
@@ -827,21 +915,24 @@ impl Accumulation {
         } else {
             let bal = balance(&e, &cap, spill, q_in);
             let tol = OPEN_LAKE_MAP_TOL_M as f32;
-            match (bal.kind, mapped_surface) {
+            match (bal.kind, main_lake) {
                 // Today's terrain and no mapped lake: the lattice dammed the valley. Breached:
                 // the inflow passes through the spill.
                 (LakeKind::Open, None) if data_lakes => Outcome::Spill { lake: None },
-                // Above the mapped lake: it stands at the mapped surface over the basin's nodes
-                // below it, and passes the rest of its inflow on (the real outlet is a gorge
+                // Above the mapped lake: it stands at the mapped surface over the mapped lake's
+                // own nodes, and passes the rest of its inflow on (the real outlet is a gorge
                 // below the lattice).
-                (LakeKind::Open, Some(surface)) if spill > surface + tol => {
+                (LakeKind::Open, Some((surface, own))) if spill > surface + tol => {
                     let level = f64::from(surface);
-                    let footprint: Vec<bool> = (0..m)
-                        .map(|k| !iced[k] && f64::from(e[k]) < level)
-                        .collect();
+                    let mut footprint: Vec<bool> = (0..m).map(|k| !iced[k] && own[k]).collect();
                     let evaporation: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
+                    // The exit joins it as its outlet (unless ice), as for every lake that
+                    // overflows: otherwise the exit would carry the whole inflow and pass on
+                    // less, a river shrinking downstream.
+                    let any = footprint.contains(&true);
+                    footprint[exit_k] |= !iced[exit_k];
                     Outcome::Spill {
-                        lake: footprint.contains(&true).then(|| {
+                        lake: any.then(|| {
                             let lake = make_lake(
                                 LakeKind::Data,
                                 level,
@@ -1050,7 +1141,28 @@ mod tests {
         points: &[(u32, f32)],
         mapped: &[(u32, f32)],
     ) -> (Accumulation, Vec<(u32, f32)>, Vec<usize>) {
-        let first_flat = if data_lakes {
+        accumulate_full(
+            g, routed, own, capacity, ice, data_lakes, false, budget, points, mapped,
+        )
+    }
+
+    /// [`accumulate_with`] in present mode or not, as the pass runs it (no data flats at the
+    /// present day; present mode implies data lakes).
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_full(
+        g: &impl HydroGraph,
+        routed: &mut Routed,
+        own: impl Fn(u32) -> f32,
+        capacity: impl Fn(u32) -> f64,
+        ice: impl Fn(u32) -> bool,
+        data_lakes: bool,
+        present: bool,
+        budget: u32,
+        points: &[(u32, f32)],
+        mapped: &[(u32, f32)],
+    ) -> (Accumulation, Vec<(u32, f32)>, Vec<usize>) {
+        let data_lakes = data_lakes || present;
+        let first_flat = if data_lakes && !present {
             let mut flats = Flats::new(g.len());
             while !flats.step(g, routed, &ice, budget).0 {}
             flats.register(g, routed)
@@ -1064,17 +1176,33 @@ mod tests {
         };
         let mut acc = Accumulation::new(g.len(), first_flat);
         acc.set_levels(placed.clone());
+        acc.set_present(present);
         // Set even without data lakes: the pass must then ignore them.
-        let mut mapped = mapped.to_vec();
-        mapped.sort_by_key(|&(n, _)| n);
-        mapped.dedup_by_key(|m| m.0);
-        acc.set_mapped(mapped);
+        acc.set_mapped(mapped_lakes(mapped));
         while !acc.init_step(g, routed, |i, _| own(i), budget).0 {}
         while !acc
             .walk_step(g, routed, &ice, |i, _, _| capacity(i), data_lakes, budget)
             .0
         {}
         (acc, placed, unplaced)
+    }
+
+    /// Mapped nodes `(node, surface)` as the pass holds them: one lake per distinct surface
+    /// (ids in ascending surface order), sorted by node, the first entry for a node kept.
+    fn mapped_lakes(mapped: &[(u32, f32)]) -> Vec<(u32, MappedLake)> {
+        let mut surfaces: Vec<f32> = mapped.iter().map(|m| m.1).collect();
+        surfaces.sort_by(f32::total_cmp);
+        surfaces.dedup();
+        let mut out: Vec<(u32, MappedLake)> = mapped
+            .iter()
+            .map(|&(v, s)| {
+                let id = surfaces.iter().position(|&x| x == s).unwrap() as u16 + 1;
+                (v, MappedLake { id, surface_m: s })
+            })
+            .collect();
+        out.sort_by_key(|&(n, _)| n);
+        out.dedup_by_key(|m| m.0);
+        out
     }
 
     fn golden_grid(fx: &Value) -> (GridGraph, Vec<f32>) {
@@ -1247,6 +1375,7 @@ mod tests {
             data_lakes in any::<bool>(),
             table in prop::collection::vec((0u32..132, -3i32..14), 0..4),
             mapped in prop::collection::vec((0u32..132, -3i32..14), 0..24),
+            present in any::<bool>(),
         ) {
             // An 11 x 12 grid at 10 km: flats, pits, ice and several outlets.
             let g = GridGraph { rows: 11, cols: 12, spacing_m: 10_000.0 };
@@ -1259,8 +1388,8 @@ mod tests {
             // Mapped lake surfaces, off the 3 m grid too.
             let mapped: Vec<(u32, f32)> =
                 mapped.iter().map(|&(n, l)| (n, l as f32 * 3.0 + 0.4)).collect();
-            let (acc, placed, _) = accumulate_with(&g, &mut r, |i| 1.0 + (i % 3) as f32,
-                |i| evap[i as usize], iced, data_lakes, 5, &points, &mapped);
+            let (acc, placed, _) = accumulate_full(&g, &mut r, |i| 1.0 + (i % 3) as f32,
+                |i| evap[i as usize], iced, data_lakes, present, 5, &points, &mapped);
             let table_exits: Vec<u32> =
                 placed.iter().map(|&(b, _)| r.basins[b as usize].exit).collect();
             let mut own = 0.0;
@@ -1272,7 +1401,11 @@ mod tests {
                 }
                 own += 1.0 + f64::from(i % 3);
                 let sink = r.basin_of[iu] != NO_BASIN && r.receiver[iu] == RECEIVER_NONE;
+                // At the present day a lake's nodes gather at its exit, which passes only its
+                // outflow (added below).
+                let in_lake = present && acc.lake_nodes.iter().any(|n| n.node == i);
                 match receiver_of(&g, &r, i) {
+                    _ if in_lake => {}
                     Some(j) if r.ocean[j as usize] => out += f64::from(acc.q[iu]),
                     None if !sink => out += f64::from(acc.q[iu]),
                     _ => {}
@@ -1289,6 +1422,17 @@ mod tests {
                     && r.basin_of[j as usize] == NO_BASIN
                 {
                     prop_assert!(acc.q[j as usize] >= acc.q[iu], "{} -> {}", i, j);
+                }
+            }
+            if present {
+                for l in &acc.lakes {
+                    let sink = r.basin_of[l.exit as usize] != NO_BASIN
+                        && r.receiver[l.exit as usize] == RECEIVER_NONE;
+                    match receiver_of(&g, &r, l.exit) {
+                        Some(j) if r.ocean[j as usize] => out += l.outflow_m3s,
+                        None if !sink => out += l.outflow_m3s,
+                        _ => {}
+                    }
                 }
             }
             let balance = out + acc.evaporated_m3s;
@@ -1789,14 +1933,15 @@ mod tests {
         assert_eq!(lake.kind, LakeKind::Data);
         assert!((lake.level_m - surface).abs() <= 0.01, "{lake:?}");
         assert_eq!(lake.spill_m, VALLEY_SPILL);
-        // The footprint: the basin's nodes below the surface, and only those.
+        // The footprint: the mapped lake's own nodes (round 2), not every basin node below the
+        // surface; some stand above it.
         let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
-        let below = floor_below(&g, surface);
-        assert_eq!(footprint, below);
-        assert!(below.len() < mapped.len());
+        let own: Vec<u32> = mapped.iter().map(|m| m.0).collect();
+        assert_eq!(footprint, own);
+        assert!(floor_below(&g, surface).len() < own.len());
         // It passes its inflow less what the footprint evaporates over the rim.
         assert_eq!(lake.inflow_m3s, q_in);
-        assert!((lake.evaporation_m3s - 0.01 * below.len() as f64).abs() < 1e-9);
+        assert!((lake.evaporation_m3s - 0.01 * own.len() as f64).abs() < 1e-9);
         assert_eq!(lake.outflow_m3s, lake.inflow_m3s - lake.evaporation_m3s);
         assert_eq!(receiver_of(&g, &r, lake.exit), Some(rim));
         let got = f64::from(acc.q[rim as usize]);
@@ -1949,6 +2094,202 @@ mod tests {
             (LakeKind::Data, 5.0),
             "{two:?}"
         );
+    }
+
+    /// The dammed valley at the present day or not, with `capacity` per node and `mapped`
+    /// nodes: `(routing, accumulation)`.
+    fn valley_at(capacity: f64, present: bool, mapped: &[(u32, f32)]) -> (Routed, Accumulation) {
+        let (g, elevation) = dammed_valley();
+        let mut r = route(&g, elevation);
+        let (acc, _, _) = accumulate_full(
+            &g,
+            &mut r,
+            |_| 1.0,
+            |_| capacity,
+            |_| false,
+            true,
+            present,
+            3,
+            &[],
+            mapped,
+        );
+        (r, acc)
+    }
+
+    /// Two mapped lakes on the valley floor: A over columns `DAM + 2 ..= DAM + 7` (6 nodes) at
+    /// `spill − 60`, B over `DAM + 12 ..= DAM + 14` (3 nodes) at `spill − 40`; the floor between
+    /// them is unmapped and below both surfaces.
+    fn two_lakes(g: &GridGraph) -> (Vec<(u32, f32)>, Vec<u32>, Vec<u32>) {
+        let a: Vec<u32> = (DAM + 2..=DAM + 7).map(|c| g.node(3, c)).collect();
+        let b: Vec<u32> = (DAM + 12..=DAM + 14).map(|c| g.node(3, c)).collect();
+        let mapped = a
+            .iter()
+            .map(|&v| (v, VALLEY_SPILL - 60.0))
+            .chain(b.iter().map(|&v| (v, VALLEY_SPILL - 40.0)))
+            .collect();
+        (mapped, a, b)
+    }
+
+    #[test]
+    fn two_mapped_lakes_in_one_basin_flood_nothing_between_them() {
+        let (g, _) = dammed_valley();
+        let (mapped, a, b) = two_lakes(&g);
+        let between: Vec<u32> = (DAM + 8..=DAM + 11).map(|c| g.node(3, c)).collect();
+        // The hazard: the floor between the lakes stands below both surfaces.
+        assert!(
+            between
+                .iter()
+                .all(|&v| 10.0 * (g.row_col(v).1 as f32) < VALLEY_SPILL - 60.0)
+        );
+        // A past era: one lake per basin, the mapped lake with the most basin nodes, over its
+        // own nodes alone.
+        let (_, past) = valley_at(0.01, false, &mapped);
+        assert_eq!(past.lakes.len(), 1, "{:?}", past.lakes);
+        assert_eq!(past.lakes[0].level_m, VALLEY_SPILL - 60.0);
+        // The basin's exit joins the footprint as its outlet.
+        let footprint: Vec<u32> = past.lake_nodes.iter().map(|n| n.node).collect();
+        assert_eq!(footprint, [vec![g.node(3, DAM + 1)], a.clone()].concat());
+        // The present day: each mapped lake over its own nodes, at its own surface.
+        let (_, today) = valley_at(0.01, true, &mapped);
+        assert_eq!(today.lakes.len(), 2, "{:?}", today.lakes);
+        let mut levels: Vec<f32> = today.lakes.iter().map(|l| l.level_m).collect();
+        levels.sort_by(f32::total_cmp);
+        assert_eq!(levels, [VALLEY_SPILL - 60.0, VALLEY_SPILL - 40.0]);
+        let footprint: Vec<u32> = today.lake_nodes.iter().map(|n| n.node).collect();
+        let mut both = [a.clone(), b.clone()].concat();
+        both.sort_unstable();
+        assert_eq!(footprint, both);
+        assert!(between.iter().all(|v| !footprint.contains(v)));
+    }
+
+    #[test]
+    fn at_the_present_day_the_map_decides_every_lake() {
+        let (g, elevation) = dammed_valley();
+        let (mapped, a, b) = two_lakes(&g);
+        let sink = g.node(3, DAM + 1);
+        let own_total = (0..g.len())
+            .filter(|&v| elevation[v as usize] >= 0.0)
+            .count() as f64;
+        for (capacity, open) in [(0.01, true), (40.0, false)] {
+            let (r, acc) = valley_at(capacity, true, &mapped);
+            assert_eq!(acc.lakes.len(), 2, "{capacity}: {:?}", acc.lakes);
+            let lake_of = |nodes: &[u32]| {
+                acc.lakes
+                    .iter()
+                    .find(|l| nodes.contains(&l.exit))
+                    .expect("a lake on these nodes")
+            };
+            let (la, lb) = (lake_of(&a), lake_of(&b));
+            for l in [la, lb] {
+                assert_eq!(l.kind, LakeKind::Data);
+                assert!((l.inflow_m3s - l.evaporation_m3s - l.outflow_m3s).abs() < 1e-9);
+            }
+            // Each lake's evaporating surface is its own nodes.
+            assert!((la.evaporation_m3s.min(capacity * 6.0) - la.evaporation_m3s).abs() < 1e-9);
+            if open {
+                // Humid: B overflows into A, A over the rim to the sea.
+                assert!(
+                    lb.outflow_m3s > 0.0 && la.outflow_m3s > 0.0,
+                    "{lb:?} {la:?}"
+                );
+                assert!(la.inflow_m3s > lb.outflow_m3s, "{la:?} {lb:?}");
+                assert!((lb.evaporation_m3s - 0.03).abs() < 1e-9, "{lb:?}");
+            } else {
+                // Arid: the basin is closed. B evaporates all it gets...
+                assert_eq!(lb.outflow_m3s, 0.0, "{lb:?}");
+                // ... and the basin's sink, unmapped, holds no lake: water ends there dry.
+                assert!(acc.lake_nodes.iter().all(|n| n.node != sink));
+                assert_eq!(receiver_of(&g, &r, sink), None);
+            }
+            // Conservation: own runoff = what reaches the sea + what evaporates.
+            let mut out = 0.0;
+            for i in 0..g.len() {
+                if r.ocean[i as usize] || acc.lake_nodes.iter().any(|n| n.node == i) {
+                    continue;
+                }
+                if receiver_of(&g, &r, i).is_some_and(|j| r.ocean[j as usize]) {
+                    out += f64::from(acc.q[i as usize]);
+                }
+            }
+            for l in &acc.lakes {
+                if receiver_of(&g, &r, l.exit).is_some_and(|j| r.ocean[j as usize]) {
+                    out += l.outflow_m3s;
+                }
+            }
+            let total = out + acc.evaporated_m3s;
+            assert!(
+                (total - own_total).abs() < 1e-3 * own_total,
+                "{total} vs {own_total}"
+            );
+        }
+        // No mapped lake: no lake at all, even in the closed basin.
+        let (r, acc) = valley_at(20.0, true, &[]);
+        assert!(acc.lakes.is_empty() && acc.lake_nodes.is_empty());
+        assert_eq!(receiver_of(&g, &r, sink), None);
+    }
+
+    #[test]
+    fn a_present_day_lake_needs_no_node_below_its_surface() {
+        // The Dead Sea's case: the lattice's lowest node stands above the lake's fine surface.
+        // And the Great Salt Lake's: an inflow far above what the flat evaporates (no veto).
+        let (g, _) = dammed_valley();
+        let nodes: Vec<u32> = (DAM + 1..=DAM + 3).map(|c| g.node(3, c)).collect();
+        let surface = 10.0 * DAM as f32 - 50.0;
+        let mapped: Vec<(u32, f32)> = nodes.iter().map(|&v| (v, surface)).collect();
+        let (_, acc) = valley_at(0.01, true, &mapped);
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let l = &acc.lakes[0];
+        assert_eq!((l.kind, l.level_m), (LakeKind::Data, surface));
+        let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+        assert_eq!(footprint, nodes);
+        assert!(l.inflow_m3s > DATA_LAKE_MAX_BALANCE * l.evaporation_m3s.max(1e-9));
+    }
+
+    #[test]
+    fn a_present_day_lake_on_a_closed_basins_sink_evaporates_all_it_gets() {
+        // The Great Salt Lake's case: the lake covers the basin's sink and gets more than its
+        // surface evaporates, but the basin is closed (its other nodes evaporate the rest).
+        let (g, elevation) = dammed_valley();
+        let lake: Vec<u32> = (DAM + 1..=DAM + 3).map(|c| g.node(3, c)).collect();
+        let mapped: Vec<(u32, f32)> = lake
+            .iter()
+            .map(|&v| (v, 10.0 * DAM as f32 + 40.0))
+            .collect();
+        let mut r = route(&g, elevation);
+        let basin = r.basins[0].nodes.clone();
+        let capacity = |v: u32| {
+            if lake.contains(&v) {
+                0.1
+            } else if basin.contains(&v) {
+                100.0
+            } else {
+                0.0
+            }
+        };
+        let (acc, _, _) = accumulate_full(
+            &g,
+            &mut r,
+            |_| 1.0,
+            capacity,
+            |_| false,
+            true,
+            true,
+            3,
+            &[],
+            &mapped,
+        );
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let l = &acc.lakes[0];
+        assert!(
+            l.inflow_m3s > 0.3,
+            "the hazard: more than the surface evaporates: {l:?}"
+        );
+        assert_eq!(
+            receiver_of(&g, &r, l.exit),
+            None,
+            "the lake's outlet is the sink"
+        );
+        assert_eq!((l.outflow_m3s, l.evaporation_m3s), (0.0, l.inflow_m3s));
     }
 
     #[test]

@@ -377,6 +377,15 @@ docstring, and `timefly_core::hydrology::lakemap` decodes it). Levels read: Titi
 Victoria 1,133 m, the Great Salt Lake 1,278 m, the Dead Sea −427 m (the 10 km overview reads
 about −276 m there), Tanganyika 770 m, Malawi 474.5 m, Issyk-Kul 1,606.5 m.
 
+At the present-day snapshot the pass takes every lake from this map (Task 8b round 2): each
+mapped lake at its baked surface over its own lattice nodes, the lake level table's lakes at
+the table's levels; in past recent eras the map only caps open lakes.
+
+`data/hydrology/straits.json` lists seaways narrower than the pass's 10 km lattice (the
+Bosporus, sill about 35 m): with today's terrain the pass lowers their nodes to the sill, moved
+with the era's shift, so the Black Sea is sea at the present day and closed when the sea stood
+below the sill. Hand-made, like `lake_levels.json`; Task 11's Python reads it too.
+
 ## Performance and memory (Task 10)
 
 Full results, method and the Chrome WebGPU steps: [`docs/testing/globe-m1/performance.md`](../docs/testing/globe-m1/performance.md).

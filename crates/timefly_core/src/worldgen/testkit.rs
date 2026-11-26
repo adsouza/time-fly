@@ -67,7 +67,7 @@ pub fn river_hydro(lattice: CubeLattice, chains: &[RiverChain], lakes: Vec<Lake>
     let nodes: Vec<u32> = info.keys().copied().collect();
     for (&v, &(down, _, _)) in &info {
         let end = match down {
-            Down::River(j) | Down::Ocean(j) | Down::Lake(_, j) | Down::Ice(j) => j,
+            Down::River(j) | Down::Ocean(j) | Down::Lake(_, j) | Down::Ice(j) | Down::Sink(j) => j,
         };
         assert!(
             lattice.neighbours(v).contains(&Some(end)),

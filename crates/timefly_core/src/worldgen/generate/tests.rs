@@ -2667,7 +2667,8 @@ mod water {
                                 }
                                 crate::hydrology::Down::Ocean(v)
                                 | crate::hydrology::Down::Lake(_, v)
-                                | crate::hydrology::Down::Ice(v) => v,
+                                | crate::hydrology::Down::Ice(v)
+                                | crate::hydrology::Down::Sink(v) => v,
                             })
                             .0,
                     );

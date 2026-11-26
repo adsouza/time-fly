@@ -617,7 +617,9 @@ fn the_active_grid_frees_its_rivers_once_uploaded() {
         }
         let grid = wet_grid(500.0);
         let (full, river) = (grid.bytes(), grid.inner.river.clone());
-        let freed = (33 * 33 + 17 * 17) * 8;
+        // The river texels go; one bit a texel stays (the river mask).
+        let freed = (33 * 33 + 17 * 17) * 8
+            - 8 * ((33 * 33usize).div_ceil(64) + (17 * 17usize).div_ceil(64));
         enter_owned(&mut app, grid);
         for _ in 0..3 {
             app.update();

@@ -256,7 +256,7 @@ pub(super) fn across(c: DVec3, normal: DVec3) -> DVec3 {
 fn end_node(n: &RiverNode, nodes: &[RiverNode]) -> u32 {
     match n.down {
         Down::River(j) => nodes[j as usize].node,
-        Down::Ocean(v) | Down::Lake(_, v) | Down::Ice(v) => v,
+        Down::Ocean(v) | Down::Lake(_, v) | Down::Ice(v) | Down::Sink(v) => v,
     }
 }
 
@@ -452,7 +452,7 @@ impl<'a> PassPath<'a> {
                 }
                 Down::Ocean(_) => (0.0, 0.0),
                 Down::Lake(l, _) => (0.0, self.hydro.lakes[l as usize].level_m),
-                Down::Ice(_) => (0.0, f32::NEG_INFINITY),
+                Down::Ice(_) | Down::Sink(_) => (0.0, f32::NEG_INFINITY),
             };
             self.memo.insert(j, (below + len, len, level));
         }

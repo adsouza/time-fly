@@ -4,7 +4,7 @@
 //! A river node is not ocean, not ice, not in a lake's footprint, and carries at least
 //! [`RIVER_MIN_DISCHARGE_M3S`]. Its bed is the lowest of its own elevation and its upstream river
 //! nodes' beds, so beds never rise downstream. Every chain of [`Down::River`] links ends in the
-//! ocean, a lake or the ice.
+//! ocean, a lake, the ice or a closed basin's dry sink.
 //!
 //! [`RIVER_MIN_DISCHARGE_M3S`]: super::params::RIVER_MIN_DISCHARGE_M3S
 
@@ -30,6 +30,9 @@ pub enum Down {
     Lake(u16, u32),
     /// An ice node.
     Ice(u32),
+    /// A closed basin's lowest node with no lake on it (a dry sink), where the river ends: the
+    /// river node itself, or the node it drains to.
+    Sink(u32),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -142,7 +145,7 @@ impl RiverGraph {
                 Down::River(t) => nodes[t as usize].bed_m,
                 Down::Ocean(_) => n.bed_m.min(0.0),
                 Down::Lake(l, _) => n.bed_m.min(lakes[l as usize].level_m),
-                Down::Ice(_) => n.bed_m,
+                Down::Ice(_) | Down::Sink(_) => n.bed_m,
             })
             .collect();
 

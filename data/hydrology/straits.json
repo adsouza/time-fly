@@ -1,0 +1,12 @@
+{
+  "comment": "Seaways narrower than the continental pass's 10 km lattice, which the pass burns into its node elevations where the terrain is today's (rivers Task 8b, round 2): each polyline's nodes are lowered to the sill depth, moved with the era's own shift from the present-day overview, so an era whose sea stood below the sill keeps the basin closed. Read by timefly_core::hydrology::straits and by Task 11's Python.",
+  "straits": [
+    {
+      "name": "Bosporus",
+      "points": [[40.95, 28.98], [41.01, 29.00], [41.07, 29.04], [41.13, 29.07], [41.19, 29.10], [41.25, 29.12], [41.33, 29.15]],
+      "sill_m": -35.0,
+      "source": "Bosporus Strait centreline from the Sea of Marmara to the Black Sea; sill about 35 m below present sea level (published bathymetry of the strait's saddle)",
+      "note": "The strait is 0.7-3.5 km wide and about 31 km long: below the 5' overview and the lattice, so without it the Black Sea is an inland basin that merges with the Caspian through the Manych."
+    }
+  ]
+}

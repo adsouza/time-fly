@@ -126,6 +126,11 @@ impl LakeMap {
         (col < end).then_some(id)
     }
 
+    /// Lake `id`'s surface level (m above present sea level). Panics on an id the map lacks.
+    pub fn level(&self, id: u16) -> f32 {
+        self.levels[usize::from(id) - 1]
+    }
+
     /// The surface level (m above present sea level) of the lake holding (lat, lon), if any.
     pub fn level_at(&self, lat: f64, lon: f64) -> Option<f32> {
         self.lake_at(lat, lon)

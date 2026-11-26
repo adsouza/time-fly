@@ -19,7 +19,8 @@ use super::params::{
     HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, PRESENT_FRAME_MAX_MYR,
     RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M,
 };
-use super::{CubeLattice, EraHydrology, HydroGraph, Routed, Routing, receiver_of};
+use super::straits::{Strait, shipped_straits, strait_nodes};
+use super::{CubeLattice, EraHydrology, HydroGraph, NO_BASIN, Routed, Routing, receiver_of};
 use crate::deep_time::YearsBp;
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
 use crate::surface::{FrameSelection, Timeline};
@@ -43,19 +44,35 @@ pub trait NodeSource: Sync {
     /// for lakes the data already holds.
     fn data_lakes(&self) -> bool;
 
-    /// The surface of the present-day mapped lake at `dir` ([`lakemap`](super::lakemap)), in
-    /// the frame of [`NodeSource::node`]'s elevation. `None` where the map holds no lake, and
-    /// everywhere unless [`NodeSource::data_lakes`] holds (the terrain is today's). The pass
-    /// reads it only with data lakes.
-    fn mapped_surface_m(&self, _dir: RenderDir) -> Option<f32> {
+    /// How far [`NodeSource::node`]'s elevation at `dir` stands from the present-day overview
+    /// there (m): the era's sea-level anomaly, ICE-6G change or crossfade. `None` where unknown
+    /// or the terrain is not today's; the pass then burns no strait there ([`super::straits`]).
+    fn present_shift_m(&self, _dir: RenderDir) -> Option<f32> {
+        None
+    }
+
+    /// The present-day mapped lake at `dir` ([`lakemap`](super::lakemap)): its map id and its
+    /// baked surface in the frame of [`NodeSource::node`]'s elevation. `None` where the map holds
+    /// no lake, and everywhere unless [`NodeSource::data_lakes`] holds (the terrain is today's).
+    /// The pass reads it only with data lakes.
+    fn mapped(&self, _dir: RenderDir) -> Option<MappedLake> {
         None
     }
 
     /// Whether the present-day map holds a lake at `dir` (Task 8b): false unless
     /// [`NodeSource::data_lakes`] holds.
     fn mapped_lake(&self, dir: RenderDir) -> bool {
-        self.mapped_surface_m(dir).is_some()
+        self.mapped(dir).is_some()
     }
+}
+
+/// A present-day mapped lake at a node ([`NodeSource::mapped`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MappedLake {
+    /// The lake's id in the map (1-based); nodes with one id are one lake.
+    pub id: u16,
+    /// Its baked surface, in the node's elevation frame.
+    pub surface_m: f32,
 }
 
 /// How [`SnapshotSource`] reads an era.
@@ -184,20 +201,31 @@ impl NodeSource for SnapshotSource<'_> {
         self.mode != SourceMode::Reference
     }
 
-    /// The shipped map's level, moved as the node's elevation moves from the present-day
-    /// overview there (the era's sea-level anomaly, the recent field's ICE-6G change or the
-    /// bridge's crossfade; nothing at 0 ka in recent mode).
-    fn mapped_surface_m(&self, dir: RenderDir) -> Option<f32> {
+    /// The node minus the present-day overview: the era's sea-level anomaly, the recent field's
+    /// ICE-6G change or the bridge's crossfade; nothing at 0 ka in recent mode.
+    fn present_shift_m(&self, dir: RenderDir) -> Option<f32> {
         if !self.data_lakes() {
             return None;
         }
         let (lat, lon) = geo_to_latlon(render_to_geo(dir));
-        let level = f64::from(shipped_lake_map().level_at(lat, lon)?);
-        let shift = match self.tiles.sample_overview(lat, lon) {
-            Some((present, _)) => f64::from(self.node(dir).elevation_m) - f64::from(present),
-            None => 0.0,
-        };
-        Some((level + shift) as f32)
+        let (present, _) = self.tiles.sample_overview(lat, lon)?;
+        Some(self.node(dir).elevation_m - present)
+    }
+
+    /// The shipped map's lake, its level moved by [`Self::present_shift_m`] (0 where unknown).
+    fn mapped(&self, dir: RenderDir) -> Option<MappedLake> {
+        if !self.data_lakes() {
+            return None;
+        }
+        let (lat, lon) = geo_to_latlon(render_to_geo(dir));
+        let map = shipped_lake_map();
+        let id = map.lake_at(lat, lon)?;
+        let level = map.level(id);
+        let shift = self.present_shift_m(dir).unwrap_or(0.0);
+        Some(MappedLake {
+            id,
+            surface_m: level + shift,
+        })
     }
 }
 
@@ -216,9 +244,8 @@ pub struct NodeBlock {
     pub start: u32,
     pub samples: Vec<NodeSample>,
     pub data_lakes: bool,
-    /// `(node, mapped surface m)` for the block's nodes the lake map holds, ascending; empty
-    /// without data lakes.
-    pub mapped: Vec<(u32, f32)>,
+    /// The block's nodes the lake map holds, ascending; empty without data lakes.
+    pub mapped: Vec<(u32, MappedLake)>,
 }
 
 /// A chamfer distance from the ocean, resumable.
@@ -295,6 +322,8 @@ impl Coast {
 
 enum Stage {
     Sample,
+    /// Sampling is done; the straits are burnt next ([`HydroPrep::burn_straits`]).
+    Straits,
     Route(Box<Routing>),
     Flats(Box<Routed>, Flats),
     Coast(Box<Routed>, Coast),
@@ -323,9 +352,11 @@ pub struct HydroPrep {
     elevation: Vec<f32>,
     /// One bit per node: ice fraction ≥ [`ICE_NODE_FRACTION`].
     ice: Vec<u64>,
-    /// `(node, mapped surface m)`, ascending, with data lakes only
-    /// ([`NodeSource::mapped_surface_m`]); moved into the accumulation.
-    mapped: Vec<(u32, f32)>,
+    /// The nodes the lake map holds, ascending, with data lakes only ([`NodeSource::mapped`]);
+    /// moved into the accumulation.
+    mapped: Vec<(u32, MappedLake)>,
+    /// The seaways burnt into the elevation with data lakes ([`super::straits`]).
+    straits: Vec<Strait>,
     stage: Stage,
 }
 
@@ -373,6 +404,7 @@ impl HydroPrep {
             elevation: Vec::with_capacity(len as usize),
             ice: vec![0; len.div_ceil(64) as usize],
             mapped: Vec::new(),
+            straits: shipped_straits().to_vec(),
             stage: Stage::Sample,
         }
     }
@@ -404,17 +436,21 @@ impl HydroPrep {
                         let dir = lattice.dir(i);
                         self.push_sample(i, source.node(dir));
                         if self.data_lakes
-                            && let Some(level) = source.mapped_surface_m(dir)
+                            && let Some(lake) = source.mapped(dir)
                         {
-                            self.mapped.push((i, level));
+                            self.mapped.push((i, lake));
                         }
                     }
                     used += (end - start).max(1);
                     if end == len {
-                        Stage::Route(Box::new(Routing::new(std::mem::take(&mut self.elevation))))
+                        Stage::Straits
                     } else {
                         Stage::Sample
                     }
+                }
+                Stage::Straits => {
+                    used += self.burn_straits(source);
+                    Stage::Route(Box::new(Routing::new(std::mem::take(&mut self.elevation))))
                 }
                 Stage::Route(mut routing) => {
                     let before = routing.units_done();
@@ -424,7 +460,8 @@ impl HydroPrep {
                         let mut routed = Box::new(routing.finish());
                         routed.filled_m = Vec::new();
                         self.first_flat = routed.basins.len() as u32;
-                        if self.data_lakes {
+                        // At the present day the map decides every lake: no data flats.
+                        if self.data_lakes && !self.present() {
                             Stage::Flats(routed, Flats::new(len))
                         } else {
                             self.after_flats(routed, climate.needs_coast_km())
@@ -561,7 +598,45 @@ impl HydroPrep {
         let mut acc = Accumulation::new(self.lattice.len(), self.first_flat);
         acc.set_levels(self.placed_levels.clone());
         acc.set_mapped(std::mem::take(&mut self.mapped));
+        acc.set_present(self.present());
         acc
+    }
+
+    /// The present-day snapshot with today's terrain: the map decides every lake.
+    fn present(&self) -> bool {
+        self.data_lakes && self.age.0 <= 0.0
+    }
+
+    /// Lowers each strait's nodes to its sill, moved by the era's shift, with data lakes only.
+    /// Returns the units used (the nodes visited, at least 1).
+    fn burn_straits<S: NodeSource>(&mut self, source: &S) -> u32 {
+        let mut used = 1;
+        if !self.data_lakes {
+            return used;
+        }
+        for strait in &self.straits {
+            for v in strait_nodes(&self.lattice, strait) {
+                used += 1;
+                if let Some(shift) = source.present_shift_m(self.lattice.dir(v)) {
+                    let e = &mut self.elevation[v as usize];
+                    *e = e.min(strait.sill_m + shift);
+                }
+            }
+        }
+        used
+    }
+
+    /// The pass with other lake level and strait tables (tests).
+    #[cfg(test)]
+    pub(crate) fn with_tables(
+        lattice: CubeLattice,
+        age: YearsBp,
+        levels: &[LakeLevel],
+        straits: &[Strait],
+    ) -> Self {
+        let mut prep = Self::with_lake_levels(lattice, age, levels);
+        prep.straits = straits.to_vec();
+        prep
     }
 
     fn push_sample(&mut self, i: u32, s: NodeSample) {
@@ -575,9 +650,13 @@ impl HydroPrep {
         let lattice = self.lattice;
         let down_of = |v: u32| {
             let Some(j) = receiver_of(&lattice, routed, v) else {
-                // Only a graph with no ocean at all has a land node with no receiver: its
-                // lowest node, where everything drains.
-                return Down::Ocean(v);
+                // A closed basin's sink with no lake on it; otherwise only a graph with no ocean
+                // at all has a land node with no receiver: its lowest node.
+                return if routed.basin_of[v as usize] == NO_BASIN {
+                    Down::Ocean(v)
+                } else {
+                    Down::Sink(v)
+                };
             };
             if routed.ocean[j as usize] {
                 Down::Ocean(j)
@@ -620,7 +699,7 @@ impl HydroPrep {
         let mapped = if data_lakes {
             range
                 .clone()
-                .filter_map(|i| source.mapped_surface_m(lattice.dir(i)).map(|l| (i, l)))
+                .filter_map(|i| source.mapped(lattice.dir(i)).map(|l| (i, l)))
                 .collect()
         } else {
             Vec::new()
@@ -658,7 +737,7 @@ impl HydroPrep {
             self.push_sample(block.start + k as u32, *s);
         }
         if self.elevation.len() == len as usize {
-            self.stage = Stage::Route(Box::new(Routing::new(std::mem::take(&mut self.elevation))));
+            self.stage = Stage::Straits;
         }
     }
 
@@ -672,7 +751,7 @@ impl HydroPrep {
         let own =
             4 * self.elevation.capacity() + 8 * (self.ice.capacity() + self.mapped.capacity());
         own + match &self.stage {
-            Stage::Sample | Stage::Moving => 0,
+            Stage::Sample | Stage::Straits | Stage::Moving => 0,
             Stage::Route(r) => r.working_bytes(),
             Stage::Flats(r, f) => routed_bytes(r) + f.working_bytes(),
             Stage::Coast(r, c) => routed_bytes(r) + c.bytes(),
@@ -1106,13 +1185,17 @@ mod tests {
             self.data_lakes
         }
 
-        /// Read even without data lakes, so tests see that the pass ignores it then.
-        fn mapped_surface_m(&self, dir: RenderDir) -> Option<f32> {
+        /// Read even without data lakes, so tests see that the pass ignores it then. Map
+        /// entry `k` is lake id `k + 1`.
+        fn mapped(&self, dir: RenderDir) -> Option<MappedLake> {
             let (k, (r, _, _)) = self.nearest(dir.0);
             self.map
                 .iter()
-                .find(|&&(island, radius, _)| island == k && r < radius)
-                .map(|&(_, _, level)| level)
+                .position(|&(island, radius, _)| island == k && r < radius)
+                .map(|e| MappedLake {
+                    id: e as u16 + 1,
+                    surface_m: self.map[e].2,
+                })
         }
     }
 
@@ -1130,7 +1213,12 @@ mod tests {
         }
     }
 
-    /// Runs the pass to the end in steps of `budget` units.
+    /// A recent era in the past: the map caps lakes, the water balance makes them.
+    const PAST: YearsBp = YearsBp(6_000.0);
+    /// The present-day snapshot: the map decides every lake.
+    const PRESENT: YearsBp = YearsBp(0.0);
+
+    /// Runs the pass for a past era ([`PAST`]) to the end in steps of `budget` units.
     fn run<S: NodeSource, C: ClimateSource>(
         lattice: CubeLattice,
         source: &S,
@@ -1138,7 +1226,19 @@ mod tests {
         table: &ClimateTable,
         budget: u32,
     ) -> EraHydrology {
-        let mut prep = HydroPrep::new(lattice, YearsBp(0.0));
+        run_at(lattice, PAST, source, climate, table, budget)
+    }
+
+    /// [`run`] at `age`.
+    fn run_at<S: NodeSource, C: ClimateSource>(
+        lattice: CubeLattice,
+        age: YearsBp,
+        source: &S,
+        climate: &C,
+        table: &ClimateTable,
+        budget: u32,
+    ) -> EraHydrology {
+        let mut prep = HydroPrep::new(lattice, age);
         while !prep.step(source, climate, table, budget) {}
         prep.finish()
     }
@@ -1151,23 +1251,37 @@ mod tests {
         h: EraHydrology,
     }
 
+    /// The world in a past recent era ([`PAST`]).
     fn shared() -> &'static Shared {
         static SHARED: OnceLock<Shared> = OnceLock::new();
-        SHARED.get_or_init(|| Shared::new(true))
+        SHARED.get_or_init(|| Shared::new(true, PAST))
     }
 
     /// The same world without data lakes: shallow flat basins pass their water through.
     fn shared_without_data() -> &'static Shared {
         static SHARED: OnceLock<Shared> = OnceLock::new();
-        SHARED.get_or_init(|| Shared::new(false))
+        SHARED.get_or_init(|| Shared::new(false, PAST))
+    }
+
+    /// The world at the present-day snapshot: the map decides every lake.
+    fn shared_present() -> &'static Shared {
+        static SHARED: OnceLock<Shared> = OnceLock::new();
+        SHARED.get_or_init(|| Shared::new(true, PRESENT))
     }
 
     impl Shared {
-        fn new(data_lakes: bool) -> Shared {
+        fn new(data_lakes: bool, age: YearsBp) -> Shared {
             let mut world = World::new();
             world.data_lakes = data_lakes;
             let table = shipped_table();
-            let h = run(CubeLattice { n: WORLD_N }, &world, &world, &table, u32::MAX);
+            let h = run_at(
+                CubeLattice { n: WORLD_N },
+                age,
+                &world,
+                &world,
+                &table,
+                u32::MAX,
+            );
             Shared { world, table, h }
         }
 
@@ -1483,7 +1597,7 @@ mod tests {
     fn down_node(rivers: &RiverGraph, n: &crate::hydrology::RiverNode) -> u32 {
         match n.down {
             Down::River(t) => rivers.nodes()[t as usize].node,
-            Down::Ocean(j) | Down::Lake(_, j) | Down::Ice(j) => j,
+            Down::Ocean(j) | Down::Lake(_, j) | Down::Ice(j) | Down::Sink(j) => j,
         }
     }
 
@@ -1664,27 +1778,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rivers_end_at_the_sea_a_lake_or_the_ice() {
-        let s = shared();
-        let rivers = &s.h.rivers;
-        let (mut ocean, mut lake, mut ice) = (0, 0, 0);
+    /// Every river chain ends in the ocean, a lake, the ice, or (at the present day only) a
+    /// closed basin's dry sink: the river node itself, a lake on none of its taps. Returns the
+    /// chain ends `(ocean, lake, ice, sink)`.
+    fn chain_ends(s: &Shared, h: &EraHydrology) -> (u32, u32, u32, u32) {
+        let rivers = &h.rivers;
+        let (mut ocean, mut lake, mut ice, mut sink) = (0, 0, 0, 0);
         for (k, n) in rivers.nodes().iter().enumerate() {
             match n.down {
                 Down::River(t) => assert!((t as usize) < rivers.nodes().len()),
-                Down::Ocean(j) => assert!(s.h.is_ocean(j)),
-                Down::Lake(l, j) => assert_eq!(s.h.lake_of(j), Some(l)),
+                Down::Ocean(j) => assert!(h.is_ocean(j)),
+                Down::Lake(l, j) => assert_eq!(h.lake_of(j), Some(l)),
                 Down::Ice(j) => assert!(s.is_ice(j)),
+                Down::Sink(j) => {
+                    assert_eq!(h.age.0, 0.0, "a dry sink only at the present day");
+                    assert_eq!(j, n.node, "{n:?}");
+                    assert_eq!(h.lake_of(j), None);
+                }
             }
             match chain_end(rivers, k as u32) {
                 Down::Ocean(_) => ocean += 1,
                 Down::Lake(..) => lake += 1,
                 Down::Ice(_) => ice += 1,
+                Down::Sink(_) => sink += 1,
                 Down::River(_) => unreachable!(),
             }
         }
+        (ocean, lake, ice, sink)
+    }
+
+    #[test]
+    fn rivers_end_at_the_sea_a_lake_or_the_ice() {
+        let s = shared();
+        let rivers = &s.h.rivers;
+        let (ocean, lake, ice, sink) = chain_ends(s, &s.h);
+        assert_eq!(sink, 0, "no dry sink in a past era");
+        // At the present day an unmapped closed basin holds no lake: its rivers end at its sink.
+        let p = shared_present();
+        let (_, _, _, present_sinks) = chain_ends(p, &p.h);
+        assert!(
+            present_sinks > 0,
+            "the hazard: closed basins at the present day"
+        );
         println!(
-            "{} river nodes: {ocean} reach the ocean, {lake} a lake, {ice} the ice",
+            "{} river nodes: {ocean} reach the ocean, {lake} a lake, {ice} the ice; at the \
+             present day {present_sinks} end at a dry sink",
             rivers.nodes().len()
         );
         assert!(ocean > 100 && lake > 20, "{ocean} {lake}");
@@ -1737,7 +1875,7 @@ mod tests {
                 Down::River(t) => assert_eq!(down, rivers.nodes()[t as usize].bed_m),
                 Down::Ocean(_) => assert!(down <= 0.0),
                 Down::Lake(l, _) => assert!(down <= s.h.lakes[l as usize].level_m),
-                Down::Ice(_) => {}
+                Down::Ice(_) | Down::Sink(_) => {}
             }
         }
         lowered
@@ -1971,7 +2109,7 @@ mod tests {
         assert_eq!(pass(&mapped), reference);
         assert!(!reference.lakes.is_empty());
         // Sampled in blocks too.
-        let mut prep = HydroPrep::new(lattice, YearsBp(0.0));
+        let mut prep = HydroPrep::new(lattice, PAST);
         let block = HydroPrep::sample_range(&lattice, &mapped, 0..lattice.len());
         assert!(block.mapped.is_empty());
         prep.add_samples(block);
@@ -1980,16 +2118,129 @@ mod tests {
     }
 
     #[test]
+    fn present_day_lakes_are_the_maps() {
+        let p = shared_present();
+        let h = &p.h;
+        let lattice = p.lattice();
+        // Each lake is a mapped lake over its own nodes, at its surface, or none.
+        let mapped = |v: u32| p.world.mapped(lattice.dir(v));
+        let mut want: Vec<u32> = (0..lattice.len())
+            .filter(|&v| mapped(v).is_some() && !h.is_ocean(v) && !p.is_ice(v))
+            .collect();
+        want.sort_unstable();
+        let got: Vec<u32> = (0..lattice.len())
+            .filter(|&v| h.lake_of(v).is_some())
+            .collect();
+        assert_eq!(got, want);
+        for v in got {
+            let l = &h.lakes[h.lake_of(v).unwrap() as usize];
+            assert_eq!(l.kind, LakeKind::Data, "{l:?}");
+            assert_eq!(l.level_m, mapped(v).unwrap().surface_m, "{l:?}");
+        }
+        // Three mapped lakes: the humid bowl's, the Caspian-like flat's, the Victoria-like shelf's.
+        assert_eq!(h.lakes.len(), 3, "{:?}", h.lakes);
+        // The humid lakes overflow; the arid cone's closed basin holds none.
+        let humid = &h.lakes[h.lake_of(floor_nodes(p, HUMID, 100.0)[0]).unwrap() as usize];
+        assert!(humid.outflow_m3s > 0.0, "{humid:?}");
+        assert!(p.lakes_on(ARID).is_empty());
+        assert!(shared().lakes_on(TERMINAL).len() == 1 && p.lakes_on(TERMINAL).is_empty());
+    }
+
+    /// An ocean planet with a 1,500 km continent at (45° N, 30° E) holding a −500 m inland sea
+    /// 300 km across at (43° N, 34° E); `shift` is the source's present-day shift.
+    #[derive(Clone)]
+    struct InlandSea {
+        data_lakes: bool,
+        shift: f32,
+    }
+
+    impl NodeSource for InlandSea {
+        fn node(&self, d: RenderDir) -> NodeSample {
+            let km =
+                |lat: f64, lon: f64| d.0.angle_between(dir(lat, lon).0) * EARTH_RADIUS_M * 1e-3;
+            let e = if km(43.0, 34.0) < 300.0 {
+                -500.0
+            } else if km(45.0, 30.0) < 1500.0 {
+                200.0
+            } else {
+                -2000.0
+            };
+            NodeSample {
+                elevation_m: e + self.shift,
+                ice: 0.0,
+            }
+        }
+
+        fn data_lakes(&self) -> bool {
+            self.data_lakes
+        }
+
+        fn present_shift_m(&self, _dir: RenderDir) -> Option<f32> {
+            self.data_lakes.then_some(self.shift)
+        }
+    }
+
+    #[test]
+    fn a_strait_joins_a_sea_to_the_ocean_where_the_sea_stands_above_its_sill() {
+        use crate::hydrology::straits::Strait;
+        let lattice = CubeLattice { n: 75 };
+        let table = shipped_table();
+        let climate = ZonalClimate {
+            table: &table,
+            sea_level_anomaly_m: 0.0,
+        };
+        // A seaway from the inland sea south to the ocean, below the lattice.
+        let strait = Strait {
+            name: "test".into(),
+            points: vec![(43.0, 34.0), (38.0, 34.5), (30.0, 35.0)],
+            sill_m: -35.0,
+        };
+        let sea = lattice.nearest(dir(43.0, 34.0));
+        let pass = |source: &InlandSea, straits: &[Strait]| {
+            let mut prep = HydroPrep::with_tables(lattice, PRESENT, &[], straits);
+            while !prep.step(source, &climate, &table, u32::MAX) {}
+            prep.finish()
+        };
+        let today = InlandSea {
+            data_lakes: true,
+            shift: 0.0,
+        };
+        // The hazard: without the strait the sea is an inland basin.
+        assert!(!pass(&today, &[]).is_ocean(sea));
+        let joined = pass(&today, std::slice::from_ref(&strait));
+        assert!(joined.is_ocean(sea));
+        assert_eq!(joined.lake_tap(dir(43.0, 34.0)), None);
+        // A glacial era: the sea stood 120 m lower, so the 35 m sill was dry.
+        let glacial = InlandSea {
+            data_lakes: true,
+            shift: 120.0,
+        };
+        assert!(!pass(&glacial, std::slice::from_ref(&strait)).is_ocean(sea));
+        // A reference era burns nothing.
+        let reference = InlandSea {
+            data_lakes: false,
+            shift: 0.0,
+        };
+        assert!(!pass(&reference, std::slice::from_ref(&strait)).is_ocean(sea));
+    }
+
+    #[test]
     fn the_pass_is_the_same_for_any_step_size() {
+        for age in [PAST, PRESENT] {
+            same_for_any_step_size(age);
+        }
+    }
+
+    fn same_for_any_step_size(age: YearsBp) {
         // 75 is not a power of two; the coast-scaled climate makes the coast phase run.
         let lattice = CubeLattice { n: 75 };
         let mut world = World::new();
         world.coast_scale = Some(400.0);
         let table = shipped_table();
-        let whole = run(lattice, &world, &world, &table, u32::MAX);
-        let one = run(lattice, &world, &world, &table, 1);
+        let whole = run_at(lattice, age, &world, &world, &table, u32::MAX);
+        let one = run_at(lattice, age, &world, &world, &table, 1);
         assert_eq!(whole, one);
-        let mut prep = HydroPrep::new(lattice, YearsBp(0.0));
+        let mut prep = HydroPrep::new(lattice, age);
         let len = lattice.len();
         let cuts = [0, 7, len / 3, len / 3 + 1, len - 5, len];
         let blocks: Vec<NodeBlock> = std::thread::scope(|scope| {
@@ -2010,8 +2261,8 @@ mod tests {
         assert_eq!(prep.finish(), whole);
         // The fixture is not trivial at this size.
         assert!(!whole.lakes.is_empty() && !whole.rivers.nodes().is_empty());
-        let mut a = HydroPrep::new(lattice, YearsBp(0.0));
-        let mut b = HydroPrep::new(lattice, YearsBp(0.0));
+        let mut a = HydroPrep::new(lattice, age);
+        let mut b = HydroPrep::new(lattice, age);
         while !a.step(&world, &world, &table, u32::MAX) {}
         while !b.step(&world, &world, &table, 3) {}
         assert_eq!(a.units_done(), b.units_done());
@@ -2266,13 +2517,13 @@ mod tests {
                 let present = f64::from(tiles.sample_overview(lat, lon).unwrap().0);
                 let shift = f64::from(source.node(titicaca).elevation_m) - present;
                 let want = f64::from(shipped_lake_map().level_at(-15.8, -69.4).unwrap()) + shift;
-                let got = f64::from(source.mapped_surface_m(titicaca).unwrap());
+                let got = f64::from(source.mapped(titicaca).unwrap().surface_m);
                 assert!((got - want).abs() < 1e-3, "{age}: {got} vs {want}");
                 if mode == SourceMode::PresentFrame {
                     assert!((shift + anomaly).abs() < 1e-3, "{shift} vs {anomaly}");
                 }
             } else {
-                assert_eq!(source.mapped_surface_m(titicaca), None);
+                assert_eq!(source.mapped(titicaca), None);
             }
             let mut iced = 0;
             for &d in &dirs {

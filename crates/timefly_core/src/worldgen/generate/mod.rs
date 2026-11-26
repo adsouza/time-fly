@@ -156,6 +156,10 @@ pub struct Field {
     /// f16 bits of `[ribbon_m, flow_east_mps, flow_north_mps, offset_m]` where the water is a
     /// river, [`RIVER_NONE`] elsewhere ([`water`]'s encoding).
     pub river: Vec<[u16; 4]>,
+    /// One bit per texel, set on a river texel: kept by [`free_rivers`](Self::free_rivers)
+    /// when it drops `river`, so readers still tell rivers from standing water
+    /// ([`is_river`](Self::is_river)). Empty until then.
+    pub river_mask: Vec<u64>,
 }
 
 impl Field {
@@ -173,6 +177,7 @@ impl Field {
             surface,
             water_level_m,
             river,
+            river_mask: Vec::new(),
         }
     }
 
@@ -180,11 +185,32 @@ impl Field {
         self.size_m / f64::from(self.res - 1)
     }
 
-    /// Drops the river texels (8 B a texel) once the shell has them on the GPU: no CPU code
-    /// reads them after the upload. Readers then see [`RIVER_NONE`] everywhere
+    /// Drops the river texels (8 B a texel) once the shell has them on the GPU, keeping one bit
+    /// a texel for [`is_river`](Self::is_river). Readers then see [`RIVER_NONE`] everywhere
     /// ([`river_at`](Self::river_at)); the levels, and the fly's floor, are unchanged.
     pub fn free_rivers(&mut self) {
+        if self.river.is_empty() {
+            return;
+        }
+        let mut mask = vec![0u64; self.river.len().div_ceil(64)];
+        for i in (0..self.river.len()).filter(|&i| self.is_river(i)) {
+            mask[i / 64] |= 1 << (i % 64);
+        }
+        self.river_mask = mask;
         self.river = Vec::new();
+    }
+
+    /// Whether texel `i` is a river texel: its ribbon or offset bits are not [`RIVER_NONE`]'s
+    /// (the flow is not looked at, as the water texture's word 2 holds only those two). Read
+    /// from the mask once the river texels are freed.
+    pub fn is_river(&self, i: usize) -> bool {
+        match self.river.get(i) {
+            Some(r) => r[0] != RIVER_NONE[0] || r[3] != RIVER_NONE[3],
+            None => self
+                .river_mask
+                .get(i / 64)
+                .is_some_and(|w| w >> (i % 64) & 1 == 1),
+        }
     }
 
     /// Texel `i`'s river bits: [`RIVER_NONE`] once [`free_rivers`](Self::free_rivers) ran.
@@ -244,6 +270,7 @@ impl RegionGrid {
                     + f.surface.capacity() * 4
                     + f.water_level_m.capacity() * 4
                     + f.river.capacity() * 8
+                    + f.river_mask.capacity() * 8
             })
             .sum::<usize>()
             + self.boulders.capacity() * std::mem::size_of::<Boulder>()
@@ -784,6 +811,7 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
                 surface: Vec::with_capacity(total),
                 water_level_m: Vec::with_capacity(total),
                 river: Vec::with_capacity(total),
+                river_mask: Vec::new(),
             };
             for b in blocks {
                 field.elevation_m.extend(b.elevation_m);

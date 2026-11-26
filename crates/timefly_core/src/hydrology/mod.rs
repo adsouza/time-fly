@@ -17,13 +17,15 @@ pub mod levels;
 pub mod params;
 mod pass;
 mod route;
+pub mod straits;
+mod today;
 
 pub use graph::{Down, NEAR_BUCKET_TEXELS, RiverGraph, RiverNode};
 pub use lakes::{Lake, LakeKind};
 pub use lattice::{CubeLattice, GridGraph, NEIGHBOUR_STEPS};
 pub use pass::{
-    HydroPrep, LatticeSizes, NodeBlock, NodeSample, NodeSource, SnapshotSource, SourceMode,
-    hydro_lattice_for, river_tile_margin_m,
+    HydroPrep, LatticeSizes, MappedLake, NodeBlock, NodeSample, NodeSource, SnapshotSource,
+    SourceMode, hydro_lattice_for, river_tile_margin_m,
 };
 pub use route::{Basin, NO_BASIN, RECEIVER_EXIT, RECEIVER_NONE, Routed, Routing, receiver_of};
 
