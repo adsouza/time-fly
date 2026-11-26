@@ -288,10 +288,12 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         // A uniform value doesn't change a pipeline, so the default options warm every one.
         look_for(&grid, TerrainOptions::default()),
     ));
+    // The sea binds the stand-in's water textures (`Field::dry`: no water, no river), as the
+    // region's water binds its own.
     let water = water_m.add(water_material(
         &buffer,
-        &fields.inner_height,
-        &fields.apron_height,
+        &fields.inner_water,
+        &fields.apron_water,
         water_look(&grid),
     ));
     let mut target = Image::new_target_texture(1, 1, WARMUP_TARGET_FORMAT, None);
@@ -514,9 +516,10 @@ mod tests {
         assert_eq!(entities.len(), 8);
         // Its camera has no clusters (ruling R28), without the app-wide observer.
         crate::clusters::assert_no_clusters(app.world_mut());
-        // Eight textures (six fields, the palette, the 1 x 1 target), two meshes (the quad and
-        // the dragonfly), one buffer, one of each material, the transition cloud's included (M3
-        // Task 5), and the dragonfly's body and wing materials (final review).
+        // Eight textures (four height and surface fields and the two water fields the sea
+        // binds, the palette, the 1 x 1 target), two meshes (the quad and the dragonfly), one
+        // buffer, one of each material, the transition cloud's included (M3 Task 5), and the
+        // dragonfly's body and wing materials (final review).
         assert_eq!(asset_counts(&app), [8, 2, 1, 1, 1, 1, 1, 2]);
         {
             let world = app.world_mut();
@@ -620,6 +623,43 @@ mod tests {
                 RenderLayers::layer(WARMUP_LAYER)
             );
         }
+    }
+
+    /// The warm-up's sea binds both water textures (Task 8), built from the stand-in grid's
+    /// dry fields like the real region's: a pipeline's key doesn't depend on the data.
+    #[test]
+    fn the_warm_up_draws_the_new_water() {
+        use bevy::render::render_resource::TextureFormat;
+        let mut app = warmup_app();
+        *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
+        app.update();
+        let entities = app.world().resource::<RegionWarmup>().entities.clone();
+        let world = app.world_mut();
+        let mut seas = world.query::<(Entity, &MeshMaterial3d<WaterMaterial>)>();
+        let seas: Vec<_> = seas.iter(world).map(|(e, m)| (e, m.0.clone())).collect();
+        assert_eq!(seas.len(), 1);
+        assert!(entities.contains(&seas[0].0));
+        let material = world
+            .resource::<Assets<WaterMaterial>>()
+            .get(&seas[0].1)
+            .unwrap()
+            .clone();
+        let images = world.resource::<Assets<Image>>();
+        let grid = warmup_grid();
+        for (handle, field) in [
+            (&material.extension.inner_water, &grid.inner),
+            (&material.extension.apron_water, &grid.apron),
+        ] {
+            let image = images
+                .get(handle)
+                .expect("a water texture held by the warm-up sea");
+            assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba32Uint);
+            assert_eq!(image.size(), UVec2::splat(field.res));
+        }
+        assert_ne!(
+            material.extension.inner_water,
+            material.extension.apron_water
+        );
     }
 
     /// The warm-up cloud's depth is positive, so its plane never projects to an infinite clip

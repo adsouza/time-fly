@@ -406,10 +406,16 @@ pub const WATER_TEXEL_BYTES: usize = 16;
 /// | 0 | the water level `W` (m), f32 bits | `bitcast<f32>(w.x)` |
 /// | 1 | `W − h` (m), f32 bits, `h` the field's stored height | `bitcast<f32>(w.y)` |
 /// | 2 | the river texel's ribbon (low half) and signed centreline offset (high half), f16 | `unpack2x16float(w.z)` |
-/// | 3 | the river's flow in region axes, `(east, −north)` = `(+x, +z)`, f16 | `unpack2x16float(w.w)` |
+/// | 3 | the river's flow `(east, −north)` (m/s) in the texel's own east/north frame, f16 | `unpack2x16float(w.w)` |
 ///
 /// Words 2 and 3 are the grid's own f16 bits, reordered (the offset beside the ribbon) and the
-/// north flow's sign bit flipped (region `+z` points south), so nothing is rounded twice. A
+/// north flow's sign bit flipped, so nothing is rounded twice. The flow is in the frame of the
+/// texel's own direction (its local east and north), not the region's axes: region `+x` and
+/// `+z` (south) match the texel's east and south at the region's centre, and turn away from
+/// them by about `(d / R) · tan(latitude)` at a distance `d` from it (1.4–3.7° across the inner
+/// region, up to about 30° in the far apron at 70° latitude). The water shader reads it as
+/// region `(+x, +z)` without rotating it (ruling 1 of Task 8): ripples drift a few degrees off
+/// the channel's line, invisible against the channel's own meanders. A
 /// reader rebuilds the ribbon between texels exactly as
 /// [`blended_water`](timefly_core::terrain::blended_water) does: it interpolates the half-width
 /// `ribbon + |offset|` and the offset, then takes `half-width − |offset|`. Word 1 interpolates to

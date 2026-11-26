@@ -15,6 +15,9 @@
 //!   `timefly_core::worldgen::biome::snowline_with_raise_m`.
 //! - `wesl_planet_position_matches_rust` runs `planet.wesl`'s `planet_position_m` against
 //!   `EARTH_RADIUS_M * FrameBasis::local_to_dir`.
+//! - `wesl_water_matches_rust` runs `terrain_cdlod.wesl`'s `blended_water` (the water shader's
+//!   sampler, with its crossing guard) against `timefly_core::terrain::blended_water`, over
+//!   random water fields with rivers read through the shell's own `water_image` textures.
 //! - `the_cloud_veils_geometry_nearer_than_its_plane` draws `cloud.wesl` (its Bevy and package
 //!   imports stood in for) over an opaque quad nearer than 1.2 × the eye-to-fly distance, with
 //!   the game's blend and reverse-Z depth test, and checks the quad comes out veiled exactly as
@@ -1365,7 +1368,7 @@ fn the_cloud_veils_geometry_nearer_than_its_plane() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The water texture (Task 7), as the water shader (Task 8) will read it
+// The water texture (Task 7), as the water shader (Task 8) reads it
 
 const WATER_ENTRY: &str = r#"
 @group(0) @binding(0) var water: texture_2d<u32>;
@@ -1387,8 +1390,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 "#;
 
 /// `water_image`'s `Rgba32Uint` texels decode on the GPU, with `bitcast` and
-/// `unpack2x16float`, to the grid's level, `level − height`, ribbon, offset and flow in region
-/// axes (`+z` south): the layout Task 8's water shader reads.
+/// `unpack2x16float`, to the grid's level, `level − height`, ribbon, offset and flow `(east,
+/// −north)` in each texel's own frame: the layout the water shader reads.
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn the_water_texture_decodes_on_the_gpu() {
@@ -1520,4 +1523,419 @@ fn the_water_texture_decodes_on_the_gpu() {
         assert_eq!([g[4], g[5]], [east, -north], "texel {i} flow");
     }
     println!("{} water texels decode on the GPU", res * res);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The water shader's sampler (Task 8)
+
+const WATER_PARITY_ENTRY: &str = r#"
+@group(0) @binding(0) var<storage, read> terrain: TerrainBuffer;
+@group(0) @binding(1) var inner_water: texture_2d<u32>;
+@group(0) @binding(2) var apron_water: texture_2d<u32>;
+@group(0) @binding(3) var<storage, read> queries: array<vec4<f32>>;   // (x, z, 0, 0)
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>; // two per query
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&queries)) {
+        return;
+    }
+    let w = blended_water(inner_water, apron_water, terrain.params, queries[n].xy);
+    out[2u * n] = vec4<f32>(w.level, w.thickness, w.ribbon, 0.0);
+    out[2u * n + 1u] = vec4<f32>(w.flow, 0.0, 0.0);
+}
+"#;
+
+/// Points checked per case.
+const WATER_POINTS: usize = 4_096;
+
+/// A field's water texture on the GPU, as the shell uploads it.
+fn water_texture(device: &wgpu::Device, queue: &wgpu::Queue, field: &Field) -> wgpu::TextureView {
+    let image = timefly::terrain::material::water_image(field);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("water"),
+            size: wgpu::Extent3d {
+                width: field.res,
+                height: field.res,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        image.data.as_ref().expect("image data"),
+    );
+    texture.create_view(&Default::default())
+}
+
+/// Random water over `rough_field` terrain: inside `calm_m` (max(|x|, |z|)) a mix of dry
+/// texels, standing water and two rivers 1.5 km apart converging side by side (opposite offset
+/// signs across the divide, the crossing guard's case), plus scattered river texels with random
+/// offsets; from `calm_m` to `still_m` one uniform lake, so the blend between the fields mixes
+/// equal values and only the blend's arithmetic is compared there; beyond `still_m` random
+/// again. (A field's rivers meander nowhere: only the sampler is under test.)
+fn wet_rough_field(res: u32, size_m: f64, seed: u64, calm_m: f64, still_m: f64) -> Field {
+    use timefly_core::worldgen::generate::water::encode_river;
+    let mut field = rough_field(res, size_m, seed);
+    let mut rng = SplitMix(seed ^ 0xAB);
+    let (west, east) = (1_234.5, 2_734.5);
+    for row in 0..res {
+        for col in 0..res {
+            let i = (row * res + col) as usize;
+            let (x, z) = field.local_of(row, col);
+            let a = x.abs().max(z.abs());
+            let h = field.elevation_m[i];
+            if (calm_m..still_m).contains(&a) {
+                field.elevation_m[i] = 30.0;
+                field.water_level_m[i] = 40.0;
+                continue;
+            }
+            let near = (x - west).abs().min((x - east).abs());
+            if near < 1_500.0 {
+                let o = if x < (west + east) / 2.0 {
+                    x - west
+                } else {
+                    x - east
+                } as f32;
+                let half = 4.0 + 30.0 * rng.unit();
+                field.water_level_m[i] = h + 4.0 * rng.unit() - 1.0;
+                let speed = 6.0 * rng.unit();
+                field.river[i] = encode_river(half - o.abs(), speed, -0.5 * speed, o);
+                continue;
+            }
+            match rng.below(4) {
+                0 => field.water_level_m[i] = h - 64.0,
+                1 => field.water_level_m[i] = h + 30.0 * rng.unit(),
+                2 => {
+                    field.water_level_m[i] = h + 4.0 * rng.unit() - 1.0;
+                    let o = 4.0 * size_m as f32 / res as f32 * (rng.unit() - 0.5);
+                    field.river[i] = encode_river(
+                        40.0 * rng.unit() - o.abs(),
+                        6.0 * (rng.unit() - 0.5),
+                        6.0 * (rng.unit() - 0.5),
+                        o,
+                    );
+                }
+                _ => field.water_level_m[i] = h - 64.0 + 70.0 * rng.unit(),
+            }
+        }
+    }
+    field
+}
+
+/// `sample_clamped`'s four texel indices at `(x, z)` (the test's own copy).
+fn tap_indices(field: &Field, x: f64, z: f64) -> [usize; 4] {
+    let last = f64::from(field.res - 1);
+    let spacing = field.spacing_m();
+    let u = ((x + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let v = ((z + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let (c0, r0) = (u.floor().min(last - 1.0), v.floor().min(last - 1.0));
+    let n = field.res as usize;
+    let i = r0 as usize * n + c0 as usize;
+    [i, i + 1, i + n, i + n + 1]
+}
+
+/// The largest magnitude and the spread (max − min) of `value` over both fields' taps at
+/// `(x, z)`.
+fn tap_range(
+    grid: &RegionGrid,
+    x: f64,
+    z: f64,
+    value: impl Fn(&Field, usize) -> f32,
+) -> (f32, f32) {
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for f in [&grid.inner, &grid.apron] {
+        for i in tap_indices(f, x, z) {
+            let v = value(f, i);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    (lo.abs().max(hi.abs()), hi - lo)
+}
+
+/// Runs `blended_water` on the GPU at `points` over `grid`'s water textures: per point
+/// `[level, thickness, ribbon, flow.x, flow.y]`.
+fn gpu_blended_water(grid: &RegionGrid, points: &[[f32; 4]]) -> Vec<[f32; 5]> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("water parity"),
+        source: wgpu::ShaderSource::Wgsl(format!("{CDLOD}\n{WATER_PARITY_ENTRY}").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("water parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let inner = water_texture(&device, &queue, &grid.inner);
+    let apron = water_texture(&device, &queue, &grid.apron);
+    let settings = LodSettings::region();
+    let params = TerrainParams::new(grid, &settings);
+    let buffer_bytes = terrain_buffer_bytes(&params, &[], 1);
+    let storage = |label, data: &[u8]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let terrain_buf = storage("terrain", &buffer_bytes);
+    let query_buf = storage("queries", bytemuck::cast_slice(points));
+    let bytes = (points.len() * 32) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: terrain_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&inner),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&apron),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(points.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<[f32; 8]> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+    got.iter().map(|g| [g[0], g[1], g[2], g[4], g[5]]).collect()
+}
+
+/// Worst differences of one case: (level in ulps of its taps, thickness, ribbon, flow in m or
+/// m/s), and how many points went through the crossing guard, the blend, rivers.
+#[derive(Debug, Default)]
+struct WaterParity {
+    level_ulps: f32,
+    thickness: f32,
+    ribbon: f32,
+    flow: f32,
+    guarded: usize,
+    blended: usize,
+    in_river: usize,
+}
+
+/// Compares the GPU's `blended_water` with the Rust reference at `points`. `weight_error` bounds
+/// how far the GPU's f32 bilinear weights may sit from the reference's (0 where the field sizes
+/// make them exact); each quantity's tolerance is `ulps` ulps of its taps' largest magnitude,
+/// plus the weight error and the blend weight's f32 rounding (1e-6) times its taps' spread.
+fn check_water_parity(grid: &RegionGrid, points: &[[f32; 4]], weight_error: f32) -> WaterParity {
+    use timefly_core::terrain::{CROSSING_REACH_TEXELS, blended_water};
+    use timefly_core::worldgen::generate::water::decode_river;
+    let got = gpu_blended_water(grid, points);
+    let mut parity = WaterParity::default();
+    let river = |f: &Field, i: usize| decode_river(f.river[i]);
+    let e1 = grid.inner.size_m / 2.0;
+    let e0 = e1 - 4.0 * grid.apron.spacing_m();
+    for (q, g) in points.iter().zip(&got) {
+        let (x, z) = (f64::from(q[0]), f64::from(q[1]));
+        let r = blended_water(grid, x, z);
+        let slack = weight_error + 1e-6;
+        let tol = |ulps: f32, (scale, spread): (f32, f32)| ulps * ulp(scale) + slack * spread;
+        let level = tap_range(grid, x, z, |f, i| f.water_level_m[i]);
+        let heights = tap_range(grid, x, z, |f, i| f.elevation_m[i]);
+        let half = tap_range(grid, x, z, |f, i| river(f, i)[0] + river(f, i)[3].abs());
+        let offset = tap_range(grid, x, z, |f, i| river(f, i)[3]);
+        let ribbon = tap_range(grid, x, z, |f, i| river(f, i)[0]);
+        let east = tap_range(grid, x, z, |f, i| river(f, i)[1]);
+        let north = tap_range(grid, x, z, |f, i| river(f, i)[2]);
+
+        let d = (g[0] - r.level_m).abs();
+        assert!(
+            d <= tol(2.0, level),
+            "level at ({x}, {z}): gpu {} vs rust {} ({} ulps)",
+            g[0],
+            r.level_m,
+            d / ulp(level.0)
+        );
+        parity.level_ulps = parity.level_ulps.max(d / ulp(level.0));
+        // The GPU interpolates each texel's `level − h`; the reference subtracts the blended
+        // height from the blended level: a few ulps of either apart.
+        let both = (level.0.max(heights.0), level.1 + heights.1);
+        let d = (g[1] - r.thickness_m).abs();
+        assert!(
+            d <= tol(4.0, both),
+            "thickness at ({x}, {z}): gpu {} vs rust {}",
+            g[1],
+            r.thickness_m
+        );
+        parity.thickness = parity.thickness.max(d);
+        let parts = (
+            half.0.max(offset.0).max(ribbon.0),
+            half.1 + offset.1 + ribbon.1,
+        );
+        let d = (g[2] - r.ribbon_m).abs();
+        assert!(
+            d <= tol(4.0, parts),
+            "ribbon at ({x}, {z}): gpu {} vs rust {}",
+            g[2],
+            r.ribbon_m
+        );
+        parity.ribbon = parity.ribbon.max(d);
+        // The GPU's flow is (east, −north).
+        for (gpu, rust, range) in [(g[3], r.flow[0], east), (g[4], -r.flow[1], north)] {
+            let d = (gpu - rust).abs();
+            assert!(
+                d <= tol(2.0, range),
+                "flow at ({x}, {z}): gpu {gpu} vs rust {rust}"
+            );
+            parity.flow = parity.flow.max(d);
+        }
+        // Coverage.
+        let guarded = [&grid.inner, &grid.apron].iter().any(|f| {
+            let o = tap_indices(f, x, z).map(|i| river(f, i)[3]);
+            let (lo, hi) = o
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            lo < 0.0 && hi > 0.0 && hi - lo > CROSSING_REACH_TEXELS * f.spacing_m() as f32
+        });
+        parity.guarded += usize::from(guarded);
+        let a = x.abs().max(z.abs());
+        parity.blended += usize::from(a > e0 && a < e1);
+        parity.in_river += usize::from(r.ribbon_m > 0.0 && r.ribbon_m < 100.0);
+    }
+    parity
+}
+
+/// Query points: a third in the inner field (half of them within 60 m of a river or the divide
+/// between them), a sixth in
+/// the blend, the rest over the apron and beyond its edge; each coordinate a multiple of
+/// `step_m`.
+fn water_points(grid: &RegionGrid, seed: u64, step_m: f64) -> Vec<[f32; 4]> {
+    let mut rng = SplitMix(seed);
+    let e1 = grid.inner.size_m / 2.0;
+    let e0 = e1 - 4.0 * grid.apron.spacing_m();
+    let snap = |v: f64| ((v / step_m).round() * step_m) as f32;
+    let mut span = |lo: f64, hi: f64| lo + (hi - lo) * f64::from(rng.unit());
+    (0..WATER_POINTS)
+        .map(|k| {
+            let (x, z) = match k % 6 {
+                // Across the two rivers (wet_rough_field's), and the divide between them.
+                0 => {
+                    let centre = [1_234.5, 2_734.5, 1_984.5][k / 6 % 3];
+                    (centre + span(-60.0, 60.0), span(-e0, e0))
+                }
+                1 => (span(-e0, e0), span(-e0, e0)),
+                2 => {
+                    let a = span(e0, e1);
+                    let b = span(-e1, e1);
+                    if k % 12 == 2 { (a, b) } else { (b, -a) }
+                }
+                _ => {
+                    let edge = grid.apron.size_m / 2.0 + 20_000.0;
+                    (span(-edge, edge), span(-edge, edge))
+                }
+            };
+            [snap(x), snap(z), 0.0, 0.0]
+        })
+        .collect()
+}
+
+/// The water shader's sampler mirrors `blended_water`, crossing guard included. First over
+/// fields whose sizes make the bilinear weights exact in f32 (spacings of 256 m and 2,048 m,
+/// points on a 1/8 m grid): the level within 2 ulps of its taps, the rest within a few. Then
+/// over the region's own sizes, whose f32 weights sit a few ulps of the texel coordinate from
+/// the reference's (WGSL's division may be 2.5 ulps off): within that times each quantity's
+/// local spread.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_water_matches_rust() {
+    let center = geo_to_render(latlon_to_geo(34.2, 74.3));
+    let dyadic = RegionGrid {
+        spec: RegionSpec::new(center, YearsBp(0.0), 1),
+        inner: wet_rough_field(1025, 262_144.0, 3, 118_000.0, 1.0e9),
+        apron: wet_rough_field(1025, 2_097_152.0, 4, 0.0, 137_000.0),
+        boulders: Vec::new(),
+    };
+    let points = water_points(&dyadic, 0xD1AD, 0.125);
+    let exact = check_water_parity(&dyadic, &points, 0.0);
+    println!("dyadic fields: {exact:?}");
+
+    let standard = RegionGrid {
+        spec: RegionSpec::new(center, YearsBp(0.0), 1),
+        inner: wet_rough_field(REGION_RES, REGION_SIZE_M, 5, 128_000.0, 1.0e9),
+        apron: wet_rough_field(APRON_RES, APRON_SIZE_M, 6, 0.0, 155_000.0),
+        boulders: Vec::new(),
+    };
+    let points = water_points(&standard, 0x57A2, 1.0 / 64.0);
+    // Three ulps of a texel coordinate below 1,025 for each weight.
+    let weight_error = 2.0 * 3.0 * ulp(1024.0);
+    let region = check_water_parity(&standard, &points, weight_error);
+    println!("region fields: {region:?}");
+
+    for (name, p) in [("dyadic", &exact), ("region", &region)] {
+        assert!(
+            p.guarded >= 50,
+            "{name}: only {} points through the guard",
+            p.guarded
+        );
+        assert!(
+            p.blended >= 300,
+            "{name}: only {} points in the blend",
+            p.blended
+        );
+        assert!(
+            p.in_river >= 100,
+            "{name}: only {} points in a river",
+            p.in_river
+        );
+    }
 }

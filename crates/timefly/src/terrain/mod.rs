@@ -151,7 +151,8 @@ pub struct TerrainScene {
     pub apron_height: Handle<Image>,
     pub inner_surface: Handle<Image>,
     pub apron_surface: Handle<Image>,
-    /// The fields' water ([`material::water_image`]), for the water's material (Task 8).
+    /// The fields' water ([`material::water_image`]), which the water's material binds. Empty
+    /// (`Handle::default()`) on a replace's swap frame, before the new water is made.
     pub inner_water: Handle<Image>,
     pub apron_water: Handle<Image>,
     pub palette: Handle<Image>,

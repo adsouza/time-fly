@@ -745,20 +745,82 @@ fn a_replace_frees_the_old_water_before_making_the_new() {
     assert_eq!(m.extension.inner_height, s.inner_height);
     assert_eq!(m.extension.apron_surface, s.apron_surface);
     assert_eq!(s.height_range_m, height_range_m(&s.grid));
-    // The sea follows the new height textures too.
+    // The sea binds the new water (it reads no heights).
     let water = world.resource::<RegionWater>();
     let wm = world
         .resource::<Assets<WaterMaterial>>()
         .get(&water.material)
         .unwrap();
-    assert_eq!(wm.extension.inner_height, s.inner_height);
-    assert_eq!(wm.extension.apron_height, s.apron_height);
+    assert_eq!(wm.extension.inner_water, s.inner_water);
+    assert_eq!(wm.extension.apron_water, s.apron_water);
     let images = world.resource::<Assets<Image>>();
     assert!(
         old[..4].iter().all(|&id| images.get(id).is_none()),
         "old fields kept"
     );
     assert_eq!(images.len(), 7);
+}
+
+/// The swap frame binds no water (Task 7's stages), so the sea draws nothing until the new
+/// water is made (Task 8): it is hidden, and its material holds neither the old water (which the
+/// render world must free) nor the default image (a float texture where `texture_2d<u32>` is
+/// bound). The frame after, it shows the new water.
+#[test]
+fn the_sea_draws_nothing_while_its_water_is_missing() {
+    use crate::water::{NO_WATER, RegionWater, WaterMaterial, add_water_systems};
+    let mut app = pool_app();
+    app.init_asset::<crate::sky::SkyMaterial>()
+        .init_asset::<WaterMaterial>();
+    crate::sky::add_sky_systems(&mut app);
+    add_water_systems(&mut app);
+    enter_owned(&mut app, wet_grid(0.0));
+    for _ in 0..3 {
+        app.update();
+    }
+    let sea = |app: &App| {
+        let world = app.world();
+        let water = world.resource::<RegionWater>();
+        let m = world
+            .resource::<Assets<WaterMaterial>>()
+            .get(&water.material)
+            .unwrap();
+        (
+            *world.get::<Visibility>(water.entity).unwrap(),
+            m.extension.inner_water.id(),
+            m.extension.apron_water.id(),
+        )
+    };
+    let scene_water = |app: &App| {
+        let s = app.world().resource::<TerrainScene>();
+        (s.inner_water.id(), s.apron_water.id())
+    };
+    let old = scene_water(&app);
+    assert_eq!(sea(&app), (Visibility::Inherited, old.0, old.1));
+    enter_owned(&mut app, wet_grid(500.0));
+    // The swap frame.
+    app.update();
+    let (visibility, inner, apron) = sea(&app);
+    assert_eq!(
+        visibility,
+        Visibility::Hidden,
+        "the sea draws on the swap frame"
+    );
+    for id in [inner, apron] {
+        assert_eq!(id, NO_WATER.id());
+        assert!(id != old.0 && id != old.1, "the old water is still bound");
+        assert_ne!(id, Handle::<Image>::default().id());
+        assert!(app.world().resource::<Assets<Image>>().get(id).is_none());
+    }
+    // The next frame: the new water, shown.
+    app.update();
+    let new = scene_water(&app);
+    assert_ne!(new, old);
+    assert_eq!(sea(&app), (Visibility::Inherited, new.0, new.1));
+    // And it stays bound through the heights' frames.
+    for _ in 0..3 {
+        app.update();
+        assert_eq!(sea(&app), (Visibility::Inherited, new.0, new.1));
+    }
 }
 
 /// A snapshot change uploads the new grid's water and drops the old textures.
@@ -841,14 +903,14 @@ fn sky_and_water_follow_the_scene() {
         let sky = world.resource::<RegionSky>();
         let water = world.resource::<RegionWater>();
         assert!(Arc::ptr_eq(&sky.grid, &grid) && Arc::ptr_eq(&water.grid, &grid));
-        // The sea reads the terrain's own buffer and height textures.
+        // The water reads the terrain's own buffer and the fields' water textures.
         let m = world
             .resource::<Assets<WaterMaterial>>()
             .get(&water.material)
             .unwrap();
         assert_eq!(m.extension.patches, scene.buffer);
-        assert_eq!(m.extension.inner_height, scene.inner_height);
-        assert_eq!(m.extension.apron_height, scene.apron_height);
+        assert_eq!(m.extension.inner_water, scene.inner_water);
+        assert_eq!(m.extension.apron_water, scene.apron_water);
         // The region camera carries the era's fog and the sky-coloured ambient light.
         let camera = world.entity(scene.camera);
         assert!(camera.contains::<DistanceFog>());
@@ -890,7 +952,7 @@ fn sky_and_water_follow_the_scene() {
             .resource::<Assets<WaterMaterial>>()
             .get(&water.material)
             .unwrap();
-        assert_eq!(m.extension.inner_height, scene.inner_height);
+        assert_eq!(m.extension.inner_water, scene.inner_water);
         let fog = world
             .entity(scene.camera)
             .get::<DistanceFog>()

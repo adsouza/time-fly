@@ -866,3 +866,44 @@ Each ruling is *what*; *why*; *cost if wrong*.
   - What: between the new water and the new heights and surface codes there is now a frame with no upload. `REPLACE_EXTRA_HELD_FRAMES` becomes 2, so a hop or a snapshot change shows 3 opaque frames from the swap on.
   - Why: with three stages the worst hop still measured +64.2 MiB. The water's upload staging was still allocated when the heights' staging and textures arrived.
   - Cost if wrong: two white frames (about 33 ms) per hop and per snapshot change instead of M3's none.
+- **Task 8: the flow is drawn in each texel's own frame, not rotated (controller's ruling 1).**
+  - What: the water texture's flow is `(east, −north)` in the texel's own frame, and the shader reads it as region `(+x, +z)`. `water_image`'s doc now says so.
+  - Why: the two frames differ by about `(d/R)·tan(lat)`: 1.4–3.7° across the inner region. A rotation per fragment buys nothing visible there.
+  - Cost if wrong: in the far apron at high latitude (up to about 30° at 70°N) the ripples drift visibly across the channel. Seen only from very high up, where the ripples have faded out.
+- **Task 8: the crossing guard (controller's ruling 2), by the offset's rate of change rather than the example rule.**
+  - What: core's `blended_water` had no guard; it gains one, mirrored in WESL. A field whose four taps hold offsets of both signs that differ by more than `CROSSING_REACH_TEXELS` (1.5) texels gives its interpolated ribbons (offset 0) instead of `hw − |o|`. Test: `converging_rivers_leave_no_ribbon_between_them`.
+  - Why: one river's signed offset changes no faster than the distance between taps (√2 texels across a cell), so a larger jump means two rivers. The example rule (signs differ and magnitudes exceed the half-width) would also fire across every sub-texel river's own centreline, where the taps sit up to a texel from a few-metre half-width, and erase those rivers.
+  - Cost if wrong: where one river's taps disagree by more than 1.5 texels (the outer wedge of a bend sharper than about 90°, near a vertex), the field draws the plain ribbon blend there. That loses a sub-texel river for under a cell; a wide river is unaffected.
+- **Task 8: the water mesh sits at the drawn surface, `max(level, ground)`, not at the level.**
+  - What: the vertex stage puts each vertex at `level − min(thickness, 0)`, which is `blended_surface_m`. The brief says "at `level`".
+  - Why: a dry texel's level is `NO_WATER_DROP_M` (64 m) under its ground. Where the polar mesh is coarser than a channel (400 m spacing at 10 km), a plane from a river vertex to a dry vertex would sink under the river's banks and hide the river. At the ground, it never does.
+  - Cost if wrong: between vertices near a shore the drawn plane stands up to a bank's height above the true level. The water is then drawn slightly high there, which is a parallax shift of the shoreline at grazing angles. Over land the mesh is discarded per fragment after one `blended_water` read: about one cheap full-screen pass, where the old sea plane under mountains was depth-culled.
+- **Task 8: rivers keep at least about a pixel's width.**
+  - What: the fragment discards where `ribbon + footprint/2 < 0` rather than `ribbon < 0`.
+  - Why: from afar a 20 m river is under a pixel wide, and a hard true-width edge breaks it into crawling dashes. The rule changes nothing up close (1–2 m footprints) and never draws water outside the carved channel, which the thickness test still bounds.
+  - Cost if wrong: distant thin rivers read up to a pixel wider than true.
+- **Task 8: "by depth" for the river tint.**
+  - What: `river_tint = mix(mix(RIVER_CLEAR, RIVER_SILTY, silt), WATER_DEEP, (1 − e^(−d/28 m))·(1 − silt))`. Clear water darkens with depth as M2's tint does; silty water stays brown.
+  - Why: the brief gives the endpoints and "by depth", not the form. Turbid water does not go navy with depth.
+  - Cost if wrong: deep, fast rivers (the Indus gorge) read darker teal than the owner wants. It is tunable from the constants.
+- **Task 8: the swell fades by the camera's height above the water's own level.**
+  - What: `SWELL_FADE_AGL_M` is measured from the vertex's water level, not from `y = 0`.
+  - Why: with lakes at their own levels (Titicaca at 3,810 m), "above the sea" no longer means above the water. The sea is unchanged.
+  - Cost if wrong: none for the sea. Lakes show the swell from as low as the sea does.
+- **Task 8: the swap frame binds `NO_WATER` and hides the water.**
+  - What: while `TerrainScene::inner_water` or `apron_water` is missing (the swap frame), the water's material binds `NO_WATER`, a handle no image is ever stored at, and the entity is `Visibility::Hidden`. Test: `the_sea_draws_nothing_while_its_water_is_missing`.
+  - Why: the scene's empty handle is `Handle::default()`, which Bevy's `ImagePlugin` fills with a float image. Bound to a `texture_2d<u32>` slot, it fails wgpu validation. Keeping the old handle would stop the render world freeing the old water (the hop-memory gate).
+  - Cost if wrong: none seen. The material retries its bind group each frame while hidden, which is a hash lookup.
+- **Task 8: the GPU parity bound.**
+  - What: `wesl_water_matches_rust` checks the level within 2 ulps of its taps on fields whose sizes make f32 bilinear weights exact (256 m and 2,048 m spacings). On the region's own sizes it allows the weights' few-ulp f32 error times each quantity's local spread. The brief's flat "2 ulps at 4,096 points" holds only where the weights are exact.
+  - Why: WGSL computes the texel coordinate in f32, and the reference computes it in f64. On a 293 m spacing the weights differ by about 1e-4, which on rough random fields is hundreds of ulps of the level (measured 1,444).
+  - Cost if wrong: a WESL slip smaller than the weight-error term on real sizes would pass the second case. The dyadic case still bounds it to 2 ulps.
+- **Task 8: the river look ramps by flow speed across the cell where a river meets standing water.**
+  - What: the brief's classification stands: rivers are `ribbon < RIBBON_NONE_M`, standing water the rest, and the vertex swell uses it as is. The fragment weights the river look (tint, ripples, white water, against the lake's waves, swash and shore foam) by `smoothstep(0.05, 0.3, |flow|)`.
+  - Why: the ribbon reaches 1,000 m only at the edge of the last mixed cell. A hard switch on it drew brown wedges with straight, texel-aligned edges at river mouths (seen south of Manaus). Rivers run at 0.3 m/s or more, standing water has no flow, and the flow falls to 0 exactly where the ribbon reaches 1,000 m, so the ramp is continuous.
+  - Cost if wrong: a river slower than 0.3 m/s would show part of the lake look. The lowland speed floor is 0.3 m/s, so only fading ends are affected.
+- **Task 8: the water draws both faces (`cull_mode: None`).**
+  - What: the water's `StandardMaterial` has no back-face culling. `double_sided` stays false, since the shader sets its own normal. Test: `the_water_draws_both_faces`.
+  - Why: the mesh now follows the drawn surface, so it has slopes. Seen from afar, a triangle stepping down to a river faces away from the camera and would be culled. The flat M2 plane never had back faces.
+  - Cost if wrong: back faces cost fragments only where the mesh slopes away (they are discarded over dry ground). The pipeline key changes, and the warm-up uses the same constructor.
+- **Task 8 renders (controller's rulings 3 and 4).** Step 5 adds Qattara (`29.5,27.0,0`, AGL 3,000), which must show dry ground. Rapids are judged by white water where `rapid_from_speed` is high, until Task 9's boulders. The brief's Manaus and Indus poses showed no river (see the report), so supplementary shots were added: south of Manaus, and an Andes river with rapids east of Titicaca.
