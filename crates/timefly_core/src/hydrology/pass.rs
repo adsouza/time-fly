@@ -375,6 +375,8 @@ pub struct HydroPrep {
     lake_levels: Vec<LakeLevel>,
     placed_levels: Vec<(u32, f32)>,
     unplaced_levels: Vec<String>,
+    /// The endorheic table lakes' basins (Task 11d fix round 2).
+    endorheic_basins: Vec<u32>,
     elevation: Vec<f32>,
     /// One bit per node: ice fraction ≥ [`ICE_NODE_FRACTION`].
     ice: Vec<u64>,
@@ -431,6 +433,7 @@ impl HydroPrep {
             lake_levels: levels.to_vec(),
             placed_levels: Vec::new(),
             unplaced_levels: Vec::new(),
+            endorheic_basins: Vec::new(),
             lattice,
             age,
             units: 0,
@@ -658,7 +661,33 @@ impl HydroPrep {
 
     /// Routing over the (burnt) elevation.
     fn route(&mut self) -> Stage {
-        Stage::Route(Box::new(Routing::new(std::mem::take(&mut self.elevation))))
+        // Endorheic table lakes seed routing like the sea at their level (with data lakes).
+        let sinks = if self.data_lakes {
+            self.lake_points()
+                .into_iter()
+                .zip(&self.lake_levels)
+                .filter(|(_, l)| l.endorheic)
+                .map(|(p, _)| p)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Stage::Route(Box::new(
+            Routing::new(std::mem::take(&mut self.elevation))
+                .with_inland(self.beds.inland())
+                .with_sinks(sinks),
+        ))
+    }
+
+    /// The lake level table's points as `(nearest node, level)`, in table order.
+    fn lake_points(&self) -> Vec<(u32, f32)> {
+        self.lake_levels
+            .iter()
+            .map(|l| {
+                let dir = geo_to_render(latlon_to_geo(l.lat, l.lon));
+                (self.lattice.nearest(dir), l.level_m)
+            })
+            .collect()
     }
 
     /// The stage after routing: the data's flats, unless the map decides every
@@ -676,17 +705,18 @@ impl HydroPrep {
     /// the coast distance if the climate needs it, else runoff.
     fn after_flats(&mut self, routed: Box<Routed>, needs_coast_km: bool) -> Stage {
         if self.data_lakes {
-            let points: Vec<(u32, f32)> = self
-                .lake_levels
-                .iter()
-                .map(|l| {
-                    let dir = geo_to_render(latlon_to_geo(l.lat, l.lon));
-                    (self.lattice.nearest(dir), l.level_m)
-                })
-                .collect();
+            let points = self.lake_points();
             let ice = &self.ice;
             let (placed, unplaced) =
                 place_levels(&routed, self.first_flat, &|i| bit(ice, i), &points);
+            // The endorheic lakes' basins (their sinks), where placed.
+            self.endorheic_basins = points
+                .iter()
+                .zip(&self.lake_levels)
+                .filter(|(_, l)| l.endorheic)
+                .map(|(&(v, _), _)| routed.basin_of[v as usize])
+                .filter(|b| placed.iter().any(|p| p.0 == *b))
+                .collect();
             self.placed_levels = placed;
             self.unplaced_levels = unplaced
                 .into_iter()
@@ -703,6 +733,7 @@ impl HydroPrep {
     fn new_accumulation(&mut self) -> Accumulation {
         let mut acc = Accumulation::new(self.lattice.len(), self.first_flat);
         acc.set_levels(self.placed_levels.clone());
+        acc.set_endorheic(self.endorheic_basins.clone());
         acc.set_mapped(std::mem::take(&mut self.mapped));
         acc.set_present(self.present());
         acc
@@ -1886,6 +1917,7 @@ mod tests {
             overview_m: None,
             source: "test".into(),
             note: String::new(),
+            endorheic: false,
         };
         let levels = [
             level("Arid", lat, lon, 300.0),
@@ -1921,6 +1953,49 @@ mod tests {
                 assert!(h.unplaced_lake_levels.is_empty());
             }
         }
+    }
+
+    /// Task 11d fix round 2: an endorheic table lake's seeded routing slices like the rest of the
+    /// pass, and its lake is terminal at its level.
+    #[test]
+    fn an_endorheic_table_lake_passes_the_same_time_boxed() {
+        let lattice = CubeLattice { n: 75 };
+        let table = shipped_table();
+        let (lat, lon) = latlon(RenderDir(World::new().islands[ARID].centre));
+        let levels = [crate::hydrology::levels::LakeLevel {
+            name: "Arid".into(),
+            lat,
+            lon,
+            level_m: 300.0,
+            overview_m: None,
+            source: "test".into(),
+            note: String::new(),
+            endorheic: true,
+        }];
+        let run = |budget: u32| {
+            let mut world = World::new();
+            world.data_lakes = true;
+            let mut prep = HydroPrep::with_lake_levels(lattice, YearsBp(0.0), &levels);
+            while !prep.step(&world, &world, &table, budget) {}
+            prep.finish()
+        };
+        let whole = run(u32::MAX);
+        assert_eq!(run(97), whole);
+        let world = World::new();
+        let on_arid: Vec<&crate::hydrology::Lake> = whole
+            .lakes
+            .iter()
+            .filter(|l| {
+                world
+                    .island_at(lattice.dir(l.exit).0)
+                    .is_some_and(|(k, _)| k == ARID)
+            })
+            .collect();
+        assert_eq!(on_arid.len(), 1, "{on_arid:?}");
+        assert_eq!(
+            (on_arid[0].kind, on_arid[0].level_m, on_arid[0].outflow_m3s),
+            (LakeKind::Terminal, 300.0, 0.0)
+        );
     }
 
     /// Every river chain ends in the ocean, a lake, the ice, or (at the present day only) a
@@ -2536,6 +2611,90 @@ mod tests {
         });
         valley.sides_m = 30.0;
         valley
+    }
+
+    /// A course south along a 0–1 m coastal plain to the sea (the Mississippi below Baton
+    /// Rouge), with an ocean lagoon one node beside it at 5–8° N (Lake Pontchartrain by
+    /// LaPlace).
+    fn laplace_plain() -> Plain {
+        Plain::new([(10.0, 10.0), (-1.0, 10.0)], |lat, lon, _| {
+            if (5.0..8.0).contains(&lat) && lon > 10.2 {
+                -5.0
+            } else {
+                0.5 + 0.05 * lat.clamp(0.0, 10.0)
+            }
+        })
+    }
+
+    fn latlon_of(v: u32) -> (f64, f64) {
+        geo_to_latlon(render_to_geo(PLAIN_LATTICE.dir(v)))
+    }
+
+    /// Task 11d fix round 2 (rule B): within 10 m of the sea a burnt course routed at 0 m, a flat
+    /// with no direction that drained to the first ocean it met. Its nodes now fall toward its
+    /// end, and only its end meets the sea.
+    #[test]
+    fn a_burnt_course_meets_the_sea_only_at_its_end() {
+        let plain = laplace_plain();
+        let nodes = plain.nodes();
+        let h = plain.pass(PRESENT, true);
+        // The hazard: course nodes beside the lagoon, which is ocean.
+        let beside = nodes.iter().filter(|&&v| {
+            !h.is_ocean(v)
+                && PLAIN_LATTICE
+                    .neighbours(v)
+                    .into_iter()
+                    .flatten()
+                    .any(|u| h.is_ocean(u) && latlon_of(u).0 > 4.0)
+        });
+        assert!(beside.count() >= 3);
+        follows(&h, &nodes).unwrap();
+        // The burn changes no ocean.
+        let bare = plain.pass(PRESENT, false);
+        for v in 0..PLAIN_LATTICE.len() {
+            assert_eq!(h.is_ocean(v), bare.is_ocean(v), "{v}");
+        }
+    }
+
+    /// Task 11d fix round 2 (rule B, the Hudi's case): a course crossing another's 0 m flat
+    /// keeps its own direction past the crossing, though the other's sea is nearer.
+    #[test]
+    fn a_crossing_course_never_runs_backwards_along_a_flat() {
+        let plain = Plain::new([(10.0, 10.0), (-1.0, 10.0)], |lat, _, _| {
+            0.5 + 0.05 * lat.clamp(0.0, 10.0)
+        });
+        let cross = TodayRiver {
+            name: "cross".into(),
+            points: vec![(5.0, 3.0), (5.0, 20.5)],
+        };
+        let table = shipped_table();
+        let mut prep = HydroPrep::with_tables(PLAIN_LATTICE, PRESENT, &[], &[])
+            .with_today_rivers(vec![plain.course(), cross.clone()]);
+        while !prep.step(&plain, &plain, &table, u32::MAX) {}
+        let h = prep.finish();
+        let main: std::collections::HashSet<u32> = plain.nodes().into_iter().collect();
+        let nodes = crate::hydrology::today_rivers::today_river_nodes(&PLAIN_LATTICE, &cross);
+        let at = nodes
+            .iter()
+            .rposition(|v| main.contains(v))
+            .expect("the courses cross");
+        // The hazard: the main course reaches the sea 6 degrees from the crossing, the crossing
+        // one 10.5 degrees, so a flat drains the crossing course's east part back west.
+        // No node past the crossing drains back to the one before it on its course (the node
+        // beside the crossing may join the main course there: a confluence)...
+        for w in nodes[at + 1..].windows(2) {
+            if let Some(k) = h.rivers.index_of(w[1]) {
+                let n = h.rivers.nodes()[k as usize];
+                assert_ne!(
+                    down_node(&h.rivers, &n),
+                    w[0],
+                    "{n:?} runs back to {}",
+                    w[0]
+                );
+            }
+        }
+        // ... and beyond the junction the crossing course follows itself to its own sea.
+        follows(&h, &nodes[at + 2..]).unwrap();
     }
 
     #[test]

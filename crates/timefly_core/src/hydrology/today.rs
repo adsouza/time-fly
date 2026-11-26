@@ -340,6 +340,7 @@ impl Today {
                 outflow_m3s: u.out,
                 area_km2: area,
                 exit: u.outlet,
+                surplus_m3s: 0.0,
             });
             let inside = |v: u32| footprint.binary_search(&v).is_ok();
             let mut steps = vec![0u16; footprint.len()];

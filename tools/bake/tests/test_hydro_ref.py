@@ -232,6 +232,53 @@ def test_present_mode_takes_its_lakes_from_the_map():
     assert lake.area_km2 == pytest.approx(3.0)
 
 
+def _deep_bowl():
+    """lakes.rs's deep_bowl: a 9 x 11 grid at 10 km, ocean in column 0, a 50 m rim at (4, 1), a
+    cone 5 + 4 r m about (4, 6) inside rows 1..7 and columns 2..9, 90 m around."""
+    g = hydro_ref.GridGraph(9, 11, 10_000.0)
+    e = []
+    for r in range(9):
+        for c in range(11):
+            if c == 0:
+                e.append(-10.0)
+            elif (r, c) == (4, 1):
+                e.append(50.0)
+            elif 1 <= r <= 7 and 2 <= c <= 9:
+                e.append(float(np.float32(5.0 + 4.0 * np.float32(math.hypot(r - 4.0, c - 6.0)))))
+            else:
+                e.append(90.0)
+    return g, e
+
+
+def test_an_endorheic_lake_seeds_routing_and_is_terminal():
+    # Task 11d fix round 2, mirroring lakes.rs's
+    # an_endorheic_table_lake_is_terminal_and_its_land_drains_by_descent.
+    g, e = _deep_bowl()
+    ocean = hydro_ref.ocean_mask(g, e)
+    centre, slope, rim = 4 * 11 + 6, 4 * 11 + 3, 4 * 11 + 1
+    own = lambda i, a: np.float32(5.0)  # noqa: E731
+    humid = lambda i, x, a: 0.1  # noqa: E731
+    # Without the flag the slope lies in the bowl's basin, filled to its 50 m spill.
+    r = hydro_ref.route(g, e, ocean)
+    assert r.basin_of[slope] != hydro_ref.NO_BASIN
+    # Flagged: the nodes below 15 m seed the flood at 15 m and are one basin, the slope drains
+    # by descent, and the lake is terminal with its surplus reported.
+    r = hydro_ref.route(g, e, ocean, sinks=[(centre, 15.0)])
+    b = r.basin_of[centre]
+    assert r.basins[b].spill_m == 15.0 and r.basins[b].rim == r.basins[b].exit
+    assert r.basin_of[slope] == hydro_ref.NO_BASIN
+    down = hydro_ref.receiver_of(g, r, slope)
+    assert e[down] < e[slope]
+    acc = hydro_ref.resolve_lakes(g, r, own, humid, endorheic={b: 15.0})
+    (lake,) = acc.lakes
+    assert (lake.kind, lake.level_m, lake.outflow_m3s) == ("Terminal", 15.0, 0.0)
+    assert lake.evaporation_m3s == lake.inflow_m3s
+    # The Rust pass's numbers: 405 in, 21 wet nodes at 0.1 each.
+    assert lake.inflow_m3s == pytest.approx(405.0)
+    assert lake.surplus_m3s == pytest.approx(405.0 - 2.1)
+    assert float(acc.q[rim]) == 5.0
+
+
 def test_a_gorge_lets_a_river_through_a_ridge():
     # A 1 degree box falling east to its edge, with a 500 m ridge across it at 10.5 E: without
     # the gorge, the west drains west; with it, through the gorge to the east.

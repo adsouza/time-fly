@@ -126,6 +126,39 @@ def test_read_extras_refuses_an_uncited_entry():
         raise AssertionError("an entry without a source was read")
 
 
+def test_lake_parts_are_oriented_by_their_connections_first():
+    # Task 11d fix round 2: a reservoir's ends are flat water, so ETOPO cannot tell its
+    # direction; the oriented river courses it joins can.
+    line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
+    rivers = [line("above", (0, 0), (1, 0)), line("below", (5, 0), (6, 0))]
+    lakes = [
+        # Its first end touches the river above's last point: it already runs downstream.
+        line("first", (1, 0), (2, 0)),
+        # Raw from the river below's first point back up: reversed.
+        line("chained", (5, 0), (3, 0)),
+        # Touches only the chain's other parts once they are oriented: (2, 0) is "first"'s end.
+        line("between", (3, 0), (2, 0)),
+        # Both ends at a course's first point, so each says the other way: ambiguous, ETOPO's.
+        line("both", (0, 0), (5, 0)),
+        # Touches nothing: ETOPO's.
+        line("alone", (9, 9), (8, 8)),
+    ]
+    by_etopo = []
+
+    def fallback(p):
+        by_etopo.append(p.name)
+        return Polyline(p.name, p.scalerank, p.points[::-1].copy())
+
+    got, counts = rivers_today.orient_lake_parts(lakes, rivers, fallback)
+    ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
+    assert ends["first"] == ((1, 0), (2, 0))
+    assert ends["chained"] == ((3, 0), (5, 0))
+    assert ends["between"] == ((2, 0), (3, 0))
+    assert sorted(by_etopo) == ["alone", "both"]
+    assert counts == {"topology": 3, "etopo": 1, "ambiguous": 1}
+    assert [p.name for p in got] == [p.name for p in lakes]
+
+
 def test_orient_puts_the_higher_end_first():
     # A 1' grid over 10..12 N, 20..22 E (rows from the south), rising to the north and east.
     rows, cols = 120, 120

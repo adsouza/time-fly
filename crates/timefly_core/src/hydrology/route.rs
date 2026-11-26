@@ -9,6 +9,11 @@
 //!   (ties: the lowest node id). Repeat until nothing changes: dilate the ocean by
 //!   `ceil(OCEAN_STRAIT_M / spacing)` graph steps through any node, and add every below-zero
 //!   component the dilation touches. Dilated land stays land.
+//! - **Sinks** ([`Routing::with_sinks`], Task 11d fix round 2): for each `(node, level)` of an
+//!   endorheic lake, the non-ocean nodes with `e ≤ level` 8-connected to `node` (none if `node`
+//!   is ocean or above `level`) are pushed first, keyed `(level, seq)`, with `filled = level` and
+//!   no parent: they seed the flood like the sea at that level, and have no receiver. They make
+//!   one basin together (whatever `e − level`), its exit the first popped, its rim the exit.
 //! - **Flood:** push every ocean node with a non-ocean neighbour, in ascending id, keyed
 //!   `(e, seq)`. Pop the minimum `(filled, seq)`; for each unvisited non-ocean neighbour `n`, in
 //!   neighbour order: `filled[n] = max(e[n], filled[c])`, `parent[n] = c`, push
@@ -16,7 +21,9 @@
 //!   at all, seed the lowest node (ties: the lowest id).
 //! - **Receiver:** the neighbour with a strictly lower filled level and the largest
 //!   `(filled[i] − filled[j]) / distance` (ties: first in neighbour order); with none strictly
-//!   lower, the parent.
+//!   lower, the parent. A burnt course's node that ends no course ([`Routing::with_inland`])
+//!   takes no ocean neighbour as its receiver: a course meets the sea only at its own end (Task
+//!   11d fix round 2).
 //! - **Basins:** 8-connected components of nodes with `filled > e + DEPRESSION_EPS_M`. The exit
 //!   is the basin node popped first; the rim is its parent. Every other basin node whose receiver
 //!   leaves the basin is redirected to the exit, so pop order is a topological order (receiver
@@ -123,6 +130,8 @@ enum Phase {
     },
     /// Dilating the ocean across straits.
     Dilate,
+    /// Growing and pushing the endorheic lakes' sinks.
+    Sinks,
     /// Pushing the flood's seeds; `next` is the next id to scan.
     Seed {
         next: u32,
@@ -174,6 +183,11 @@ pub struct Routing {
     basin_of: Vec<u32>,
     open: Option<Basin>,
     units: u64,
+    /// Nodes (sorted) that take no ocean neighbour as their receiver.
+    inland: Vec<u32>,
+    /// Endorheic lakes' `(node, level)`, and once grown, each node's sink flag (empty with none).
+    sink_points: Vec<(u32, f32)>,
+    sink: Vec<bool>,
 }
 
 impl Routing {
@@ -214,7 +228,25 @@ impl Routing {
             basin_of: Vec::new(),
             open: None,
             units: 0,
+            inland: Vec::new(),
+            sink_points: Vec::new(),
+            sink: Vec::new(),
         }
+    }
+
+    /// The router, with each endorheic lake's `(node, level)` seeding the flood like the sea at
+    /// its level (Task 11d fix round 2; the module's rules).
+    pub fn with_sinks(mut self, points: Vec<(u32, f32)>) -> Self {
+        self.sink_points = points;
+        self
+    }
+
+    /// The router, with `inland` (sorted node ids) never draining into an ocean neighbour: a
+    /// burnt course's nodes other than its end (Task 11d fix round 2).
+    pub fn with_inland(mut self, inland: Vec<u32>) -> Self {
+        debug_assert!(inland.is_sorted());
+        self.inland = inland;
+        self
     }
 
     /// Does up to `budget` units of work (one unit is a node visit or a heap pop) and returns
@@ -256,7 +288,10 @@ impl Routing {
             + self.steps.capacity()
             + self.queue.capacity()
             + self.order.capacity()
-            + self.basin_of.capacity())
+            + self.basin_of.capacity()
+            + self.inland.capacity()
+            + 2 * self.sink_points.capacity())
+            + self.sink.capacity()
             + self.component_ocean.capacity()
             + self.ocean.capacity()
             + self.visited.capacity()
@@ -291,6 +326,7 @@ impl Routing {
             Phase::Steps { c } => self.fill_steps(c),
             Phase::Ocean { c, k } => self.add_largest(c, k),
             Phase::Dilate => self.dilate(g),
+            Phase::Sinks => self.sinks(g),
             Phase::Seed { next } => self.seed(g, next),
             Phase::Flood => self.flood(g),
             Phase::Receivers { next } => self.pick_receiver(g, next),
@@ -443,7 +479,43 @@ impl Routing {
         self.visited = vec![false; len];
         self.parent = vec![NO_PARENT; len];
         self.order = Vec::with_capacity(len - self.ocean_count as usize);
+        self.phase = Phase::Sinks;
+    }
+
+    /// Grows and pushes every endorheic lake's sinks in one unit, costing the nodes visited.
+    fn sinks(&mut self, g: &impl HydroGraph) -> u32 {
         self.phase = Phase::Seed { next: 0 };
+        if self.sink_points.is_empty() {
+            return 1;
+        }
+        self.sink = vec![false; self.elevation.len()];
+        let mut cost = 1u32;
+        for &(node, level) in &std::mem::take(&mut self.sink_points) {
+            let n = node as usize;
+            if self.ocean[n] || self.visited[n] || self.elevation[n] > level {
+                continue;
+            }
+            let mut queue = VecDeque::from([node]);
+            self.visited[n] = true;
+            while let Some(v) = queue.pop_front() {
+                cost = cost.saturating_add(1);
+                self.sink[v as usize] = true;
+                self.filled[v as usize] = level;
+                self.push(v);
+                for u in g.neighbours(v).into_iter().flatten() {
+                    let uu = u as usize;
+                    if !self.ocean[uu] && !self.visited[uu] && self.elevation[uu] <= level {
+                        self.visited[uu] = true;
+                        queue.push_back(u);
+                    }
+                }
+            }
+        }
+        cost
+    }
+
+    fn is_sink(&self, i: u32) -> bool {
+        self.sink.get(i as usize).copied().unwrap_or(false)
     }
 
     fn push(&mut self, i: u32) {
@@ -509,11 +581,15 @@ impl Routing {
             return 1;
         }
         let i = next as usize;
-        if !self.ocean[i] {
+        if !self.ocean[i] && !self.is_sink(next) {
             let level = self.filled[i];
+            let inland = self.inland.binary_search(&next).is_ok();
             let mut best: Option<(u8, f64)> = None;
             for (k, j) in g.neighbours(next).into_iter().enumerate() {
                 let Some(j) = j else { continue };
+                if inland && self.ocean[j as usize] {
+                    continue;
+                }
                 let other = self.filled[j as usize];
                 if other < level {
                     let slope = (f64::from(level) - f64::from(other)) / g.distance_m(next, j);
@@ -537,7 +613,7 @@ impl Routing {
         if let Some(v) = self.queue.pop_front() {
             let b = self.basins.len() as u32;
             for u in g.neighbours(v).into_iter().flatten() {
-                if self.basin_of[u as usize] == NO_BASIN && self.depressed(u) {
+                if self.basin_of[u as usize] == NO_BASIN && (self.depressed(u) || self.is_sink(u)) {
                     self.basin_of[u as usize] = b;
                     let open = self.open.as_mut().expect("a basin is open");
                     debug_assert_eq!(self.filled[u as usize], open.spill_m);
@@ -557,11 +633,16 @@ impl Routing {
             return 1;
         }
         let v = self.order[next as usize];
-        if self.basin_of[v as usize] == NO_BASIN && self.depressed(v) {
+        if self.basin_of[v as usize] == NO_BASIN && (self.depressed(v) || self.is_sink(v)) {
             // Scanning in pop order, the first node met of a basin is the one popped first.
             self.basin_of[v as usize] = self.basins.len() as u32;
             let parent = usize::from(self.parent[v as usize]);
-            let rim = g.neighbours(v)[parent].expect("a depressed node has a parent");
+            // An endorheic lake's sinks spill nowhere: the rim is the exit.
+            let rim = if self.is_sink(v) {
+                v
+            } else {
+                g.neighbours(v)[parent].expect("a depressed node has a parent")
+            };
             self.open = Some(Basin {
                 nodes: vec![v],
                 spill_m: self.filled[v as usize],
@@ -577,6 +658,7 @@ impl Routing {
     fn redirect(&mut self, g: &impl HydroGraph, basin: u32, k: u32) -> u32 {
         let Some(b) = self.basins.get(basin as usize) else {
             self.parent = Vec::new();
+            self.sink = Vec::new();
             self.queue = VecDeque::new();
             self.phase = Phase::Done;
             return 1;
@@ -588,7 +670,7 @@ impl Routing {
             };
             return 1;
         };
-        if v != b.exit {
+        if v != b.exit && self.receiver[v as usize] != RECEIVER_NONE {
             let r = usize::from(self.receiver[v as usize]);
             let to = g.neighbours(v)[r].expect("a basin node has a receiver");
             if self.basin_of[to as usize] != basin {

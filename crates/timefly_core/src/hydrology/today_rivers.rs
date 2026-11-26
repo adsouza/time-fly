@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use bevy_math::DVec3;
 use serde_json::Value;
 
-use super::params::TODAY_RIVER_BURN_M;
+use super::params::{DEPRESSION_EPS_M, TODAY_RIVER_BURN_M};
 use super::{CubeLattice, HydroGraph, NodeSource};
 use crate::geo::{RenderDir, geo_to_render, latlon_to_geo};
 
@@ -338,6 +338,12 @@ struct CourseLevel {
     node: u32,
     /// Routing's level: the running minimum.
     level: f32,
+    /// The elevation routing takes ([`course_levels`]): `level − TODAY_RIVER_BURN_M`, never below
+    /// 0 m on a node at or above sea level, and on such a node at least `DEPRESSION_EPS_M` above
+    /// the next node's (Task 11d fix round 2: a course keeps its order within 10 m of the sea).
+    route: f32,
+    /// The course's last burnable node: the only one that may meet the sea.
+    last: bool,
     /// The river graph's bed: the running minimum, sloped across held stretches.
     bed: f32,
     anchor: DVec3,
@@ -350,6 +356,10 @@ struct CourseLevel {
 ///   minimum, up to the next that lowers it): there it falls linearly by path length (`dist`
 ///   between consecutive nodes) from the held level toward the next lower one, so it never
 ///   rises and never stands above the level. After the last lowering it stays level.
+///
+/// Routing's elevation is `level − TODAY_RIVER_BURN_M`; on a node at or above sea level never
+/// below 0 m, and at least `DEPRESSION_EPS_M` above the next node's (taken from the course's end
+/// upstream), so a stretch the 0 m floor would flatten still falls toward the course's end.
 ///
 /// `add` gets each node that `burnable` allows; the others still feed the running minimum.
 fn course_levels(
@@ -380,6 +390,22 @@ fn course_levels(
         }
         path.push(m);
     }
+    // Routing's elevation, from the course's end upstream.
+    let burn = TODAY_RIVER_BURN_M as f32;
+    let eps = DEPRESSION_EPS_M as f32;
+    let mut route = vec![0.0f32; e.len()];
+    for k in (0..e.len()).rev() {
+        route[k] = if e[k] >= 0.0 {
+            let raw = (level[k] - burn).max(0.0);
+            match route.get(k + 1) {
+                Some(&down) => raw.max(down + eps),
+                None => raw,
+            }
+        } else {
+            level[k] - burn
+        };
+    }
+    let last = nodes.iter().rposition(|&(v, _)| burnable(v));
     let mut next = 0;
     for (k, &(v, anchor)) in nodes.iter().enumerate() {
         while next < setters.len() && setters[next] <= k {
@@ -402,6 +428,8 @@ fn course_levels(
             add(CourseLevel {
                 node: v,
                 level: clamp(held),
+                route: route[k],
+                last: last == Some(k),
                 bed: bed.min(clamp(held)),
                 anchor,
             });
@@ -505,9 +533,14 @@ pub fn course_beds<S: NodeSource>(
 /// anchor (ties: the first).
 #[derive(Default)]
 pub(crate) struct BurntNodes {
+    /// Each node and the lowest level any course gave it.
     list: Vec<(u32, f32)>,
+    /// Each node's lowest routing elevation any course gave it (`list`'s order).
+    routes: Vec<f32>,
     beds: Vec<(f32, DVec3)>,
     at: HashMap<u32, u32>,
+    /// The nodes that end a course (its last burnable node), which alone may meet the sea.
+    ends: Vec<u32>,
 }
 
 impl BurntNodes {
@@ -537,12 +570,32 @@ impl BurntNodes {
         &self.list
     }
 
+    /// The burnt nodes that end no course, sorted: routing never drains them into the ocean
+    /// (Task 11d fix round 2: a course meets the sea only at its own end).
+    pub(crate) fn inland(&self) -> Vec<u32> {
+        let mut ends = self.ends.clone();
+        ends.sort_unstable();
+        let mut out: Vec<u32> = self
+            .list
+            .iter()
+            .map(|&(v, _)| v)
+            .filter(|v| ends.binary_search(v).is_err())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     fn add(&mut self, c: CourseLevel) {
+        if c.last {
+            self.ends.push(c.node);
+        }
         match self.at.entry(c.node) {
             Entry::Occupied(o) => {
                 let k = *o.get() as usize;
                 let l = &mut self.list[k].1;
                 *l = l.min(c.level);
+                let r = &mut self.routes[k];
+                *r = r.min(c.route);
                 if c.bed < self.beds[k].0 {
                     self.beds[k] = (c.bed, c.anchor);
                 }
@@ -550,13 +603,18 @@ impl BurntNodes {
             Entry::Vacant(e) => {
                 e.insert(self.list.len() as u32);
                 self.list.push((c.node, c.level));
+                self.routes.push(c.route);
                 self.beds.push((c.bed, c.anchor));
             }
         }
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        8 * self.list.capacity() + 32 * self.beds.capacity() + 12 * self.at.capacity()
+        8 * self.list.capacity()
+            + 32 * self.beds.capacity()
+            + 12 * self.at.capacity()
+            + 4 * self.ends.capacity()
+            + 4 * self.routes.capacity()
     }
 }
 
@@ -628,19 +686,16 @@ impl TodayBurn {
         while used < budget {
             if let Some(start) = self.applying {
                 let list = &self.burnt.list;
+                let routes = &self.burnt.routes;
                 let end = start
                     .saturating_add((budget - used) as usize)
                     .min(list.len());
-                let burn = TODAY_RIVER_BURN_M as f32;
-                for &(v, level) in &list[start..end] {
+                for (&(v, _), &route) in list[start..end].iter().zip(&routes[start..end]) {
                     let e = &mut elevation[v as usize];
-                    // Never across sea level, so the burn changes no ocean.
-                    let routed = if *e >= 0.0 {
-                        (level - burn).max(0.0)
-                    } else {
-                        level - burn
-                    };
-                    *e = e.min(routed);
+                    // Never across sea level, so the burn changes no ocean (`route` is never below
+                    // 0 m on land). On land it is set: the course's fall of DEPRESSION_EPS_M a node
+                    // may stand a little above the node's own height near the sea.
+                    *e = if *e >= 0.0 { route } else { e.min(route) };
                 }
                 used += (end - start) as u32;
                 self.applying = Some(end);

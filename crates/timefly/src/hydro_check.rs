@@ -1438,6 +1438,7 @@ pub fn hydro_check(
             DISCHARGE_FLAG_RATIO
         ));
     }
+    lines.push(surplus_line(hydro));
     let precip_at = |v: u32| {
         let d = hydro.lattice.dir(v);
         let e = field.sample_overview(d).elevation_m as f32;
@@ -1455,8 +1456,52 @@ pub fn hydro_check(
     let names: Vec<&str> = rivers.iter().map(|r| r.name.as_str()).collect();
     let beds = course_beds(&hydro.lattice, rivers, &source);
     lines.extend(burn_depth_lines(&hydro.lattice, &beds, &names));
+    // Every lake, one line each (Task 11d fix round 2): for diffing lakes between runs.
+    let tsv = out_dir.join("hydro-check-lakes.tsv");
+    fs::write(&tsv, lakes_tsv(hydro)).map_err(|e| format!("{}: {e}", tsv.display()))?;
     lines.push(format!("hydro check {}", verdict(pass)));
     Ok(HydroCheckReport { lines, pass, svgs })
+}
+
+/// Informative (Task 11d fix round 2): each endorheic table lake's surplus, the inflow beyond
+/// its evaporation capacity, which the pass reports and does not route.
+pub fn surplus_line(hydro: &EraHydrology) -> String {
+    let held: Vec<String> = hydro
+        .lakes
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.surplus_m3s > 0.0)
+        .map(|(k, l)| {
+            let (lat, lon) = latlon(hydro.lattice.dir(l.exit).0);
+            format!(
+                "lake {k} ({:?}, {:.1} m, {:.0} km2) at ({lat:.2}, {lon:.2}): surplus {:.0} m3/s of \
+                 {:.0} in",
+                l.kind, l.level_m, l.area_km2, l.surplus_m3s, l.inflow_m3s
+            )
+        })
+        .collect();
+    format!(
+        "endorheic lakes' surplus (informative, not routed): {} [{}]",
+        held.len(),
+        held.join("; ")
+    )
+}
+
+/// Every lake as a tab-separated line: index, kind, level, area, inflow, evaporation, outflow
+/// and its exit's (lat, lon), under a header.
+pub fn lakes_tsv(hydro: &EraHydrology) -> String {
+    let mut out = String::from(
+        "lake\tkind\tlevel_m\tarea_km2\tinflow_m3s\tevaporation_m3s\toutflow_m3s\tlat\tlon\n",
+    );
+    for (k, l) in hydro.lakes.iter().enumerate() {
+        let (lat, lon) = latlon(hydro.lattice.dir(l.exit).0);
+        let _ = writeln!(
+            out,
+            "{k}\t{:?}\t{:.1}\t{:.0}\t{:.1}\t{:.1}\t{:.1}\t{lat:.3}\t{lon:.3}",
+            l.kind, l.level_m, l.area_km2, l.inflow_m3s, l.evaporation_m3s, l.outflow_m3s
+        );
+    }
+    out
 }
 
 /// The burn's depth below the terrain over `beds` (`e − bed`): its maximum, 99th percentile and

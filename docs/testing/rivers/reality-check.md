@@ -27,6 +27,77 @@ Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (162
 
 ## Result, 2026-11-26 (Task 11d: the world's major river systems)
 
+### Fix round 2 (2026-11-26)
+
+The controller's rulings:
+- **A. The Caspian is a cited endorheic lake.** `lake_levels.json` flags the Caspian alone (`endorheic: true`). The source is Wikipedia's "Caspian Sea", read 2026-11-26: "An endorheic basin…"; its infobox gives the type "Endorheic" and the outflow "Evaporation". The Dead Sea and the Great Salt Lake are the lake map's, not the table's, so they carry no flag. A flagged lake:
+  - is terminal whatever its balance, with its surplus reported (`Lake::surplus_m3s`, the check's "endorheic lakes' surplus" line);
+  - has its nodes at or below its level seed routing like the sea at that level (`Routing::with_sinks`), so the land around it drains by descent instead of filling to its spill.
+
+  Unflagged lakes keep their rules. `hydro_ref.py` mirrors the seeding (`route(..., sinks=)`, `resolve_lakes(..., endorheic=)`). A flagged table lake inside a reference box is mirrored; an unflagged one is still refused.
+- **B. Burnt courses keep their order.** A course node's routing elevation is computed from the course's end upstream: `level − 10 m`, never below 0 m on land, and at least `DEPRESSION_EPS_M` (0.01 m) above the next node's. A stretch the 0 m floor would flatten now still falls toward the course's end. A burnt node that ends no course never drains into an ocean neighbour (`Routing::with_inland`), so a course meets the sea only at its own end.
+- **C. Lake-centreline parts are oriented by their connections first** (`orient_lake_parts`). An end at an oriented course's first point is the part's downstream end; an end at a course's last point is its upstream end. This is repeated, so chains of reservoirs resolve. ETOPO decides only where neither end connects or the ends disagree.
+  - Of the 183 parts: 149 were oriented by connection, 27 by ETOPO (no connection) and 7 were ambiguous (ETOPO). 14 parts changed direction, among them the Zambezi's Cahora Bassa, three Columbia reservoirs, the Volta and the Firat.
+  - Spot checks:
+    - The Novosibirsk Reservoir runs Kamen (53.89, 81.33) to the dam (54.85, 83.03), by connection.
+    - Krasnoyarsk, Lake Nasser and Tsimlyansk (Don) are oriented by connection, all downstream.
+    - The Volga: six reservoir parts by connection. The Gorky, Saratov and Volgograd reservoirs fell back to ETOPO, because their neighbours include the river part between Saratov and Balakovo, which ETOPO orients the wrong way. All three still run downstream.
+
+The table is 964,421 bytes (unchanged). Run: `dev` profile. Pass time at 0 ka 1.33 s (0.20 s sampling); 118,963 river nodes (118,753 before the round), 861 lakes.
+
+**hydro check: FAIL.** 20 of 22 outlets pass (19 before):
+- **Yangtze:** fails on its tolerance only, 162 km, awaiting the owner.
+- **Mississippi:** fails on its New Orleans via only, 23.1 km; it ends 137 km from its mouth.
+- **Indus box:** fails on its links, as before.
+
+| Bar | Before this round (round 1) | After | Verdict |
+|---|---|---|---|
+| Indus box, relaxed | 81.3%, 73/84, worst 77.5 km | the same | FAIL (links only) |
+| Amazon flats | 91.6%, 458/482 | the same | PASS |
+| The five lakes | exact | exact (the Caspian −28.0 m: its seeded lake holds the table's level) | PASS |
+| Arid basins | 0 of 3, 0 of 2 | the same | PASS |
+| Danube | 0.3 km, 42 km | the same | PASS |
+| Jhelum / Indus | 1.1 km; 7 km | 1.1 km; 21 km (the delta's course now leads to its own end) | PASS |
+| Ganges / Brahmaputra | 110 km | 95 km | PASS |
+| Mekong | 91 km | 103 km | PASS |
+| Nile | 136 km | 138 km | PASS |
+| Niger, Congo, Hudson, Yenisei, Ob, Paraná, Lena, Mackenzie, Yellow, Pearl | — | the same margins | PASS |
+| Orinoco | 27 km | 11 km | PASS |
+| Yangtze | 162 km | 162 km | **FAIL** (12 km over) |
+| Mississippi | 170 km; New Orleans 51.8 km | 137 km; New Orleans 23.1 km | **FAIL** (the via, 8.1 km over) |
+| Volga | Volgograd 157.3 km; the Sea of Azov | Volgograd 13.0 km; ends in the Caspian, 70 km from its mouth | **PASS** |
+| Discharge flags | Nile 5.11; Volga no river | Nile 5.11 only; Volga at Volgograd 10,118 m³/s, ratio 1.23 | |
+| Endorheic surplus | — | the Caspian: 3,449 of 12,853 m³/s in, not routed | |
+| Burnt nodes | 31,987; p99 434 m; 4,622 over 50 m | 31,987; p99 439 m; 4,638 over 50 m | |
+
+Other discharge moves, all under 3%:
+- Mekong at Kratié: 7,603 → 7,842 m³/s.
+- Hudson: 412 → 407.
+- Yenisei: 20,051 → 20,053.
+- Ob: 17,977 → 17,979.
+- Paraná: 25,644 → 25,647.
+- Lena: 17,592 → 17,588.
+
+**The lakes, diffed.** The check now writes `hydro-check-lakes.tsv`: every lake's kind, level, area, inflow, evaporation, outflow and exit. The round's start (commit c1ddda6, rebuilt with only that dump added) was diffed against this run by each lake's exit. Of 861 lakes, 840 are identical. The rest:
+- **The Caspian:** Open → Terminal, 3,270 → 0 m³/s out (the flag). Its exit moved, since its basin is now its sinks.
+- **One lake's exit moved with the same flows:** lake 497, 421.9 m, in Sweden.
+- **19 lakes changed inflow, and so outflow, because the routing upstream of them changed.** None changed its kind, and none lost an outflow by a lake rule.
+  - Lake Elton (49.10, 46.66): 10,041 → 0.7 m³/s in. The Volga no longer runs through it; it keeps its 0.7 m³/s and evaporates it.
+  - Five small lakes in the Caspian depression: 481 → 5 m³/s at (50.56, 51.69), 21 → 54 at (48.79, 50.15), and three under 6 m³/s. Their basin now drains by descent to the Caspian.
+  - Flathead Lake (47.80, −114.08): 792 → 921. Pend Oreille (48.21, −116.34): 954 → 1,083. The Clark Fork's reservoir parts were reoriented.
+  - Ladoga's outlet at (59.98, 31.15): 2,503 → 2,440.
+  - Lake Constance (47.69, 9.06): 414 → 430. The Rhine's lake part was reoriented.
+  - A lake by the Yellow River's source (34.90, 97.28): 25 → 39.
+  - Eight more, each by under 3%.
+
+Pictures:
+- The Volga before and after this round: [hydro-check-outlet-volga-before.svg](hydro-check-outlet-volga-before.svg), [hydro-check-outlet-volga.svg](hydro-check-outlet-volga.svg).
+- The rivers that still fail: [hydro-check-outlet-mississippi.svg](hydro-check-outlet-mississippi.svg) and [hydro-check-outlet-yangtze.svg](hydro-check-outlet-yangtze.svg).
+
+**The Mississippi now.** Rule B holds it on its course past LaPlace. Its course nodes route 0.69, 0.38 and 0.04 m toward the Gulf, and none drains into the Maurepas–Pontchartrain ocean node beside it. At (29.97, −90.45) its next course node, (29.97, −90.32), is itself an ocean node: Lake Pontchartrain's south shore at Kenner falls inside that 10 km cell. The burn never turns ocean into land, so the course meets the sea there, 23.1 km from New Orleans' point and 137 km from the Head of Passes. This is a lattice-resolution limit, not a rule fault. It goes to the owner unchanged.
+
+**The Yangtze** is as round 1 left it: 162 km from its cited outer mouth, where the game's sea begins up the estuary. It waits on the owner's allowance.
+
 ### Fix round 1 (2026-11-26)
 
 One review finding, one controller ruling and three owner decisions:

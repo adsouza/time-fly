@@ -43,8 +43,10 @@
 //!   is trusted over the data's 10 km spill); footprint = non-ice nodes with e < L. It drains
 //!   by its surplus, whatever L is against the spill: Open if Q_in > Σc over the nodes below L
 //!   (outflow = Q_in − Σc, evaporation = Σc, and the exit then joins the footprint as its
-//!   outlet unless ice), else Terminal (outflow 0, evaporation = Q_in). It overrides every rule
-//!   below.
+//!   outlet unless ice), else Terminal (outflow 0, evaporation = Q_in). An endorheic table lake
+//!   (the Caspian; its basin is the sinks routing seeded) is Terminal whatever its balance, its
+//!   surplus max(0, Q_in − Σc) reported, not routed (Task 11d fix round 2). It overrides every
+//!   rule below.
 //! A flat basin: if Q_in ≥ DATA_LAKE_MIN_BALANCE × Σc and at least DATA_LAKE_MIN_NODES of its
 //!   nodes are mapped: Data lake at level = spill = min e, footprint = all its nodes, outflow =
 //!   max(0, Q_in − Σc), evaporation = Q_in − outflow. Otherwise no lake (it passes Q_in on).
@@ -128,6 +130,10 @@ pub struct Lake {
     /// basin's rim), or for a past era's capped mapped lake its outlet among its own nodes, and
     /// for a present-day mapped lake its outlet ([`super::today`]).
     pub exit: u32,
+    /// What an endorheic table lake (the Caspian) receives beyond its evaporation capacity
+    /// (m³/s): it is terminal whatever its balance, and the surplus is reported, not routed
+    /// (Task 11d fix round 2). 0 for every other lake.
+    pub surplus_m3s: f64,
 }
 
 /// A footprint node: its lake and its distance from the shore in nodes (1 on the shore).
@@ -231,6 +237,8 @@ pub(crate) struct Accumulation {
     first_flat: u32,
     /// `(basin, level)` from the lake level table, sorted by basin ([`place_levels`]).
     levels: Vec<(u32, f32)>,
+    /// Endorheic table lakes' basins, sorted ([`Accumulation::set_endorheic`]).
+    endorheic: Vec<u32>,
     /// The nodes a present-day mapped lake holds, sorted by node ([`Accumulation::set_mapped`]).
     /// Empty without data lakes.
     mapped: Vec<(u32, MappedLake)>,
@@ -609,6 +617,7 @@ impl Accumulation {
         Self {
             first_flat,
             levels: Vec::new(),
+            endorheic: Vec::new(),
             mapped: Vec::new(),
             present: false,
             own: None,
@@ -625,6 +634,13 @@ impl Accumulation {
     }
 
     /// Sets the table's basin levels ([`place_levels`]).
+    /// The basins of endorheic table lakes, sorted: terminal whatever their balance (Task 11d
+    /// fix round 2).
+    pub fn set_endorheic(&mut self, mut basins: Vec<u32>) {
+        basins.sort_unstable();
+        self.endorheic = basins;
+    }
+
     pub fn set_levels(&mut self, levels: Vec<(u32, f32)>) {
         self.levels = levels;
     }
@@ -904,6 +920,7 @@ impl Accumulation {
                 outflow_m3s: outflow,
                 area_km2: area,
                 exit: basin.exit,
+                surplus_m3s: 0.0,
             }
         };
 
@@ -963,7 +980,10 @@ impl Accumulation {
             // It drains by its surplus, whatever its level against the data's spill: the
             // table's levels are low-water datums, and the data's outlet can stand above them.
             let capacity: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
-            Some(if q_in > capacity {
+            // An endorheic lake (the Caspian; Task 11d fix round 2) is terminal whatever its
+            // balance: its surplus is reported, not routed.
+            let endorheic = self.endorheic.binary_search(&(b as u32)).is_ok();
+            Some(if q_in > capacity && !endorheic {
                 footprint[exit_k] |= !iced[exit_k];
                 let outflow = q_in - capacity;
                 let lake = make_lake(LakeKind::Open, level, capacity, outflow, &footprint);
@@ -971,7 +991,10 @@ impl Accumulation {
                     lake: Some((lake, footprint)),
                 }
             } else {
-                let lake = make_lake(LakeKind::Terminal, level, q_in, 0.0, &footprint);
+                let mut lake = make_lake(LakeKind::Terminal, level, q_in, 0.0, &footprint);
+                if endorheic {
+                    lake.surplus_m3s = (q_in - capacity).max(0.0);
+                }
                 Outcome::Sink {
                     lake: Some((lake, footprint)),
                     sinks,
@@ -1862,6 +1885,79 @@ mod tests {
         assert_eq!(acc.q[rim as usize], 5.0);
         let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
         assert!(footprint.iter().all(|&v| elevation[v as usize] < 15.0));
+    }
+
+    /// Task 11d fix round 2 (ruling A): an endorheic table lake (the Caspian, its level 69 m
+    /// under its Manych spill) is terminal whatever its balance, and its nodes below its level
+    /// seed routing like the sea at that level, so the land around it drains to it by descent
+    /// instead of filling to the spill. An unflagged lake at its level is unchanged.
+    #[test]
+    fn an_endorheic_table_lake_is_terminal_and_its_land_drains_by_descent() {
+        let (g, elevation) = deep_bowl();
+        let centre = g.node(4, 6);
+        let rim = g.node(4, 1);
+        // 17 m: above the lake's 15 m, under the bowl's 50 m spill.
+        let slope = g.node(4, 3);
+        let run = |endorheic: bool| {
+            let mut routing = Routing::new(elevation.clone());
+            if endorheic {
+                routing = routing.with_sinks(vec![(centre, 15.0)]);
+            }
+            while !routing.step(&g, 7) {}
+            let mut r = routing.finish();
+            let first_flat = r.basins.len() as u32;
+            let (placed, unplaced) = place_levels(&r, first_flat, &|_| false, &[(centre, 15.0)]);
+            assert!(unplaced.is_empty(), "{endorheic}");
+            let mut acc = Accumulation::new(g.len(), first_flat);
+            acc.set_levels(placed.clone());
+            if endorheic {
+                acc.set_endorheic(placed.iter().map(|p| p.0).collect());
+            }
+            acc.set_mapped(Vec::new());
+            while !acc.init_step(&g, &r, |_, _| 5.0, 7).0 {}
+            while !acc
+                .walk_step(&g, &mut r, &|_| false, |_, _, _| 0.1, true, 7)
+                .0
+            {}
+            (r, acc)
+        };
+        // Unflagged: humid, so open over the rim, and the slope lies in the filled basin.
+        let (r, acc) = run(false);
+        let open = &acc.lakes[0];
+        assert_eq!((open.kind, open.level_m), (LakeKind::Open, 15.0));
+        assert!(open.outflow_m3s > 0.0 && acc.q[rim as usize] > 5.0);
+        assert_eq!(open.surplus_m3s, 0.0);
+        assert_ne!(r.basin_of[slope as usize], NO_BASIN);
+        // Flagged: terminal at its level, the surplus reported, nothing over the rim.
+        let (r, acc) = run(true);
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let lake = &acc.lakes[0];
+        assert_eq!((lake.kind, lake.level_m), (LakeKind::Terminal, 15.0));
+        assert_eq!(
+            (lake.outflow_m3s, lake.evaporation_m3s),
+            (0.0, lake.inflow_m3s)
+        );
+        let wet = (0..g.len())
+            .filter(|&v| (0.0..15.0).contains(&elevation[v as usize]))
+            .count();
+        assert!(
+            (lake.surplus_m3s - (lake.inflow_m3s - 0.1 * wet as f64)).abs() < 1e-9,
+            "{lake:?}"
+        );
+        assert!(
+            lake.surplus_m3s > 1.0,
+            "the hazard: an open balance: {lake:?}"
+        );
+        assert_eq!(acc.q[rim as usize], 5.0);
+        // The slope is in no basin: it drains to a lower neighbour, by descent.
+        assert_eq!(r.basin_of[slope as usize], NO_BASIN);
+        let down = receiver_of(&g, &r, slope).expect("the slope drains");
+        assert!(elevation[down as usize] < elevation[slope as usize]);
+        // Every node of the bowl reaches the lake.
+        let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+        assert!(footprint.contains(&centre));
+        // At least the bowl's 7 x 8 nodes inside its rim.
+        assert!(lake.inflow_m3s >= 5.0 * 56.0 - 1e-6, "{lake:?}");
     }
 
     #[test]

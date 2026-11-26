@@ -30,7 +30,8 @@ component that touches the box's edge, not only the largest (the box cuts the op
 pieces); and the box's edge nodes are extra flood seeds, so water may leave the box (an edge
 node with no lower neighbour has no receiver). No node is ice. Table lakes (the lake level table)
 are not mirrored: none lies in a reference box, and :func:`reference` refuses a box that holds
-one. The data-flat and past-era rules of ``lakes.rs`` are not mirrored either: they never run at
+one, except an endorheic one (the Caspian; Task 11d fix round 2), whose nodes below its level
+seed routing and make a terminal lake (:func:`route`'s ``sinks``). The data-flat and past-era rules of ``lakes.rs`` are not mirrored either: they never run at
 the present-day snapshot.
 
 The fixture (:func:`reference`)::
@@ -301,10 +302,13 @@ class Routed:
 
 
 @traced
-def route(graph, elevation, ocean, outlets=None) -> Routed:
+def route(graph, elevation, ocean, outlets=None, sinks=None) -> Routed:
     """``route.rs``'s flood, receivers and basins for a given ``ocean``. ``outlets`` (a list of
     flags, the box's edge) are land nodes seeded with the coast, in ascending id: water reaches
-    them at their own level and leaves (no receiver unless a neighbour is lower)."""
+    them at their own level and leaves (no receiver unless a neighbour is lower). ``sinks``
+    (``[(node, level)]``, endorheic lakes; Task 11d fix round 2): the non-ocean nodes with
+    ``e <= level`` 8-connected to ``node`` are pushed first at ``level``, with no parent and no
+    receiver, and make one basin whose rim is its exit."""
     n = len(graph)
     e = [float(x) for x in elevation]
     filled = list(e)
@@ -312,6 +316,22 @@ def route(graph, elevation, ocean, outlets=None) -> Routed:
     parent = [RECEIVER_NONE] * n
     heap: list[tuple[float, int, int]] = []
     seq = 0
+    sink = [False] * n
+    for node, level in sinks or ():
+        if ocean[node] or visited[node] or e[node] > level:
+            continue
+        visited[node] = True
+        queue = deque([node])
+        while queue:
+            v = queue.popleft()
+            sink[v] = True
+            filled[v] = float(level)
+            heapq.heappush(heap, (filled[v], seq, v))
+            seq += 1
+            for u in graph.neighbours(v):
+                if u is not None and not ocean[u] and not visited[u] and e[u] <= level:
+                    visited[u] = True
+                    queue.append(u)
     any_seed = any(ocean) or (outlets is not None and any(outlets))
     if any_seed:
         for i in range(n):
@@ -343,7 +363,7 @@ def route(graph, elevation, ocean, outlets=None) -> Routed:
             seq += 1
     receiver = [RECEIVER_NONE] * n
     for i in range(n):
-        if ocean[i]:
+        if ocean[i] or sink[i]:
             continue
         level = filled[i]
         best_k, best_s = -1, 0.0
@@ -358,14 +378,14 @@ def route(graph, elevation, ocean, outlets=None) -> Routed:
     basins: list[Basin] = []
 
     def depressed(i: int) -> bool:
-        return filled[i] - e[i] > DEPRESSION_EPS_M
+        return filled[i] - e[i] > DEPRESSION_EPS_M or sink[i]
 
     for v in order:
         if basin_of[v] != NO_BASIN or not depressed(v):
             continue
         b = len(basins)
         basin_of[v] = b
-        rim = graph.neighbours(v)[parent[v]]
+        rim = v if sink[v] else graph.neighbours(v)[parent[v]]
         nodes = [v]
         queue = deque([v])
         while queue:
@@ -379,7 +399,7 @@ def route(graph, elevation, ocean, outlets=None) -> Routed:
         basins.append(Basin(nodes, filled[v], v, rim))
     for b, basin in enumerate(basins):
         for v in basin.nodes:
-            if v == basin.exit:
+            if v == basin.exit or receiver[v] == RECEIVER_NONE:
                 continue
             to = graph.neighbours(v)[receiver[v]]
             if basin_of[to] != b:
@@ -413,6 +433,8 @@ class Lake:
     area_km2: float
     exit: int
     footprint: list[int] = field(default_factory=list)
+    #: An endorheic lake's inflow beyond its evaporation capacity (Task 11d fix round 2).
+    surplus_m3s: float = 0.0
 
 
 @dataclass
@@ -451,12 +473,14 @@ def _f32(x: float) -> float:
 
 
 @traced
-def resolve_lakes(graph, routed: Routed, own, capacity, mapped=None) -> Accumulated:
+def resolve_lakes(graph, routed: Routed, own, capacity, mapped=None, endorheic=None) -> Accumulated:
     """``lakes.rs``'s discharge with the lake hook, rewriting ``routed.receiver`` inside basins.
     ``own(i, area_m2)`` is a land node's runoff (m³/s), ``capacity(i, e, area_m2)`` its lake
     evaporation capacity (m³/s). Without ``mapped`` it is the plain water balance (data lakes
     off, the golden fixture); with ``mapped`` (``{node: (map id, surface)}``) it is the
-    present-day mode: no lake but the map's (``today.rs``)."""
+    present-day mode: no lake but the map's (``today.rs``). ``endorheic`` (``{basin: level}``,
+    the sinks of :func:`route`) makes each such basin a terminal lake at its level whatever its
+    balance, its surplus reported (``lakes.rs``'s endorheic table lake; Task 11d fix round 2)."""
     n = len(graph)
     ocean = routed.ocean
     q = np.zeros(n, dtype=np.float32)
@@ -482,10 +506,69 @@ def resolve_lakes(graph, routed: Routed, own, capacity, mapped=None) -> Accumula
                     q[j] += q[i]
                     area[j] += area[i]
         elif routed.basins[b].exit == i:
-            _resolve(graph, routed, b, q, area, capacity, present, lakes, lake_of, state)
+            level = (endorheic or {}).get(b)
+            if level is not None:
+                _endorheic(graph, routed, b, level, q, area, capacity, lakes, lake_of, state)
+            else:
+                _resolve(graph, routed, b, q, area, capacity, present, lakes, lake_of, state)
     if present:
         q, area = _today(graph, routed, own_q, own_area, q, capacity, mapped, lakes, lake_of, state)
     return Accumulated(q, area, lakes, lake_of, state["evaporated"])
+
+
+def _endorheic(graph, routed, b, level, q, area, capacity, lakes, lake_of, state) -> None:
+    """An endorheic lake's basin (``lakes.rs``'s table branch, flagged): a terminal lake at
+    ``level`` over its nodes below it, which keep their water; the others route to them by BFS."""
+    basin = routed.basins[b]
+    nodes = basin.nodes
+    m = len(nodes)
+    local = {v: k for k, v in enumerate(nodes)}
+    ev = routed.elevation_m
+    e = [ev[v] for v in nodes]
+    q_in = 0.0
+    for v in nodes:
+        q_in += float(q[v])
+    sinks = [x < level for x in e]
+    capacity_sum = sum(capacity(v, ev[v], graph.area_m2(v)) for k, v in enumerate(nodes) if sinks[k])
+    inside = [[None if j is None else local.get(j, -1) for j in graph.neighbours(v)] for v in nodes]
+    dist = [-1] * m
+    queue = deque(k for k in range(m) if sinks[k])
+    for k in queue:
+        dist[k] = 0
+    while queue:
+        k = queue.popleft()
+        for j in inside[k]:
+            if j is not None and j >= 0 and dist[j] < 0:
+                dist[j] = dist[k] + 1
+                queue.append(j)
+    receiver = routed.receiver
+    target = [-1] * m
+    for k in range(m):
+        if sinks[k]:
+            continue
+        best = None
+        for slot, j in enumerate(inside[k]):
+            if j is None or j < 0:
+                continue
+            if dist[j] < dist[k] and (best is None or e[j] < e[best[1]]):
+                best = (slot, j)
+        receiver[nodes[k]] = best[0]
+        target[k] = best[1]
+    for k in sorted((k for k in range(m) if not sinks[k]), key=lambda k: (-dist[k], k)):
+        f, t = nodes[k], nodes[target[k]]
+        q[t] += q[f]
+        area[t] += area[f]
+    state["evaporated"] += q_in
+    for k in range(m):
+        if sinks[k]:
+            receiver[nodes[k]] = RECEIVER_NONE
+    lake = Lake(_f32(level), basin.spill_m, "Terminal", q_in, q_in, 0.0, 0.0, basin.exit)
+    lake.surplus_m3s = max(0.0, q_in - capacity_sum)
+    lake.footprint = [nodes[k] for k in range(m) if sinks[k]]
+    lake.area_km2 = sum(graph.area_m2(v) * 1e-6 for v in lake.footprint)
+    for v in lake.footprint:
+        lake_of[v] = len(lakes)
+    lakes.append(lake)
 
 
 def _resolve(graph, routed, b, q, area, capacity, present, lakes, lake_of, state) -> None:
@@ -959,10 +1042,12 @@ def reference_from_grid(
     lake_levels=None,
     straits=(),
     min_area_km2: float = LINK_MIN_AREA_KM2,
+    endorheic=(),
 ) -> dict:
     """The fixture for ``box`` from its 60 arc-second ``elevation`` (rows from the north),
     the 0 ka climate grid, the climate table, the lake map (``lake_ids`` at 0.05 degrees with
-    ``lake_levels``; none without) and the straits and gorges (``straits.json``'s entries)."""
+    ``lake_levels``; none without), the straits and gorges (``straits.json``'s entries) and the
+    endorheic table lakes in the box (``[(lat, lon, level)]``; Task 11d fix round 2)."""
     lat_n, lon_w, lat_s, lon_e = box
     rows, cols = elevation.shape
     if (rows, cols) != (round((lat_n - lat_s) * PER_DEG), round((lon_e - lon_w) * PER_DEG)):
@@ -979,7 +1064,18 @@ def reference_from_grid(
     _log.info("box %s: %d x %d nodes", box, rows, cols)
     ocean = ocean_mask(g, elev, extra_components=True)
     outlets = [g.edge(i) and not ocean[i] for i in range(len(g))]
-    routed = route(g, elev, ocean, outlets)
+    sinks = [
+        (
+            min(rows - 1, int((lat_n - la) * PER_DEG)) * cols
+            + min(cols - 1, int((lo - lon_w) * PER_DEG)),
+            float(np.float32(level)),
+        )
+        for la, lo, level in endorheic
+    ]
+    routed = route(g, elev, ocean, outlets, sinks=sinks)
+    endorheic_basins = {
+        routed.basin_of[v]: level for v, level in sinks if routed.basin_of[v] != NO_BASIN
+    }
     _log.info("routed: %d basins", len(routed.basins))
     precip, temp = node_climate(climate, table, lat, lon, e)
     run = runoff_mm(table, precip, temp).astype(np.float64)
@@ -1001,7 +1097,7 @@ def reference_from_grid(
         for v in np.flatnonzero(ids):
             lid = int(ids[v])
             mapped[int(v)] = (lid, float(lake_levels[lid - 1]))
-    acc = resolve_lakes(g, routed, own, capacity, mapped=mapped)
+    acc = resolve_lakes(g, routed, own, capacity, mapped=mapped, endorheic=endorheic_basins)
     links = _links(g, routed, acc, min_area_km2)
     lakes = _lakes(g, routed, acc, precip.astype(np.float64))
     _log.info("%d links, %d large lakes, %d lakes in all", len(links), len(lakes), len(acc.lakes))
@@ -1023,9 +1119,13 @@ def reference(
     hydrology_dir = Path(hydrology_dir or HYDROLOGY_DIR)
     table = json.loads(Path(table_path or hydrology_dir / "climate_table.json").read_text())
     lat_n, lon_w, lat_s, lon_e = box
+    endorheic = []
     for level in json.loads((hydrology_dir / "lake_levels.json").read_text())["lakes"]:
         if lat_s <= level["lat"] <= lat_n and lon_w <= level["lon"] <= lon_e:
-            raise ValueError(f"{level['name']} is a table lake inside {box}: not mirrored")
+            # An endorheic table lake is mirrored (Task 11d fix round 2); the others are not.
+            if not level.get("endorheic", False):
+                raise ValueError(f"{level['name']} is a table lake inside {box}: not mirrored")
+            endorheic.append((level["lat"], level["lon"], level["level_m"]))
     ids, levels = lakemap.decode((hydrology_dir / "lake_map.bin").read_bytes())
     straits = json.loads((hydrology_dir / "straits.json").read_text())["straits"]
     return reference_from_grid(
@@ -1037,6 +1137,7 @@ def reference(
         levels,
         straits,
         min_area_km2,
+        endorheic,
     )
 
 

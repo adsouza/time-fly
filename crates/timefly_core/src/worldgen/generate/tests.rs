@@ -2804,6 +2804,7 @@ mod water {
             outflow_m3s: 90.0,
             area_km2: 1000.0,
             exit: nodes[0].0,
+            surplus_m3s: 0.0,
         };
         let hydro = river_hydro(lattice, &[], vec![lake]).with_lake_nodes(&nodes);
         let field = FnField {

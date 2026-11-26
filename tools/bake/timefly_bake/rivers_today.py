@@ -17,6 +17,9 @@ routing wherever the terrain is today's (``timefly_core::hydrology::today_rivers
   ``data/hydrology/rivers_extra.json`` holds a delta's main channel where Natural Earth's course
   stops above it, each entry cited (:func:`read_extras`). They are appended after Natural
   Earth's courses as given: already upstream first and simplified.
+- **Orient lake centrelines by their connections** (Task 11d fix round 2): a reservoir's ends
+  are flat water, so the oriented courses it joins decide (:func:`orient_lake_parts`); ETOPO
+  only where neither end connects, or the ends disagree.
 - **Orient:** upstream first. Each end's height is the lowest ETOPO 2022 60″ surface cell whose
   centre lies within :data:`ORIENT_CELLS` cells (2′) of the end's cell, in both rows and columns;
   the higher end goes first. Ties keep Natural Earth's order.
@@ -82,6 +85,8 @@ class Polyline:
     scalerank: int
     #: ``(n, 2)`` float64 (lat, lon) degrees.
     points: np.ndarray
+    #: A ``Lake Centerline`` part (oriented by :func:`orient_lake_parts`).
+    lake: bool = False
 
 
 class CellGrid:
@@ -167,8 +172,56 @@ def select(features, cover=None) -> list[Polyline]:
             points = lonlat[:, ::-1].copy()
             if lake and cover(name, points) >= LAKE_CENTRELINE_MAX_COVER:
                 continue
-            out.append(Polyline(name, _rank(p), points))
+            out.append(Polyline(name, _rank(p), points, lake))
     return out
+
+
+def _key(point) -> tuple[float, float]:
+    return (round(float(point[0]), 6), round(float(point[1]), 6))
+
+
+@traced
+def orient_lake_parts(lakes, rivers, fallback) -> tuple[list[Polyline], dict]:
+    """The lake centreline parts ``lakes`` upstream first, by their connections to the oriented
+    ``rivers``: an end at a course's first point (its upstream end) is the part's downstream end,
+    an end at a course's last point its upstream end. Repeated, so a chain of parts resolves from
+    the courses it joins. A part whose ends disagree, or which touches nothing, takes
+    ``fallback(part)`` (ETOPO). Returns the parts in their order and the counts by rule:
+    ``{"topology", "etopo", "ambiguous"}``."""
+    firsts = {_key(p.points[0]) for p in rivers}
+    lasts = {_key(p.points[-1]) for p in rivers}
+    done: dict[int, Polyline] = {}
+    ambiguous: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for k, part in enumerate(lakes):
+            if k in done or k in ambiguous:
+                continue
+            a, b = _key(part.points[0]), _key(part.points[-1])
+            keep = (a in lasts) or (b in firsts)
+            flip = (a in firsts) or (b in lasts)
+            if keep and flip:
+                ambiguous.add(k)
+                continue
+            if not (keep or flip):
+                continue
+            out = part
+            if flip:
+                out = Polyline(part.name, part.scalerank, part.points[::-1].copy(), True)
+            done[k] = out
+            firsts.add(_key(out.points[0]))
+            lasts.add(_key(out.points[-1]))
+            changed = True
+    counts = {"topology": len(done), "etopo": 0, "ambiguous": len(ambiguous)}
+    result = []
+    for k, part in enumerate(lakes):
+        if k in done:
+            result.append(done[k])
+        else:
+            counts["etopo"] += k not in ambiguous
+            result.append(fallback(part))
+    return result, counts
 
 
 @traced
@@ -316,7 +369,13 @@ def bake(
         if abs(float(lon[0]) + 180.0 - 0.5 / 60) > 1e-6:
             raise ValueError(f"{Path(etopo_path).name}: longitudes do not start at -180")
         grid = CellGrid(z, lat_s=-90.0, lon_w=-180.0, per_deg=60)
-        oriented = [orient(p, grid) for p in selected]
+        rivers = [orient(p, grid) for p in selected if not p.lake]
+        lakes = [p for p in selected if p.lake]
+        lakes_oriented, orient_counts = orient_lake_parts(
+            lakes, rivers, lambda p: orient(p, grid)
+        )
+        by_kind = {False: iter(rivers), True: iter(lakes_oriented)}
+        oriented = [next(by_kind[p.lake]) for p in selected]
     reversed_count = sum(
         1 for a, b in zip(selected, oriented) if a.points[0].tolist() != b.points[0].tolist()
     )
@@ -338,6 +397,7 @@ def bake(
         "points_out": sum(len(r["points"]) for r in table["rivers"]),
         "bytes": size,
         "extras": [p.name for p in extras],
+        "lake_orientation": orient_counts,
         "lake_centrelines_added": lake_parts["added"],
         "lake_centrelines_covered": lake_parts["covered"],
     }
@@ -381,6 +441,7 @@ __all__ = [
     "lake_cover",
     "main",
     "orient",
+    "orient_lake_parts",
     "read_extras",
     "select",
     "simplify",

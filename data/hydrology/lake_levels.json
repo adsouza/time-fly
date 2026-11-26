@@ -8,7 +8,9 @@
       "level_m": -28.0,
       "overview_m": -660.0,
       "source": "Wikipedia, Caspian Sea; DAHITI satellite altimetry (https://dahiti.dgfi.tum.de/39/); 2025 record-low reports",
-      "note": "long-run average about -26 to -27 m (Baltic datum); 2025 about -29.4 m"
+      "note": "long-run average about -26 to -27 m (Baltic datum); 2025 about -29.4 m",
+      "endorheic": true,
+      "endorheic_source": "Wikipedia, 'Caspian Sea' (read 2026-11-26): 'An endorheic basin, it is situated in both Europe and Asia'; infobox type 'Endorheic', outflow 'Evaporation'. The flag makes the lake terminal whatever its balance, and its nodes below its level seed routing like the sea at that level (rivers Task 11d fix round 2)."
     },
     {
       "name": "Lake Baikal",

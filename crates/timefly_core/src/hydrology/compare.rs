@@ -701,6 +701,7 @@ mod tests {
             outflow_m3s,
             area_km2: 2000.0,
             exit: lake[1],
+            surplus_m3s: 0.0,
         };
         let chain = |nodes: &[u32], q: f32, end| RiverChain {
             q: vec![q; nodes.len()],
@@ -776,6 +777,7 @@ mod tests {
                 outflow_m3s: 100.0,
                 area_km2: 2000.0,
                 exit,
+                surplus_m3s: 0.0,
             }],
         );
         let t = trace_outlet(&hydro, lattice.dir(start).0, 1.0, None).unwrap();
