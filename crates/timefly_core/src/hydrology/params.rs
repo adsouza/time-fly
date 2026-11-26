@@ -24,9 +24,9 @@ pub const ICE_NODE_FRACTION: f64 = 0.5;
 /// running minimum itself.
 pub const TODAY_RIVER_BURN_M: f64 = 10.0;
 /// A burnt course's river node is relaxed by the regions to its anchor, the nearest point on
-/// its course, held within this many mean lattice spacings of the node (Task 11b, fix round 2).
-/// The course passes through every one of its nodes' texels, so its anchors lie within a
-/// texel's half-diagonal; the regions' reach allows for this.
+/// its course (Task 11b, fix round 2). The pass clamps each anchor to at most this many mean
+/// lattice spacings from the node's centre, and the regions' gather and read reach allow for
+/// it.
 pub const TODAY_RIVER_ANCHOR_MAX_SPACINGS: f64 = 0.75;
 
 // Data lakes.

@@ -254,7 +254,7 @@ impl NodeSource for SnapshotSource<'_> {
 /// How far beyond a region's inner field its river refinement reads the terrain (m), for
 /// [`CoarseField::tiles_needed_with_margin`]: the farthest read
 /// ([`river_read_reach_m`](crate::worldgen::generate::rivers::river_read_reach_m) at
-/// [`SUBPOINT_M`]) plus [`TILE_MARGIN_M`] for the coarse lattice's taps around it. About 116 km
+/// [`SUBPOINT_M`]) plus [`TILE_MARGIN_M`] for the coarse lattice's taps around it. About 120 km
 /// on the recent lattice.
 pub fn river_tile_margin_m(lattice: &CubeLattice) -> f64 {
     TILE_MARGIN_M + crate::worldgen::generate::rivers::river_read_reach_m(lattice, SUBPOINT_M)

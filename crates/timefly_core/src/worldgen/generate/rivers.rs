@@ -186,7 +186,7 @@ fn gather_reach_m(w: f64, w_down: f64, relax_m: f64, subpoint_m: f64) -> f64 {
 /// frame's local metres): a segment gathered at the edge of its reach, its start node a lattice
 /// step further, the incision window and the slope baseline above it, one more step for the
 /// segment that straddles the window's end, and the relaxation around that segment. Rivers are
-/// widest at [`MAX_CHANNEL_DISCHARGE_M3S`]. About 111 km on the recent lattice at
+/// widest at [`MAX_CHANNEL_DISCHARGE_M3S`]. About 115 km on the recent lattice at
 /// [`SUBPOINT_M`](crate::hydrology::params::SUBPOINT_M).
 pub fn river_read_reach_m(lattice: &CubeLattice, subpoint_m: f64) -> f64 {
     let relax = relax_reach_m(lattice);
@@ -2702,8 +2702,9 @@ mod tests {
     }
 
     /// Task 11b, fix round 2: a node on one of today's burnt courses relaxes to its anchor, as
-    /// far as the anchor bound from its node, and regions still agree on every segment they
-    /// share (the gather allows for the anchors' reach).
+    /// far as the anchor bound from its node, and regions 100 km apart along the river still
+    /// agree on every segment they share. (The gather's widening for the anchors is pinned by
+    /// [`the_gather_reaches_a_course_relaxed_to_its_anchors`].)
     #[test]
     fn anchored_nodes_relax_to_their_anchors_from_any_region() {
         let base = tree(3e-4);
@@ -2736,6 +2737,97 @@ mod tests {
         let b = by_river(&build_at(&hydro, east, &floor, u32::MAX));
         let (shared, only_one) = agree(&a, &b);
         assert!(shared >= 15 && only_one > 0, "{shared} {only_one}");
+    }
+
+    /// Task 11b, fix round 3: a region whose edge lies just past the old relaxation reach,
+    /// C(1 + √2), from an anchored course, on its anchors' side, still gathers it, so the river
+    /// its neighbour carves into it is carved there too. On a coarse lattice (46 km spacing) the
+    /// anchors (0.75 spacings) plus a valley at the corridor's far interior sample (5C/6) put the
+    /// channel's valley about 2.7 km past the old reach.
+    #[test]
+    fn the_gather_reaches_a_course_relaxed_to_its_anchors() {
+        let lat = CubeLattice { n: 200 };
+        let row = 100;
+        let at = |c: u32| lat.node(CubeFace::PosX, c, row);
+        let spacing = lat.mean_spacing_m();
+        let corridor = corridor_m(&lat);
+        let cols: Vec<u32> = (80..=120).collect();
+        let chain = RiverChain {
+            nodes: cols.iter().map(|&c| at(c)).collect(),
+            q: vec![500.0; cols.len()],
+            bed: cols
+                .iter()
+                .map(|&c| 900.0 - 5.0 * f64::from(c - 80) as f32 as f64)
+                .map(|b| b as f32)
+                .collect(),
+            end: Down::Ocean(at(121)),
+        };
+        let north_of = |c: DVec3, m: f64| {
+            let t = (DVec3::Y - c * c.y).normalize();
+            offset_point(c, t, m)
+        };
+        let reach = TODAY_RIVER_ANCHOR_MAX_SPACINGS * spacing;
+        let anchors: Vec<(u32, DVec3)> = (90..=110)
+            .map(|c| (at(c), north_of(lat.dir(at(c)).0, reach)))
+            .collect();
+        let hydro = river_hydro(lat, &[chain], Vec::new()).with_anchors(&anchors);
+        // A valley `reach + 5C/6` north of the row: the corridor's far interior sample.
+        let row_north = north_m(lat.dir(at(100)).0);
+        let valley = reach + 5.0 * corridor / 6.0;
+        let floor = |d: RenderDir| {
+            let y = north_m(d.0) - row_north;
+            1000.0 - 1e-4 * along_m(d.0) + 0.05 * (y - valley).abs()
+        };
+        let build = |centre: RenderDir| {
+            let mut b = RiverBuilder::new(
+                &hydro,
+                &RegionFrame { center: centre },
+                HALF,
+                SUBPOINT_M,
+                MIN_Q,
+            );
+            while !b.step(&floor, &key, 997) {}
+            b.finish()
+        };
+        let texel = 2.0 * SUBPOINT_M;
+        let w = f64::from(hydraulic_geometry(500.0).0);
+        let old = LOCAL_SLACK * gather_reach_m(w, w, corridor * (1.0 + SQRT_2), SUBPOINT_M);
+        // The widened reach, stated here rather than read from `relax_reach_m`, which the test
+        // covers.
+        let widened = (corridor * SQRT_2).max(reach) + corridor;
+        let new = LOCAL_SLACK * gather_reach_m(w, w, widened, SUBPOINT_M);
+        // A's south edge: past the old reach (plus the gather's sampling slack), inside the new.
+        let edge = old + 0.5 * spacing / (spacing / GATHER_SAMPLE_M).ceil() + 800.0;
+        assert!(edge < new, "{edge} {new}");
+        let middle = lat.dir(at(100));
+        let a_frame = RegionFrame { center: middle }.local_to_dir(0.0, -(edge + HALF));
+        let a = build(a_frame);
+        let b = build(middle);
+        // The hazard: B's channel valley reaches into A. Its northernmost anchored sub-point,
+        // moved north by three quarters of its valley's half-width, lies inside A.
+        let v = valley_half_width_m(w, texel);
+        let anchored = |sp: &SubPoint| {
+            let n = &hydro.rivers.nodes()[sp.river as usize];
+            hydro.anchor(n.node).is_some()
+                && hydro.anchor(end_node(n, hydro.rivers.nodes())).is_some()
+        };
+        let a_east = |d: DVec3| RegionFrame { center: a_frame }.dir_to_local(RenderDir(d));
+        let top = b
+            .subpoints()
+            .iter()
+            .filter(|sp| anchored(sp) && a_east(sp.dir).is_some_and(|(x, _)| x.abs() < 0.5 * HALF))
+            .max_by(|x, y| north_m(x.dir).total_cmp(&north_m(y.dir)))
+            .expect("anchored sub-points");
+        let p = RenderDir(north_of(top.dir, 0.75 * v));
+        let (x, z) = RegionFrame { center: a_frame }.dir_to_local(p).unwrap();
+        assert!(
+            x.abs() <= HALF && z.abs() <= HALF,
+            "the probe lies outside A: ({x}, {z})"
+        );
+        let tb = b.texel(p, floor(p), texel);
+        assert!(tb.hit.is_some(), "B's valley does not reach the probe");
+        // The two regions agree there.
+        assert_eq!(a.texel(p, floor(p), texel), tb);
     }
 
     #[test]
