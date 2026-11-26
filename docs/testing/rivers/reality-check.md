@@ -32,7 +32,7 @@ The lattice is n = 900, with 121,263 river nodes and 861 lakes.
 
 **hydro check: FAIL.** The Indus box fails. Every other bar passes.
 
-| Bar | Needs | Relaxed (judged) | Coarse graph | Verdict |
+| Bar | Needs (brief, or † set in this task) | Relaxed (judged) | Coarse graph | Verdict |
 |---|---|---|---|---|
 | Indus box | ≥ 80% within 10 km, every link | 76.4%, 70/84 links, worst 134.6 km | 75.0%, 69/84, worst 137.5 km | **FAIL** |
 | Amazon flats (< 300 m) | ≥ 80% within 25 km | 91.7%, 456/482 links, worst 144.3 km | 91.1%, 454/482, worst 142.6 km | PASS |
@@ -41,11 +41,11 @@ The lattice is n = 900, with 121,263 river nodes and 861 lakes.
 | Titicaca (−15.8, −69.4) | the same (3,808.5) | 3,808.5 m | | PASS |
 | Great Salt Lake (41.1, −112.5) | the same (1,278.0) | 1,278.0 m | | PASS |
 | Victoria (−1.0, 33.0) | the same (1,133.0) | 1,133.0 m | | PASS |
-| Danube from Budapest | within 15 km of the Iron Gate (44.67, 22.5), into the ocean within 150 km of its mouth | 0.5 km from the gate; ends at (45.16, 29.23), 37 km from the delta | | PASS |
-| Jhelum from Srinagar | within 15 km of Baramulla (34.2, 74.35), on to the sea | 4.0 km from Baramulla; through Mangla, the Indus, to the sea 144 km from its mouth | | PASS |
-| Indus from Skardu | the sea | ends at (24.16, 68.80), 144 km from (24.0, 67.4) | | PASS |
-| Amazon from Iquitos | the sea | through one floodplain lake; ends at (−0.54, −50.76), 140 km from (−0.5, −49.5) | | PASS |
-| Arid basins | no lake ≥ 1,000 km² averaging < 250 mm/yr, in either network | game 0 of 3 (750, 1,942 and 386 mm/yr); reference 0 of 2 | | PASS |
+| Danube from Budapest | through the Iron Gate (44.67, 22.5) to the Black Sea; † within 15 km of the gate, ocean within 150 km of the delta | 0.5 km from the gate; ends at (45.16, 29.23), 37 km from the delta | | PASS |
+| Jhelum from Srinagar | out of the Kashmir valley at Baramulla (34.2, 74.35); † within 15 km of it, then the sea within 150 km of the Indus mouth | 4.0 km from Baramulla; through Mangla, the Indus, to the sea 144 km from its mouth | | PASS |
+| Indus from Skardu | its sea; † ocean within 150 km of (24.0, 67.4) | ends at (24.16, 68.80), 144 km from (24.0, 67.4) | | PASS |
+| Amazon from Iquitos | its sea; † ocean within 150 km of (−0.5, −49.5) | through one floodplain lake; ends at (−0.54, −50.76), 140 km from (−0.5, −49.5) | | PASS |
+| Arid basins | no lake ≥ 1,000 km² where the basin averages < 250 mm/yr, in either network († basin = lake plus upstream river nodes) | game 0 of 3 (750, 1,942 and 386 mm/yr); reference 0 of 2 | | PASS |
 
 The relaxed and coarse figures differ by about a point. The relaxation cannot fix what is left:
 the misses are 40–135 km apart, which are differences in the river's route, not in its valley.
@@ -74,6 +74,47 @@ Tibetan headwaters (32.5, 80.8) flowed east through three Tibetan lakes to the B
 To pass, the lower Indus would need the Sindh plain routed by its real channel. That means
 "burning" a river course across a plain. Gorge entries were not meant for that. The decision on
 the bar, or on burning plains, is the owner's.
+
+## Choices made in this task
+
+The brief gives the box, lake and arid bars' numbers. The choices below were made while building
+the check, and the controller has ratified them (2026-11-26).
+
+- **Outlet tolerances** (`hydro_check.rs`): the river starts at the largest within
+  `OUTLET_START_KM` = 30 km of its point. It must pass within `OUTLET_VIA_KM` = 15 km of its
+  gorge, about one and a half lattice spacings. It must end in the ocean within `OUTLET_SEA_KM` =
+  150 km of its mouth. The brief only says "reach their real outlets".
+  - Why 150 km: the misroutes this bar exists for end in the wrong sea, 1,000 km or more off. The
+    Danube reached the Oder mouth, 1,469 km off; the Indus headwaters reached the Bay of Bengal,
+    over 3,000 km off. Deltas and estuaries are wide: the Amazon's is about 300 km across.
+  - Margins on this run:
+    - Danube: 0.5 km from the gate (14.5 km margin), 37 km from the delta (113 km).
+    - Jhelum: 4.0 km from Baramulla (11 km margin), 144 km from the Indus mouth (6 km).
+    - Indus: 144 km from the mouth (6 km margin).
+    - Amazon: 140 km from the mouth (10 km margin).
+  - The Indus (and the Jhelum, which follows it) ends 144 km east of (24.0, 67.4), at (24.16,
+    68.80) by Kori Creek. That is the same Sindh-plain route error the Indus box fails on: the
+    game's lower Indus runs east of the real course.
+- **The Upper Indus gorge agrees with the reference by construction.** Its course and levels are
+  the 1′ reference's own Indus link from (32.49, 80.81) to Nimo, so the game's river there follows
+  the reference's line. That link is 459 km of the box's 16,570 km of reference links, about 2.8%.
+  The Indus box reads 74.3% without the gorge and 76.4% with it (69 → 70 of 84 links). The other
+  two gorges lie outside both boxes.
+- **Game rivers near the box, not clipped to it.** The controller's ruling said to compare the
+  game's rivers clipped to the box. The check instead keeps every game segment with an end within
+  the box plus 0.5° (44–56 km across these boxes' latitudes). Distances are measured only from reference points, which all lie
+  inside the box, and the widest tolerance is 25 km. So a game segment outside the margin can never
+  count. A segment inside the margin counts only where it truly lies within the tolerance of a
+  reference point. Strict clipping would cut a segment that crosses the box edge, and would score a
+  reference river along the edge as missed when the game's river runs a few km outside. The SVG
+  shows only the box itself.
+- **The arid bar's "basin mean precipitation" is a proxy.** It is the area-weighted mean over the
+  lake's own nodes and the river nodes (discharge ≥ 20 m³/s) upstream of it. The bar uses the same
+  definition in both networks. The game's result keeps no per-node receivers, so its full basin
+  cannot be listed; the Python side uses the same set to match. Smaller streams' land is left out
+  on both sides.
+- **The reference fixture matches the committed table.** `indus.json` was re-baked from the
+  committed `straits.json` on 2026-11-26 and came out byte-identical (95,668 bytes).
 
 ## Gorges added to `data/hydrology/straits.json`
 
