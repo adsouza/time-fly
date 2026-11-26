@@ -95,7 +95,7 @@ mod tests {
             [
                 ("Caspian Sea", -28.0),
                 ("Lake Baikal", 455.5),
-                ("Lake Superior", 183.0),
+                ("Lake Superior", 183.4),
                 ("Lake Michigan", 176.0),
                 ("Lake Huron", 176.0),
                 ("Lake Erie", 173.0),
@@ -121,6 +121,14 @@ mod tests {
         assert_eq!(flagged, ["Caspian Sea"]);
         // Michigan and Huron are one water body at one level.
         assert_eq!(levels[3].level_m, levels[4].level_m);
+        // Task 11f: Baikal and the Great Lakes cite the page read and its own source.
+        for l in &levels[1..] {
+            assert!(l.source.contains("(read 2026-11-26)"), "{l:?}");
+            assert!(
+                l.source.contains("citing") || l.source.contains("uncited there"),
+                "{l:?}"
+            );
+        }
     }
 
     #[test]

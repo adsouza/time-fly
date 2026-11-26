@@ -1,7 +1,7 @@
 # Rivers reality check (Task 11)
 
 The hidden `--hydro-check[=OUT_DIR]` runs the continental pass at 0 ka on the real bake and
-compares it with a 1′ reference pass over two boxes, five lakes and 22 river outlets
+compares it with a 1′ reference pass over two boxes, eight lakes and 22 river outlets
 (`crates/timefly/src/hydro_check.rs`, bars in `CheckSpec::standard`). It also prints a
 discharge table for 18 gauges (informative, not a bar).
 
@@ -24,6 +24,75 @@ checkout's real data.
 
 Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (1620 × 1920 nodes).
 `indus.json` is 95,668 bytes and `amazon.json` 503,031 bytes.
+
+## Result, 2026-11-26 (Task 11f: lakes baked at their bed)
+
+The lake map bakes Baikal and the Great Lakes at their bed (fix round 5's audit). The table already set their levels, but each map lake's nodes outside its table lake's footprint were a separate Data lake at the bed level. Those Data lakes took the table lake's flow: Baikal's 384 at −328 m took the whole Angara, 3,597 m³/s. The shipped map was not re-baked, as ruled. Re-baking it from water surfaces is the follow-up.
+
+**The level table** (`data/hydrology/lake_levels.json`).
+- **Michigan, Huron and Erie were already entries**, at 176, 176 and 173 m, with Baikal, Superior and Ontario. Their sources were generic ("US EPA, Physical features of the Great Lakes; NOAA GLERL").
+- **Every entry but the Caspian now cites its page, read 2026-11-26, and that page's own source.** `levels.rs`'s test checks both.
+  - Superior: the English Wikipedia infobox, 601.71 ft (183.40 m), the 2013 average, citing the US Army Corps of Engineers' "Great Lakes Water Levels".
+  - Michigan: 577 ft (176 m), citing *The New York Times Almanac* (2007 ed.), p. 64.
+  - Huron: 577 ft (176 m), citing the EPA's Great Lakes Factsheet No. 1.
+  - Erie: 569 ft (173 m), citing the EPA's "Physical Features of the Great Lakes"; the article's own mean is 571 ft (174 m).
+  - Ontario: 74 m (243 ft), citing the EPA's Great Lakes Atlas Factsheet #1.
+  - Baikal: 455.5 m, uncited in the infobox. It is the bottom of the regulated range (455.54 to 457.85 m, per a 2001 Russian Government decree, as a UNESCO document reports it), within 1 m of the long-term average of 456.43 m (UNDP-GEF Baikal Project).
+  - The EPA page no longer carries its elevation row. The USACE long-term average for Michigan–Huron, 1918–2023, is 578.90 ft (176.45 m), as the Indiana DNR reports it. I found no long-term means for the others in a readable page; GLERL shows them only in images.
+- **Superior moves from 183.0 to 183.4 m, matching its source.** Alone this moves one node (86 km²) from fragment 375 into the table lake; nothing else changed.
+- **Michigan and Huron stay two entries at one level.** They are "hydrologically a single lake" (Wikipedia, "Lake Michigan–Huron"), and the pass already makes them one lake: one basin holds both points, and `place_levels` is silent on two points at one level. Two entries keep each arm at the level if the 10 km lattice ever splits them at the Straits of Mackinac, which are 8 km wide.
+
+**The joining rule** (`today.rs`, mirrored in `hydro_ref.py`).
+- **Who joins.** A mapped lake joins table lake T when its surface stands below T's level and at least one of its nodes touches T: it lies in T's depression basin, or has a lattice neighbour in T's footprint.
+- **Ties.** Of several such T, it joins the one most of its nodes touch, then the lower level, then the lower index. Joins do not chain: a lake touching only another fragment stays its own.
+- **The merged lake.** After the mapped lakes, each table lake with joined nodes takes as its outlet the downstream-most node of its whole footprint, the one of the largest discharge (as a mapped lake does). Every other node of it routes to that outlet.
+  - A terminal table lake picks its outlet among its own sinks, so it stays terminal. Its surplus, if it is endorheic, is taken over the joined surface.
+  - An open lake's capacity is its walk evaporation plus the joined nodes'. Its exit moves to the outlet.
+  - Its area and shore steps are taken over the whole footprint.
+
+**The joins on the real bake** (12 Data lakes gone; 861 → 849 lakes):
+
+| Table lake | Joined (map lake, baked surface, area) | Area | Exit |
+|---|---|---|---|
+| Baikal 455.5 m | its own fragment (−328.0 m, 1,248 km²) | 33,137 → 34,385 km² | moves to the Angara's end (51.87, 104.84); outflow 3,597.2 m³/s, what fragment 384 passed on before |
+| Superior 183.4 m | its own (24.1 m, 3,028 km²); map lake 455 near Whitefish Bay (150.4 m, 387 km²); the lower St. Marys (175.0 m, 76 km²) | 80,065 → 83,557 km² | moves to the St. Marys node (46.46, −84.30); outflow 2,780.0 m³/s, as before |
+| Michigan–Huron 176 m | Michigan's own (Green Bay, 96.4 m, 2,277 km²), Huron's own (124.7 m, 2,358 km²), Georgian Bay (129.8 m, 1,075 km²), the North Channel (153.8 m, 899 km²), Saginaw Bay (169.2 m, 221 km²), Lake St. Clair (173.0 m, 78 km²) | 115,888 → 122,796 km² | unchanged |
+| Erie 173 m | its own (155.0 m, 1,560 km²; it took the Detroit River's 7,409 m³/s) | 24,355 → 25,915 km² | unchanged |
+| Ontario 74 m | its own (−4.4 m, 1,464 km²) | 18,440 → 19,903 km² | unchanged |
+| Caspian −28 m | none (the map holds no Caspian) | | |
+
+Every outflow downstream is unchanged to 0.1 m³/s.
+
+**The lake bar: eight lakes, the three new ones PASS.**
+- **The new points:** Lake Michigan in Green Bay (44.7, −87.85), Lake Huron by the St. Marys' mouth (45.95, −83.9) and Lake Erie's western basin (41.7, −82.9). Each lies in its table lake's own map lake, more than 25 km from every table point.
+- **`expected_level`:** a point in a map lake that holds a table point now expects the table's level.
+- **RED: the first bar passed with the fragments in place.** In a run with HEAD's `today.rs` (scratch `task11f/red-check.bars.txt`), all three points read their table levels. `lake_tap` takes the highest lake among its four taps, so a tap beside the table lake never sees the fragment.
+- **The fix to the bar.** Each lake point is now also judged over its whole map lake: every pass lake holding the map lake's nodes must stand within 5 m (`map_lake_stands_at`). The line names them, worst first.
+  - Michigan: `[2 at 176.0 m (766 nodes)]`; Huron: `[2 at 176.0 m (550 nodes)]`; Erie: `[3 at 173.0 m (320 nodes)]`.
+  - In the RED run, Michigan's map lake also held lake 376 at 96.4 m (the audit's list), 80 m off, which this judgement fails. The unit test pins that case.
+- **The other five lakes pass as before**, each map lake in a single pass lake (Dead Sea 11 nodes, Titicaca 55, Great Salt Lake 62, Victoria 565).
+
+**The lake map audit: 149 → 144 flagged.**
+- **What changed.** A map lake whose nodes table lakes alone hold is now judged at the table's level ("stands at the table's … m"). A map lake any Data lake still holds keeps its baked surface.
+- **The RED run showed why that second clause is needed.** With a looser rule, a table lake holding only some of the map lake's nodes, the audit cleared Baikal with fragment 384 still there.
+- **The five bed-baked lakes are no longer flagged.** Baikal, Superior, Michigan, Huron and Ontario all read `- ok`; Erie was ok before. Their "pass's lakes there" lists no longer name a Data lake.
+- **The 144 left** are the ones round 5 described: small mountain lakes, Assal, the Sea of Galilee, Loch Ness and the Amur-mouth lake.
+
+**hydro check (`dev`): FAIL, on the Indus box's links only, as before.** Before is fix round 5 (db5be01); after is this task.
+- **Unchanged, digit for digit:**
+  - every line but the lakes and the lake numbering in two lines (the arid bar's and Issyk-Kul's);
+  - both boxes, all 22 outlets and all 18 gauges;
+  - the Caspian's surplus (3,449 of 12,853 m³/s);
+  - burnt nodes 31,985, the course order counts, pinned 19 nodes on 10 courses, p99 439 m.
+- **The pass:** 1.65 → 1.36 s.
+- **The lake dump:** the 12 Data lakes above are gone and the five table lakes' rows changed as in the table; every other lake is identical.
+
+**Tests.**
+- Rust, RED first (scratch `task11f/red-rs.txt`, HEAD's `today.rs`): `a_bed_fragment_joins_its_table_lake` and `a_bed_fragment_joins_an_endorheic_lake_which_stays_terminal` both failed on the extra Data lakes (5 lakes for 3; 2 for 1).
+  - The first test covers a fragment in the basin, one beside the footprint off the basin (the outlet moves into it), and a lake above the level and one far off, which stay separate. It also checks conservation, and that budgets 1, 2 and unlimited give the same result bit for bit.
+- Python, RED first (`task11f/red-py.txt`): `test_a_bed_fragment_joins_its_table_lake` mirrors the endorheic case, with 405 m³/s in and 22 wet nodes at 0.1 m³/s each.
+- The gate's `water_is_conserved_through_the_basins` failed once on a random case: it found table lakes by their basin's exit, and a joined open lake's exit moves to its outlet. It now counts the walk's lakes at the present day as the table's. The case is kept in `proptest-regressions/hydrology/lakes.txt`; its shrunk form is a different failure, which shrinking reached on the way.
+- Written with the code: `the_great_lakes_stand_at_their_table_levels` (the bar's points, the map-id rule, the whole-map-lake judgement and the audit's standing levels), the audit test's Baikal case, and `levels.rs`'s citation check.
 
 ## Result, 2026-11-26 (Task 11d: the world's major river systems)
 

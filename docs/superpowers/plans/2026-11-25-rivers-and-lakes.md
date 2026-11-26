@@ -932,6 +932,25 @@ Owner, 2026-11-26: "We should do sanity checks on other major river systems of t
 - [ ] **Step 5: Run the check** (dev profile acceptable). Record every river's outlet margins and discharge ratio in `reality-check.md`. For each failing outlet, find the cause (a closed gorge, a burnt course's gap, a pit) and fix a narrow pass with a cited gorge entry, as Task 11 did; anything else goes to the owner unchanged with its numbers and an SVG or render of the misroute.
 - [ ] **Step 6: Run the gate and commit** `feat: the reality check follows the world's major rivers to their mouths`.
 
+### Task 11f: Lakes baked at their bed
+
+Owner, 2026-11-26: "Table entries now". Task 11d's lake-map audit found the lake map baked at the bed for Baikal (−328 m against 455.5 m), Superior (24.1 against 183), Michigan (96.4 against 176), Huron (124.7 against 176) and Ontario (−4.4 against 74), with Erie probably too (155 against 173). Their footprints also hold bed-level fragments that are separate data lakes (384 at Baikal, 375 at Superior, 376, 377, 15) and take river flow (384 took 3,597 m³/s). Baikal, Superior and Ontario already stand at their table levels; Michigan, Huron and Erie would be drawn 20–80 m low. The proper fix (re-baking the lake map from water surfaces) is a follow-up after this milestone.
+
+**Files:** `data/hydrology/lake_levels.json` (the level table), `crates/timefly_core/src/hydrology/{levels.rs,today.rs,lakemap.rs}` as needed, `tools/bake/timefly_bake/hydro_ref.py` (the mirror reads the same table), `docs/testing/rivers/reality-check.md`.
+
+**Interfaces and decisions:**
+- **Table entries.** Add Michigan, Huron and Erie to the level table, each with a cited surface (e.g. NOAA GLERL or the US Army Corps of Engineers long-term mean, or Wikipedia's infobox with its cited source) and its point. Check the existing Baikal, Superior and Ontario entries and cite them if they lack sources. Michigan and Huron are hydraulically one lake (the Straits of Mackinac); decide one entry or two, and justify.
+- **Fragments.** Every lake-map lake whose footprint lies within a table lake's basin, or adjoins the table lake's footprint, at a baked surface below the table level takes the table lake's level and joins it, so no bed-level fragment is a separate data lake with its own flow. Decide the joining rule concretely and test it.
+- **The audit line and the lake bar.** After the fix, the audit line no longer flags the bed-baked lakes (it may still list the small mountain lakes); add Michigan/Huron and Erie to the reality check's lake bar (within 5 m of the table).
+- **No re-bake of the shipped lake map.**
+
+- [ ] **Step 1: Write the failing tests:** `the_great_lakes_stand_at_their_table_levels` (Michigan, Huron, Erie within 5 m), `a_bed_fragment_joins_its_table_lake` (a fixture with a table lake and a bed-level fragment: one lake, at the table level, no separate flow), and the Python mirror's equivalent.
+- [ ] **Step 2: Run them to check they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run them to check they pass.**
+- [ ] **Step 5: Re-run the check.** Record the lake bar, the audit line, every outlet (unchanged or better) and the lake-dump diff in reality-check.md.
+- [ ] **Step 6: Run the gate and commit** `fix: the Great Lakes and Baikal stand at their table levels, fragments included`.
+
 ### Task 11e: Tributaries find their canyons
 
 Owner, 2026-11-26: "Tributaries find canyons". With today's courses burnt in (Task 11b), a burnt canyon is the lowest ground for a lattice spacing around, so plateau tributaries drain into it, which is right in kind. But the region refines the joining link as a node-to-node chord, and where a fine ridge stands between the tributary's node and the canyon, the incision carves a gash through it: in Hells Canyon, 826–1,146 m deep and 375–875 m wide. This task routes such a link down the fine terrain instead.

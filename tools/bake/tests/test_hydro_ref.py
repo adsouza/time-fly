@@ -279,6 +279,40 @@ def test_an_endorheic_lake_seeds_routing_and_is_terminal():
     assert float(acc.q[rim]) == 5.0
 
 
+def test_a_bed_fragment_joins_its_table_lake():
+    # Task 11f, mirroring lakes.rs's a_bed_fragment_joins_an_endorheic_lake_which_stays_terminal:
+    # a mapped lake baked at the bed (3 m) beside the endorheic lake's footprint joins it.
+    g, e = _deep_bowl()
+    ocean = hydro_ref.ocean_mask(g, e)
+    centre, slope = 4 * 11 + 6, 4 * 11 + 3
+    own = lambda i, a: np.float32(5.0)  # noqa: E731
+    humid = lambda i, x, a: 0.1  # noqa: E731
+
+    def run(mapped):
+        r = hydro_ref.route(g, e, ocean, sinks=[(centre, 15.0)])
+        b = r.basin_of[centre]
+        return r, hydro_ref.resolve_lakes(g, r, own, humid, mapped=mapped, endorheic={b: 15.0})
+
+    _, plain = run({})
+    (before,) = plain.lakes
+    r, acc = run({slope: (1, 3.0)})
+    # The hazard: the slope is off the lake's basin and footprint, its surface far below.
+    assert r.basin_of[slope] == hydro_ref.NO_BASIN and slope not in before.footprint
+    (lake,) = acc.lakes
+    assert (lake.kind, lake.level_m, lake.outflow_m3s) == ("Terminal", 15.0, 0.0)
+    assert lake.exit == before.exit
+    assert lake.footprint == sorted(before.footprint + [slope])
+    assert acc.lake_of[slope] == 0
+    # The same water, one node more to evaporate it: 405 in, 22 wet nodes at 0.1 each.
+    assert lake.inflow_m3s == pytest.approx(before.inflow_m3s) == pytest.approx(405.0)
+    assert lake.evaporation_m3s == lake.inflow_m3s
+    assert lake.surplus_m3s == pytest.approx(405.0 - 2.2)
+    assert lake.area_km2 == pytest.approx(before.area_km2 + 100.0)
+    # A mapped lake above the level stays its own.
+    _, apart = run({slope: (1, 30.0)})
+    assert [l.kind for l in apart.lakes] == ["Terminal", "Data"]
+
+
 def test_a_gorge_lets_a_river_through_a_ridge():
     # A 1 degree box falling east to its edge, with a 500 m ridge across it at 10.5 E: without
     # the gorge, the west drains west; with it, through the gorge to the east.

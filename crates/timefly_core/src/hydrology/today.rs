@@ -20,6 +20,21 @@
 //!   Q_in, outflow as above, evaporation Q_in − outflow, exit o, shore steps from F. Mapped
 //!   lakes follow the table's lakes in the lake list, in map id order. Open table lakes take
 //!   the new Q_in and outflow.
+//! Bed fragments (Task 11f): the map bakes the lakes ETOPO holds bathymetry for (Baikal, the
+//!   Great Lakes) at their bed, and the map's nodes outside a table lake's footprint were
+//!   separate data lakes at that bed, taking the table lake's flow (Baikal's Angara end took
+//!   3,597 m³/s). A mapped lake joins table lake T when its surface stands below T's level and
+//!   at least one of its F nodes touches T: lies in T's depression basin, or has a lattice
+//!   neighbour in T's footprint. Of several such T: the one most of its F nodes touch, then the
+//!   lower level, then the lower index. A joined lake makes no unit of its own; after the
+//!   mapped lakes, each table lake with joined nodes J, in index order: U = its footprint ∪ J;
+//!   its outlet is the U node, among those whose chain of next() meets no other U node (for a
+//!   table lake with no outflow after the walk, a terminal one, among its own footprint nodes,
+//!   its sinks, so it stays terminal), with the largest discharge after the walk (ties: the
+//!   lowest id); every other U node's next becomes the outlet. Its capacity: an open lake's
+//!   evaporation after the walk + Σ_J c; a terminal lake's Σ_U c. At the end it stands at its level over U (shore steps from U, area over U),
+//!   takes Q_in, outflow and evaporation as above, an open lake's exit becomes its outlet, and
+//!   an endorheic one's surplus is max(0, Q_in − capacity).
 //! ```
 
 use std::collections::VecDeque;
@@ -37,6 +52,8 @@ struct Unit {
     mapped: Option<(u16, f32, Vec<u32>)>,
     /// The table lake's index in `Accumulation::lakes`.
     table: Option<usize>,
+    /// A table lake that bed fragments joined: its whole footprint U, sorted.
+    joined: Option<Vec<u32>>,
     q_in: f64,
     out: f64,
 }
@@ -45,6 +62,7 @@ struct Unit {
 enum Phase {
     Next,
     Lakes,
+    Join,
     Indegree,
     Seed,
     Flow,
@@ -57,6 +75,11 @@ pub(crate) struct Today {
     i: u32,
     next: Vec<u32>,
     groups: Vec<(u16, f32, Vec<u32>)>,
+    /// Each table lake's `(basin, level)`, by its index in `Accumulation::lakes`.
+    tables: Vec<(u32, f32)>,
+    /// Mapped lakes' nodes joining a table lake, `(table lake, nodes)`; once the mapped lakes
+    /// are placed, sorted by descending table lake so that they pop in ascending order.
+    joins: Vec<(usize, Vec<u32>)>,
     units: Vec<Unit>,
     /// `(outlet, unit)`, sorted by outlet once the units are known.
     outlets: Vec<(u32, usize)>,
@@ -76,6 +99,8 @@ impl Today {
             i: 0,
             next: vec![NONE; len],
             groups: Vec::new(),
+            tables: Vec::new(),
+            joins: Vec::new(),
             units: Vec::new(),
             outlets: Vec::new(),
             indeg: Vec::new(),
@@ -96,6 +121,13 @@ impl Today {
                 .groups
                 .iter()
                 .map(|g| 4 * g.2.capacity())
+                .sum::<usize>()
+            + self.joins.iter().map(|j| 4 * j.1.capacity()).sum::<usize>()
+            + self
+                .units
+                .iter()
+                .filter_map(|u| u.joined.as_ref())
+                .map(|j| 4 * j.capacity())
                 .sum::<usize>()
     }
 
@@ -135,6 +167,23 @@ impl Today {
                 }
                 Phase::Lakes => {
                     let Some((id, surface, footprint)) = self.groups.pop() else {
+                        // Stable: each table lake's joined lakes stay in map id order.
+                        self.joins.sort_by_key(|j| std::cmp::Reverse(j.0));
+                        self.phase = Phase::Join;
+                        continue;
+                    };
+                    used = used.saturating_add(footprint.len() as u32);
+                    match self.joined_table(g, acc, routed, surface, &footprint) {
+                        Some(k) => self.joins.push((k, footprint)),
+                        None => {
+                            used = used.saturating_add(
+                                self.place(g, acc, routed, id, surface, footprint, capacity),
+                            );
+                        }
+                    }
+                }
+                Phase::Join => {
+                    let Some((k, mut joined)) = self.joins.pop() else {
                         for (k, u) in self.units.iter().enumerate() {
                             self.outlets.push((u.outlet, k));
                         }
@@ -144,9 +193,12 @@ impl Today {
                         self.phase = Phase::Indegree;
                         continue;
                     };
-                    used = used.saturating_add(
-                        self.place(g, acc, routed, id, surface, footprint, capacity),
-                    );
+                    while self.joins.last().is_some_and(|j| j.0 == k) {
+                        let (_, more) = self.joins.pop().expect("checked");
+                        joined.extend(more);
+                    }
+                    joined.sort_unstable();
+                    used = used.saturating_add(self.merge(g, acc, routed, k, joined, capacity));
                 }
                 Phase::Indegree => {
                     if self.i == len {
@@ -193,13 +245,17 @@ impl Today {
         routed: &Routed,
         ice: &impl Fn(u32) -> bool,
     ) {
+        // The walk made no lake but the table's.
         for (k, lake) in acc.lakes.iter().enumerate() {
+            self.tables
+                .push((routed.basin_of[lake.exit as usize], lake.level_m));
             if lake.outflow_m3s > 0.0 {
                 self.units.push(Unit {
                     outlet: lake.exit,
                     capacity: lake.evaporation_m3s,
                     mapped: None,
                     table: Some(k),
+                    joined: None,
                     q_in: 0.0,
                     out: 0.0,
                 });
@@ -266,9 +322,131 @@ impl Today {
             capacity: cap,
             mapped: Some((id, surface, footprint)),
             table: None,
+            joined: None,
             q_in: 0.0,
             out: 0.0,
         });
+        used
+    }
+
+    /// The table lake a mapped lake at `surface` over `footprint` joins, if any (the module's
+    /// bed fragments rule).
+    fn joined_table(
+        &self,
+        g: &impl HydroGraph,
+        acc: &Accumulation,
+        routed: &Routed,
+        surface: f32,
+        footprint: &[u32],
+    ) -> Option<usize> {
+        // The table lake whose footprint holds node `j` (the walk's lakes are the table's).
+        let table_lake = |j: u32| {
+            acc.lake_nodes
+                .binary_search_by_key(&j, |n| n.node)
+                .ok()
+                .map(|x| usize::from(acc.lake_nodes[x].lake))
+        };
+        let mut touching = vec![0u32; self.tables.len()];
+        let mut touched = Vec::new();
+        for &v in footprint {
+            touched.clear();
+            if let Some(k) = self
+                .tables
+                .iter()
+                .position(|&(b, _)| b == routed.basin_of[v as usize])
+            {
+                touched.push(k);
+            }
+            touched.extend(g.neighbours(v).into_iter().flatten().filter_map(table_lake));
+            touched.sort_unstable();
+            touched.dedup();
+            for &k in &touched {
+                touching[k] += 1;
+            }
+        }
+        (0..self.tables.len())
+            .filter(|&k| touching[k] > 0 && surface < self.tables[k].1)
+            .min_by(|&a, &b| {
+                touching[b]
+                    .cmp(&touching[a])
+                    .then(self.tables[a].1.total_cmp(&self.tables[b].1))
+                    .then(a.cmp(&b))
+            })
+    }
+
+    /// Joins mapped lakes' nodes `joined` (sorted) to table lake `k`: its outlet over the whole
+    /// footprint, the redirects, its capacity. Returns the units used.
+    fn merge(
+        &mut self,
+        g: &impl HydroGraph,
+        acc: &Accumulation,
+        routed: &Routed,
+        k: usize,
+        joined: Vec<u32>,
+        capacity: &mut impl FnMut(u32, f32, f64) -> f64,
+    ) -> u32 {
+        let lake = &acc.lakes[k];
+        let own: Vec<u32> = acc
+            .lake_nodes
+            .iter()
+            .filter(|n| usize::from(n.lake) == k)
+            .map(|n| n.node)
+            .collect();
+        let mut all = [own.as_slice(), joined.as_slice()].concat();
+        all.sort_unstable();
+        let unit = self.units.iter().position(|u| u.table == Some(k));
+        let inside = |v: u32| all.binary_search(&v).is_ok();
+        let mut used = all.len() as u32;
+        let mut outlet: Option<u32> = None;
+        // A terminal table lake stays terminal: its outlet is one of its own sinks.
+        for &v in if unit.is_some() { &all } else { &own } {
+            let mut at = self.next[v as usize];
+            let mut meets = false;
+            while at != NONE {
+                used = used.saturating_add(1);
+                if inside(at) {
+                    meets = true;
+                    break;
+                }
+                at = self.next[at as usize];
+            }
+            let better = outlet.is_none_or(|o| acc.q[v as usize] > acc.q[o as usize]);
+            if !meets && better {
+                outlet = Some(v);
+            }
+        }
+        let outlet = outlet.expect("a forest's footprint has a downstream-most node");
+        for &v in &all {
+            if v != outlet {
+                self.next[v as usize] = outlet;
+            }
+        }
+        let mut cap = |nodes: &[u32]| -> f64 {
+            nodes
+                .iter()
+                .map(|&v| capacity(v, routed.elevation_m[v as usize], g.area_m2(v)))
+                .sum()
+        };
+        match unit {
+            Some(u) => {
+                let u = &mut self.units[u];
+                u.outlet = outlet;
+                u.capacity = lake.evaporation_m3s + cap(&joined);
+                u.joined = Some(all);
+            }
+            None => {
+                let capacity = cap(&all);
+                self.units.push(Unit {
+                    outlet,
+                    capacity,
+                    mapped: None,
+                    table: Some(k),
+                    joined: Some(all),
+                    q_in: 0.0,
+                    out: 0.0,
+                });
+            }
+        }
         used
     }
 
@@ -321,10 +499,31 @@ impl Today {
         acc.evaporated_m3s = self.evaporated_m3s;
         for u in &mut self.units {
             if let Some(k) = u.table {
+                let endorheic = acc.is_endorheic(self.tables[k].0);
                 let lake = &mut acc.lakes[k];
                 lake.inflow_m3s = u.q_in;
                 lake.outflow_m3s = u.out;
                 lake.evaporation_m3s = u.q_in - u.out;
+                let Some(all) = u.joined.take() else {
+                    continue;
+                };
+                // Bed fragments joined it: it stands at its level over them too.
+                lake.area_km2 = all.iter().map(|&v| g.area_m2(v) * 1e-6).sum();
+                if lake.kind != LakeKind::Terminal {
+                    lake.exit = u.outlet;
+                }
+                if endorheic {
+                    lake.surplus_m3s = (u.q_in - u.capacity).max(0.0);
+                }
+                let id = u16::try_from(k).expect("at most 65,535 lakes per era");
+                acc.lake_nodes.retain(|n| n.lake != id);
+                for (&v, steps) in all.iter().zip(shore_steps(g, &all)) {
+                    acc.lake_nodes.push(LakeNode {
+                        node: v,
+                        lake: id,
+                        shore_steps: steps,
+                    });
+                }
             }
         }
         // Mapped lakes in ascending map id.
@@ -349,30 +548,11 @@ impl Today {
                 exit: u.outlet,
                 surplus_m3s: 0.0,
             });
-            let inside = |v: u32| footprint.binary_search(&v).is_ok();
-            let mut steps = vec![0u16; footprint.len()];
-            let mut queue = VecDeque::new();
-            for (k, &v) in footprint.iter().enumerate() {
-                if g.neighbours(v).into_iter().flatten().any(|j| !inside(j)) {
-                    steps[k] = 1;
-                    queue.push_back(k);
-                }
-            }
-            while let Some(k) = queue.pop_front() {
-                for j in g.neighbours(footprint[k]).into_iter().flatten() {
-                    if let Ok(kj) = footprint.binary_search(&j)
-                        && steps[kj] == 0
-                    {
-                        steps[kj] = steps[k].saturating_add(1);
-                        queue.push_back(kj);
-                    }
-                }
-            }
-            for (k, &v) in footprint.iter().enumerate() {
+            for (&v, steps) in footprint.iter().zip(shore_steps(g, &footprint)) {
                 acc.lake_nodes.push(LakeNode {
                     node: v,
                     lake: id,
-                    shore_steps: steps[k],
+                    shore_steps: steps,
                 });
             }
         }
@@ -380,4 +560,28 @@ impl Today {
         self.next = Vec::new();
         self.indeg = Vec::new();
     }
+}
+
+/// Shore steps over a sorted footprint: 1 on a node with a neighbour off it, then BFS inward.
+fn shore_steps(g: &impl HydroGraph, footprint: &[u32]) -> Vec<u16> {
+    let inside = |v: u32| footprint.binary_search(&v).is_ok();
+    let mut steps = vec![0u16; footprint.len()];
+    let mut queue = VecDeque::new();
+    for (k, &v) in footprint.iter().enumerate() {
+        if g.neighbours(v).into_iter().flatten().any(|j| !inside(j)) {
+            steps[k] = 1;
+            queue.push_back(k);
+        }
+    }
+    while let Some(k) = queue.pop_front() {
+        for j in g.neighbours(footprint[k]).into_iter().flatten() {
+            if let Ok(kj) = footprint.binary_search(&j)
+                && steps[kj] == 0
+            {
+                steps[kj] = steps[k].saturating_add(1);
+                queue.push_back(kj);
+            }
+        }
+    }
+    steps
 }

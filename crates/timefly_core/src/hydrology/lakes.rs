@@ -645,6 +645,11 @@ impl Accumulation {
         self.endorheic = basins;
     }
 
+    /// Whether basin `b` holds an endorheic table lake.
+    pub(crate) fn is_endorheic(&self, b: u32) -> bool {
+        self.endorheic.binary_search(&b).is_ok()
+    }
+
     pub fn set_levels(&mut self, levels: Vec<(u32, f32)>) {
         self.levels = levels;
     }
@@ -1710,11 +1715,14 @@ mod tests {
             let balance = out + acc.evaporated_m3s;
             prop_assert!((balance - own).abs() <= 1e-4 * own, "{} out + {} evaporated vs {}",
                 out, acc.evaporated_m3s, own);
-            for lake in &acc.lakes {
+            for (k, lake) in acc.lakes.iter().enumerate() {
                 let sum = lake.evaporation_m3s + lake.outflow_m3s;
                 prop_assert!((sum - lake.inflow_m3s).abs() <= 1e-9 * lake.inflow_m3s.max(1.0));
-                // A table lake keeps the table's level, which may stand above the spill.
-                if !table_exits.contains(&lake.exit) {
+                // A table lake keeps the table's level, which may stand above the spill. At the
+                // present day the walk's lakes, the table's, come first, and one that bed
+                // fragments joined has its exit at their outlet (Task 11f).
+                let table = table_exits.contains(&lake.exit) || (present && k < placed.len());
+                if !table {
                     prop_assert!(lake.level_m <= lake.spill_m);
                 }
             }
@@ -2622,6 +2630,187 @@ mod tests {
         let (r, acc) = valley_at(20.0, true, &[]);
         assert!(acc.lakes.is_empty() && acc.lake_nodes.is_empty());
         assert_eq!(receiver_of(&g, &r, sink), None);
+    }
+
+    /// Task 11f: the map bakes Baikal and the Great Lakes at their bed, so its nodes outside a
+    /// table lake's footprint were separate data lakes at the bed, taking the table lake's flow.
+    /// A mapped lake below a table lake's level that lies in its basin or beside its footprint
+    /// joins it: one lake at the table's level, no flow of its own.
+    #[test]
+    fn a_bed_fragment_joins_its_table_lake() {
+        let (g, elevation) = dammed_valley();
+        let floor = |cols: std::ops::RangeInclusive<u32>| -> Vec<u32> {
+            cols.map(|c| g.node(3, c)).collect()
+        };
+        // The table lake at 150 m over the floor's columns 9..=14, the exit (column 9) among them.
+        let level = 150.0;
+        let point = g.node(3, DAM + 4);
+        // In its basin above its level (columns 15..=17), baked at the bed (100 m).
+        let in_basin = floor(DAM + 7..=DAM + 9);
+        // Beside its footprint, off its basin: the rim and the node below it (the Angara's end of
+        // Baikal), baked at 60 m.
+        let beside = floor(DAM - 1..=DAM);
+        // Not fragments: a lake above the table's level in its basin, and one below it far
+        // downstream.
+        let above = floor(DAM + 12..=DAM + 14);
+        let far = floor(2..=3);
+        let mapped: Vec<(u32, f32)> = [
+            (&in_basin, 100.0),
+            (&beside, 60.0),
+            (&above, 200.0),
+            (&far, 10.0),
+        ]
+        .into_iter()
+        .flat_map(|(nodes, s)| nodes.iter().map(move |&v| (v, s)))
+        .collect();
+        let capacity = 0.01;
+        let mut r = route(&g, elevation.clone());
+        let (acc, placed, unplaced) = accumulate_full(
+            &g,
+            &mut r,
+            |_| 1.0,
+            |_| capacity,
+            |_| false,
+            true,
+            true,
+            3,
+            &[(point, level)],
+            &mapped,
+        );
+        assert!(unplaced.is_empty() && placed.len() == 1);
+        // The hazard: the fragments are off the walk's footprint, below the table's level.
+        let own = floor(DAM + 1..=DAM + 6);
+        assert!(in_basin.iter().all(|&v| r.basin_of[v as usize] == 0));
+        assert!(beside.iter().all(|&v| r.basin_of[v as usize] == NO_BASIN));
+        // One table lake and the two lakes that are not fragments, in map id order.
+        let levels: Vec<(LakeKind, f32)> = acc.lakes.iter().map(|l| (l.kind, l.level_m)).collect();
+        assert_eq!(
+            levels,
+            [
+                (LakeKind::Open, level),
+                (LakeKind::Data, 10.0),
+                (LakeKind::Data, 200.0)
+            ],
+            "{:?}",
+            acc.lakes
+        );
+        let footprint = |k: u16| -> Vec<u32> {
+            acc.lake_nodes
+                .iter()
+                .filter(|n| n.lake == k)
+                .map(|n| n.node)
+                .collect()
+        };
+        let mut joined = [own.clone(), in_basin.clone(), beside.clone()].concat();
+        joined.sort_unstable();
+        assert_eq!(footprint(0), joined);
+        assert_eq!(footprint(1), far);
+        assert_eq!(footprint(2), above);
+        assert!(acc.lake_nodes.iter().all(|n| n.shore_steps >= 1));
+        // Its outlet is the downstream-most node, the rim's: the outflow leaves from there.
+        let t = &acc.lakes[0];
+        assert_eq!(t.exit, g.node(3, DAM - 1));
+        assert!(
+            (t.evaporation_m3s - capacity * joined.len() as f64).abs() < 1e-9,
+            "{t:?}"
+        );
+        assert!((t.inflow_m3s - t.evaporation_m3s - t.outflow_m3s).abs() < 1e-9);
+        let below = receiver_of(&g, &r, t.exit).expect("the outlet drains");
+        assert_eq!(below, g.node(3, DAM - 2));
+        assert!(f64::from(acc.q[below as usize]) >= t.outflow_m3s, "{t:?}");
+        // Conservation: own runoff = what reaches the sea + what evaporates.
+        let own_total = (0..g.len())
+            .filter(|&v| elevation[v as usize] >= 0.0)
+            .count() as f64;
+        let sea: f64 = (0..g.len())
+            .filter(|&v| !r.ocean[v as usize] && acc.lake_nodes.iter().all(|n| n.node != v))
+            .filter(|&v| receiver_of(&g, &r, v).is_some_and(|j| r.ocean[j as usize]))
+            .map(|v| f64::from(acc.q[v as usize]))
+            .sum();
+        assert!(
+            (sea + acc.evaporated_m3s - own_total).abs() < 1e-3 * own_total,
+            "{sea} {}",
+            acc.evaporated_m3s
+        );
+        // Time-boxed or whole, the same result, bit for bit.
+        for budget in [1, 2, u32::MAX] {
+            let mut rb = route(&g, elevation.clone());
+            let (b, _, _) = accumulate_full(
+                &g,
+                &mut rb,
+                |_| 1.0,
+                |_| capacity,
+                |_| false,
+                true,
+                true,
+                budget,
+                &[(point, level)],
+                &mapped,
+            );
+            assert_eq!(
+                (&b.lakes, &b.lake_nodes, &b.q, &b.area_km2),
+                (&acc.lakes, &acc.lake_nodes, &acc.q, &acc.area_km2),
+                "{budget}"
+            );
+            assert_eq!(b.evaporated_m3s.to_bits(), acc.evaporated_m3s.to_bits());
+            assert_eq!(rb, r, "{budget}");
+        }
+    }
+
+    /// Task 11f: an endorheic table lake (the Caspian) takes a bed fragment beside it and stays
+    /// terminal, its surplus over the joined surface (the Python mirror's test pins the same
+    /// numbers).
+    #[test]
+    fn a_bed_fragment_joins_an_endorheic_lake_which_stays_terminal() {
+        let (g, elevation) = deep_bowl();
+        let centre = g.node(4, 6);
+        // 17 m: above the lake's 15 m, beside its footprint, drained by descent.
+        let slope = g.node(4, 3);
+        let run = |mapped: &[(u32, f32)]| {
+            let mut routing = Routing::new(elevation.clone()).with_sinks(vec![(centre, 15.0)]);
+            while !routing.step(&g, 7) {}
+            let mut r = routing.finish();
+            let first_flat = r.basins.len() as u32;
+            let (placed, unplaced) = place_levels(&r, first_flat, &|_| false, &[(centre, 15.0)]);
+            assert!(unplaced.is_empty());
+            let mut acc = Accumulation::new(g.len(), first_flat);
+            acc.set_levels(placed.clone());
+            acc.set_endorheic(placed.iter().map(|p| p.0).collect());
+            acc.set_present(true);
+            acc.set_mapped(mapped_lakes(mapped));
+            while !acc.init_step(&g, &r, |_, _| 5.0, 7).0 {}
+            while !acc
+                .walk_step(&g, &mut r, &|_| false, |_, _, _| 0.1, true, 7)
+                .0
+            {}
+            (r, acc)
+        };
+        let (_, plain) = run(&[]);
+        assert_eq!(plain.lakes.len(), 1);
+        let (r, acc) = run(&[(slope, 3.0)]);
+        assert_eq!(r.basin_of[slope as usize], NO_BASIN);
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let lake = &acc.lakes[0];
+        assert_eq!(
+            (lake.kind, lake.level_m, lake.outflow_m3s),
+            (LakeKind::Terminal, 15.0, 0.0)
+        );
+        // Its exit is the basin's: a terminal lake has no outlet to move to.
+        assert_eq!(lake.exit, plain.lakes[0].exit);
+        let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+        let mut want: Vec<u32> = plain.lake_nodes.iter().map(|n| n.node).collect();
+        want.push(slope);
+        want.sort_unstable();
+        assert_eq!(footprint, want);
+        // The same water (the slope drained to it by descent), one node more to evaporate it.
+        let wet = want.len() as f64;
+        assert!((lake.inflow_m3s - plain.lakes[0].inflow_m3s).abs() < 1e-6);
+        assert_eq!(lake.evaporation_m3s, lake.inflow_m3s);
+        assert!(
+            (lake.surplus_m3s - (lake.inflow_m3s - 0.1 * wet)).abs() < 1e-9,
+            "{lake:?}"
+        );
+        assert!((lake.area_km2 - plain.lakes[0].area_km2 - 100.0).abs() < 1e-6);
     }
 
     #[test]

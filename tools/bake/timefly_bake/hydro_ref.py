@@ -16,7 +16,8 @@ What is mirrored, rule for rule (the golden fixture ``hydro_golden.json`` pins i
   water through, a closed one ends at its lowest node (a dry sink), and every mapped lake stands
   at its baked surface over its own mapped nodes, its outlet the footprint node with the largest
   discharge whose chain meets no other of its nodes; discharge is then recomputed over the
-  redirected receivers.
+  redirected receivers. A mapped lake below a table lake's level that lies in its basin or
+  beside its footprint (a bed fragment; Task 11f) joins the table lake instead (:func:`_today`).
 - The climate (``climate.rs``): Beyer et al. 2020 at 0 ka, bilinear on the 1 degree grid, a tap
   with no value taking the zonal climate at a coast distance of 0, as the game's
   ``BeyerClimate`` does; Turc-Pike runoff and net lake evaporation from the climate table.
@@ -673,8 +674,31 @@ def _resolve(graph, routed, b, q, area, capacity, present, lakes, lake_of, state
         lakes.append(l)
 
 
+def _joined_table(graph, routed, tables, lake_of, surface, footprint):
+    """``today.rs``'s bed fragments rule: the table lake a mapped lake at ``surface`` over
+    ``footprint`` joins, if any. ``tables`` is each table lake's ``(basin, level)``; it joins one
+    below whose level it stands and which one of its nodes touches (in the basin, or beside the
+    footprint): the one most of its nodes touch, then the lower level, then the lower index."""
+    touching = [0] * len(tables)
+    for v in footprint:
+        touched = {k for k, (b, _) in enumerate(tables) if b == routed.basin_of[v]}
+        touched |= {lake_of[j] for j in graph.neighbours(v) if j is not None and j in lake_of}
+        for k in touched:
+            touching[k] += 1
+    best = None
+    for k, (_, level) in enumerate(tables):
+        if touching[k] > 0 and surface < level:
+            key = (-touching[k], level, k)
+            if best is None or key < best[0]:
+                best = (key, k)
+    return None if best is None else best[1]
+
+
 def _today(graph, routed, q, area, walked_q, capacity, mapped, lakes, lake_of, state):
-    """``today.rs``: the map's lakes over the walk's receivers, then discharge again."""
+    """``today.rs``: the map's lakes over the walk's receivers, then discharge again. The walk's
+    lakes are the table's (here only endorheic ones, terminal): a bed fragment joins one, whose
+    outlet is then one of its own sinks, with every other node of it and the fragments
+    redirected there."""
     n = len(graph)
     ocean = routed.ocean
     none = -1
@@ -683,6 +707,7 @@ def _today(graph, routed, q, area, walked_q, capacity, mapped, lakes, lake_of, s
         if not ocean[v]:
             j = _receiver_of(graph, routed, v)
             nxt[v] = none if j is None else j
+    tables = [(routed.basin_of[l.exit], l.level_m) for l in lakes]
     groups: dict[int, tuple[float, list[int]]] = {}
     for v in sorted(mapped):
         if ocean[v] or v in lake_of:
@@ -692,8 +717,13 @@ def _today(graph, routed, q, area, walked_q, capacity, mapped, lakes, lake_of, s
         nodes.append(v)
         groups[lid] = (max(s, surface), nodes)
     units: dict[int, list] = {}
+    joins: dict[int, list[int]] = {}
     for lid in sorted(groups):
         surface, footprint = groups[lid]
+        k = _joined_table(graph, routed, tables, lake_of, surface, footprint)
+        if k is not None:
+            joins.setdefault(k, []).extend(footprint)
+            continue
         inside = set(footprint)
         outlet = None
         for v in footprint:
@@ -711,6 +741,28 @@ def _today(graph, routed, q, area, walked_q, capacity, mapped, lakes, lake_of, s
                 nxt[v] = outlet
             cap += capacity(v, routed.elevation_m[v], graph.area_m2(v))
         units[outlet] = [lid, surface, footprint, cap, 0.0, 0.0]
+    # Table lakes with joined fragments, in index order. Only terminal ones are mirrored, so the
+    # outlet is among the lake's own nodes (its sinks), and the capacity is over all its nodes.
+    tabled: dict[int, list] = {}
+    for k in sorted(joins):
+        own = sorted(lakes[k].footprint)
+        every = sorted(set(own) | set(joins[k]))
+        inside = set(every)
+        outlet = None
+        for v in own:
+            at, meets = nxt[v], False
+            while at != none:
+                if at in inside:
+                    meets = True
+                    break
+                at = nxt[at]
+            if not meets and (outlet is None or walked_q[v] > walked_q[outlet]):
+                outlet = v
+        for v in every:
+            if v != outlet:
+                nxt[v] = outlet
+        cap = sum(capacity(v, routed.elevation_m[v], graph.area_m2(v)) for v in every)
+        tabled[outlet] = [k, every, cap, 0.0, 0.0]
     indeg = [0] * n
     for v in range(n):
         if nxt[v] != none:
@@ -721,11 +773,17 @@ def _today(graph, routed, q, area, walked_q, capacity, mapped, lakes, lake_of, s
         v = queue.popleft()
         to = nxt[v]
         unit = units.get(v)
+        table = tabled.get(v)
         if unit is not None:
             unit[4] = float(q[v])
             unit[5] = 0.0 if to == none else max(0.0, unit[4] - unit[3])
             evaporated += unit[4] - unit[5]
             passed = np.float32(unit[5])
+        elif table is not None:
+            table[3] = float(q[v])
+            table[4] = 0.0 if to == none else max(0.0, table[3] - table[2])
+            evaporated += table[3] - table[4]
+            passed = np.float32(table[4])
         else:
             if to == none:
                 evaporated += float(q[v])
@@ -739,6 +797,14 @@ def _today(graph, routed, q, area, walked_q, capacity, mapped, lakes, lake_of, s
         if indeg[to] == 0 and not ocean[to]:
             queue.append(to)
     state["evaporated"] = evaporated
+    for outlet, (k, every, cap, q_in, out) in sorted(tabled.items(), key=lambda u: u[1][0]):
+        lake = lakes[k]
+        lake.inflow_m3s, lake.outflow_m3s, lake.evaporation_m3s = q_in, out, q_in - out
+        lake.surplus_m3s = max(0.0, q_in - cap)
+        lake.footprint = every
+        lake.area_km2 = sum(graph.area_m2(v) * 1e-6 for v in every)
+        for v in every:
+            lake_of[v] = k
     for outlet, (lid, surface, footprint, _, q_in, out) in sorted(units.items(), key=lambda u: u[1][0]):
         lake_area = sum(graph.area_m2(v) * 1e-6 for v in footprint)
         lake = Lake(surface, surface, "Data", q_in, q_in - out, out, lake_area, outlet, footprint)

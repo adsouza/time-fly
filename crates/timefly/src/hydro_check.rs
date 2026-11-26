@@ -12,9 +12,10 @@
 //!   reference's length with every link matched, the Amazon's flats (reference below 300 m)
 //!   within 25 km for 80%. The coarse graph's numbers (straight node-to-node segments) are
 //!   printed beside them, not judged.
-//! - **Lakes:** at each point, `lake_tap(..).level_m` within [`LAKE_TOLERANCE_M`] of the lake
-//!   level table's level (a table lake within [`TABLE_LAKE_KM`]), else of the lake map's baked
-//!   surface there.
+//! - **Lakes:** at each point, `lake_tap(..).level_m`, and every pass lake holding nodes of the
+//!   point's map lake (Task 11f), within [`LAKE_TOLERANCE_M`] of the lake level table's level (a
+//!   table point within [`TABLE_LAKE_KM`], or in the point's map lake), else of the lake map's
+//!   baked surface there.
 //! - **Outlets:** the river of the largest discharge within [`OUTLET_START_KM`] of a point flows
 //!   within [`OUTLET_VIA_KM`] of each of its named places ([`OutletBar::vias`]) and ends in the
 //!   ocean (or, for [`OutletEnd::Lake`], a lake with no outflow: the Volga's Caspian) within
@@ -61,7 +62,8 @@ use timefly_core::hydrology::today_rivers::{
     CourseBed, CourseStep, course_beds, course_steps, shipped_today_rivers,
 };
 use timefly_core::hydrology::{
-    CubeLattice, Down, EraHydrology, HydroGraph, LatticeSizes, SnapshotSource, hydro_lattice_for,
+    CubeLattice, Down, EraHydrology, HydroGraph, LakeKind, LatticeSizes, SnapshotSource,
+    hydro_lattice_for,
 };
 use timefly_core::worldgen::coarse::{
     CoarseField, frames_needed, snapshot_field, snapshot_sea_level_anomaly_m,
@@ -241,6 +243,12 @@ impl CheckSpec {
                 lake("Lake Titicaca", -15.8, -69.4),
                 lake("Great Salt Lake", 41.1, -112.5),
                 lake("Lake Victoria", -1.0, 33.0),
+                // Task 11f: the map bakes the Great Lakes at their bed. Each point lies in its
+                // table lake's own map lake, far from its table point, near where a bed
+                // fragment was; the bar judges the whole map lake.
+                lake("Lake Michigan (Green Bay)", 44.7, -87.85),
+                lake("Lake Huron (by the St. Marys' mouth)", 45.95, -83.9),
+                lake("Lake Erie (its western basin)", 41.7, -82.9),
             ],
             // Every point is an English Wikipedia article's coordinates (its own, or its
             // infobox's mouth), read 2026-11-26 (the owner's ruling: cited outlet points); each
@@ -765,29 +773,45 @@ fn verdict(pass: bool) -> &'static str {
 }
 
 /// The level a lake point should read: the lake level table's (a point within
-/// [`TABLE_LAKE_KM`]), else the lake map's baked surface; and where it came from.
+/// [`TABLE_LAKE_KM`] of a table point, or in the map lake holding one: Task 11f, the map bakes
+/// the table's lakes at their bed), else the lake map's baked surface; and where it came from.
 pub fn expected_level(lake: &LakePoint) -> Option<(f32, &'static str)> {
     let at = dir(lake.lat, lake.lon);
-    if let Some(t) = shipped_lake_levels()
-        .iter()
-        .find(|t| km_between(dir(t.lat, t.lon), at) <= TABLE_LAKE_KM)
-    {
+    let map = shipped_lake_map();
+    let id = map.lake_at(lake.lat, lake.lon);
+    if let Some(t) = shipped_lake_levels().iter().find(|t| {
+        km_between(dir(t.lat, t.lon), at) <= TABLE_LAKE_KM
+            || id.is_some_and(|id| map.lake_at(t.lat, t.lon) == Some(id))
+    }) {
         return Some((t.level_m, "the lake level table"));
     }
-    let map = shipped_lake_map();
-    map.lake_at(lake.lat, lake.lon)
-        .map(|id| (map.level(id), "the lake map's fine surface"))
+    id.map(|id| (map.level(id), "the lake map's fine surface"))
 }
 
-pub fn judge_lake(hydro: &EraHydrology, lake: &LakePoint) -> BarResult {
+/// Judges a lake point: the pass's lake there ([`EraHydrology::lake_tap`]) and every pass lake
+/// holding nodes of the point's map lake (`holders`, [`map_lake_holders`]; Task 11f: a tap takes
+/// the highest of four nodes' lakes, so it never sees a bed fragment beside the table lake)
+/// stand within [`LAKE_TOLERANCE_M`] of the expected level.
+pub fn judge_lake(
+    hydro: &EraHydrology,
+    lake: &LakePoint,
+    holders: &[(u16, u16, u32)],
+) -> BarResult {
     let got = hydro.lake_tap(RenderDir(dir(lake.lat, lake.lon)));
     let (pass, line) = match (got, expected_level(lake)) {
         (Some(tap), Some((want, from))) => {
             let diff = f64::from(tap.level_m) - f64::from(want);
+            let (whole, whole_line) = match shipped_lake_map().lake_at(lake.lat, lake.lon) {
+                Some(id) => map_lake_stands_at(want, holders_of(holders, id), &|l| {
+                    hydro.lakes[usize::from(l)].level_m
+                }),
+                None => (true, String::new()),
+            };
             (
-                diff.abs() <= LAKE_TOLERANCE_M,
+                diff.abs() <= LAKE_TOLERANCE_M && whole,
                 format!(
-                    "level {:.1} m, {from} {:.1} m (off {:+.1} m, {LAKE_TOLERANCE_M} m allowed)",
+                    "level {:.1} m, {from} {:.1} m (off {:+.1} m, {LAKE_TOLERANCE_M} m allowed)\
+                     {whole_line}",
                     tap.level_m, want, diff
                 ),
             )
@@ -809,6 +833,33 @@ pub fn judge_lake(hydro: &EraHydrology, lake: &LakePoint) -> BarResult {
         ),
         details: Vec::new(),
     }
+}
+
+/// Whether every pass lake holding nodes of a map lake (`held`: `(map id, pass lake, nodes)`)
+/// stands within [`LAKE_TOLERANCE_M`] of `want` (`level(lake)`), and the line's tail naming
+/// them, worst first.
+pub fn map_lake_stands_at(
+    want: f32,
+    held: &[(u16, u16, u32)],
+    level: &dyn Fn(u16) -> f32,
+) -> (bool, String) {
+    if held.is_empty() {
+        return (true, String::new());
+    }
+    let mut by: Vec<(f64, u16, u32)> = held
+        .iter()
+        .map(|&(_, l, n)| (f64::from(level(l)) - f64::from(want), l, n))
+        .collect();
+    by.sort_by(|a, b| b.0.abs().total_cmp(&a.0.abs()).then(a.1.cmp(&b.1)));
+    let pass = by.iter().all(|b| b.0.abs() <= LAKE_TOLERANCE_M);
+    let named: Vec<String> = by
+        .iter()
+        .map(|&(d, l, n)| format!("{l} at {:.1} m ({n} nodes)", f64::from(want) + d))
+        .collect();
+    (
+        pass,
+        format!("; its map lake's nodes lie in lakes [{}]", named.join(", ")),
+    )
 }
 
 /// Traces `outlet`'s river ([`trace_outlet`]) once to its end and once per via, and judges it
@@ -1404,8 +1455,9 @@ pub fn hydro_check(
         lines.push(result.line);
         lines.extend(result.details);
     }
+    let holders = map_lake_holders(hydro, shipped_lake_map());
     for lake in &spec.lakes {
-        let result = judge_lake(hydro, lake);
+        let result = judge_lake(hydro, lake, &holders);
         pass &= result.pass;
         lines.push(result.line);
     }
@@ -1480,7 +1532,22 @@ pub fn hydro_check(
             .collect();
         found.join(", ")
     };
-    lines.extend(lake_map_audit_lines(map, &shore_height, &game_lakes));
+    let standing = table_lake_levels(&holders, &|l| {
+        let lake = &hydro.lakes[usize::from(l)];
+        (lake.kind, lake.level_m)
+    });
+    let stands_at = |id: u16| {
+        standing
+            .binary_search_by_key(&id, |s| s.0)
+            .ok()
+            .map(|k| standing[k].1)
+    };
+    lines.extend(lake_map_audit_lines(
+        map,
+        &shore_height,
+        &stands_at,
+        &game_lakes,
+    ));
     // Every lake, one line each (Task 11d fix round 2): for diffing lakes between runs.
     let tsv = out_dir.join("hydro-check-lakes.tsv");
     fs::write(&tsv, lakes_tsv(hydro)).map_err(|e| format!("{}: {e}", tsv.display()))?;
@@ -1509,29 +1576,81 @@ pub const AUDITED_LAKES: &[(&str, (f64, f64))] = &[
     ("Issyk-Kul", (42.45, 77.25)),
 ];
 
+/// The pass's lakes holding each lake-map lake's lattice nodes (a node's centre in its map
+/// cell): `(map id, pass lake, nodes)`, sorted.
+pub fn map_lake_holders(hydro: &EraHydrology, map: &LakeMap) -> Vec<(u16, u16, u32)> {
+    let lattice = &hydro.lattice;
+    let mut held: Vec<(u16, u16)> = Vec::new();
+    for v in 0..lattice.len() {
+        let Some(l) = hydro.lake_of(v) else {
+            continue;
+        };
+        let (la, lo) = latlon(lattice.dir(v).0);
+        if let Some(id) = map.lake_at(la, lo) {
+            held.push((id, l));
+        }
+    }
+    held.sort_unstable();
+    held.chunk_by(|a, b| a == b)
+        .map(|c| (c[0].0, c[0].1, c.len() as u32))
+        .collect()
+}
+
+/// Map lake `id`'s entries in [`map_lake_holders`]' list.
+pub fn holders_of(holders: &[(u16, u16, u32)], id: u16) -> &[(u16, u16, u32)] {
+    let from = holders.partition_point(|h| h.0 < id);
+    let to = holders.partition_point(|h| h.0 <= id);
+    &holders[from..to]
+}
+
+/// The level each lake-map lake stands at where table lakes alone hold its nodes (the one
+/// holding the most; ties: the lower index), `(map id, level)` sorted by id, from
+/// [`map_lake_holders`] and each pass lake's `(kind, level)`. At 0 ka the pass's lakes other
+/// than the table's are the map's, kind `Data`: a map lake any of them holds is left out (Task
+/// 11f: a bed fragment beside its table lake still stands at the bed).
+pub fn table_lake_levels(
+    holders: &[(u16, u16, u32)],
+    lake: &dyn Fn(u16) -> (LakeKind, f32),
+) -> Vec<(u16, f64)> {
+    holders
+        .chunk_by(|a, b| a.0 == b.0)
+        .filter(|by_id| by_id.iter().all(|h| lake(h.1).0 != LakeKind::Data))
+        .map(|by_id| {
+            let best = by_id
+                .iter()
+                .max_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)))
+                .expect("a chunk is never empty");
+            (by_id[0].0, f64::from(lake(best.1).1))
+        })
+        .collect()
+}
+
 fn dir_render(lat: f64, lon: f64) -> RenderDir {
     geo_to_render(latlon_to_geo(lat, lon))
 }
 
-/// Informative (Task 11d fix round 5), never a failure: the lake map's lakes whose baked
-/// surface stands more than [`LAKE_MAP_GAP_M`] below their shoreline ring's lowest cell
+/// Informative (Task 11d fix round 5), never a failure: the lake map's lakes whose surface
+/// stands more than [`LAKE_MAP_GAP_M`] below their shoreline ring's lowest cell
 /// ([`LakeMap::rings`], the heights from `height_at(lat, lon)`), the largest gap first, each
 /// with `game(id)` (the pass's lakes whose exit lies in it); then [`AUDITED_LAKES`], flagged or
-/// not.
+/// not. The surface is the level `stands_at(id)` gives (a table lake's, where the pass joined
+/// the map lake to one: Task 11f), else the baked one.
 pub fn lake_map_audit_lines(
     map: &LakeMap,
     height_at: &dyn Fn(f64, f64) -> f64,
+    stands_at: &dyn Fn(u16) -> Option<f64>,
     game: &dyn Fn(u16) -> String,
 ) -> Vec<String> {
     let rings = map.rings();
-    // Each lake's (baked, ring min, ring median), where it has a ring.
+    // Each lake's (surface, ring min, ring median), where it has a ring.
     let shore: Vec<Option<(f64, f64, f64)>> = rings
         .iter()
         .map(|r| {
             let mut h: Vec<f64> = r.ring.iter().map(|&(la, lo)| height_at(la, lo)).collect();
             h.sort_by(f64::total_cmp);
             let (&min, med) = (h.first()?, h[h.len() / 2]);
-            Some((f64::from(map.level(r.id)), min, med))
+            let surface = stands_at(r.id).unwrap_or(f64::from(map.level(r.id)));
+            Some((surface, min, med))
         })
         .collect();
     let named = |id: u16| {
@@ -1540,15 +1659,21 @@ pub fn lake_map_audit_lines(
             .find(|(_, (la, lo))| map.lake_at(*la, *lo) == Some(id))
             .map(|(n, _)| (*n).to_string())
     };
-    let line = |r: &LakeRing, (baked, min, med): (f64, f64, f64)| {
+    let line = |r: &LakeRing, (surface, min, med): (f64, f64, f64)| {
         let name = named(r.id).unwrap_or_else(|| format!("map lake {}", r.id));
+        let baked = f64::from(map.level(r.id));
+        let stands = if stands_at(r.id).is_some() {
+            format!(", stands at the table's {surface:.1} m")
+        } else {
+            String::new()
+        };
         format!(
-            "  {name} at ({:.2}, {:.2}), {} cells: baked {baked:.1} m, ring lowest {min:.1} m \
-             (median {med:.1} m), {:.0} m below; the pass's lakes there [{}]",
+            "  {name} at ({:.2}, {:.2}), {} cells: baked {baked:.1} m{stands}, ring lowest \
+             {min:.1} m (median {med:.1} m), {:.0} m below; the pass's lakes there [{}]",
             r.centre.0,
             r.centre.1,
             r.cells,
-            min - baked,
+            min - surface,
             game(r.id)
         )
     };
@@ -1556,7 +1681,7 @@ pub fn lake_map_audit_lines(
         .iter()
         .zip(&shore)
         .filter_map(|(r, s)| s.map(|s| (r, s)))
-        .filter(|(_, (baked, min, _))| min - baked > LAKE_MAP_GAP_M)
+        .filter(|(_, (surface, min, _))| min - surface > LAKE_MAP_GAP_M)
         .collect();
     flagged.sort_by(|a, b| (b.1.1 - b.1.0).total_cmp(&(a.1.1 - a.1.0)));
     let mut lines = vec![format!(
@@ -1801,11 +1926,12 @@ mod tests {
             ),
             (25.0, 0.8, false, Some(300.0))
         );
-        assert_eq!(s.lakes.len(), 5);
-        // The Caspian reads the table; the other four the map's fine surfaces.
+        assert_eq!(s.lakes.len(), 8);
+        // The Caspian reads the table; the next four the map's fine surfaces; the Great Lakes
+        // the table again (the_great_lakes_stand_at_their_table_levels).
         let (_, from) = expected_level(&s.lakes[0]).unwrap();
         assert_eq!(from, "the lake level table");
-        for lake in &s.lakes[1..] {
+        for lake in &s.lakes[1..5] {
             let (level, from) = expected_level(lake).unwrap_or_else(|| panic!("{lake:?}"));
             assert_eq!(from, "the lake map's fine surface", "{lake:?}");
             assert!(level.is_finite());
@@ -1921,7 +2047,7 @@ mod tests {
     fn the_lake_map_audit_lists_lakes_baked_below_their_shores() {
         let map = shipped_lake_map();
         // Every shore at 500 m: lakes baked under 480 m are flagged, Victoria (1133 m) is not.
-        let lines = lake_map_audit_lines(map, &|_, _| 500.0, &|id| format!("game {id}"));
+        let lines = lake_map_audit_lines(map, &|_, _| 500.0, &|_| None, &|id| format!("game {id}"));
         let count: usize = lines[0]
             .split_whitespace()
             .nth(4)
@@ -1954,8 +2080,89 @@ mod tests {
             AUDITED_LAKES.len()
         );
         // With every shore below the sea's floor, nothing is flagged.
-        let none = lake_map_audit_lines(map, &|_, _| -1e4, &|_| String::new());
+        let none = lake_map_audit_lines(map, &|_, _| -1e4, &|_| None, &|_| String::new());
         assert!(none[0].contains(" 0 of "), "{}", none[0]);
+        // Task 11f: a map lake the pass joins to a table lake is judged at the table's level.
+        let baikal_id = map.lake_at(53.5, 108.0).expect("Baikal is mapped");
+        let baikal = |stands: &dyn Fn(u16) -> Option<f64>| {
+            lake_map_audit_lines(map, &|_, _| 400.0, stands, &|_| String::new())
+                .into_iter()
+                // The named lakes' line, which ends with its verdict.
+                .find(|l| {
+                    l.starts_with("  Baikal at") && (l.ends_with("FLAGGED") || l.ends_with(" - ok"))
+                })
+                .expect("Baikal is named")
+        };
+        assert!(baikal(&|_| None).ends_with("FLAGGED"));
+        let joined = baikal(&|id| (id == baikal_id).then_some(455.5));
+        assert!(joined.ends_with(" - ok"), "{joined}");
+        assert!(
+            joined.contains("baked -328.0 m, stands at the table's 455.5 m"),
+            "{joined}"
+        );
+    }
+
+    /// Task 11f: the map bakes Michigan, Huron and Erie at their bed (and their fragments were
+    /// separate data lakes there); the lake bar reads each at its table level, at a point far
+    /// from its table point in its own map lake, where the fragments lay.
+    #[test]
+    fn the_great_lakes_stand_at_their_table_levels() {
+        let s = CheckSpec::standard();
+        let levels = shipped_lake_levels();
+        let map = shipped_lake_map();
+        for name in ["Lake Michigan", "Lake Huron", "Lake Erie"] {
+            let p = s
+                .lakes
+                .iter()
+                .find(|l| l.name.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} is in the lake bar"));
+            let t = levels
+                .iter()
+                .find(|t| t.name == name)
+                .expect("a table entry");
+            assert_eq!(
+                expected_level(p),
+                Some((t.level_m, "the lake level table")),
+                "{p:?}"
+            );
+            // The map lake decides, not the 25 km rule.
+            let at = dir(p.lat, p.lon);
+            assert!(
+                levels
+                    .iter()
+                    .all(|t| km_between(dir(t.lat, t.lon), at) > TABLE_LAKE_KM),
+                "{p:?}"
+            );
+            // The hazard: the point's map lake is the table lake's own, baked far below it.
+            let id = map.lake_at(p.lat, p.lon).expect("in a map lake");
+            assert_eq!(map.lake_at(t.lat, t.lon), Some(id), "{p:?}");
+            assert!(
+                f64::from(t.level_m - map.level(id)) > LAKE_TOLERANCE_M,
+                "{p:?}: baked {}",
+                map.level(id)
+            );
+        }
+        // The bar and the audit judge the whole map lake: a bed fragment beside the table lake
+        // (Michigan's, at 96.4 m, the pass's lake 376 before Task 11f) fails it.
+        let lakes = |l: u16| match l {
+            2 => (LakeKind::Open, 176.0),
+            _ => (LakeKind::Data, 96.4),
+        };
+        let level = |l: u16| lakes(l).1;
+        let split = [(7, 2, 1100), (7, 376, 23), (9, 376, 1)];
+        let (pass, line) = map_lake_stands_at(176.0, holders_of(&split, 7), &level);
+        assert!(!pass, "{line}");
+        assert!(
+            line.starts_with(
+                "; its map lake's nodes lie in lakes [376 at 96.4 m (23 nodes), 2 at 176.0 m"
+            ),
+            "{line}"
+        );
+        assert_eq!(table_lake_levels(&split, &lakes), []);
+        let joined = [(7, 2, 1123), (9, 376, 1)];
+        assert!(map_lake_stands_at(176.0, holders_of(&joined, 7), &level).0);
+        assert_eq!(table_lake_levels(&joined, &lakes), [(7, 176.0)]);
+        assert_eq!(map_lake_stands_at(1.0, &[], &level), (true, String::new()));
     }
 
     /// Owner, 2026-11-26: the Amazon alone may end 160 km from its mouth; the rest keep
