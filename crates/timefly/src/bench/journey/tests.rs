@@ -216,7 +216,7 @@ fn the_globe_keys_fly_to_the_region_and_descend_to_the_dive() {
     }
     // Over the region, the keys only descend.
     let over = GlobeFlight::start(46.5, 10.0);
-    assert_eq!(globe_keys(&over, target), [KeyCode::ControlLeft]);
+    assert_eq!(globe_keys(&over, target), [KeyCode::KeyQ]);
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
     // puts it higher above the ground does not stop it.
     assert_eq!(
         region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, false, EAST_YAW),
-        [KeyCode::ControlLeft]
+        [KeyCode::KeyQ]
     );
     assert_eq!(
         region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, true, EAST_YAW),

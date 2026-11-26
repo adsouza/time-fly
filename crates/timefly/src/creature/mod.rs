@@ -602,24 +602,16 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn the_wings_never_lie_edge_on_to_the_chase_view() {
-        use bevy::math::DVec3;
-        use timefly_core::flight::altitudes::CHASE_MIN_DISTANCE_M;
-        use timefly_core::flight::chase::{CHASE_START_LOOK_DEG, chase_pose};
-        // The fly heading −z from the origin; the region's chase eye behind it, raised
-        // CHASE_ELEVATION_DEG above its horizon (the look pitch moves only the target).
-        let chase = chase_pose(
-            DVec3::ZERO,
-            DVec3::NEG_Z,
-            DVec3::Y,
-            1_000.0,
-            CHASE_START_LOOK_DEG,
-            CHASE_MIN_DISTANCE_M,
-        );
-        let behind = chase.eye.normalize().as_vec3();
-        // At least this angle between a wing's plane and the view.
-        const MIN_VIEW_DEG: f32 = 10.0;
+    /// The least angle (degrees) the wings must show the chase view: the brightest of them at
+    /// every point of the stroke, and each of them on average through it.
+    const MIN_VIEW_DEG: f32 = 10.0;
+
+    /// Checks the wings are never edge-on to an eye in the direction `behind` from the fly (in
+    /// the fly's heading frame: `−z` forward, `+y` up), at every pitch (a full-speed descent is
+    /// the steepest, nose down `MAX_PITCH_DEG`), bank, swing of the eye to either side (the
+    /// chase eye glides, so in turns it swings a little off behind) and point of the stroke.
+    /// `Err` names the first failure.
+    fn wings_never_edge_on_from(behind: Vec3) -> Result<(), String> {
         // The chase eye glides, so in turns it swings a little to either side of behind.
         const SWING_DEG: i32 = 10;
         const STROKE_SAMPLES: usize = 40;
@@ -632,8 +624,6 @@ mod tests {
                 .step_by(step)
                 .map(|d| (d as f32).to_radians())
         };
-        // Every pitch (a full-speed descent is the steepest, nose down MAX_PITCH_DEG), bank and
-        // swing of the eye, at every point of the stroke.
         for pitch_rad in degrees(MAX_PITCH_DEG, 2) {
             for bank_rad in degrees(MAX_BANK_DEG, 4) {
                 for swing in degrees(SWING_DEG as f32, 5) {
@@ -661,32 +651,103 @@ mod tests {
                             })
                             .collect();
                         let best = seen.iter().copied().fold(0.0, f32::max);
-                        assert!(
-                            best >= least,
-                            "every wing edge-on: pitch {:.0}°, bank {:.0}°, swing {:.0}°, \
-                             flap {flap:.2}: best {:.1}°",
-                            pitch_rad.to_degrees(),
-                            bank_rad.to_degrees(),
-                            swing.to_degrees(),
-                            best.asin().to_degrees()
-                        );
+                        if best < least {
+                            return Err(format!(
+                                "every wing edge-on: pitch {:.0}°, bank {:.0}°, swing {:.0}°, \
+                                 flap {flap:.2}: best {:.1}°",
+                                pitch_rad.to_degrees(),
+                                bank_rad.to_degrees(),
+                                swing.to_degrees(),
+                                best.asin().to_degrees()
+                            ));
+                        }
                         for (m, s) in mean.iter_mut().zip(&seen) {
                             *m += s / STROKE_SAMPLES as f32;
                         }
                     }
                     // No wing stays edge-on through its stroke either.
-                    for (i, m) in mean.iter().enumerate() {
-                        assert!(
-                            *m >= least,
+                    if let Some((i, m)) = mean.iter().enumerate().find(|(_, m)| **m < least) {
+                        return Err(format!(
                             "wing face {i} edge-on through the stroke: pitch {:.0}°, bank \
                              {:.0}°, swing {:.0}°: {:.1}°",
                             pitch_rad.to_degrees(),
                             bank_rad.to_degrees(),
                             swing.to_degrees(),
                             m.asin().to_degrees()
-                        );
+                        ));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_wings_never_lie_edge_on_to_the_chase_view() {
+        use bevy::math::DVec3;
+        use timefly_core::flight::altitudes::CHASE_MIN_DISTANCE_M;
+        use timefly_core::flight::chase::{CHASE_START_LOOK_DEG, chase_pose};
+        // The fly heading −z from the origin; the region's chase eye behind it, raised
+        // CHASE_ELEVATION_DEG above its horizon whatever the drag (the look pitch moves only
+        // the target).
+        let chase = chase_pose(
+            DVec3::ZERO,
+            DVec3::NEG_Z,
+            DVec3::Y,
+            1_000.0,
+            CHASE_START_LOOK_DEG,
+            CHASE_MIN_DISTANCE_M,
+        );
+        if let Err(e) = wings_never_edge_on_from(chase.eye.normalize().as_vec3()) {
+            panic!("region: {e}");
+        }
+    }
+
+    #[test]
+    fn the_wings_never_lie_edge_on_to_the_globe_chase_view() {
+        use timefly_core::flight::altitudes::GLOBE_MAX_ALTITUDE_KM;
+        use timefly_core::flight::chase::{globe_chase_pose, globe_look_offset_range};
+        use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, GlobeFlight};
+        // On the globe the drag raises and lowers the eye itself (the region's eye stays at
+        // CHASE_ELEVATION_DEG): every altitude from the floor to the top, every drag offset
+        // across its range there and past it (the pose clamps). The eye's direction from the
+        // fly depends only on its elevation, so each whole degree of it is checked once.
+        let mut checked = std::collections::BTreeMap::new();
+        let (lo, hi) = (GLOBE_MIN_ALTITUDE_KM.ln(), GLOBE_MAX_ALTITUDE_KM.ln());
+        for i in 0..=24 {
+            let alt = (lo + (hi - lo) * f64::from(i) / 24.0).exp();
+            let f = GlobeFlight {
+                altitude_km: alt,
+                ..GlobeFlight::start(20.0, 30.0)
+            };
+            let (fwd, up) = (f.heading, f.up());
+            let right = fwd.cross(up);
+            let (low, high) = globe_look_offset_range(alt);
+            for k in -2..=42 {
+                let offset = low + (high - low) * f64::from(k) / 40.0;
+                let back = globe_chase_pose(&f, offset).eye - f.position_km();
+                // In the fly's heading frame.
+                let behind = bevy::math::DVec3::new(back.dot(right), back.dot(up), -back.dot(fwd))
+                    .normalize()
+                    .as_vec3();
+                let elevation = behind.y.asin().to_degrees();
+                checked
+                    .entry(elevation.round() as i32)
+                    .or_insert((alt, offset, behind));
+            }
+        }
+        // The whole range, the dragged-low eye included.
+        let lowest = *checked.keys().next().unwrap();
+        let highest = *checked.keys().next_back().unwrap();
+        assert!(
+            (lowest as f64 - timefly_core::flight::chase::GLOBE_CHASE_MIN_ELEVATION_DEG).abs()
+                <= 0.5,
+            "{lowest}"
+        );
+        assert!(highest >= 45, "{highest}");
+        for (elevation, (alt, offset, behind)) in checked {
+            if let Err(e) = wings_never_edge_on_from(behind) {
+                panic!("globe, eye {elevation}° up ({alt:.0} km, drag {offset:.1}°): {e}");
             }
         }
     }

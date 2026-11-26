@@ -8,14 +8,14 @@
 //! and:
 //!
 //! 1. **Flies the globe** to above the route's region (within [`ARRIVE_DEG`]) with the turn keys
-//!    and `W` ([`globe_keys`]), then descends with `Ctrl`, still steering in to within
+//!    and `W` ([`globe_keys`]), then descends with `Q`, still steering in to within
 //!    [`SETTLE_DEG`], until the dive commits below `DIVE_ALTITUDE_KM`. It lets go while the dive
 //!    waits in the cloud and the fly emerges.
 //! 2. **Descends, then flies out** along the route's heading in the region ([`region_keys`]:
 //!    north for the Andes, Pangaea and the Grand Canyon, west for Mt Fuji, east for the headless
 //!    tests' Alps). The fly emerges at 230 km,
 //!    above `HOP_ALTITUDE_M`, where a hop's lift would do nothing; so before the first hop it
-//!    holds `Ctrl` alone, straight down in place (about 21 s at the 10 km/s cap), to
+//!    holds `Q` alone, straight down in place (about 21 s at the 10 km/s cap), to
 //!    [`CRUISE_AGL_M`] above the ground, turning to face the heading meanwhile. Then it holds `W` to the
 //!    edge, still at the speed cap, so the preload's lead is the worst case. The neighbour
 //!    preloads, the lift raises the fly to the cloud bank and the cloud gathers, the fly holds in
@@ -459,13 +459,13 @@ fn region_dir(arg: &RegionArg) -> DVec3 {
 }
 
 /// The keys flying the globe's fly toward `target` (a direction): turn toward its bearing,
-/// fly forward while facing it, and once within [`ARRIVE_DEG`] only descend (`Ctrl`) to the dive.
+/// fly forward while facing it, and once within [`ARRIVE_DEG`] only descend (`Q`, a descend key on every platform) to the dive.
 pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
     let up = flight.dir.normalize();
     let target = target.normalize();
     let arc = up.dot(target).clamp(-1.0, 1.0).acos();
     if arc <= SETTLE_DEG.to_radians() {
-        return vec![KeyCode::ControlLeft];
+        return vec![KeyCode::KeyQ];
     }
     let toward = (target - up * up.dot(target)).normalize_or_zero();
     if toward == DVec3::ZERO {
@@ -489,14 +489,14 @@ pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
         keys.push(KeyCode::KeyW);
     }
     if arrived {
-        keys.push(KeyCode::ControlLeft);
+        keys.push(KeyCode::KeyQ);
     }
     keys
 }
 
 /// The keys flying the region's fly, heading `yaw`, `agl_m` above the ground, in `phase`, on a
 /// route heading `want` (a yaw):
-/// - flying, not yet `cruising` and above [`CRUISE_AGL_M`]: descend (`Ctrl`) in place, turning
+/// - flying, not yet `cruising` and above [`CRUISE_AGL_M`]: descend (`Q`) in place, turning
 ///   toward `want` meanwhile;
 /// - flying otherwise: turn to face `want` and fly forward within [`YAW_TOLERANCE_DEG`] of it
 ///   (once cruising, a valley that puts the fly higher above the ground does not stop it);
@@ -527,7 +527,7 @@ pub fn region_keys(
                 });
             }
             if !cruising && agl_m > CRUISE_AGL_M {
-                keys.push(KeyCode::ControlLeft);
+                keys.push(KeyCode::KeyQ);
             } else if err.abs() <= YAW_TOLERANCE_DEG.to_radians() {
                 keys.push(KeyCode::KeyW);
             }

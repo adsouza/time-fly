@@ -18,11 +18,12 @@ TIMEFLY_LOG_DIR=/tmp/timefly-m3-checks target/release/timefly
 to start in a region instead of on the globe (the fly at M2's start pose).
 
 **Controls:** `W` `A` `S` `D` or the arrows fly; drag turns the fly and tilts the view;
-`Space`/`E` climb, `Ctrl`/`Q` descend; `Shift` with forward boosts; on the globe the scroll
-wheel climbs and descends; `Backspace` climbs back out to the globe; `[` and `]` step to the
-older and younger snapshot; `F12` (or the small camera button under the compass) saves a bug
-shot, a PNG named by the place and view with a JSON sidecar beside it, in `Pictures/Time Fly`
-(see check 16); `--from-shot <sidecar.json>` starts the game at a shot's pose.
+`Space`/`E` climb, `Option`/`Q` descend (`Ctrl`/`Q` on Windows and Linux, and in a browser
+away from a Mac: on a Mac `Ctrl+↑` is Mission Control); `Shift` with forward boosts; on the
+globe the scroll wheel climbs and descends; `Backspace` climbs back out to the globe; `[` and
+`]` step to the older and younger snapshot; `F12` (or the small camera button under the
+compass) saves a bug shot, a PNG named by the place and view with a JSON sidecar beside it, in
+`Pictures/Time Fly` (see check 16); `--from-shot <sidecar.json>` starts the game at a shot's pose.
 
 **The HUD** (top left): the altitude, under it the latitude and longitude (`22.87° N  71.42° E`,
 in the era's frame, the frame `--region` takes; marked `(then)` past 26 ka, where that frame is
@@ -47,7 +48,7 @@ tree):
 ### 1. The dive and the climb, recent era
 
 1. Launch on the globe at the present. Steer toward the Alps (about 46.5° N, 10° E) and descend
-   (`Ctrl`) until the cloud gathers and you pass through it.
+   (`Option` or `Q`) until the cloud gathers and you pass through it.
 2. Below the cloud, fly a little. Then climb (`Space`) up through the cloud base until you come
    out over the globe.
 3. Repeat once with `Backspace` instead of climbing by hand.

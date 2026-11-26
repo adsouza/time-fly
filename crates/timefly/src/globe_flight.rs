@@ -987,7 +987,7 @@ mod tests {
         set_flight(&mut app, at(3_000.0));
         run(&mut app, 3);
         let limit = crate::creature::MAX_PITCH_DEG.to_radians();
-        for (key, sign) in [(KeyCode::Space, 1.0), (KeyCode::ControlLeft, -1.0)] {
+        for (key, sign) in [(KeyCode::Space, 1.0), (KeyCode::KeyQ, -1.0)] {
             app.world_mut()
                 .resource_mut::<ButtonInput<KeyCode>>()
                 .press(key);
@@ -1089,7 +1089,7 @@ mod tests {
         set_flight(&mut app, at(DIVE_ALTITUDE_KM - 1.0));
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::ControlLeft);
+            .press(KeyCode::KeyQ);
         app.update();
         let mut last = flight(&app).altitude_km;
         let mut step = f64::INFINITY;

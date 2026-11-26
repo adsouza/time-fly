@@ -7,7 +7,7 @@
 //! back blank on macOS. The window itself stays empty while the tour runs.
 //!
 //! `cargo run -p timefly --example region_tour -- <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix]
-//! [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
+//! [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1|…|globedescent] [AGL_M]` (run through cargo, or set `BEVY_ASSET_ROOT=crates/timefly`, so the assets are
 //! found). `--no-dunes`, anywhere among the arguments, turns the dunes off as the game's flag
 //! does. The region defaults to the Alps at the present (`46.5,10,0`) and the prefix to
 //! `cdlod`, giving `<prefix>-shaded.png` and `<prefix>-wire.png`; a fifth argument `shaded`
@@ -66,7 +66,7 @@
 //! A fifth argument `dive` checks the dive and the climb through the cloud (M3 Task 7). The game
 //! starts on the globe (no launch region), the globe camera renders into the offscreen image
 //! too, and the tour puts the fly over `LAT,LON` at `AGE_YEARS`, [`ABOVE_CLOUD_KM`] up, just
-//! above the cloud: `<prefix>-globe-above.png`. Then it holds `Ctrl` (descend) through the cloud
+//! above the cloud: `<prefix>-globe-above.png`. Then it holds `Q` (descend) through the cloud
 //! top and the dive altitude, and saves `<prefix>-dive-cloud.png` in the white-out over the
 //! globe and `<prefix>-dive-swap.png` from the swap frame, on the region's side. Once the fly
 //! has emerged below the cloud base and the region has settled: `<prefix>-region-below.png`.
@@ -99,6 +99,15 @@
 //! `globebug` does the same over the globe: the game starts on the globe, the fly is put over
 //! `LAT,LON` at `AGE_YEARS`, `AGL_M` metres up (default [`GLOBE_BUG_ALTITUDE_KM`]), facing
 //! [`BUG_HEADING_DEG`].
+//!
+//! A fifth argument `globedescent` checks the wings in a descent over the globe (M3 Task 14):
+//! the game starts on the globe, the fly is put over `LAT,LON` at `AGE_YEARS`, `AGL_M` metres up
+//! (default the top altitude), facing [`BUG_HEADING_DEG`], with the view dragged as far up as it
+//! goes (the chase eye at its lowest elevation). After the settle it holds `Q` (straight down at
+//! the climb keys' full speed, the fly pitched `MAX_PITCH_DEG` nose down) for
+//! [`GLOBE_DESCENT_SECS`] and saves `<prefix>-globe-descent.png`, then
+//! `<prefix>-globe-descent-b.png` [`DESCENT_SHOT_GAP`] frames later. Each shot logs a
+//! `region tour wings` line, as `descent` does.
 //!
 //! `--from-shot <json>` (or `--from-shot=<json>`), anywhere among the arguments, starts the game
 //! at a bug shot's pose (the game's own `--from-shot`): the window is the shot's size unless
@@ -143,7 +152,7 @@ use timefly::ui::bug_shot::{
     HeldCamera, LastShot, SHOT_KEY, ShotFolder, ShotRestore, ShotTarget, load_shot,
 };
 use timefly_core::deep_time::YearsBp;
-use timefly_core::flight::altitudes::CLOUD_TOP_KM;
+use timefly_core::flight::altitudes::{CLOUD_TOP_KM, GLOBE_MAX_ALTITUDE_KM};
 use timefly_core::flight::globe::GlobeFlight;
 use timefly_core::worldgen::frame::RegionFrame;
 
@@ -202,6 +211,10 @@ const HOP_GIVE_UP_FRAMES: u32 = 6_000;
 const BUG_HEADING_DEG: f64 = 47.0;
 /// The `globebug` mode's default altitude (km).
 const GLOBE_BUG_ALTITUDE_KM: f64 = 5_000.0;
+/// Seconds the `globedescent` mode descends before its first shot: the drawn pitch settles (a
+/// 0.25 s time constant) while the fly, at 0.8 × its altitude a second, is still well above the
+/// cloud from the top altitude.
+const GLOBE_DESCENT_SECS: f32 = 1.0;
 /// Seconds the `bugshot`, `globebug` and `--from-shot` modes wait for the shot to be written.
 const SHOT_GIVE_UP_SECS: f32 = 30.0;
 
@@ -273,6 +286,8 @@ enum Mode {
     },
     /// `--from-shot`: the repro of a bug shot.
     FromShot,
+    /// A full-speed descent over the globe with the view dragged up (`globedescent`).
+    GlobeDescent,
 }
 
 #[derive(Resource)]
@@ -335,7 +350,7 @@ fn render_offscreen(
     // The globe camera carries the UI on the globe.
     let diving = matches!(
         tour.mode,
-        Mode::Dive { .. } | Mode::Bug { .. } | Mode::FromShot
+        Mode::Dive { .. } | Mode::Bug { .. } | Mode::FromShot | Mode::GlobeDescent
     );
     for camera in cameras.iter().filter(|(_, globe)| diving || !globe) {
         let camera = camera.0;
@@ -380,10 +395,11 @@ fn log_flight(label: &str, fly: &FlyState, region: Option<&ActiveRegion>, time: 
     );
 }
 
-/// Logs how the chase camera sees the fly's wings (`descent`): the fly's drawn pitch, the eye's
-/// elevation above the fly's horizon, and the angles (degrees, 0 edge-on) between the view and
-/// the body's plane and the resting wings' plane (the wing mesh's own normal).
-fn log_wings(label: &str, pose: &FlyPose, camera: &Transform) {
+/// Logs how the chase camera sees the fly's wings (`descent`, `globedescent`): the fly's drawn
+/// pitch, the eye's elevation above the fly's horizon (`up` is the fly's local vertical), and the
+/// angles (degrees, 0 edge-on) between the view and the body's plane and the resting wings'
+/// plane (the wing mesh's own normal).
+fn log_wings(label: &str, pose: &FlyPose, camera: &Transform, up: Vec3) {
     let to_eye = (camera.translation - pose.translation).normalize();
     let rotation = pose.transform().rotation;
     let wing_normal = match dragonfly_wings_mesh().attribute(Mesh::ATTRIBUTE_NORMAL) {
@@ -395,7 +411,7 @@ fn log_wings(label: &str, pose: &FlyPose, camera: &Transform) {
         label,
         pitch_deg = pose.pitch_rad.to_degrees(),
         bank_deg = pose.bank_rad.to_degrees(),
-        eye_elevation_deg = to_eye.y.asin().to_degrees(),
+        eye_elevation_deg = to_eye.dot(up).asin().to_degrees(),
         body_plane_view_deg = seen(Vec3::Y),
         wing_plane_view_deg = seen(wing_normal),
         "region tour wings"
@@ -542,7 +558,7 @@ fn tour(
                 }
             } else if tour.mode == Mode::Descent && tour.frames >= WIRE_FRAMES {
                 if let Ok(camera) = cameras.single() {
-                    log_wings("level", &pose, camera);
+                    log_wings("level", &pose, camera, Vec3::Y);
                 }
                 tour.step = Step::Descend;
                 tour.since = now;
@@ -601,7 +617,7 @@ fn tour(
             keys.press(KeyCode::KeyQ);
             let wings = |label: &str| {
                 if let Ok(camera) = cameras.single() {
-                    log_wings(label, &pose, camera);
+                    log_wings(label, &pose, camera, Vec3::Y);
                     log_chase_view(label, camera, &fly);
                 }
             };
@@ -1141,9 +1157,9 @@ fn dive_tour(
             }
         }
         DiveStep::Descend => {
-            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::KeyQ);
             if matches!(nav.phase, NavPhase::Diving { .. }) {
-                keys.release(KeyCode::ControlLeft);
+                keys.release(KeyCode::KeyQ);
                 log_dive("dive committed", &nav, &fly, &flight.0, &time);
                 next(&mut dive, DiveStep::DiveCloud);
             }
@@ -1256,6 +1272,9 @@ enum ShotStep {
     Settle,
     /// `globebug`: `F12` is pressed; waiting for the game's shot.
     Shooting,
+    /// `globedescent`: descending; the first shot, then the second.
+    Descending,
+    DescendingB,
     Done,
 }
 
@@ -1264,6 +1283,8 @@ enum ShotStep {
 struct ShotTour {
     /// `globebug`: where to put the fly (lat, lon, age, km); `None` for `--from-shot`.
     globe: Option<(f64, f64, f64, f64)>,
+    /// `globedescent`: descend with the view dragged up and shoot, instead of `F12`.
+    descend: bool,
     step: ShotStep,
     since: f32,
     frames: u32,
@@ -1286,6 +1307,7 @@ fn shot_tour(
         ResMut<GlobeFlightState>,
         ResMut<GlobeLook>,
     ),
+    seen: (Res<FlyPose>, Query<&Transform, With<GlobeCamera>>),
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1316,7 +1338,9 @@ fn shot_tour(
                         let h = BUG_HEADING_DEG.to_radians();
                         f.heading = (f.heading * h.cos() + east * h.sin()).normalize();
                         flight.0 = f;
-                        look.offset_deg = 0.0;
+                        // `globedescent`: dragged up as far as it goes (the step clamps it to
+                        // the altitude's range).
+                        look.offset_deg = if shot.descend { -1_000.0 } else { 0.0 };
                     }
                     interactive
                 }
@@ -1332,7 +1356,11 @@ fn shot_tour(
             if now - shot.since < SETTLE_SECS {
                 return;
             }
-            if shot.globe.is_some() {
+            if shot.descend {
+                info!("region tour: descending over the globe");
+                keys.press(KeyCode::KeyQ);
+                shot.step = ShotStep::Descending;
+            } else if shot.globe.is_some() {
                 info!("region tour: pressing the bug-shot key");
                 keys.press(SHOT_KEY);
                 shot.step = ShotStep::Shooting;
@@ -1358,6 +1386,33 @@ fn shot_tour(
             } else if now - shot.since > SHOT_GIVE_UP_SECS {
                 error!("region tour: the bug shot was never written");
                 exit.write(AppExit::error());
+            }
+        }
+        ShotStep::Descending | ShotStep::DescendingB => {
+            // Still dragged up as far as the altitude allows.
+            globe.2.offset_deg = -1_000.0;
+            let (pose, cameras) = &seen;
+            let wings = |label: &str| {
+                if let Ok(camera) = cameras.single() {
+                    log_wings(label, pose, camera, globe.1.0.up().as_vec3());
+                }
+                info!(
+                    label,
+                    altitude_km = globe.1.0.altitude_km,
+                    "region tour globe descent"
+                );
+            };
+            if shot.step == ShotStep::Descending && now - shot.since >= GLOBE_DESCENT_SECS {
+                wings("globe-descent");
+                shoot(&mut commands, &tour, "globe-descent");
+                shot.step = ShotStep::DescendingB;
+                shot.frames = 0;
+            } else if shot.step == ShotStep::DescendingB && shot.frames == DESCENT_SHOT_GAP {
+                wings("globe-descent-b");
+                shoot(&mut commands, &tour, "globe-descent-b");
+                keys.release(KeyCode::KeyQ);
+                shot.step = ShotStep::Done;
+                shot.frames = 0;
             }
         }
         ShotStep::Done => {
@@ -1419,7 +1474,7 @@ fn main() -> AppExit {
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
             "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
-             [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1|dive|divekey|lowclimb|hop|hop1|bugshot|globebug] [AGL_M] [LATER_S] \
+             [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1|dive|divekey|lowclimb|hop|hop1|bugshot|globebug|globedescent] [AGL_M] [LATER_S] \
              [--from-shot <json>]"
         );
         return AppExit::error();
@@ -1461,6 +1516,7 @@ fn main() -> AppExit {
         Some("hop1") => Mode::Hop { hops: 1 },
         Some("bugshot") => Mode::Bug { globe: false },
         Some("globebug") => Mode::Bug { globe: true },
+        Some("globedescent") => Mode::GlobeDescent,
         _ => Mode::Wire,
     };
     let mode = if shot_pose.is_some() {
@@ -1471,10 +1527,11 @@ fn main() -> AppExit {
     // These start on the globe.
     let diving = matches!(
         mode,
-        Mode::Dive { .. } | Mode::Bug { globe: true } | Mode::FromShot
+        Mode::Dive { .. } | Mode::Bug { globe: true } | Mode::FromShot | Mode::GlobeDescent
     );
     let agl_m = match args.get(5) {
         None if mode == (Mode::Bug { globe: true }) => (GLOBE_BUG_ALTITUDE_KM * 1000.0) as f32,
+        None if mode == Mode::GlobeDescent => (GLOBE_MAX_ALTITUDE_KM * 1000.0) as f32,
         None => CAMERA_START_ALTITUDE_M,
         Some(s) => match s.parse::<f32>() {
             Ok(v) if v.is_finite() && v > 0.0 => v,
@@ -1535,8 +1592,12 @@ fn main() -> AppExit {
             PreUpdate,
             (tour, hop_tour).chain().after(bevy::input::InputSystems),
         );
-    } else if matches!(mode, Mode::Bug { globe: true } | Mode::FromShot) {
+    } else if matches!(
+        mode,
+        Mode::Bug { globe: true } | Mode::FromShot | Mode::GlobeDescent
+    ) {
         app.insert_resource(ShotTour {
+            descend: mode == Mode::GlobeDescent,
             globe: (mode != Mode::FromShot).then_some((
                 region.lat_deg,
                 region.lon_deg,

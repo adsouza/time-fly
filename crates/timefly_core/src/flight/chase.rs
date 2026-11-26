@@ -16,9 +16,11 @@ pub const CHASE_START_LOOK_DEG: f64 = CHASE_ELEVATION_DEG - CHASE_FLY_BELOW_CENT
 /// ground under the fly fills at least the lower two-thirds of the frame there, landscape or
 /// portrait (controller ruling, Task 4 fix round 1; the horizon dips about 38° from the eye).
 pub const GLOBE_CHASE_DIVE_LOOK_DEG: f64 = 50.0;
-/// The lowest the globe's chase eye may sit above the fly's horizon (degrees): a drag up stops
-/// with the view level.
-pub const GLOBE_CHASE_MIN_ELEVATION_DEG: f64 = CHASE_FLY_BELOW_CENTRE_DEG;
+/// The lowest the globe's chase eye may sit above the fly's horizon (degrees): the region's
+/// [`CHASE_ELEVATION_DEG`], so a drag up stops with the view looking 15° down, the region's
+/// start look. Lower, a fly descending nose down shows the eye its wings edge-on (M3 Task 14:
+/// below about 15°; 2° of wing at the old floor of 5°, `creature`'s edge-on test).
+pub const GLOBE_CHASE_MIN_ELEVATION_DEG: f64 = CHASE_ELEVATION_DEG;
 /// The highest the globe's chase eye may climb above the fly (degrees): straight overhead,
 /// where it sits at the top altitude so the globe's centre is as near the view's centre as the
 /// fly's place [`CHASE_FLY_BELOW_CENTRE_DEG`] below it allows. The look stays 5° short of
