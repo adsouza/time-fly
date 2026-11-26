@@ -229,6 +229,9 @@ pub(crate) struct Accumulation {
     pub lakes: Vec<Lake>,
     /// Footprint nodes, sorted by node once the walk is done.
     pub lake_nodes: Vec<LakeNode>,
+    /// Held course nodes whose receivers a basin's rewrite changed, sorted once the walk is
+    /// done ([`Routed::held`]).
+    pub basin_routed: Vec<u32>,
     /// All the water evaporated in basins, lakes or not (a check on conservation).
     pub evaporated_m3s: f64,
     next_init: u32,
@@ -627,6 +630,7 @@ impl Accumulation {
             area_km2: vec![0.0; len as usize],
             lakes: Vec::new(),
             lake_nodes: Vec::new(),
+            basin_routed: Vec::new(),
             evaporated_m3s: 0.0,
             next_init: 0,
             next_walk: 0,
@@ -759,6 +763,7 @@ impl Accumulation {
         let walked = self.next_walk == len && self.gathering.is_none();
         if walked {
             self.lake_nodes.sort_unstable_by_key(|n| n.node);
+            self.basin_routed.sort_unstable();
         }
         if !walked || !(self.present && data_lakes) {
             return (walked, used);
@@ -867,6 +872,7 @@ impl Accumulation {
             ocean,
             receiver,
             basins,
+            held,
             ..
         } = routed;
         let basin = &basins[b];
@@ -1156,14 +1162,25 @@ impl Accumulation {
         }
         let mut target = vec![usize::MAX; m];
         for k in (0..m).filter(|&k| !sources[k]) {
-            let mut best: Option<(usize, usize)> = None;
+            // A course node held to its successor keeps it where the successor is a step closer
+            // (Task 11d fix round 4).
+            let is_held = held.binary_search(&nodes[k]).is_ok();
+            let kept = is_held
+                .then(|| usize::from(receiver[nodes[k] as usize]))
+                .filter(|&slot| slot < 8)
+                .and_then(|slot| neighbours_in(k)[slot].map(|j| (slot, j)))
+                .filter(|&(_, j)| dist[j] < dist[k]);
+            let mut best: Option<(usize, usize)> = kept;
             for (slot, j) in neighbours_in(k).into_iter().enumerate() {
                 let Some(j) = j else { continue };
-                if dist[j] < dist[k] && best.is_none_or(|(_, b)| e[j] < e[b]) {
+                if kept.is_none() && dist[j] < dist[k] && best.is_none_or(|(_, b)| e[j] < e[b]) {
                     best = Some((slot, j));
                 }
             }
             let (slot, j) = best.expect("a basin is connected to its sources");
+            if is_held && kept.is_none() {
+                self.basin_routed.push(nodes[k]);
+            }
             receiver[nodes[k] as usize] = slot as u8;
             target[k] = j;
         }

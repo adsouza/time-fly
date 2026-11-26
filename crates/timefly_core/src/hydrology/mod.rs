@@ -92,6 +92,9 @@ pub struct EraHydrology {
     /// [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`](params::TODAY_RIVER_ANCHOR_MAX_SPACINGS) mean
     /// spacings from the node. The regions relax such a node to its anchor.
     anchors: Vec<(u32, [f64; 3])>,
+    /// Course nodes held to their course successors whose receivers a basin's rewrite changed
+    /// (Task 11d fix round 4: the successor was no step closer to the basin's lake), sorted.
+    basin_routed: Vec<u32>,
 }
 
 impl EraHydrology {
@@ -185,6 +188,7 @@ impl EraHydrology {
             ocean: vec![0; lattice.len().div_ceil(64) as usize],
             lake_nodes: Vec::new(),
             anchors: Vec::new(),
+            basin_routed: Vec::new(),
         }
     }
 
@@ -237,5 +241,12 @@ impl EraHydrology {
             + 8 * self.ocean.capacity()
             + self.lake_nodes.capacity() * std::mem::size_of::<LakeNode>()
             + self.anchors.capacity() * std::mem::size_of::<(u32, [f64; 3])>()
+            + 4 * self.basin_routed.capacity()
+    }
+
+    /// Whether `node` is a course node held to its course successor whose receiver a basin's
+    /// rewrite changed ([`route::Routed::held`]).
+    pub fn basin_routed(&self, node: u32) -> bool {
+        self.basin_routed.binary_search(&node).is_ok()
     }
 }

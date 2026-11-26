@@ -57,7 +57,9 @@ use timefly_core::hydrology::compare::{
 use timefly_core::hydrology::lakemap::shipped_lake_map;
 use timefly_core::hydrology::levels::shipped_lake_levels;
 use timefly_core::hydrology::params::{HYDRO_RECENT_N, LARGE_LAKE_KM2, SUBPOINT_M};
-use timefly_core::hydrology::today_rivers::{CourseBed, course_beds, shipped_today_rivers};
+use timefly_core::hydrology::today_rivers::{
+    CourseBed, CourseStep, course_beds, course_steps, shipped_today_rivers,
+};
 use timefly_core::hydrology::{
     CubeLattice, Down, EraHydrology, HydroGraph, LatticeSizes, SnapshotSource, hydro_lattice_for,
 };
@@ -348,9 +350,11 @@ impl CheckSpec {
                         ("Khartoum", (15.6, 32.5)),
                         ("Aswan", (24.08888889, 32.89972222)),
                     ],
-                    (30.1725, 31.14),
-                    "from \"Nalubaale Hydroelectric Power Station\" (the Owen Falls Dam at Jinja); via \"Khartoum\", \"Aswan\"; mouth \"Nile\" \
-                     (infobox: 30 10 21 N, 31 8 24 E, the delta's head)",
+                    (31.5125, 31.82555556),
+                    "from \"Nalubaale Hydroelectric Power Station\" (the Owen Falls Dam at Jinja); via \"Khartoum\", \"Aswan\"; mouth \"Ras El Bar\" \
+                     (31 30 45 N, 31 49 32 E, read 2026-11-26: \"at the mouth of the Damietta Nile branch\"; \
+                     fix round 4, the controller's ruling as the owner chose for the Orinoco; the \
+                     \"Nile\" infobox's 30 10 21 N, 31 8 24 E is the delta's head)",
                 ),
                 outlet(
                     "Congo",
@@ -1454,8 +1458,12 @@ pub fn hydro_check(
     let source = SnapshotSource::new(&field, &tiles, &timeline, 0.0, mode);
     let rivers = shipped_today_rivers();
     let names: Vec<&str> = rivers.iter().map(|r| r.name.as_str()).collect();
-    let beds = course_beds(&hydro.lattice, rivers, &source);
+    let beds = course_beds(&hydro.lattice, rivers, &source, shipped_lake_levels());
     lines.extend(burn_depth_lines(&hydro.lattice, &beds, &names));
+    // Informative (Task 11d fix round 4): whether each course's interior nodes drain to their
+    // course successors.
+    let steps = course_steps(hydro, rivers, &source);
+    lines.extend(course_step_lines(&hydro.lattice, &steps, &names));
     // Every lake, one line each (Task 11d fix round 2): for diffing lakes between runs.
     let tsv = out_dir.join("hydro-check-lakes.tsv");
     fs::write(&tsv, lakes_tsv(hydro)).map_err(|e| format!("{}: {e}", tsv.display()))?;
@@ -1537,9 +1545,15 @@ pub fn burn_depth_lines(lattice: &CubeLattice, beds: &[CourseBed], names: &[&str
         ));
     }
     let pinned: Vec<&CourseBed> = beds.iter().filter(|b| b.pinned_at_sea_level).collect();
-    let mut courses: Vec<String> = pinned.iter().map(|b| name(b)).collect();
-    courses.sort();
-    courses.dedup();
+    // Every pinned course (Task 11d fix round 4: each must be explained), by name, then course.
+    let mut courses: Vec<(String, usize, Vec<&CourseBed>)> = Vec::new();
+    for &b in &pinned {
+        match courses.iter_mut().find(|c| c.1 == b.course) {
+            Some(c) => c.2.push(b),
+            None => courses.push((name(b), b.course, vec![b])),
+        }
+    }
+    courses.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     lines.push(format!(
         "  pinned at 0 m after a node below sea level: {} nodes on {} courses{}",
         pinned.len(),
@@ -1551,13 +1565,60 @@ pub fn burn_depth_lines(lattice: &CubeLattice, beds: &[CourseBed], names: &[&str
                 " ({})",
                 courses
                     .iter()
-                    .take(8)
-                    .cloned()
+                    .map(|c| c.0.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         }
     ));
+    for (n, _, at) in &courses {
+        let (lat, lon) = latlon(lattice.dir(at[0].node).0);
+        lines.push(format!(
+            "    {n}: {} nodes, the first at ({lat:.2}, {lon:.2}), terrain {:.1} m",
+            at.len(),
+            at[0].elevation_m
+        ));
+    }
+    lines
+}
+
+/// How today's courses' interior nodes drain against their course successors
+/// ([`course_steps`]): the count of each kind, and the first nodes of the unexplained kind
+/// ([`CourseStep::Other`]) with their courses.
+pub fn course_step_lines(
+    lattice: &CubeLattice,
+    steps: &[(usize, u32, u32, CourseStep)],
+    names: &[&str],
+) -> Vec<String> {
+    let mut counts: Vec<(CourseStep, usize)> = Vec::new();
+    for &(_, _, _, step) in steps {
+        match counts.iter_mut().find(|c| c.0 == step) {
+            Some(c) => c.1 += 1,
+            None => counts.push((step, 1)),
+        }
+    }
+    counts.sort();
+    let mut lines = vec![format!(
+        "today's courses' order (informative): {} interior nodes [{}]",
+        steps.len(),
+        counts
+            .iter()
+            .map(|(s, n)| format!("{s:?} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )];
+    for &(k, v, s, _) in steps.iter().filter(|e| e.3 == CourseStep::Other).take(12) {
+        let (lat, lon) = latlon(lattice.dir(v).0);
+        let (slat, slon) = latlon(lattice.dir(s).0);
+        let name = match names.get(k) {
+            Some(n) if !n.is_empty() => (*n).to_string(),
+            _ => format!("course {k}"),
+        };
+        lines.push(format!(
+            "  leaves its course: {name} at ({lat:.2}, {lon:.2}), node {v}, successor ({slat:.2}, \
+             {slon:.2})"
+        ));
+    }
     lines
 }
 
@@ -1705,16 +1766,37 @@ mod tests {
             "{}",
             lines[1]
         );
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         assert!(
             lines[6].contains("1 nodes on 1 courses (course 2)"),
             "{}",
             lines[6]
         );
+        assert!(
+            lines[7].starts_with("    course 2: 1 nodes, the first at ("),
+            "{}",
+            lines[7]
+        );
         assert_eq!(
             burn_depth_lines(&lattice, &[], &[]),
             ["today's courses: nothing burnt"]
         );
+    }
+
+    /// Task 11d fix round 4 (the controller's ruling, as the owner chose for the Orinoco): the
+    /// Nile's mouth is where its Damietta branch meets the sea, at Ras El Bar, not the delta's
+    /// head, and its allowance stays 150 km.
+    #[test]
+    fn the_nile_ends_at_the_damietta_mouth() {
+        let spec = CheckSpec::standard();
+        let nile = spec
+            .outlets
+            .iter()
+            .find(|o| o.name == "Nile")
+            .expect("a Nile bar");
+        assert_eq!(nile.sea, (31.5125, 31.82555556));
+        assert!(nile.source.contains("\"Ras El Bar\""), "{}", nile.source);
+        assert_eq!(nile.sea_allowance_km(), 150.0);
     }
 
     /// Owner, 2026-11-26: the Amazon alone may end 160 km from its mouth; the rest keep

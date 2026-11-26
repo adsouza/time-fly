@@ -41,6 +41,7 @@ struct Unit {
     out: f64,
 }
 
+#[derive(PartialEq, Eq)]
 enum Phase {
     Next,
     Lakes,
@@ -113,6 +114,12 @@ impl Today {
         let len = g.len();
         let mut used = 0u32;
         while used < budget {
+            // Done costs nothing, so the units do not depend on whether the budget ran out at
+            // the last flow step (Task 11d fix round 4: that unit was charged only when it did
+            // not).
+            if self.phase == Phase::Done {
+                return (true, used);
+            }
             used += 1;
             match self.phase {
                 Phase::Next => {
@@ -172,7 +179,7 @@ impl Today {
                     };
                     self.flow(routed, v);
                 }
-                Phase::Done => return (true, used),
+                Phase::Done => unreachable!("checked above"),
             }
         }
         (matches!(self.phase, Phase::Done), used)

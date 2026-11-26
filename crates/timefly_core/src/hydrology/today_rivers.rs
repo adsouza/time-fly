@@ -5,8 +5,11 @@
 //! Where the terrain is today's ([`NodeSource::todays_terrain`](super::NodeSource)), the pass
 //! burns each course into its routing after the straits: along the course's nodes
 //! ([`today_river_nodes`]), upstream first, the level is the running minimum of the era's own
-//! node elevations, and the node routes at `level − TODAY_RIVER_BURN_M`
-//! ([`TODAY_RIVER_BURN_M`](super::params::TODAY_RIVER_BURN_M)). The river graph's bed there is
+//! node elevations (a node within reach of a mapped lake reads at least its surface:
+//! `lake_surface_near`), and the node routes at `level − TODAY_RIVER_BURN_M`
+//! ([`TODAY_RIVER_BURN_M`](super::params::TODAY_RIVER_BURN_M)), chained over every course so
+//! each falls toward its end (`BurntNodes`); routing drains each interior node to its course
+//! successor (`route`'s course order). The river graph's bed there is
 //! the level itself, so the regions carve no trench; the flats, the climate and the lakes read the
 //! burnt surface, as routing did, so every basin agrees with its own spill. Without it the lattice routes rivers across
 //! flat plains by its own lines: the lower Indus ran about 90 km east of its course through the
@@ -23,7 +26,7 @@ use bevy_math::DVec3;
 use serde_json::Value;
 
 use super::params::{DEPRESSION_EPS_M, TODAY_RIVER_BURN_M};
-use super::{CubeLattice, HydroGraph, NodeSource};
+use super::{CubeLattice, HydroGraph, MappedLake, NodeSource};
 use crate::geo::{RenderDir, geo_to_render, latlon_to_geo};
 
 /// The shipped table's JSON.
@@ -338,16 +341,18 @@ struct CourseLevel {
     node: u32,
     /// Routing's level: the running minimum.
     level: f32,
-    /// The elevation routing takes ([`course_levels`]): `level − TODAY_RIVER_BURN_M`, never below
-    /// 0 m on a node at or above sea level, and on such a node at least `DEPRESSION_EPS_M` above
-    /// the next node's (Task 11d fix round 2: a course keeps its order within 10 m of the sea).
-    route: f32,
+    /// `level − TODAY_RIVER_BURN_M`, before any floor: routing's elevation is built from it over
+    /// every course at once ([`BurntNodes`]).
+    base: f32,
+    /// The node's own elevation as the course read it ([`course_levels`]'s `elevation`).
+    own: f32,
     /// The course's last burnable node: the only one that may meet the sea.
     last: bool,
-    /// An interior node below the sea: `(its routing elevation if routing finds it joined to the
-    /// ocean (the course corridor, Task 11d fix round 3): the land chain, never below 0 m; its
-    /// own elevation, for the open-sea guard)`.
-    corridor: Option<(f32, f32)>,
+    /// The next node, for an interior node whose next node is burnable (Task 11d fix round 4:
+    /// an interior node drains to it), with the course's own chain there: `max(level − burn,
+    /// 0 m)`, and at least `DEPRESSION_EPS_M` above the chain at the node after, from the
+    /// course's end upstream (how this course alone would route it).
+    succ: Option<(u32, f32)>,
     /// The river graph's bed: the running minimum, sloped across held stretches.
     bed: f32,
     anchor: DVec3,
@@ -361,9 +366,8 @@ struct CourseLevel {
 ///   between consecutive nodes) from the held level toward the next lower one, so it never
 ///   rises and never stands above the level. After the last lowering it stays level.
 ///
-/// Routing's elevation is `level − TODAY_RIVER_BURN_M`; on a node at or above sea level never
-/// below 0 m, and at least `DEPRESSION_EPS_M` above the next node's (taken from the course's end
-/// upstream), so a stretch the 0 m floor would flatten still falls toward the course's end.
+/// Routing's elevation is built from `level − TODAY_RIVER_BURN_M` over every course at once
+/// ([`BurntNodes::chain_step`]).
 ///
 /// `add` gets each node that `burnable` allows; the others still feed the running minimum.
 fn course_levels(
@@ -394,29 +398,15 @@ fn course_levels(
         }
         path.push(m);
     }
-    // Routing's elevation, from the course's end upstream: the land chain treats every node as
-    // land (never below 0 m, at least DEPRESSION_EPS_M above the next); a node below the sea
-    // keeps `level − burn`, unless routing finds it an interior node joined to the ocean (the
-    // corridor), when it takes the chain.
     let burn = TODAY_RIVER_BURN_M as f32;
     let eps = DEPRESSION_EPS_M as f32;
-    let mut chain = vec![0.0f32; e.len()];
+    let mut own_chain = vec![0.0f32; e.len()];
     for k in (0..e.len()).rev() {
         let raw = (level[k] - burn).max(0.0);
-        chain[k] = match chain.get(k + 1) {
-            Some(&down) => raw.max(down + eps),
-            None => raw,
-        };
+        own_chain[k] = own_chain
+            .get(k + 1)
+            .map_or(raw, |&down| raw.max(down + eps));
     }
-    let route: Vec<f32> = (0..e.len())
-        .map(|k| {
-            if e[k] >= 0.0 {
-                chain[k]
-            } else {
-                level[k] - burn
-            }
-        })
-        .collect();
     let last = nodes.iter().rposition(|&(v, _)| burnable(v));
     let mut next = 0;
     for (k, &(v, anchor)) in nodes.iter().enumerate() {
@@ -437,12 +427,17 @@ fn course_levels(
             _ => clamp(held),
         };
         if burnable(v) {
+            let interior = last.is_some_and(|l| k < l);
             add(CourseLevel {
                 node: v,
                 level: clamp(held),
-                route: route[k],
+                base: level[k] - burn,
+                own: e[k],
                 last: last == Some(k),
-                corridor: (last != Some(k) && e[k] < 0.0).then_some((chain[k], e[k])),
+                succ: nodes
+                    .get(k + 1)
+                    .map(|&(s, _)| (s, own_chain[k + 1]))
+                    .filter(|&(s, _)| interior && burnable(s)),
                 bed: bed.min(clamp(held)),
                 anchor,
             });
@@ -465,12 +460,14 @@ pub struct CourseBed {
     pub pinned_at_sea_level: bool,
 }
 
-/// The beds the pass gives `rivers` over `source` (a present-day era: data lakes), the straits
-/// burnt first as the pass does ([`super::straits`]). Not time-boxed: for checks.
+/// The beds the pass gives `rivers` over `source` (a present-day era: data lakes) with the lake
+/// level table `levels`, the straits burnt first as the pass does ([`super::straits`]). Not
+/// time-boxed: for checks.
 pub fn course_beds<S: NodeSource>(
     lattice: &CubeLattice,
     rivers: &[TodayRiver],
     source: &S,
+    levels: &[super::levels::LakeLevel],
 ) -> Vec<CourseBed> {
     use super::params::ICE_NODE_FRACTION;
     use super::straits::{shipped_straits, strait_levels};
@@ -479,6 +476,16 @@ pub fn course_beds<S: NodeSource>(
         *sample.entry(v).or_insert_with(|| {
             let s = source.node(lattice.dir(v));
             (s.elevation_m, f64::from(s.ice) >= ICE_NODE_FRACTION)
+        })
+    };
+    // The mapped lakes' surfaces at nodes, as the pass reads them.
+    let table = table_surfaces(levels, source);
+    let mut lakes: HashMap<u32, Option<f32>> = HashMap::new();
+    let mut lake = |u: u32| {
+        *lakes.entry(u).or_insert_with(|| {
+            source
+                .mapped(lattice.dir(u))
+                .map(|l| lake_surface(l, &table))
         })
     };
     // The straits' burn, as the pass's.
@@ -504,10 +511,15 @@ pub fn course_beds<S: NodeSource>(
             .enumerate()
             .map(|(i, &(v, _))| (v, i))
             .collect();
+        let (lat, lon) = river.points[0];
+        let start = source
+            .mapped(geo_to_render(latlon_to_geo(lat, lon)))
+            .map(|l| lake_surface(l, &table));
         let mut below_sea = false;
         let mut levels: Vec<(u32, f32, bool)> = Vec::new();
         for (i, &(v, _)) in nodes.iter().enumerate() {
-            let e = routed(v, own[i].0);
+            let near = lake_surface_near(lattice, v, &mut lake);
+            let e = course_height(routed(v, own[i].0), near, start.filter(|_| i == 0));
             let pinned = below_sea && e >= 0.0;
             below_sea |= e < 0.0;
             levels.push((v, e, pinned));
@@ -541,24 +553,157 @@ pub fn course_beds<S: NodeSource>(
     out
 }
 
+/// How one interior node of a course drains, against its course successor (Task 11d fix round
+/// 4: every interior node's receiver is its successor, apart from these counted exceptions).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CourseStep {
+    /// It drains to its successor.
+    Follows,
+    /// A node several courses pass through, draining to another course's successor there (the
+    /// node's owner: `BurntNodes`).
+    SharedNode,
+    /// It is ocean: past its course's open-sea end (`route`'s corridor).
+    Ocean,
+    /// Its successor is ocean past its course's open-sea end: a course that left the coast and
+    /// came back to land, which meets the sea where routing takes it.
+    PastSeaEnd,
+    /// Its successor is not burnt (ice, or not today's terrain).
+    NotBurnt,
+    /// It lies in a lake and carries no river.
+    InLake,
+    /// It carries no river: too little water.
+    NoRiver,
+    /// A river node redirected to its basin's exit, which is not its neighbour.
+    BasinExit,
+    /// A river node in a basin whose rewrite routes it a step closer to the basin's lake or
+    /// sink, where its successor is none ([`super::EraHydrology::basin_routed`]).
+    BasinRoute,
+    /// A river node ending in a dry sink.
+    Sink,
+    /// Anything else: a river node draining to a neighbour that is no course's successor there.
+    Other,
+}
+
+/// Each interior node of each of `rivers` (every burnable node but a course's last), in table
+/// and course order: `(course, node, successor, how it drains)`, over the pass's result `h`
+/// for `source` (a present-day era with today's terrain).
+pub fn course_steps<S: NodeSource>(
+    h: &super::EraHydrology,
+    rivers: &[TodayRiver],
+    source: &S,
+) -> Vec<(usize, u32, u32, CourseStep)> {
+    use super::params::ICE_NODE_FRACTION;
+    let lattice = &h.lattice;
+    let mut burnable_at: HashMap<u32, bool> = HashMap::new();
+    let mut burnable = |v: u32| {
+        *burnable_at.entry(v).or_insert_with(|| {
+            let d = lattice.dir(v);
+            f64::from(source.node(d).ice) < ICE_NODE_FRACTION && source.todays_terrain(d)
+        })
+    };
+    let courses: Vec<Vec<u32>> = rivers
+        .iter()
+        .map(|r| today_river_nodes(lattice, r))
+        .collect();
+    // Each course's interior nodes and their successors (None: not burnt).
+    let mut interior: Vec<(usize, u32, Option<u32>)> = Vec::new();
+    for (k, nodes) in courses.iter().enumerate() {
+        let Some(last) = nodes.iter().rposition(|&v| burnable(v)) else {
+            continue;
+        };
+        for i in 0..last {
+            if burnable(nodes[i]) {
+                let next = nodes[i + 1];
+                interior.push((k, nodes[i], burnable(next).then_some(next)));
+            }
+        }
+    }
+    let mut successors: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(_, v, s) in &interior {
+        if let Some(s) = s {
+            successors.entry(v).or_default().push(s);
+        }
+    }
+    interior
+        .iter()
+        .map(|&(k, v, s)| {
+            let Some(s) = s else {
+                return (k, v, v, CourseStep::NotBurnt);
+            };
+            let step = if h.is_ocean(v) {
+                CourseStep::Ocean
+            } else if let Some(i) = h.rivers.index_of(v) {
+                let n = h.rivers.nodes()[i as usize];
+                let to = match n.down {
+                    super::Down::River(t) => Some(h.rivers.nodes()[t as usize].node),
+                    super::Down::Ocean(j) | super::Down::Lake(_, j) | super::Down::Ice(j) => {
+                        Some(j)
+                    }
+                    super::Down::Sink(_) => None,
+                };
+                match to {
+                    Some(j) if j == s => CourseStep::Follows,
+                    Some(j) if successors[&v].contains(&j) => CourseStep::SharedNode,
+                    Some(_) if h.is_ocean(s) => CourseStep::PastSeaEnd,
+                    Some(_) if h.basin_routed(v) => CourseStep::BasinRoute,
+                    Some(j) if !lattice.neighbours(v).contains(&Some(j)) => CourseStep::BasinExit,
+                    Some(_) => CourseStep::Other,
+                    None => CourseStep::Sink,
+                }
+            } else if h.lake_of(v).is_some() {
+                CourseStep::InLake
+            } else {
+                CourseStep::NoRiver
+            };
+            (k, v, s, step)
+        })
+        .collect()
+}
+
+/// A node's successor slot with none.
+const NO_SUCC: u32 = u32::MAX;
+
 /// Per-node levels gathered from many courses: each node once, in the order first burnt, with
 /// the lowest routing level any course gave it, and the lowest bed with that bed's course's
 /// anchor (ties: the first).
+///
+/// **Routing's elevation** (Task 11d fix round 4) is built over every course at once, so the
+/// courses' order agrees where they meet. Each interior node's **successor** is its next node on
+/// one of the courses that pass it as an interior node: the course whose own chain is lowest at
+/// that next node (`max(level − TODAY_RIVER_BURN_M, 0 m)`, at least `DEPRESSION_EPS_M` above the
+/// node after, from that course's own end), ties to the first in the table. At a fork, or where
+/// a distributary leaves a stem, that is the branch whose own course falls lowest there, as
+/// steepest descent picked it when each course routed on its own chain (Task 11d fix round 2).
+/// Then from the courses' ends upstream along the successors, the **land chain** is
+/// `max(base, 0 m, chain(successor) + DEPRESSION_EPS_M)`, where `base` is the lowest
+/// `level − TODAY_RIVER_BURN_M` any course gave the node. A node at or above sea level routes at
+/// its chain; one below the sea at `base`, unless routing finds it an interior node joined to the
+/// ocean (the corridor), when it takes the chain. A successor that would close a loop is dropped
+/// (the node where the walk, in the order nodes were first burnt, meets its own path keeps none).
 #[derive(Default)]
 pub(crate) struct BurntNodes {
     /// Each node and the lowest level any course gave it.
     list: Vec<(u32, f32)>,
-    /// Each node's lowest routing elevation any course gave it (`list`'s order).
+    /// Each node's routing elevation (`list`'s order), once [`BurntNodes::chain_step`] is done.
     routes: Vec<f32>,
+    /// Each node's lowest `level − burn` (`list`'s order).
+    base: Vec<f32>,
+    /// Each node's own elevation as read by its courses (the highest; `list`'s order).
+    own: Vec<f32>,
+    /// Each node's successor and its course's own chain there (`list`'s order).
+    succ: Vec<(u32, f32)>,
     beds: Vec<(f32, DVec3)>,
     at: HashMap<u32, u32>,
     /// The nodes that end a course (its last burnable node), which alone may meet the sea.
     ends: Vec<u32>,
     /// The nodes inside some course (any but its last).
     interior: Vec<u32>,
-    /// Each course's interior nodes below the sea, in course order: `(node, land-chain
-    /// elevation, own elevation)`.
-    corridor: Vec<Vec<(u32, f32, f32)>>,
+    /// Each course's interior nodes below the sea, in course order: `(node, own elevation)`.
+    corridor: Vec<Vec<(u32, f32)>>,
+    /// The land chain (`list`'s order), while it is built: NaN where not yet known.
+    chain: Vec<f32>,
+    /// The next node to chain from, while the chain is built.
+    chained: usize,
 }
 
 impl BurntNodes {
@@ -588,6 +733,16 @@ impl BurntNodes {
         &self.list
     }
 
+    /// The burnt nodes and their routing elevations, in the order first burnt.
+    #[cfg(test)]
+    pub(crate) fn routes(&self) -> Vec<(u32, f32)> {
+        self.list
+            .iter()
+            .map(|&(v, _)| v)
+            .zip(self.routes.iter().copied())
+            .collect()
+    }
+
     /// The nodes inside some course (any node but a course's last), sorted: routing never
     /// drains them into the ocean (Task 11d fix rounds 2 and 3: a course meets the sea only at
     /// its own end, and a node that ends one course but lies inside another is inland).
@@ -600,13 +755,31 @@ impl BurntNodes {
 
     /// Each course's interior nodes below the sea, in course order, `(node, land-chain
     /// elevation, own elevation)`: routing keeps them out of the ocean up to the first open-sea
-    /// node (Task 11d fix round 3).
+    /// node (Task 11d fix round 3). Once the chain is built.
     pub(crate) fn corridor(&self) -> Vec<Vec<(u32, f32, f32)>> {
         self.corridor
             .iter()
             .filter(|c| !c.is_empty())
-            .cloned()
+            .map(|c| {
+                c.iter()
+                    .map(|&(v, e)| (v, self.chain[self.at[&v] as usize], e))
+                    .collect()
+            })
             .collect()
+    }
+
+    /// Each interior node with a successor and that successor, sorted by node (Task 11d fix
+    /// round 4: routing drains the node there). Once the chain is built: no loops.
+    pub(crate) fn successors(&self) -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = self
+            .list
+            .iter()
+            .zip(&self.succ)
+            .filter(|&(_, &(s, _))| s != NO_SUCC)
+            .map(|(&(v, _), &(s, _))| (v, s))
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     /// Starts the next course's corridor.
@@ -630,22 +803,27 @@ impl BurntNodes {
         } else {
             self.interior.push(c.node);
         }
-        if let Some((r, e)) = c.corridor {
+        if !c.last && c.own < 0.0 {
             if self.corridor.is_empty() {
                 self.corridor.push(Vec::new());
             }
             self.corridor
                 .last_mut()
                 .expect("a course")
-                .push((c.node, r, e));
+                .push((c.node, c.own));
         }
         match self.at.entry(c.node) {
             Entry::Occupied(o) => {
                 let k = *o.get() as usize;
                 let l = &mut self.list[k].1;
                 *l = l.min(c.level);
-                let r = &mut self.routes[k];
-                *r = r.min(c.route);
+                self.base[k] = self.base[k].min(c.base);
+                self.own[k] = self.own[k].max(c.own);
+                if let Some(s) = c.succ
+                    && s.1 < self.succ[k].1
+                {
+                    self.succ[k] = s;
+                }
                 if c.bed < self.beds[k].0 {
                     self.beds[k] = (c.bed, c.anchor);
                 }
@@ -653,10 +831,67 @@ impl BurntNodes {
             Entry::Vacant(e) => {
                 e.insert(self.list.len() as u32);
                 self.list.push((c.node, c.level));
-                self.routes.push(c.route);
+                self.base.push(c.base);
+                self.own.push(c.own);
+                self.succ.push(c.succ.unwrap_or((NO_SUCC, f32::INFINITY)));
                 self.beds.push((c.bed, c.anchor));
             }
         }
+    }
+
+    /// Builds the land chain and the routing elevations from about `budget` more nodes (a walk
+    /// along successors is not split); returns whether it is done, and the units used (a unit
+    /// per node walked from, and one per further node a walk chains: independent of the slicing).
+    pub(crate) fn chain_step(&mut self, budget: u32) -> (bool, u32) {
+        let n = self.list.len();
+        if self.chain.len() != n {
+            self.chain = vec![f32::NAN; n];
+            self.routes = vec![0.0; n];
+        }
+        let eps = DEPRESSION_EPS_M as f32;
+        let mut used = 0u32;
+        let mut path: Vec<usize> = Vec::new();
+        // Nodes on the current walk, so a loop is seen.
+        let mut on_path: HashMap<usize, ()> = HashMap::new();
+        while self.chained < n && used < budget {
+            let start = self.chained;
+            self.chained += 1;
+            used += 1;
+            if !self.chain[start].is_nan() {
+                continue;
+            }
+            path.clear();
+            on_path.clear();
+            let mut k = start;
+            // Walk down the successors to a node already chained, a root, or a loop.
+            let mut below = loop {
+                path.push(k);
+                on_path.insert(k, ());
+                let s = self.succ[k].0;
+                if s == NO_SUCC {
+                    break None;
+                }
+                let j = self.at[&s] as usize;
+                if on_path.contains_key(&j) {
+                    // A loop: this node keeps no successor.
+                    self.succ[k] = (NO_SUCC, f32::INFINITY);
+                    break None;
+                }
+                if !self.chain[j].is_nan() {
+                    break Some(self.chain[j]);
+                }
+                k = j;
+            };
+            for &k in path.iter().rev() {
+                let floor = self.base[k].max(0.0);
+                let c = below.map_or(floor, |down| floor.max(down + eps));
+                self.chain[k] = c;
+                self.routes[k] = if self.own[k] >= 0.0 { c } else { self.base[k] };
+                below = Some(c);
+                used += u32::from(k != start);
+            }
+        }
+        (self.chained == n, used.max(1))
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -668,9 +903,13 @@ impl BurntNodes {
             + self
                 .corridor
                 .iter()
-                .map(|c| 24 + 12 * c.capacity())
+                .map(|c| 24 + 8 * c.capacity())
                 .sum::<usize>()
-            + 4 * self.routes.capacity()
+            + 4 * (self.routes.capacity()
+                + self.base.capacity()
+                + self.own.capacity()
+                + self.chain.capacity())
+            + 8 * self.succ.capacity()
     }
 }
 
@@ -691,11 +930,72 @@ pub(crate) struct TodayBurn {
     reader: TodayRiverReader<'static>,
     /// The next of [`TodayTable::Given`]'s courses.
     next: usize,
-    /// The course whose nodes are being found.
-    course: Option<RiverNodes>,
+    /// The course whose nodes are being found, and the surface of the mapped lake its first
+    /// point lies in.
+    course: Option<(RiverNodes, Option<f32>)>,
     burnt: BurntNodes,
-    /// Every course is read; the burnt nodes are being lowered from this one on.
+    /// Every course is read; the land chain is being built.
+    chaining: bool,
+    /// The chain is built; the burnt nodes are being lowered from this one on.
     applying: Option<usize>,
+    /// The level table's lakes by map id ([`table_surfaces`]).
+    table: Vec<(u16, f32)>,
+}
+
+/// How near a mapped lake's node a course node reads that lake's surface, in mean spacings: a
+/// node's footprint reaches about half a spacing, so 1.5 is one spacing from the footprint.
+const LAKE_REACH_SPACINGS: f64 = 1.5;
+
+/// The highest surface of the mapped lakes (`lake`) at `v` or at a lattice neighbour within
+/// [`LAKE_REACH_SPACINGS`] of it (Task 11d fix round 4): a course node there reads its height as
+/// at least that surface, so a deep lake's bed (Baikal's lies 1,186 m below the sea), mixed into
+/// a shore node's sample, never sets a course's level.
+fn lake_surface_near(
+    lattice: &CubeLattice,
+    v: u32,
+    lake: impl FnMut(u32) -> Option<f32>,
+) -> Option<f32> {
+    let reach = LAKE_REACH_SPACINGS * lattice.mean_spacing_m();
+    std::iter::once(Some(v))
+        .chain(lattice.neighbours(v))
+        .flatten()
+        .filter(|&u| u == v || lattice.distance_m(v, u) <= reach)
+        .filter_map(lake)
+        .reduce(f32::max)
+}
+
+/// The lake level table's lakes as mapped lakes: each table point's map id and its table level,
+/// sorted by id ([`super::levels`]). A course reads such a lake at its table level, as the pass
+/// fills it: the map's own baked surface can be its bed's (Baikal's reads −328 m).
+pub(crate) fn table_surfaces<S: NodeSource>(
+    levels: &[super::levels::LakeLevel],
+    source: &S,
+) -> Vec<(u16, f32)> {
+    let mut out: Vec<(u16, f32)> = levels
+        .iter()
+        .filter_map(|l| {
+            let m = source.mapped(geo_to_render(latlon_to_geo(l.lat, l.lon)))?;
+            Some((m.id, l.level_m))
+        })
+        .collect();
+    out.sort_by_key(|e| e.0);
+    out.dedup_by_key(|e| e.0);
+    out
+}
+
+/// A mapped lake's surface for a course: its table level where the level table holds it
+/// (`table`, from [`table_surfaces`]), else the map's.
+fn lake_surface(lake: MappedLake, table: &[(u16, f32)]) -> f32 {
+    table
+        .binary_search_by_key(&lake.id, |e| e.0)
+        .map_or(lake.surface_m, |k| table[k].1)
+}
+
+/// A course node's height for its levels: its own `e`, and at least the surface of a mapped lake
+/// within reach ([`lake_surface_near`]), or of the lake its course leaves (`start`, for its first
+/// node).
+fn course_height(e: f32, near: Option<f32>, start: Option<f32>) -> f32 {
+    [near, start].into_iter().flatten().fold(e, f32::max)
 }
 
 /// Units for reading one course: a unit a point, plus one.
@@ -707,18 +1007,21 @@ fn course_read_units(river: &TodayRiver) -> u32 {
 const LEVEL_UNITS: u32 = 2;
 
 impl TodayBurn {
-    pub(crate) fn new() -> Self {
+    /// The burn, with the level table's lakes by map id ([`table_surfaces`]).
+    pub(crate) fn new(table: Vec<(u16, f32)>) -> Self {
         Self {
+            table,
             reader: TodayRiverReader::new(TODAY_RIVERS_JSON),
             next: 0,
             course: None,
             burnt: BurntNodes::default(),
+            chaining: false,
             applying: None,
         }
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        self.burnt.bytes() + self.course.as_ref().map_or(0, RiverNodes::bytes)
+        self.burnt.bytes() + self.course.as_ref().map_or(0, |c| c.0.bytes())
     }
 
     /// The burnt nodes and their levels, for the river graph's beds.
@@ -728,12 +1031,14 @@ impl TodayBurn {
 
     /// Up to about `budget` units (a course's reading and its levels are not split); returns
     /// whether every burnt node is lowered, and the units used (at least 1). The units do not
-    /// depend on how the work is sliced.
+    /// depend on how the work is sliced. `mapped` holds the mapped lakes' nodes, ascending.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step<S: NodeSource>(
         &mut self,
         table: &TodayTable,
         lattice: &CubeLattice,
         elevation: &mut [f32],
+        mapped: &[(u32, MappedLake)],
         is_ice: &dyn Fn(u32) -> bool,
         source: &S,
         budget: u32,
@@ -741,39 +1046,66 @@ impl TodayBurn {
         let mut used = 0;
         while used < budget {
             if let Some(start) = self.applying {
-                let list = &self.burnt.list;
-                let routes = &self.burnt.routes;
+                let burnt = &self.burnt;
                 let end = start
                     .saturating_add((budget - used) as usize)
-                    .min(list.len());
-                for (&(v, _), &route) in list[start..end].iter().zip(&routes[start..end]) {
-                    let e = &mut elevation[v as usize];
+                    .min(burnt.list.len());
+                for k in start..end {
+                    let e = &mut elevation[burnt.list[k].0 as usize];
+                    let route = burnt.routes[k];
                     // Never across sea level, so the burn changes no ocean (`route` is never below
-                    // 0 m on land). On land it is set: the course's fall of DEPRESSION_EPS_M a node
-                    // may stand a little above the node's own height near the sea.
-                    *e = if *e >= 0.0 { route } else { e.min(route) };
+                    // 0 m on land), except beside a mapped lake, where a node the course reads as
+                    // land at the lake's surface is land. On land it is set: the course's fall of
+                    // DEPRESSION_EPS_M a node may stand a little above the node's own height.
+                    *e = if burnt.own[k] >= 0.0 {
+                        route
+                    } else {
+                        e.min(route)
+                    };
                 }
                 used += (end - start) as u32;
                 self.applying = Some(end);
-                if end == list.len() {
+                if end == burnt.list.len() {
                     return (true, used);
                 }
                 continue;
             }
-            if let Some(course) = &mut self.course {
+            if self.chaining {
+                let (done, u) = self.burnt.chain_step(budget - used);
+                used += u;
+                if done {
+                    self.chaining = false;
+                    self.applying = Some(0);
+                }
+                continue;
+            }
+            if let Some((course, _)) = &mut self.course {
                 let (done, u) = course.step(lattice, budget - used);
                 used += u;
                 if !done {
                     continue;
                 }
-                let nodes = self.course.take().expect("a course").finish_with_anchors();
+                let (course, start) = self.course.take().expect("a course");
+                let nodes = course.finish_with_anchors();
                 used += LEVEL_UNITS * nodes.len() as u32;
                 let burnable = |v: u32| !is_ice(v) && source.todays_terrain(lattice.dir(v));
+                let table = &self.table;
+                let lake = |u: u32| {
+                    mapped
+                        .binary_search_by_key(&u, |&(i, _)| i)
+                        .ok()
+                        .map(|k| lake_surface(mapped[k].1, table))
+                };
+                let first = nodes.first().map(|&(v, _)| v);
                 let burnt = &mut self.burnt;
                 burnt.begin_course();
                 course_levels(
                     &nodes,
-                    |v| elevation[v as usize],
+                    |v| {
+                        let near = lake_surface_near(lattice, v, lake);
+                        let start = start.filter(|_| Some(v) == first);
+                        course_height(elevation[v as usize], near, start)
+                    },
                     burnable,
                     |a, b| lattice.distance_m(a, b),
                     |c| burnt.add(c),
@@ -793,14 +1125,18 @@ impl TodayBurn {
             match river {
                 Some(river) => {
                     used += course_read_units(&river);
-                    self.course = Some(RiverNodes::new(lattice, &river));
+                    let (lat, lon) = river.points[0];
+                    let start = source
+                        .mapped(geo_to_render(latlon_to_geo(lat, lon)))
+                        .map(|l| lake_surface(l, &self.table));
+                    self.course = Some((RiverNodes::new(lattice, &river), start));
                 }
                 None => {
                     used += 1;
                     if self.burnt.list.is_empty() {
                         return (true, used);
                     }
-                    self.applying = Some(0);
+                    self.chaining = true;
                 }
             }
         }
@@ -812,6 +1148,32 @@ impl TodayBurn {
 mod tests {
     use super::*;
     use crate::geo::{geo_to_latlon, render_to_geo};
+
+    /// Task 11d fix round 4: a course node reads a mapped lake's surface at its own node or a
+    /// neighbour within reach, and a course's first node the lake its first point lies in.
+    #[test]
+    fn a_course_node_reads_a_lake_within_reach_at_its_surface() {
+        let lattice = CubeLattice { n: 300 };
+        let v = lattice.nearest(geo_to_render(latlon_to_geo(10.0, 10.0)));
+        let u = lattice.neighbours(v)[0].expect("a neighbour");
+        let lake = |x: u32| (x == u).then_some(120.0f32);
+        assert_eq!(lake_surface_near(&lattice, v, lake), Some(120.0));
+        assert_eq!(lake_surface_near(&lattice, u, lake), Some(120.0));
+        // Two steps away the lake is out of reach.
+        let far = lattice
+            .neighbours(v)
+            .into_iter()
+            .flatten()
+            .flat_map(|w| lattice.neighbours(w).into_iter().flatten())
+            .find(|&w| lattice.distance_m(w, u) > 2.0 * lattice.mean_spacing_m())
+            .expect("a node two steps off");
+        assert_eq!(lake_surface_near(&lattice, far, lake), None);
+        // A lake raises a node read below it; it never lowers one.
+        assert_eq!(course_height(-50.0, Some(120.0), None), 120.0);
+        assert_eq!(course_height(300.0, Some(120.0), None), 300.0);
+        assert_eq!(course_height(-300.0, None, Some(120.0)), 120.0);
+        assert_eq!(course_height(-300.0, None, None), -300.0);
+    }
 
     #[test]
     fn the_shipped_table_parses() {

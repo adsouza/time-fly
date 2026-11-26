@@ -24,7 +24,7 @@ use super::params::{
 use super::straits::{Strait, shipped_straits, strait_levels};
 #[cfg(test)]
 use super::today_rivers::TodayRiver;
-use super::today_rivers::{BurntNodes, TodayBurn, TodayTable};
+use super::today_rivers::{BurntNodes, TodayBurn, TodayTable, table_surfaces};
 use super::{CubeLattice, EraHydrology, HydroGraph, NO_BASIN, Routed, Routing, receiver_of};
 use crate::deep_time::YearsBp;
 use crate::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
@@ -414,7 +414,8 @@ fn routed_bytes(r: &Routed) -> usize {
     4 * (r.elevation_m.capacity()
         + r.filled_m.capacity()
         + r.order.capacity()
-        + r.basin_of.capacity())
+        + r.basin_of.capacity()
+        + r.held.capacity())
         + r.ocean.capacity()
         + r.receiver.capacity()
         + basins
@@ -492,7 +493,8 @@ impl HydroPrep {
                 Stage::Straits => {
                     used += self.burn_straits(source);
                     if self.data_lakes {
-                        Stage::TodayRivers(Box::new(TodayBurn::new()))
+                        let table = table_surfaces(&self.lake_levels, source);
+                        Stage::TodayRivers(Box::new(TodayBurn::new(table)))
                     } else {
                         self.route()
                     }
@@ -503,6 +505,7 @@ impl HydroPrep {
                         &self.today,
                         &lattice,
                         &mut self.elevation,
+                        &self.mapped,
                         &|v| bit(ice, v),
                         source,
                         left,
@@ -676,6 +679,7 @@ impl HydroPrep {
             Routing::new(std::mem::take(&mut self.elevation))
                 .with_inland(self.beds.inland(), self.beds.ends())
                 .with_corridor(self.beds.corridor())
+                .with_courses(self.beds.successors())
                 .with_sinks(sinks),
         ))
     }
@@ -847,6 +851,7 @@ impl HydroPrep {
             ocean,
             lake_nodes: acc.lake_nodes,
             anchors: Vec::new(),
+            basin_routed: acc.basin_routed,
         }
     }
 
@@ -2465,6 +2470,8 @@ mod tests {
         ice_north_of: f64,
         data_lakes: bool,
         climate: Climate,
+        /// A mapped lake north of this latitude, at this surface (m).
+        lake: Option<(f64, f32)>,
     }
 
     impl Plain {
@@ -2482,6 +2489,7 @@ mod tests {
                 ice_north_of: 90.0,
                 data_lakes: true,
                 climate: shipped_table().biome(BiomeClass::TropicalRainforest),
+                lake: None,
             }
         }
 
@@ -2527,6 +2535,17 @@ mod tests {
             prep.beds.list().to_vec()
         }
 
+        /// The burnt nodes and their routing elevations once the burn is done.
+        fn routes(&self, age: YearsBp) -> Vec<(u32, f32)> {
+            let table = shipped_table();
+            let mut prep = HydroPrep::with_tables(PLAIN_LATTICE, age, &[], &[])
+                .with_today_rivers(vec![self.course()]);
+            while prep.stage_name() != "route" {
+                assert!(!prep.step(self, self, &table, 4096), "the pass ended");
+            }
+            prep.beds.routes()
+        }
+
         /// The burnt nodes and their river-graph beds once the burn is done.
         fn burnt_beds(&self, age: YearsBp) -> Vec<(u32, f32)> {
             let table = shipped_table();
@@ -2566,6 +2585,13 @@ mod tests {
 
         fn present_shift_m(&self, _dir: RenderDir) -> Option<f32> {
             Some(0.0)
+        }
+
+        fn mapped(&self, d: RenderDir) -> Option<MappedLake> {
+            let (lat, lon) = geo_to_latlon(render_to_geo(d));
+            let (north_of, surface_m) = self.lake?;
+            (self.data_lakes && lat > north_of && (0.0..20.0).contains(&lon))
+                .then_some(MappedLake { id: 1, surface_m })
         }
     }
 
@@ -2657,8 +2683,6 @@ mod tests {
         }
     }
 
-    /// Task 11d fix round 2 (rule B, the Hudi's case): a course crossing another's 0 m flat
-    /// keeps its own direction past the crossing, though the other's sea is nearer.
     /// Whether each interior node of `course` (all but its last) is land and drains to the next
     /// (the last may be ocean); the first that does not, otherwise.
     fn runs_to_its_end(h: &EraHydrology, course: &[u32]) -> Result<(), String> {
@@ -2825,6 +2849,8 @@ mod tests {
         }
     }
 
+    /// Task 11d fix round 2 (rule B, the Hudi's case): a course crossing another's 0 m flat
+    /// keeps its own direction past the crossing, though the other's sea is nearer.
     #[test]
     fn a_crossing_course_never_runs_backwards_along_a_flat() {
         let plain = Plain::new([(10.0, 10.0), (-1.0, 10.0)], |lat, _, _| {
@@ -2862,6 +2888,250 @@ mod tests {
         }
         // ... and beyond the junction the crossing course follows itself to its own sea.
         follows(&h, &nodes[at + 2..]).unwrap();
+    }
+
+    // ---- Task 11d fix round 4: course nodes drain to their course successors. ----
+
+    /// A course south across a 0–0.2 m delta plain to the sea at 0° N (the Mississippi below
+    /// Baton Rouge): 0.05 m marsh east of it below 4° N, and beyond the marsh a lagoon 2 m deep,
+    /// open to the sea (Barataria). The course's fall of 0.01 m a node stands above the marsh.
+    fn marsh_plain() -> Plain {
+        Plain::new([(10.0, 10.0), (-1.0, 10.0)], |lat, lon, _| {
+            if lat < 4.0 && lon > 10.9 {
+                -2.0
+            } else if lat < 4.0 && lon > 10.15 {
+                0.05
+            } else {
+                0.02 * lat.clamp(0.0, 10.0)
+            }
+        })
+    }
+
+    /// The course's nodes up to its first ocean node (its end at the coast).
+    fn to_the_coast(h: &EraHydrology, nodes: &[u32]) -> Vec<u32> {
+        let end = nodes
+            .iter()
+            .position(|&v| h.is_ocean(v))
+            .expect("the course reaches the sea");
+        nodes[..=end].to_vec()
+    }
+
+    /// Task 11d fix round 4 (the Mississippi at (30.06, −90.70)): a course whose fall toward its
+    /// end stands above the marsh beside it still runs to its own end, not across the marsh to
+    /// the lagoon's sea.
+    #[test]
+    fn a_delta_course_beside_a_marsh_reaches_its_own_end() {
+        let plain = marsh_plain();
+        let nodes = plain.nodes();
+        let h = plain.pass(PRESENT, true);
+        // The hazard: the lagoon is the sea, and course nodes stand beside the marsh, which
+        // lies below their routing elevations.
+        let lagoon = (0..PLAIN_LATTICE.len()).filter(|&v| {
+            let (lat, lon) = latlon_of(v);
+            (1.0..3.0).contains(&lat) && lon > 11.0 && lon < 12.0
+        });
+        assert!(lagoon.clone().count() >= 3);
+        assert!(lagoon.clone().all(|v| h.is_ocean(v)));
+        let routes: std::collections::HashMap<u32, f32> =
+            plain.routes(PRESENT).into_iter().collect();
+        let beside = nodes
+            .iter()
+            .filter(|&&v| {
+                PLAIN_LATTICE.neighbours(v).into_iter().flatten().any(|u| {
+                    !routes.contains_key(&u)
+                        && plain.node(PLAIN_LATTICE.dir(u)).elevation_m < routes[&v]
+                        && plain.node(PLAIN_LATTICE.dir(u)).elevation_m >= 0.0
+                })
+            })
+            .count();
+        assert!(beside >= 3, "{beside}");
+        runs_to_its_end(&h, &to_the_coast(&h, &nodes)).unwrap();
+    }
+
+    /// The marsh plain with an estuary 3 m deep along the course below 2° N (the corridor), a
+    /// tributary from the west ending on the course and a distributary leaving it to the south
+    /// west: every rule of the course order at once.
+    fn delta_plain() -> (Plain, Vec<TodayRiver>) {
+        let plain = Plain::new([(10.0, 10.0), (-1.0, 10.0)], |lat, lon, _| {
+            if lat < 2.0 && (lon - 10.0).abs() < 0.4 {
+                -3.0
+            } else if lat < 4.0 && lon > 10.9 {
+                -2.0
+            } else if lat < 4.0 && lon > 10.15 {
+                0.05
+            } else {
+                0.02 * lat.clamp(0.0, 10.0)
+            }
+        });
+        let tributary = TodayRiver {
+            name: "tributary".into(),
+            points: vec![(6.5, 5.0), (6.5, 10.0)],
+        };
+        let distributary = TodayRiver {
+            name: "distributary".into(),
+            points: vec![(7.0, 10.0), (-1.0, 4.0)],
+        };
+        let courses = vec![plain.course(), tributary, distributary];
+        (plain, courses)
+    }
+
+    /// Task 11d fix round 4: the time-boxed pass equals the whole pass, and the pass sampled in
+    /// parallel blocks, on a fixture whose courses engage the corridor, shared nodes and the
+    /// course order (the shipped-rivers test's Synthetic terrain engages none of them).
+    #[test]
+    fn the_time_boxed_pass_matches_run_parallel_on_a_delta() {
+        let (plain, courses) = delta_plain();
+        let table = shipped_table();
+        let prep = || {
+            HydroPrep::with_tables(PLAIN_LATTICE, PRESENT, &[], &[])
+                .with_today_rivers(courses.clone())
+        };
+        let mut whole = prep();
+        while !whole.step(&plain, &plain, &table, u32::MAX) {}
+        let units = whole.units_done();
+        let whole = whole.finish();
+        // The hazards: the estuary is the sea without the courses, and the courses share nodes.
+        let bare = plain.pass(PRESENT, false);
+        let main = plain.nodes();
+        let corridor = main
+            .iter()
+            .filter(|&&v| bare.is_ocean(v) && !whole.is_ocean(v));
+        assert!(corridor.count() >= 3);
+        let steps = crate::hydrology::today_rivers::course_steps(&whole, &courses, &plain);
+        let count = |s| steps.iter().filter(|e| e.3 == s).count();
+        use crate::hydrology::today_rivers::CourseStep;
+        assert!(count(CourseStep::Follows) >= 40, "{steps:?}");
+        assert_eq!(count(CourseStep::Other), 0, "{steps:?}");
+        // Step by step, as the web's time-boxed run does.
+        for budget in [1, 7, 64] {
+            let mut stepped = prep();
+            while !stepped.step(&plain, &plain, &table, budget) {}
+            assert_eq!(stepped.units_done(), units, "budget {budget}");
+            assert_eq!(stepped.finish(), whole, "budget {budget}");
+        }
+        // Sampled in parallel blocks, as the native task does, then stepped.
+        let len = PLAIN_LATTICE.len();
+        let blocks: Vec<NodeBlock> = std::thread::scope(|scope| {
+            let handles: Vec<_> = [0, len / 3, len]
+                .windows(2)
+                .map(|w| {
+                    let plain = &plain;
+                    let range = w[0]..w[1];
+                    scope.spawn(move || HydroPrep::sample_range(&PLAIN_LATTICE, plain, range))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut parallel = prep();
+        for block in blocks {
+            parallel.add_samples(block);
+        }
+        while !parallel.step(&plain, &plain, &table, 1 << 18) {}
+        assert_eq!(parallel.finish(), whole);
+    }
+
+    /// Task 11d fix round 4: over the shipped table, every interior node of every course drains
+    /// to its course successor, apart from the counted exceptions [`CourseStep`] names (shared
+    /// nodes, nodes in lakes or basins, nodes with too little water, the ocean past a corridor's
+    /// end); none drains anywhere else.
+    ///
+    /// [`CourseStep`]: crate::hydrology::today_rivers::CourseStep
+    #[test]
+    fn the_shipped_courses_drain_to_their_successors() {
+        use crate::hydrology::today_rivers::{CourseStep, course_steps, shipped_today_rivers};
+        let lattice = CubeLattice { n: 150 };
+        // Two sea levels: the second puts most courses on land.
+        for offset in [1450.0, 300.0] {
+            let today = Today(Synthetic(offset));
+            let h = run_at(lattice, PRESENT, &today, &today, &shipped_table(), u32::MAX);
+            let steps = course_steps(&h, shipped_today_rivers(), &today);
+            let mut counts = std::collections::BTreeMap::new();
+            for e in &steps {
+                *counts.entry(e.3).or_insert(0) += 1;
+            }
+            println!(
+                "offset {offset}: {} interior nodes: {counts:?}",
+                steps.len()
+            );
+            // The fixture is not trivial: hundreds of course nodes carry rivers.
+            assert!(
+                counts.get(&CourseStep::Follows).copied().unwrap_or(0) > 500,
+                "{counts:?}"
+            );
+            let other: Vec<_> = steps
+                .iter()
+                .filter(|e| e.3 == CourseStep::Other)
+                .take(5)
+                .collect();
+            assert!(other.is_empty(), "offset {offset}: {counts:?}; {other:?}");
+        }
+    }
+
+    /// Task 11d fix round 4 (the Angara at Listvyanka): a course leaving a deep lake starts at
+    /// the lake's surface. Its first nodes lie in the lake, on its bed below the sea, and the
+    /// shore node beyond, outside the map, samples the bed as well (a 5′ block mixing it in);
+    /// both read the lake's surface, so the land below is not pinned at 0 m. The map's own baked
+    /// surface reads the bed here (Baikal's reads −328 m), so a lake of the level table is read
+    /// at its table level.
+    #[test]
+    fn a_course_leaving_a_deep_lake_starts_at_its_surface() {
+        use crate::hydrology::levels::LakeLevel;
+        use crate::hydrology::today_rivers::course_beds;
+        let mut plain = Plain::new([(19.0, 10.0), (-1.0, 10.0)], |lat, _, _| {
+            if lat > 17.0 {
+                -300.0
+            } else if lat > 16.8 {
+                -50.0
+            } else {
+                50.0 + 3.0 * lat
+            }
+        });
+        plain.lake = Some((17.0, -300.0));
+        let levels = [LakeLevel {
+            name: "deep lake".into(),
+            lat: 18.5,
+            lon: 10.0,
+            level_m: 120.0,
+            overview_m: None,
+            source: "a fixture".into(),
+            note: String::new(),
+            endorheic: false,
+        }];
+        let nodes = plain.nodes();
+        let mapped = |v: u32| plain.mapped(PLAIN_LATTICE.dir(v)).is_some();
+        let own = |v: u32| plain.node(PLAIN_LATTICE.dir(v)).elevation_m;
+        // The hazard: lake nodes on the bed, and a shore node off the map below the sea.
+        assert!(nodes.iter().filter(|&&v| mapped(v)).count() >= 2);
+        let shore: Vec<u32> = nodes
+            .iter()
+            .copied()
+            .filter(|&v| !mapped(v) && own(v) < 0.0)
+            .collect();
+        assert!(!shore.is_empty(), "no shore node");
+        let beds = course_beds(&PLAIN_LATTICE, &[plain.course()], &plain, &levels);
+        let pinned: Vec<_> = beds.iter().filter(|b| b.pinned_at_sea_level).collect();
+        assert!(pinned.is_empty(), "pinned at 0 m: {pinned:?}");
+        // The land below the lake (47 m and up) keeps its own level as its bed, not 0 m.
+        let land: Vec<_> = beds
+            .iter()
+            .filter(|b| b.elevation_m > 0.0 && !mapped(b.node))
+            .collect();
+        assert!(land.len() > 25);
+        assert!(land.iter().all(|b| b.bed_m > 40.0), "{land:?}");
+        // The pass burns the same beds its measurement reports, and the course starts at the
+        // lake's table level.
+        let table = shipped_table();
+        let mut prep = HydroPrep::with_tables(PLAIN_LATTICE, PRESENT, &levels, &[])
+            .with_today_rivers(vec![plain.course()]);
+        while prep.stage_name() != "route" {
+            assert!(!prep.step(&plain, &plain, &table, 4096), "the pass ended");
+        }
+        let got: Vec<(u32, f32)> = beds.iter().map(|b| (b.node, b.bed_m)).collect();
+        assert_eq!(got, prep.beds.beds());
+        assert_eq!(prep.beds.list()[0], (nodes[0], 120.0));
+        // Without the table, the map's bed-level surface would pin the land below.
+        let unlisted = course_beds(&PLAIN_LATTICE, &[plain.course()], &plain, &[]);
+        assert!(unlisted.iter().any(|b| b.pinned_at_sea_level));
     }
 
     #[test]
@@ -3198,7 +3468,7 @@ mod tests {
         let mut valley = hump_valley();
         valley.ice_north_of = 16.0;
         let burnt = valley.burnt_beds(PAST);
-        let beds = course_beds(&PLAIN_LATTICE, &[valley.course()], &valley);
+        let beds = course_beds(&PLAIN_LATTICE, &[valley.course()], &valley, &[]);
         let got: Vec<(u32, f32)> = beds.iter().map(|b| (b.node, b.bed_m)).collect();
         assert_eq!(got, burnt);
         assert!(

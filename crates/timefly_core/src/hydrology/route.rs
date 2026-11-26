@@ -15,6 +15,12 @@
 //!   the sea up estuaries. The labelling itself is unchanged. Each course's corridor ends at its
 //!   first such node below [`OPEN_SEA_M`] (open sea: a line drawn past the coast), which
 //!   becomes one of the ends an inland node may drain to.
+//! - **Course order** ([`Routing::with_courses`], Task 11d fix round 4): after the corridor,
+//!   each burnt course's interior node that is land, whose course successor is its neighbour and
+//!   land or a course's end, is *held*: the flood reaches it from its successor alone, so its
+//!   parent and its receiver are the successor and its filled level is never below the
+//!   successor's. The successors hold no loop, so every held node is reached; should the flood
+//!   reseed at one, it is held no more.
 //! - **Inland nodes** ([`Routing::with_inland`]): an ocean node that ends no course pushes no
 //!   inland neighbour in the flood, so an inland node's parent is never such an ocean node.
 //!   Should the flood run out with nodes unreached, the lowest of them seeds it again.
@@ -28,12 +34,14 @@
 //!   neighbour order: `filled[n] = max(e[n], filled[c])`, `parent[n] = c`, push
 //!   `(filled[n], seq++)`. `seq` is a running u64; f32 keys compare by total order. With no ocean
 //!   at all, seed the lowest node (ties: the lowest id).
-//! - **Receiver:** the neighbour with a strictly lower filled level and the largest
+//! - **Receiver:** a held node's successor. Otherwise the neighbour with a strictly lower filled
+//!   level and the largest
 //!   `(filled[i] − filled[j]) / distance` (ties: first in neighbour order); with none strictly
 //!   lower, the parent. A burnt course's interior node ([`Routing::with_inland`]) takes no ocean
 //!   neighbour as its receiver unless that neighbour ends a course: a course meets the sea only
 //!   at its own end (Task 11d fix rounds 2 and 3).
-//! - **Basins:** 8-connected components of nodes with `filled > e + DEPRESSION_EPS_M`. The exit
+//! - **Basins:** 8-connected components of nodes with `filled > e + DEPRESSION_EPS_M` at one
+//!   filled level (without held nodes neighbouring depressed nodes always share it). The exit
 //!   is the basin node popped first; the rim is its parent. Every other basin node whose receiver
 //!   leaves the basin is redirected to the exit, so pop order is a topological order (receiver
 //!   before node).
@@ -53,6 +61,10 @@ pub const RECEIVER_EXIT: u8 = 9;
 pub const NO_BASIN: u32 = u32::MAX;
 
 const NO_PARENT: u8 = RECEIVER_NONE;
+/// A parent slot's flag for a node held to its course successor ([`Routing::with_courses`]):
+/// the low bits name the successor's neighbour index.
+const FORCED: u8 = 0x10;
+const NEIGHBOUR_BITS: u8 = 0x0f;
 const NO_COMPONENT: u32 = u32::MAX;
 
 /// A depression on the filled surface: where a lake may stand (Task 3 decides how full).
@@ -86,6 +98,9 @@ pub struct Routed {
     pub basins: Vec<Basin>,
     /// Each node's index into `basins`, or [`NO_BASIN`].
     pub basin_of: Vec<u32>,
+    /// The nodes held to their course successors ([`Routing::with_courses`]), sorted: a basin's
+    /// rewrite keeps such a receiver where it leads a step closer to the basin's lake.
+    pub held: Vec<u32>,
 }
 
 /// The node `i` drains to, or `None` for the ocean and a no-ocean graph's seed.
@@ -139,6 +154,10 @@ enum Phase {
     },
     /// Dilating the ocean across straits.
     Dilate,
+    /// Holding course nodes to their successors, from the `k`-th.
+    Courses {
+        k: u32,
+    },
     /// Growing and pushing the endorheic lakes' sinks.
     Sinks,
     /// Pushing the flood's seeds; `next` is the next id to scan.
@@ -203,6 +222,10 @@ pub struct Routing {
     reached: u32,
     /// The corridor's nodes made land (sorted), while it is applied.
     made_land: Vec<u32>,
+    /// Burnt courses' interior nodes and their course successors, sorted by node.
+    courses: Vec<(u32, u32)>,
+    /// The nodes held to them, sorted.
+    held: Vec<u32>,
     /// Endorheic lakes' `(node, level)`, and once grown, each node's sink flag (empty with none).
     sink_points: Vec<(u32, f32)>,
     sink: Vec<bool>,
@@ -251,6 +274,8 @@ impl Routing {
             corridor: Vec::new(),
             reached: 0,
             made_land: Vec::new(),
+            courses: Vec::new(),
+            held: Vec::new(),
             sink_points: Vec::new(),
             sink: Vec::new(),
         }
@@ -261,6 +286,14 @@ impl Routing {
     /// elevation, up to the course's first open-sea node (Task 11d fix round 3).
     pub fn with_corridor(mut self, corridor: Vec<Vec<(u32, f32, f32)>>) -> Self {
         self.corridor = corridor;
+        self
+    }
+
+    /// The router, with burnt courses' interior nodes and their course successors (sorted by
+    /// node): each drains to its successor (Task 11d fix round 4; the module's rules).
+    pub fn with_courses(mut self, courses: Vec<(u32, u32)>) -> Self {
+        debug_assert!(courses.is_sorted());
+        self.courses = courses;
         self
     }
 
@@ -331,6 +364,8 @@ impl Routing {
             + self.inland.capacity()
             + self.ends.capacity()
             + self.made_land.capacity()
+            + 2 * self.courses.capacity()
+            + self.held.capacity()
             + 3 * self.corridor.iter().map(Vec::capacity).sum::<usize>()
             + 2 * self.sink_points.capacity())
             + self.sink.capacity()
@@ -354,6 +389,7 @@ impl Routing {
             order: self.order,
             basins: self.basins,
             basin_of: self.basin_of,
+            held: self.held,
         }
     }
 
@@ -368,6 +404,7 @@ impl Routing {
             Phase::Steps { c } => self.fill_steps(c),
             Phase::Ocean { c, k } => self.add_largest(c, k),
             Phase::Dilate => self.dilate(g),
+            Phase::Courses { k } => self.hold_courses(g, k),
             Phase::Sinks => self.sinks(g),
             Phase::Seed { next } => self.seed(g, next),
             Phase::Flood => self.flood(g),
@@ -548,7 +585,41 @@ impl Routing {
         self.visited = vec![false; len];
         self.parent = vec![NO_PARENT; len];
         self.order = Vec::with_capacity(len - self.ocean_count as usize);
-        self.phase = Phase::Sinks;
+        self.phase = Phase::Courses { k: 0 };
+    }
+
+    /// Up to [`BLOCK_UNITS`] course nodes from the `k`-th: a land node whose successor is a
+    /// neighbour and land or a course's end is held to it ([`FORCED`] in its parent slot). The
+    /// successors hold no loop ([`super::today_rivers`]), so every held node is reached.
+    fn hold_courses(&mut self, g: &impl HydroGraph, k: u32) -> u32 {
+        let end = (k as usize + BLOCK_UNITS as usize).min(self.courses.len());
+        for i in k as usize..end {
+            let (v, s) = self.courses[i];
+            if self.ocean[v as usize] || (self.ocean[s as usize] && !self.is_end(s)) {
+                continue;
+            }
+            if let Some(n) = g.neighbours(v).iter().position(|&j| j == Some(s)) {
+                self.parent[v as usize] = FORCED | n as u8;
+                self.held.push(v);
+            }
+        }
+        self.phase = if end == self.courses.len() {
+            self.courses = Vec::new();
+            Phase::Sinks
+        } else {
+            Phase::Courses { k: end as u32 }
+        };
+        (end as u32 - k).max(1)
+    }
+
+    /// Whether `i` is held to its course successor ([`Routing::hold_courses`]).
+    fn is_held(&self, i: u32) -> bool {
+        self.parent[i as usize] & FORCED != 0
+    }
+
+    /// The neighbour index in `i`'s parent slot.
+    fn parent_index(&self, i: u32) -> usize {
+        usize::from(self.parent[i as usize] & NEIGHBOUR_BITS)
     }
 
     /// Grows and pushes every endorheic lake's sinks in one unit, costing the nodes visited.
@@ -633,6 +704,7 @@ impl Routing {
                         .then(a.cmp(&b))
                 })
                 .expect("an unreached node");
+            self.parent[lowest as usize] = NO_PARENT;
             self.visited[lowest as usize] = true;
             self.reached += 1;
             self.push(lowest);
@@ -656,10 +728,14 @@ impl Routing {
             if self.ocean[uu] || self.visited[uu] || (shut && self.is_inland(u)) {
                 continue;
             }
+            // A node held to its course successor is reached from it alone.
+            if self.is_held(u) && g.neighbours(u)[self.parent_index(u)] != Some(c) {
+                continue;
+            }
             self.visited[uu] = true;
             self.reached += 1;
             self.filled[uu] = max_total(self.elevation[uu], level);
-            self.parent[uu] = back_index(g, u, c);
+            self.parent[uu] = (self.parent[uu] & FORCED) | back_index(g, u, c);
             self.push(u);
         }
         1
@@ -672,7 +748,10 @@ impl Routing {
             return 1;
         }
         let i = next as usize;
-        if !self.ocean[i] && !self.is_sink(next) {
+        if !self.ocean[i] && !self.is_sink(next) && self.is_held(next) {
+            // Reached from its successor alone, so its parent: never above it.
+            self.receiver[i] = self.parent[i] & NEIGHBOUR_BITS;
+        } else if !self.ocean[i] && !self.is_sink(next) {
             let level = self.filled[i];
             let inland = self.is_inland(next);
             let mut best: Option<(u8, f64)> = None;
@@ -689,7 +768,7 @@ impl Routing {
                     }
                 }
             }
-            self.receiver[i] = best.map_or(self.parent[i], |(k, _)| k);
+            self.receiver[i] = best.map_or(self.parent[i] & NEIGHBOUR_BITS, |(k, _)| k);
         }
         self.phase = Phase::Receivers { next: next + 1 };
         1
@@ -703,11 +782,16 @@ impl Routing {
     fn label_basin(&mut self, g: &impl HydroGraph, next: u32) -> u32 {
         if let Some(v) = self.queue.pop_front() {
             let b = self.basins.len() as u32;
+            let spill = self.open.as_ref().expect("a basin is open").spill_m;
             for u in g.neighbours(v).into_iter().flatten() {
-                if self.basin_of[u as usize] == NO_BASIN && (self.depressed(u) || self.is_sink(u)) {
+                // One level: without held course nodes neighbouring depressed nodes always share
+                // it; a held node can stand filled to its successor's lake beside a lower pit.
+                if self.basin_of[u as usize] == NO_BASIN
+                    && (self.depressed(u) || self.is_sink(u))
+                    && self.filled[u as usize].to_bits() == spill.to_bits()
+                {
                     self.basin_of[u as usize] = b;
                     let open = self.open.as_mut().expect("a basin is open");
-                    debug_assert_eq!(self.filled[u as usize], open.spill_m);
                     open.nodes.push(u);
                     self.queue.push_back(u);
                 }
@@ -727,7 +811,7 @@ impl Routing {
         if self.basin_of[v as usize] == NO_BASIN && (self.depressed(v) || self.is_sink(v)) {
             // Scanning in pop order, the first node met of a basin is the one popped first.
             self.basin_of[v as usize] = self.basins.len() as u32;
-            let parent = usize::from(self.parent[v as usize]);
+            let parent = self.parent_index(v);
             // An endorheic lake's sinks spill nowhere: the rim is the exit.
             let rim = if self.is_sink(v) {
                 v

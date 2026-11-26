@@ -27,6 +27,135 @@ Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (162
 
 ## Result, 2026-11-26 (Task 11d: the world's major river systems)
 
+### Fix round 4 (2026-11-26)
+
+The controller's rulings, and what was built:
+
+- **1. Course nodes drain to their course successors.**
+  - **Mechanism: held receivers.** Routing (`Routing::with_courses`) *holds* each burnt course's interior node to its successor, after the corridor and before the fill. A node is held when it is land, its successor is a lattice neighbour, and the successor is land or a course's end. The flood reaches a held node from its successor alone, so its parent and its receiver are the successor. Its filled level is `max(e, filled(successor))`: it never rises along a receiver, and pop order stays a topological order.
+  - **Why not a gutter.** A gutter below the marsh would have to stand below every neighbour's filled level along every course, and below its outlet too, or the gutter itself becomes a basin. Holding needs no elevation change, so the ocean labelling and the 0 m floor are untouched.
+  - **Routing elevations over all courses at once** (`BurntNodes::chain_step`). Each interior node keeps one successor. From the ends upstream along the successors, the land chain is `max(level − 10 m, 0 m, chain(successor) + 0.01 m)`, with `level − 10 m` the lowest any course gave the node. A held node therefore stands above its successor, so held nodes form no basin of their own. Where several courses pass a node, the per-course chains disagreed at junctions; this chain cannot.
+  - **The rule at shared nodes** (deterministic, documented in `BurntNodes`). The successor is the next node of the course whose own chain is lowest there. That chain is `max(level − 10, 0)`, at least 0.01 m above the next node's, counted from that course's own end, as each course routed alone in round 2. Ties go to the first course in the table. At a fork, or where a distributary leaves a stem, this picks the branch that steepest descent picked before this round. A successor that would close a loop (misoriented parts) is dropped.
+  - Two rules were tried first, and the evidence is below. Through-courses before starting courses: the Orinoco went down the Caño Mánamo and the Nile down the Rosetta branch. The lowest chain over the network: the Orinoco went down the Mánamo, and the Lena moved 18 km off.
+  - **Basins.** A basin is an 8-connected set of depressed nodes *at one filled level*. Without held nodes, neighbouring depressed nodes always share one level (the old debug assertion). A held node can stand filled to its successor's lake beside a lower pit.
+  - **Basin rewrites.** At the present day every basin's receivers are rewritten toward its lake or sink, one BFS step closer each. That rewrite keeps a held node's successor where the successor is a step closer. Elsewhere it overrides the hold, and such nodes are listed (`EraHydrology::basin_routed`).
+- **2. The Nile's mouth is Ras El Bar,** (31.5125, 31.82556), from Wikipedia "Ras El Bar" (31°30′45″N 31°49′32″E, read 2026-11-26). The article calls it "at the mouth of the Damietta Nile branch". The allowance stays at 150 km.
+- **3. A course's level never reads a lake bed.** A course node reads its height as `max(sample, surface)` when it, or a lattice neighbour within 1.5 mean spacings (one spacing from that node's footprint), is a mapped-lake node (`lake_surface_near`). A course's first node does the same when its first point lies in a mapped lake. That reach alone did not move the Angara, because the lake map's baked surface for Baikal is −328 m (its bed; a probe printed it). So a lake of the level table is read at its table level (`table_surfaces`; Baikal 455.5 m), and the map's surface only otherwise.
+- **The units fix.** `Today::step` charged its Done check only when budget was left after the last flow step, so the pass's units differed by one between budgets 1/7 and 2/64/2¹⁸. The bug was already there: at HEAD, budget 1 gave 729,090 and the others 729,091. Done now costs nothing.
+- **The check gains two lines.** One lists every pinned course with its first node. The other, `today's courses' order`, sorts each interior node by how it drains against its successor (`course_steps`, `CourseStep`).
+
+**Tests (RED at HEAD with the tests and their helpers added, then GREEN):**
+- `a_delta_course_beside_a_marsh_reaches_its_own_end`: a 0–0.2 m plain, marsh at 0.05 m and a lagoon open to the sea. RED: "RiverNode 397076 … does not drain to 397376".
+- `the_shipped_courses_drain_to_their_successors`: the shipped table over Synthetic terrain at n = 150, at two sea levels. RED: `Other: 661`. GREEN: no `Other`. Exceptions at offset 300: `SharedNode` 31, `Ocean` 2,034, `PastSeaEnd` 2, `NotBurnt` 1, `NoRiver` 667, `BasinRoute` 114, `Sink` 3.
+- `the_time_boxed_pass_matches_run_parallel_on_a_delta`: three courses with an estuary corridor, a tributary and a distributary, at budgets 1, 7 and 64 and sampled in parallel. RED at HEAD on its hazard (`Other` steps along the course). GREEN, with equal units.
+- `a_course_leaving_a_deep_lake_starts_at_its_surface`: a lake bed at −300 m, a shore node off the map at −50 m, and the map's surface at the bed with a table level of 120 m. RED at HEAD: 13 pinned beds. GREEN; without the table entry it still pins, which proves the table rule is engaged.
+- `a_course_node_reads_a_lake_within_reach_at_its_surface` (unit). `the_nile_ends_at_the_damietta_mouth`, RED: `left: (30.1725, 31.14)`.
+
+**hydro check (`dev`): FAIL, on the Indus box's links only, as before. All 22 outlets pass.** Before is HEAD 1216a2e with the two new report lines; after is this round.
+
+| Bar | Before | After |
+|---|---|---|
+| Indus box, relaxed | 81.3%, 73/84 links, worst 77.5 km | 83.0%, 74/84, worst **81.3 km** (FAIL, links) |
+| Indus box, coarse | 80.1%, 72/84, worst 77.7 km | 82.0%, 73/84, worst **82.4 km** |
+| Amazon box, relaxed | 91.6%, 458/482 | 91.8%, **457**/482 (PASS) |
+| Amazon box, coarse | 91.3%, 455/482 | 91.4%, **454**/482 |
+| The five lakes | exact | exact |
+| Arid basins | 0 of 3, 0 of 2 | the same (lake 537 at 1940 mm/yr, was 1942) |
+| Danube | 0.3 km; 7 km | the same |
+| Jhelum | 1.1 km; 8 km (1 lake) | the same (2 lakes) |
+| Indus | 8 km | 8 km |
+| Amazon | 152 km | 152 km |
+| Ganges | 0.1, 1.2 km; 110 km | 0.1, 1.2 km; **133 km** |
+| Brahmaputra | 5.7, 2.7 km; 110 km | **6.4**, 2.7 km; **133 km** |
+| Yangtze | 1.3, 0.0, 3.4 km; 121 km | the same vias; 6 km |
+| Yellow River | 0.4, 1.4 km; 100 km | the same vias; 13 km |
+| Pearl | 4.4 km; 31 km | 2.7 km; 31 km |
+| Mekong | 7.6 km; 103 km | 7.6 km; 103 km |
+| **Nile** | 1.8, 5.6 km; 161 km from the delta's head, FAIL | 1.8, 5.6 km; **3 km from Ras El Bar, PASS** |
+| Congo | 2.0, 3.2 km; 17 km | the same |
+| Niger | 10.3, 6.7, 8.6 km; 124 km | **10.9**, 6.7, 3.9 km; 124 km |
+| **Mississippi** | 0.6 km; New Orleans 37.2 km, FAIL; 141 km | 0.6 km; **New Orleans 7.6 km, PASS**; 21 km |
+| Hudson | 3.8 km; 26 km | the same |
+| Yenisei | 1.8 km; 90 km | the same |
+| Ob | 9.1 km; 87 km | the same |
+| Orinoco | 0.1 km; 14 km | the same |
+| Paraná | 3.1 km; 9 km | the same |
+| Lena | 0.4 km; 117 km | the same |
+| Volga | 13.0 km; 70 km | 3.8 km; 70 km |
+| Mackenzie | 1.9 km; 9 km | 1.9 km; **84 km** |
+| Discharge | Nile 5.11 flagged; 18 gauges | Nile 5.11 flagged. Moved: Mekong 0.59 → 0.75, Mississippi 1.71 → 1.76, Niger 1.31 → 1.28, Orinoco 1.00 → 0.97, Mackenzie 1.18 → 1.14, Yangtze 0.74 (16,655 → 16,733 m³/s), Pearl 0.77 → 0.76, Yellow 1.70 → 1.69; the rest within 1% |
+| Endorheic surplus | the Caspian 3,449 of 12,853 m³/s | 3,449 of 12,853 |
+| Burnt nodes | 31,986; p99 446 m; 4,621 over 50 m | 31,986; p99 439 m; 4,611 over 50 m |
+| Pinned at 0 m | 32 nodes on 11 courses, the Angara 13 | **19 nodes on 10 courses: the Angara is gone** |
+| Course order | Follows 24,111; Other 2,259 | Follows 28,701; Other 3 (below) |
+| Pass at 0 ka | 1.31 s | 1.36–1.74 s over four runs, with another implementer building on the machine; not measured quiet |
+| River nodes | 118,983 | 120,052; 861 lakes |
+
+**Worse, for the controller (unchanged):**
+- Ganges and Brahmaputra 110 → 133 km.
+- Mackenzie 9 → 84 km.
+- Brahmaputra's Pasighat via 5.7 → 6.4 km, and the Niger's inner-delta via 10.3 → 10.9 km.
+- The Amazon box one link fewer (458 → 457 relaxed, 455 → 454 coarse).
+- The Indus box's worst distance 77.5 → 81.3 km; its share and links improved.
+
+All still pass. Pictures: [Ganges](hydro-check-outlet-ganges.svg) ([before](hydro-check-outlet-ganges-before.svg)) and [Mackenzie](hydro-check-outlet-mackenzie.svg) ([before](hydro-check-outlet-mackenzie-before.svg)).
+
+**The shared-node rule, three variants on real data:**
+
+| Rule | Orinoco | Nile | Lena | Mekong | Mississippi |
+|---|---|---|---|---|---|
+| Through before starting, then lowest `level − 10` | **272 km FAIL** (the Caño Mánamo, table order at the fork) | 131 km, down the Rosetta | 117 km | 19 km | 32 km |
+| Lowest chain over the network | **272 km FAIL** (the Mánamo is the shortest way to a sea) | 3 km, Damietta | 135 km | 19 km | 21 km |
+| **Shipped: the course's own chain** | 14 km | 3 km, Damietta | 117 km | 103 km | 21 km |
+
+**The course order on real data** (`course_steps`, 31,634 interior nodes):
+- Follows 28,701.
+- SharedNode 91: drains to another course's successor at a node they share.
+- Ocean 5: past the corridor's open-sea end.
+- InLake 73.
+- NoRiver 2,666: too little water to be a river node, so the river graph cannot show it. Held in routing all the same.
+- BasinRoute 95: the present-day basin rewrite, where the successor is no step closer.
+- **Other 3**, each a loop cut at misoriented parts:
+  - the Lena delta's Tumatskaya and Bykovskaya Protoka at (72.45, 126.43), node 1949064. The Bykovskaya part runs from the sea into the delta's apex.
+  - the Bell's lake-chain parts at (48.50, −75.53), node 2114164, which round 3 listed as unverified.
+
+**The pinned courses still listed** (19 nodes, each at most 4.2 m above the sea). In every case the course passes an ETOPO channel or polder floor below 0 m, then a delta or estuary node from 0.0 to 4.2 m. The 0 m floor would give that node 0 m in any case:
+
+| Course | Where | What lies below sea level upstream |
+|---|---|---|
+| Bratul Sulina | (45.19, 29.40), 2 nodes, 1.2 m | the Danube delta |
+| Lek | (51.92, 4.47), 1 node, 0.0 m | the Rhine delta's polders |
+| Waal | (51.75, 4.77), 1 node, 1.1 m | the Rhine delta's polders |
+| Lena | (72.22, 126.83), 2 nodes, 1.1 m | delta channels |
+| Rio Grande (Orinoco) | (8.63, −60.41), 1 node, 0.2 m | at Barima Point |
+| Sacramento | (38.16, −121.66), 1 node, 0.3 m | the delta's islands |
+| Sénégal | (15.76, −16.52), 1 node, 4.2 m | Saint-Louis's channel |
+| Volga | (48.70, 44.59), 6 nodes, 3.7 m | at Volgograd, where the course enters the Caspian depression |
+| Xingu | (−1.76, −52.32), 2 nodes, 3.7 m | its ria's floor |
+| Yangtze estuary | (32.05, 120.63), 2 nodes, 0.8 m | the estuary's floor |
+
+**The lakes, diffed** (`hydro-check-lakes.tsv`):
+- 749 of 861 are identical; 112 changed flows, and none changed kind.
+- **Baikal** now spills at Listvyanka, (51.79, 104.80), not 160 km down the Angara at (53.11, 103.44): 35,343 → 33,137 km², inflow 3,968 → 3,572 m³/s. Its outflow passes the −328 m data flat beside Listvyanka (lake 384: 25 → 3,597 m³/s in), then the Angara.
+- Large moves come where a held course now carries the water another way:
+
+| Lake | Change, m³/s |
+|---|---|
+| A data lake by Dongting (29.33, 112.95) | 11 → 12,588 (the Yangtze now passes through it) |
+| Its neighbour (28.96, 111.97) | 1,965 → 135 |
+| Two Athabasca-delta lakes | 101 → 2,082 and 1,997 → 722 |
+| The Ordos lake on the Yellow River (40.99, 108.95) | 3 → 1,155 |
+| The Aral Sea (44.51, 58.31) | 863 → 239 |
+| Flathead | 921 → 354 |
+| Winnebago | 417 → 151 |
+| Lake Nipigon area (48.89, −88.18) | 644 → 258 |
+| Taymyr | 313 → 470 |
+
+  Flathead's and Winnebago's new inflows are nearer their rivers' gauged means (about 330 and 120 m³/s, from memory, not cited). The Aral is unverified.
+- 11 exits moved and 2 areas changed.
+
+Pictures, refreshed: [Mississippi](hydro-check-outlet-mississippi.svg) (round 3's [before](hydro-check-outlet-mississippi-before.svg)), [Nile](hydro-check-outlet-nile.svg), [Yangtze](hydro-check-outlet-yangtze.svg), [Volga](hydro-check-outlet-volga.svg), [Danube](hydro-check-outlet-danube.svg), and the two box pictures. No outlet fails, so there are no misroute pictures.
+
 ### Fix round 3 (2026-11-26)
 
 The controller's rulings:
