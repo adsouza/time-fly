@@ -22,6 +22,25 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
   target/release/timefly --journey-bench --target-fps 60 --window 2560x1440
 ```
 
+Since Task 15 (owner, 2026-11-26) the region, journey and scrub benches stop at the first failed
+gate instead of running to the end. The summary still prints: the stops run, the failed gate on a
+`stopped early at stop k of n, <stop>: <gate>` line, and the stops skipped. The run exits 3, as
+for any FAIL. A stop is a region (or a globe pan) in the region bench, a journey in the journey
+bench and a scrub direction in the scrub bench. Gates decided within a stop end the run:
+
+- **Region bench:** a region's R14 flight (gated regions only), its globe pan, its first-entry
+  generation and R11 on the web, or a region that fails to load or is left early. The run stops
+  after that region's block.
+- **Journey bench:** a hold over its native gate, a swap frame over its native gate, a hop's
+  memory over its gate, or a route check. The run stops as soon as the gate fails.
+- **Scrub bench:** the older direction, when its frames fail both pass rules. Then the run has
+  failed whatever pacing the pooled frames show.
+
+Gates that need the whole run are judged at the end, as before: the memory cycles, warm
+generation, and the journey bench's flight (one pacing for the run, from every flight frame
+pooled). Add `--keep-going` (web `?keep-going`) to run every stop and get every verdict. Each
+summary says which mode ran: `on a failed gate: stop` or `on a failed gate: keep going`.
+
 ## Summary
 
 | Bench | Run 1 | Run 2 (judged) |

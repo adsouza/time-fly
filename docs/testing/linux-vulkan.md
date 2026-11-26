@@ -160,7 +160,9 @@ Everest's area), Sundaland at 21 ka (5° N, 107° E), Japan at 1 Ma (era-frame 3
 21 ka (48.5° N, 113.5° W), and Panama at 3 Ma (era-frame 9° N, 79.5° W). In each it flies a 60 s path (a low pass at 300 m, a climb to 30 km, a run along or
 toward the coast, a sweep toward the apron), then leaves. Then it re-enters the Himalayas ten times to
 measure warm generation and memory. It prints one block per region and a summary block, then
-exits: 0 on PASS, 3 on FAIL. A run takes about ten minutes. Leave the mouse and keyboard alone
+exits: 0 on PASS, 3 on FAIL. A failed gate ends the run after that region's block, with a
+`stopped early` line in the summary. Add `--keep-going` to fly every stop anyway. A full run
+takes about ten minutes. Leave the mouse and keyboard alone
 while it runs, and paste every block back unedited (one per region and the summary). A banner
 at the top centre shows the current stop (`Sundaland · 21 thousand years ago · 4 of 9`, the pan,
 `Next: …` on the globe) and finally `Region bench finished: PASS` or `FAIL`. The

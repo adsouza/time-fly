@@ -57,6 +57,12 @@
 //! - **Sites** (reported only): the canyon's depth and Fuji's height, read from the grid of the
 //!   hop's neighbour ([`read_site`]).
 //!
+//! **Stopping early.** A stop is a journey. A gate decided within one ends the run as soon as it
+//! fails ([`failed_journey_gate`]): a hold or a swap frame over its native gate, a hop's memory
+//! over its gate, or a route check. The summary names the stops run, the failed gate and the
+//! stops skipped. The flight (one pacing for the run, from every flight frame pooled) and the
+//! journey memory cycles are judged at the end. `--keep-going` flies every journey.
+//!
 //! A stage that does not finish within [`STAGE_TIMEOUT_SECS`] (the longest, the region's, is
 //! about 21 s of descent, 15 s and 25 s of flight and two holds: about 65 s natively), a dive that comes back out over
 //! the globe, or a hop that turns back fails the run with the reason. On native the run exits
@@ -79,8 +85,9 @@ use super::region::{
     pacing_for, pacing_name, show_mib,
 };
 use super::{
-    MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
-    frame_budget_ms, frame_time_stats, header_lines_titled, missed_frames, passes, stall_count,
+    EarlyStop, MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS,
+    bench_exit, frame_budget_ms, frame_time_stats, header_lines_titled, missed_frames,
+    on_failure_line, passes, stall_count, stopped_early_lines,
 };
 use crate::args::RegionArg;
 use crate::data::GlobeData;
@@ -545,6 +552,8 @@ pub struct JourneyBenchConfig {
     pub journeys: Vec<usize>,
     pub target_fps: u32,
     pub exit_when_done: bool,
+    /// `--keep-going`: fly every journey even after a gate has failed.
+    pub keep_going: bool,
 }
 
 impl JourneyBenchConfig {
@@ -555,6 +564,7 @@ impl JourneyBenchConfig {
             journeys: JOURNEY_ORDER.to_vec(),
             target_fps,
             exit_when_done,
+            keep_going: false,
         }
     }
 
@@ -565,6 +575,7 @@ impl JourneyBenchConfig {
             journeys: vec![0; JOURNEY_CYCLES as usize],
             target_fps,
             exit_when_done,
+            keep_going: false,
         }
     }
 
@@ -602,6 +613,20 @@ impl JourneyBenchConfig {
         } else {
             format!("cycle {}, {}", cycle + 1, self.route(cycle).region.name)
         }
+    }
+
+    /// The stops' names, one per journey: `journey 2`, or with several routes
+    /// `journey 2 (Mt Fuji)`.
+    pub fn stop_names(&self) -> Vec<String> {
+        (0..self.journeys.len())
+            .map(|j| {
+                if self.routes.len() == 1 {
+                    format!("journey {}", j + 1)
+                } else {
+                    format!("journey {} ({})", j + 1, self.route(j as u32).region.name)
+                }
+            })
+            .collect()
     }
 
     /// Whether journey `cycle` visits a route flown earlier in the run.
@@ -929,6 +954,8 @@ pub struct JourneyBench {
     keys_held: Vec<KeyCode>,
     summary: Option<String>,
     passed: Option<bool>,
+    /// Where the run stopped at its first failed gate, if it did.
+    stopped: Option<EarlyStop>,
 }
 
 impl JourneyBench {
@@ -947,6 +974,7 @@ impl JourneyBench {
             keys_held: Vec::new(),
             summary: None,
             passed: None,
+            stopped: None,
         }
     }
 
@@ -1145,6 +1173,20 @@ fn measure_journey(
                 .site
                 .filter(|site| site.hop == hop.hop)
                 .and_then(|site| read_site(&site, &region.grid, &region.frame));
+        }
+        if !bench.config.keep_going
+            && let Some(gate) = failed_journey_gate(bench, cfg!(target_arch = "wasm32"))
+        {
+            warn!(
+                cycle = cycle + 1,
+                gate, "journey bench: a gate failed, stopping early"
+            );
+            bench.stopped = Some(EarlyStop {
+                stops_run: cycle as usize + 1,
+                gate,
+            });
+            finish(bench, &game, &display, &mut controls, None);
+            return;
         }
     }
     let timed_out = |since: f64| now - since > STAGE_TIMEOUT_SECS;
@@ -1412,6 +1454,67 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
     }
 }
 
+/// The first gate decided within a journey that has failed, as the summary's lines name it
+/// (`hold: hop 1 3500 ms (cycle 1) -> FAIL`): a hold over its native gate once it has ended, a
+/// swap frame over its native gate once its window has closed, a hop's memory over its gate
+/// ([`hop_memory_gate`] on that hop alone) once the hop is over, or a route check once its hop
+/// is over and the region it left was read. Each is final when it fails, so the run has failed.
+/// Holds and swaps are reported only on the web (`web`), so never stop a run there.
+fn failed_journey_gate(bench: &JourneyBench, web: bool) -> Option<String> {
+    let config = &bench.config;
+    if !web {
+        for hold in &bench.holds {
+            if let Some(ms) = hold.clock.hold_ms()
+                && ms > HOLD_LIMIT_NATIVE_MS
+            {
+                return Some(hold_line(hold.transition, ms, &config.tag(hold.cycle), web).0);
+            }
+        }
+        for s in &bench.swaps {
+            if s.frames_left == 0 && s.worst_ms > SWAP_FRAME_LIMIT_MS {
+                return Some(format!(
+                    "swap worst frame: {} {:.2} ms ({}) -> FAIL",
+                    s.transition.label(),
+                    s.worst_ms,
+                    config.tag(s.cycle)
+                ));
+            }
+        }
+    }
+    for h in bench.hops.iter().filter(|h| !h.open) {
+        let sample = HopMemory {
+            baseline: h.baseline,
+            peak: h.peak,
+            end: h.end,
+            repeat: config.is_repeat(h.cycle),
+        };
+        if let Some((false, worst)) = hop_memory_gate(&[sample], web) {
+            return Some(format!(
+                "hop memory peak: hop {} {} ({}) -> FAIL",
+                h.hop,
+                signed_mib(worst),
+                config.tag(h.cycle)
+            ));
+        }
+        if h.land_share.is_none() {
+            continue;
+        }
+        for &(hop, c) in config.route(h.cycle).crosses {
+            if hop != h.hop {
+                continue;
+            }
+            let (ok, text) = crossing_check(c, h);
+            if !ok {
+                return Some(format!(
+                    "route check: hop {hop} ({}): {text} FAIL",
+                    config.tag(h.cycle)
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// `+1.5 MiB` or `-0.3 MiB`.
 fn signed_mib(bytes: i64) -> String {
     let mib = bytes as f64 / (1024.0 * 1024.0);
@@ -1478,7 +1581,8 @@ fn finish(
             order.join(", ")
         ));
     }
-    let mut pass = failure.is_none();
+    out.push(on_failure_line(config.keep_going));
+    let mut pass = failure.is_none() && bench.stopped.is_none();
 
     // Holds.
     out.push(format!(
@@ -1875,6 +1979,9 @@ fn finish(
             CYCLE_MEMORY_TOLERANCE * 100.0,
             gate_word(ok)
         ));
+    }
+    if let Some(stop) = &bench.stopped {
+        out.extend(stopped_early_lines(stop, &config.stop_names(), None));
     }
     out.push(match failure {
         Some(reason) => format!("result: FAIL ({reason})"),

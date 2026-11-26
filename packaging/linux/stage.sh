@@ -133,6 +133,7 @@ RUN
                     flatpak run --env=WGPU_BACKEND=vulkan io.github.adsouza.TimeFly
   Scrub benchmark:  time-fly --scrub-bench --target-fps 60 --window 2560x1440
   Region benchmark: time-fly --region-bench --target-fps 60 --window 2560x1440
+                    (a benchmark stops at its first failed gate; add --keep-going to run on)
   Crash probe:      time-fly --diagnostics-probe=panic   (then launch normally)
 
   Controls: drag to orbit, scroll to zoom, [ and ] to step older or younger, Esc for credits.

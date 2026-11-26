@@ -29,6 +29,13 @@
 //!   [`CYCLE_MEMORY_TOLERANCE`] of the first cycle's. Natively the process footprint; on the web
 //!   the wasm linear memory (it only grows, so the check is that it stops growing).
 //!
+//! **Stopping early.** A stop is a region, or the globe pan before a panned one. A region that
+//! fails a gate decided within it (its gated R14 flight, its pan, its first-entry generation and
+//! R11 on the web, or a region that fails to load or is left early) ends the run after its block:
+//! the summary names the stops run, the failed gate and the stops skipped (the memory cycles
+//! with them). Warm generation and the memory cycles are judged at the end. `--keep-going` flies
+//! every stop.
+//!
 //! On native the run exits after the summary: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL
 //! (a result, not a crash). The web logs each block to the console as one message.
 //!
@@ -46,9 +53,9 @@ use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, 
 use timefly_core::terrain::blended_height_m;
 
 use super::{
-    MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
-    frame_budget_ms, frame_time_stats, header_lines_titled, memory, mib, missed_frames, pacing,
-    passes, stall_count,
+    EarlyStop, MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS,
+    bench_exit, frame_budget_ms, frame_time_stats, header_lines_titled, memory, mib, missed_frames,
+    on_failure_line, pacing, passes, stall_count, stopped_early_lines,
 };
 use crate::args::RegionArg;
 use crate::data::GlobeData;
@@ -223,6 +230,20 @@ pub fn stop_count(regions: &[BenchRegion]) -> usize {
     regions.len() + regions.iter().filter(|r| r.pan_from_previous).count()
 }
 
+/// The stops' names, in order ([`stop_count`] of them): each region, after the globe pan into
+/// it if it has one (`globe pan Beringia -> Rockies ice margin`).
+pub fn stop_names(regions: &[BenchRegion]) -> Vec<String> {
+    let mut names = Vec::with_capacity(stop_count(regions));
+    for (i, r) in regions.iter().enumerate() {
+        if r.pan_from_previous {
+            let from = regions[i.saturating_sub(1)].name;
+            names.push(format!("globe pan {from} -> {}", r.name));
+        }
+        names.push(r.name.to_string());
+    }
+    names
+}
+
 /// The name a single-region run gives the region it was asked to bench.
 pub const CHOSEN_REGION: &str = "Chosen region";
 
@@ -254,6 +275,8 @@ pub struct RegionBenchConfig {
     /// The regions to fly, in order: [`BENCH_REGIONS`] for the full bench, or one
     /// [`CHOSEN_REGION`] for `--region-bench --region=…`.
     pub regions: Vec<BenchRegion>,
+    /// `--keep-going`: run every stop even after a gate has failed.
+    pub keep_going: bool,
 }
 
 impl RegionBenchConfig {
@@ -265,6 +288,7 @@ impl RegionBenchConfig {
             cycles: MEMORY_CYCLES,
             timeout_secs: REGION_TIMEOUT_SECS,
             regions: BENCH_REGIONS.to_vec(),
+            keep_going: false,
         }
     }
 
@@ -424,6 +448,9 @@ struct RegionRun {
     /// The flight's own verdict (whether or not it gates the region).
     flight_pass: Option<bool>,
     pass: bool,
+    /// The gates the region failed, as the summary's `stopped early` line names them (R11 on the
+    /// web included for the first region): any ends the run unless `--keep-going`.
+    failed_gates: Vec<String>,
 }
 
 /// One enter/leave cycle.
@@ -450,6 +477,8 @@ pub struct RegionBench {
     passed: Option<bool>,
     /// The path segment being flown (for the banner).
     segment: Segment,
+    /// Where the run stopped at its first failed gate, if it did.
+    stopped: Option<EarlyStop>,
 }
 
 impl RegionBench {
@@ -464,6 +493,7 @@ impl RegionBench {
             summary: None,
             passed: None,
             segment: Segment::LowPass,
+            stopped: None,
         }
     }
 
@@ -754,11 +784,7 @@ fn drive_region_bench(
                 emit(&block);
                 bench.reports.push(block);
                 controls.leave.write(RegionLeft);
-                bench.stage = Stage::Leaving {
-                    next: after_region(region, bench.config.regions.len(), bench.config.cycles),
-                    cycle: None,
-                    since: now,
-                };
+                after_stop(bench, region, now, &game, &display, &mut controls);
             } else {
                 fly(bench, region, script, &game, &mut controls);
             }
@@ -944,11 +970,38 @@ fn fail_region(
     if game.state() != RegionState::Globe {
         controls.leave.write(RegionLeft);
     }
-    bench.stage = Stage::Leaving {
-        next: after_region(region, bench.config.regions.len(), bench.config.cycles),
-        cycle: None,
-        since: now,
-    };
+    after_stop(bench, region, now, game, display, controls);
+}
+
+/// After region `region`'s block (its leave already written): the summary if it failed a gate
+/// (unless `--keep-going`), else on to what follows it.
+fn after_stop(
+    bench: &mut RegionBench,
+    region: usize,
+    now: f64,
+    game: &Game,
+    display: &Screen,
+    controls: &mut Controls,
+) {
+    let failed = &bench.runs[region].failed_gates;
+    if !bench.config.keep_going && !failed.is_empty() {
+        let gate = failed.join(", ");
+        warn!(
+            region = bench.config.regions[region].name,
+            gate, "region bench: a gate failed, stopping early"
+        );
+        bench.stopped = Some(EarlyStop {
+            stops_run: banner::stop_number(region, &bench.config.regions),
+            gate,
+        });
+        finish(bench, game, display, controls, None);
+    } else {
+        bench.stage = Stage::Leaving {
+            next: after_region(region, bench.config.regions.len(), bench.config.cycles),
+            cycle: None,
+            since: now,
+        };
+    }
 }
 
 fn secs(v: Option<f64>) -> String {
@@ -1294,8 +1347,36 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         ),
     });
     out.push("===== end region bench =====".to_string());
-    bench.runs[region].pass = pass;
-    bench.runs[region].flight_pass = Some(flight_pass);
+    let mut failed_gates = Vec::new();
+    match &r.failure {
+        Some(reason) => failed_gates.push(reason.clone()),
+        None => {
+            if spec.flight_gated && !flight_pass {
+                failed_gates.push(format!(
+                    "R14 flight frame rate ({} rule) FAIL",
+                    pacing_name(pacing)
+                ));
+            }
+            if !pan_pass {
+                failed_gates.push("globe pan frame rate FAIL".to_string());
+            }
+            if gen_gate == Some(false) {
+                failed_gates.push(format!(
+                    "first-entry generation (web gate <= {WEB_GEN_TARGET_MS} ms) FAIL"
+                ));
+            }
+        }
+    }
+    // R11 decides the result on the web only.
+    if web && region == 0 && first_region_gate(bench).is_some_and(|(_, ok)| !ok) {
+        failed_gates.push(format!(
+            "R11 first-region worst frame (<= {FIRST_REGION_FRAME_LIMIT_MS:.0} ms) FAIL"
+        ));
+    }
+    let run = &mut bench.runs[region];
+    run.pass = pass;
+    run.flight_pass = Some(flight_pass);
+    run.failed_gates = failed_gates;
     out.join("\n")
 }
 
@@ -1316,7 +1397,8 @@ fn finish(
     );
     push_dunes_line(&mut out, game);
     out.push(regions_line(&bench.config));
-    let mut pass = failure.is_none();
+    out.push(on_failure_line(bench.config.keep_going));
+    let mut pass = failure.is_none() && bench.stopped.is_none();
     let regions: Vec<String> = bench
         .config
         .regions
@@ -1449,6 +1531,20 @@ fn finish(
     }
     if bench.cycles.iter().any(|c| c.failed) {
         pass = false;
+    }
+    if let Some(stop) = &bench.stopped {
+        let cycles = bench.config.cycles;
+        let then = (cycles > 0).then(|| {
+            format!(
+                "the {cycles} memory cycle{}",
+                if cycles == 1 { "" } else { "s" }
+            )
+        });
+        out.extend(stopped_early_lines(
+            stop,
+            &stop_names(&bench.config.regions),
+            then.as_deref(),
+        ));
     }
     out.push(match failure {
         Some(reason) => format!("result: FAIL ({reason})"),
@@ -1673,6 +1769,43 @@ mod tests {
         assert_eq!(entry(true, false, true, Some(false)), "Red Sea FAIL");
         // Not run: nothing to mark.
         assert_eq!(entry(false, false, false, None), "Red Sea not run");
+    }
+
+    #[test]
+    fn a_stopped_run_names_its_stops_the_pan_included() {
+        let names = stop_names(&BENCH_REGIONS);
+        assert_eq!(names.len(), stop_count(&BENCH_REGIONS));
+        assert_eq!(names[5], "Beringia");
+        assert_eq!(names[6], "globe pan Beringia -> Rockies ice margin");
+        assert_eq!(names[7], "Rockies ice margin");
+        // Stopped by the pan's region: the pan counts as a run stop.
+        let stop = EarlyStop {
+            stops_run: banner::stop_number(6, &BENCH_REGIONS),
+            gate: "globe pan frame rate FAIL".to_string(),
+        };
+        let [at, run, skipped] = stopped_early_lines(&stop, &names, Some("the 10 memory cycles"));
+        assert_eq!(
+            at,
+            "stopped early at stop 8 of 9, Rockies ice margin: globe pan frame rate FAIL; --keep-going runs every stop"
+        );
+        assert!(
+            run.starts_with("stops run: 8 of 9: Pangaea interior, ")
+                && run.ends_with(", Rockies ice margin"),
+            "{run}"
+        );
+        assert_eq!(
+            skipped,
+            "stops skipped: 1: Panama; and the 10 memory cycles"
+        );
+        // The last stop: nothing skipped.
+        let last = EarlyStop {
+            stops_run: 9,
+            gate: "x".to_string(),
+        };
+        assert_eq!(
+            stopped_early_lines(&last, &names, None)[2],
+            "stops skipped: 0: none"
+        );
     }
 
     #[test]

@@ -92,20 +92,27 @@ pub enum ChosenBench {
 /// The benchmark the launch arguments ask for: the region bench over the journey bench over the
 /// scrub bench. With `--region`, the region and journey benches fly that region (the region
 /// bench only that one, with no pan or memory cycles); the scrub bench leaves it to the launch.
+/// `--keep-going` reaches every bench (the scrub bench's through its plugin).
 pub fn chosen_bench(
     args: &LaunchArgs,
     target_fps: u32,
     exit_when_done: bool,
 ) -> Option<ChosenBench> {
     if args.region_bench {
-        Some(ChosenBench::Region(match args.region {
-            Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
-            None => RegionBenchConfig::new(target_fps, exit_when_done),
+        Some(ChosenBench::Region(RegionBenchConfig {
+            keep_going: args.keep_going,
+            ..match args.region {
+                Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
+                None => RegionBenchConfig::new(target_fps, exit_when_done),
+            }
         }))
     } else if args.journey_bench {
-        Some(ChosenBench::Journey(match args.region {
-            Some(region) => JourneyBenchConfig::chosen(target_fps, exit_when_done, region),
-            None => JourneyBenchConfig::new(target_fps, exit_when_done),
+        Some(ChosenBench::Journey(JourneyBenchConfig {
+            keep_going: args.keep_going,
+            ..match args.region {
+                Some(region) => JourneyBenchConfig::chosen(target_fps, exit_when_done, region),
+                None => JourneyBenchConfig::new(target_fps, exit_when_done),
+            }
         }))
     } else if args.scrub_bench {
         Some(ChosenBench::Scrub)
@@ -235,6 +242,7 @@ pub fn app(session: &Session) -> App {
                 app.add_plugins(ScrubBenchPlugin {
                     target_fps,
                     exit_when_done,
+                    keep_going: args.keep_going,
                 });
             }
         }
@@ -308,6 +316,32 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn keep_going_reaches_the_benches() {
+        let arg = args::parse_region("20,37.5,0").unwrap();
+        for keep_going in [false, true] {
+            for region in [None, Some(arg)] {
+                let args = |region_bench, journey_bench| LaunchArgs {
+                    region_bench,
+                    journey_bench,
+                    keep_going,
+                    region,
+                    ..default()
+                };
+                let Some(ChosenBench::Region(r)) = chosen_bench(&args(true, false), 60, true)
+                else {
+                    panic!("not the region bench");
+                };
+                assert_eq!(r.keep_going, keep_going);
+                let Some(ChosenBench::Journey(j)) = chosen_bench(&args(false, true), 60, true)
+                else {
+                    panic!("not the journey bench");
+                };
+                assert_eq!(j.keep_going, keep_going);
+            }
+        }
     }
 
     #[test]

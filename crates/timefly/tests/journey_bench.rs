@@ -16,8 +16,8 @@ use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::bench::bench_exit;
 use timefly::bench::journey::{
-    ALPS_ROUTE, CRUISE_AGL_M, JourneyBench, JourneyBenchConfig, JourneyBenchPlugin, JourneyRoute,
-    WEST_YAW,
+    ALPS_ROUTE, CRUISE_AGL_M, Crossing, JourneyBench, JourneyBenchConfig, JourneyBenchPlugin,
+    JourneyRoute, WEST_YAW,
 };
 use timefly::bench::region::BenchRegion;
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
@@ -278,6 +278,95 @@ fn a_route_set_flies_each_route_its_own_way_and_compares_like_with_like() {
     }
     assert!(summary.contains("\nresult: PASS\n"), "{summary}");
     assert_eq!(exit, vec![bench_exit(true)], "{summary}");
+}
+
+/// The Alps east, then the same route checked for a cube corner its first hop never comes near
+/// (a route check, gated), then the Alps again: the first failed gate is journey 2's first hop.
+fn failing_at_journey_2(keep_going: bool) -> JourneyBenchConfig {
+    let corner = JourneyRoute {
+        region: BenchRegion {
+            name: "Alps corner",
+            ..ALPS_ROUTE.region
+        },
+        crosses: &[(1, Crossing::Corner)],
+        ..ALPS_ROUTE
+    };
+    JourneyBenchConfig {
+        routes: vec![ALPS_ROUTE, corner],
+        journeys: vec![0, 1, 0],
+        keep_going,
+        ..JourneyBenchConfig::new(60, true)
+    }
+}
+
+#[test]
+fn a_failed_gate_stops_the_journey_bench() {
+    let mut app = journey_app(failing_at_journey_2(false));
+    let (summary, exit) = run_to_summary(&mut app);
+    println!("{summary}");
+    // Journey 1 flew whole; journey 2 ended with its first hop, whose route check failed.
+    let hops: Vec<(u32, u32)> = app
+        .world()
+        .resource::<JourneyBench>()
+        .hops()
+        .iter()
+        .map(|h| (h.cycle, h.hop))
+        .collect();
+    assert_eq!(hops, [(0, 1), (0, 2), (1, 1)], "{summary}");
+    let stopped = summary
+        .lines()
+        .find(|l| l.starts_with("stopped early at stop 2 of 3, journey 2 (Alps corner): route check: hop 1 (cycle 2, Alps corner): cube corner "))
+        .unwrap_or_else(|| panic!("no stopped-early line in\n{summary}"));
+    assert!(
+        stopped.ends_with(
+            " km from the neighbour's centre (<= 150 km) FAIL; --keep-going runs every stop"
+        ),
+        "{stopped}"
+    );
+    for line in [
+        "\non a failed gate: stop (--keep-going runs every stop)\n",
+        "\nstops run: 2 of 3: journey 1 (Alps), journey 2 (Alps corner)\n",
+        "\nstops skipped: 1: journey 3 (Alps)\n",
+        "\nresult: FAIL\n",
+    ] {
+        assert!(summary.contains(line), "missing {line:?} in\n{summary}");
+    }
+    // Nothing of journey 3, and journey 2 stopped before its second hop.
+    assert!(!summary.contains("(cycle 3, Alps)"), "{summary}");
+    assert!(
+        !summary
+            .lines()
+            .any(|l| l.starts_with("hold: hop 2 ") && l.contains("(cycle 2, ")),
+        "{summary}"
+    );
+    assert_eq!(exit, vec![bench_exit(false)], "{summary}");
+    app.update();
+    assert!(exits(&mut app).is_empty());
+}
+
+#[test]
+fn keep_going_runs_every_journey() {
+    let mut app = journey_app(failing_at_journey_2(true));
+    let (summary, exit) = run_to_summary(&mut app);
+    println!("{summary}");
+    assert_eq!(app.world().resource::<JourneyBench>().hops().len(), 6);
+    let holds = summary
+        .lines()
+        .filter(|l| l.starts_with("hold: ") && l.contains("(cycle 3, Alps)"))
+        .count();
+    assert_eq!(holds, 4, "{summary}");
+    let checks = summary
+        .lines()
+        .find(|l| l.starts_with("route checks ("))
+        .unwrap_or_else(|| panic!("{summary}"));
+    assert!(checks.ends_with("-> FAIL"), "{checks}");
+    assert!(
+        summary.contains("\non a failed gate: keep going (--keep-going)\n"),
+        "{summary}"
+    );
+    assert!(!summary.contains("stopped early"), "{summary}");
+    assert!(summary.contains("\nresult: FAIL\n"), "{summary}");
+    assert_eq!(exit, vec![bench_exit(false)], "{summary}");
 }
 
 #[test]

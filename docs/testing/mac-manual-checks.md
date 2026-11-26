@@ -186,6 +186,8 @@ Run the game normally (`cargo run -p timefly`, or the release build). Wait for t
       (250 Ma), Red Sea (present), Himalayas (present), Sundaland (21 ka), Japan (1 Ma), Beringia (21 ka), an 8 s
       globe pan to the Rockies ice margin (21 ka), Panama (3 Ma); then ten Himalaya re-entries
       (rulings R24–R26, R30). Each block ends `result: PASS`; the Rockies block has the pan's line.
+      A failed gate ends the run after that region's block, with a `stopped early` line in the
+      summary. Add `--keep-going` (web `&keep-going`) to fly every stop anyway.
 
 ### 13. A snapshot change keeps the place
 

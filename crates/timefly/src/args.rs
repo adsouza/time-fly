@@ -1,8 +1,8 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--region-bench`, `--journey-bench`, `--no-dunes`, `--target-fps N`, `--window WxH`,
-//! `--region LAT,LON,AGE_YEARS` and `--from-shot <json>`. A value
+//! `--region-bench`, `--journey-bench`, `--keep-going`, `--no-dunes`, `--target-fps N`,
+//! `--window WxH`, `--region LAT,LON,AGE_YEARS` and `--from-shot <json>`. A value
 //! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
 //! with `--` is the next flag, never a value.
 //! `--check-data` takes its optional value only as `--check-data=DIR`.
@@ -26,6 +26,9 @@ pub struct LaunchArgs {
     /// to its neighbours and climb back out, several times, and report. A bare flag. It takes
     /// precedence over the scrub bench, and the region bench over it.
     pub journey_bench: bool,
+    /// `--keep-going` (web: `?keep-going`): the benches run every stop even after a gate has
+    /// failed, instead of stopping at the first failed gate. A bare flag.
+    pub keep_going: bool,
     /// `--no-dunes` (web: `?no-dunes`): skip the terrain's dune shading, for slower machines.
     /// A bare flag: `--no-dunes=VALUE` is not it and goes to `unknown`.
     pub no_dunes: bool,
@@ -60,6 +63,7 @@ const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const REGION_BENCH_FLAG: &str = "--region-bench";
 const JOURNEY_BENCH_FLAG: &str = "--journey-bench";
+const KEEP_GOING_FLAG: &str = "--keep-going";
 const NO_DUNES_FLAG: &str = "--no-dunes";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
@@ -128,6 +132,10 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
         }
         if arg == JOURNEY_BENCH_FLAG {
             parsed.journey_bench = true;
+            continue;
+        }
+        if arg == KEEP_GOING_FLAG {
+            parsed.keep_going = true;
             continue;
         }
         if arg == NO_DUNES_FLAG {
@@ -252,6 +260,22 @@ mod tests {
             assert!(parsed.no_dunes && parsed.region_bench, "{q}");
         }
         assert!(!parse_query_args("?no-dunes=true").no_dunes);
+    }
+
+    #[test]
+    fn keep_going_is_a_bare_flag_on_both_platforms() {
+        let parsed = parse_launch_args(args(&["--region-bench", "--keep-going"]));
+        assert!(parsed.keep_going && parsed.region_bench);
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        assert!(!parse_launch_args(args(&["--region-bench"])).keep_going);
+        let valued = parse_launch_args(args(&["--keep-going=1"]));
+        assert!(!valued.keep_going);
+        assert_eq!(valued.unknown, args(&["--keep-going=1"]));
+        for q in ["?journey-bench&keep-going", "?keep-going&journey-bench"] {
+            let parsed = parse_query_args(q);
+            assert!(parsed.keep_going && parsed.journey_bench, "{q}");
+        }
+        assert!(!parse_query_args("?journey-bench").keep_going);
     }
 
     #[test]
