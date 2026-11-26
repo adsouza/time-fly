@@ -19,7 +19,7 @@ use super::lakes::{Accumulation, Flats, place_levels};
 use super::levels::{LakeLevel, shipped_lake_levels};
 use super::params::{
     HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, PRESENT_FRAME_MAX_MYR,
-    RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M,
+    RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M, TODAY_RIVER_ANCHOR_MAX_SPACINGS,
 };
 use super::straits::{Strait, shipped_straits, strait_levels};
 #[cfg(test)]
@@ -390,6 +390,8 @@ pub struct HydroPrep {
     /// surface (Task 11b, fix round 1: raising the elevation back after routing put basin nodes
     /// above their own spill).
     beds: BurntNodes,
+    /// The river nodes' anchors on today's courses, ascending (gathered with the river nodes).
+    anchors: Vec<(u32, [f64; 3])>,
     stage: Stage,
 }
 
@@ -440,6 +442,7 @@ impl HydroPrep {
             straits: shipped_straits().to_vec(),
             today: TodayTable::Shipped,
             beds: BurntNodes::default(),
+            anchors: Vec::new(),
             stage: Stage::Sample,
         }
     }
@@ -593,6 +596,13 @@ impl HydroPrep {
                             && lake_at(&acc, i).is_none()
                         {
                             list.push(i);
+                            if let Some(a) = self.beds.anchor(i) {
+                                let c = lattice.dir(i).0;
+                                let reach = TODAY_RIVER_ANCHOR_MAX_SPACINGS
+                                    * lattice.mean_spacing_m()
+                                    / crate::worldgen::frame::EARTH_RADIUS_M;
+                                self.anchors.push((i, held_within(c, a, reach).to_array()));
+                            }
                         }
                     }
                     used += (end - next).max(1);
@@ -627,7 +637,9 @@ impl HydroPrep {
                     } else {
                         used += 1;
                         self.beds = BurntNodes::default();
-                        Stage::Done(Box::new(self.assemble(acc, graph.finish(), ocean)))
+                        let mut h = self.assemble(acc, graph.finish(), ocean);
+                        h.anchors = std::mem::take(&mut self.anchors);
+                        Stage::Done(Box::new(h))
                     }
                 }
                 done @ Stage::Done(_) => {
@@ -802,6 +814,7 @@ impl HydroPrep {
             unplaced_lake_levels: self.unplaced_levels.clone(),
             ocean,
             lake_nodes: acc.lake_nodes,
+            anchors: Vec::new(),
         }
     }
 
@@ -866,7 +879,8 @@ impl HydroPrep {
     pub fn working_bytes(&self) -> usize {
         let own = 4 * self.elevation.capacity()
             + 8 * (self.ice.capacity() + self.mapped.capacity())
-            + self.beds.bytes();
+            + self.beds.bytes()
+            + 32 * self.anchors.capacity();
         own + match &self.stage {
             Stage::Sample | Stage::Straits | Stage::Moving => 0,
             Stage::TodayRivers(b) => b.bytes(),
@@ -912,6 +926,16 @@ fn node_climate(
         Some(&c) => (f64::from(c) * 0.5 * lattice.mean_spacing_m() * 1e-3) as f32,
     };
     climate.climate(lattice.dir(i), elevation_m, coast_km)
+}
+
+/// `p` moved toward `c` (unit vectors) until it lies within `reach` radians of it.
+fn held_within(c: bevy_math::DVec3, p: bevy_math::DVec3, reach: f64) -> bevy_math::DVec3 {
+    let angle = c.angle_between(p);
+    if angle <= reach {
+        return p;
+    }
+    let t = (p - c * c.dot(p)).normalize();
+    (c * reach.cos() + t * reach.sin()).normalize()
 }
 
 /// The lake whose footprint holds `node`.
@@ -2427,6 +2451,17 @@ mod tests {
             prep.beds.list().to_vec()
         }
 
+        /// The burnt nodes and their river-graph beds once the burn is done.
+        fn burnt_beds(&self, age: YearsBp) -> Vec<(u32, f32)> {
+            let table = shipped_table();
+            let mut prep = HydroPrep::with_tables(PLAIN_LATTICE, age, &[], &[])
+                .with_today_rivers(vec![self.course()]);
+            while prep.stage_name() != "route" {
+                assert!(!prep.step(self, self, &table, 4096), "the pass ended");
+            }
+            prep.beds.beds()
+        }
+
         fn ice(&self, node: u32) -> bool {
             is_ice_sample(&self.node(PLAIN_LATTICE.dir(node)))
         }
@@ -2542,11 +2577,213 @@ mod tests {
             .collect();
         assert!(beds.len() > 40);
         assert!(beds.windows(2).all(|w| w[1] <= w[0]), "{beds:?}");
-        // Across the hump the course holds its level.
+        // Across the hump routing holds its level.
         let burnt = valley.burnt(PAST);
         assert!(burnt.windows(2).all(|w| w[1].1 <= w[0].1), "{burnt:?}");
         let flat = burnt.windows(2).filter(|w| w[1].1 == w[0].1).count();
         assert!(flat >= 4, "{flat} level steps over the hump");
+        // Fix round 2: the river graph's beds keep falling across the hump (interpolated by
+        // path length to the next lower level), never above the held level.
+        let held: Vec<(u32, f32)> = burnt
+            .windows(2)
+            .filter(|w| valley.node(PLAIN_LATTICE.dir(w[1].0)).elevation_m > w[1].1)
+            .map(|w| w[1])
+            .collect();
+        assert!(held.len() >= 4, "{held:?}");
+        let graph_bed = |v: u32| h.rivers.nodes()[h.rivers.index_of(v).unwrap() as usize].bed_m;
+        let mut across: Vec<u32> = Vec::new();
+        for (k, &v) in nodes.iter().enumerate() {
+            if held.iter().any(|&(u, _)| u == v) {
+                if across.is_empty() && k > 0 {
+                    across.push(nodes[k - 1]);
+                }
+                across.push(v);
+            } else if !across.is_empty() {
+                across.push(v);
+                break;
+            }
+        }
+        let beds_across: Vec<f32> = across.iter().map(|&v| graph_bed(v)).collect();
+        assert!(
+            beds_across.windows(2).all(|w| w[1] < w[0]),
+            "beds across the hump: {beds_across:?}"
+        );
+        for (&(v, level), bed) in held.iter().zip(held.iter().map(|&(v, _)| graph_bed(v))) {
+            assert!(
+                bed <= level,
+                "node {v}: bed {bed} above the held level {level}"
+            );
+        }
+    }
+
+    /// Task 11b, fix round 2: a plateau cut by a canyon 2 km wide that the lattice cannot see.
+    /// The course runs in the canyon: from node `A`'s centre it bends out to run 15 km north
+    /// of its lattice row (0.45 spacings: past the relaxation's interior reach of 2/3 of the
+    /// corridor, as Hells Canyon lies 5–7 km off its nodes at n = 900), then back into node `B`
+    /// by the coast. The canyon floor falls 0.5 m a km toward `B`; the plateau stands 1,200 m
+    /// above it; the sea lies past `B`.
+    struct CanyonPlateau {
+        polyline: Vec<DVec3>,
+        a: DVec3,
+        row_normal: DVec3,
+        len_km: f64,
+        climate: Climate,
+    }
+
+    const CANYON_LATTICE: CubeLattice = CubeLattice { n: 300 };
+    const CANYON_ROW: u32 = 150;
+    const CANYON_COLS: (u32, u32) = (135, 165);
+
+    impl CanyonPlateau {
+        fn new() -> Self {
+            let l = CANYON_LATTICE;
+            let (c0, c1) = CANYON_COLS;
+            let at = |c: u32| l.dir(l.node(CubeFace::PosX, c, CANYON_ROW)).0;
+            let (a, b) = (at(c0), at(c1));
+            let row_normal = a.cross(b).normalize();
+            let off = |p: DVec3| (p + row_normal * (15.0 / 6371.0)).normalize();
+            let polyline = vec![a, off(at(c0 + 3)), off(at(c1 - 3)), b];
+            CanyonPlateau {
+                polyline,
+                a,
+                row_normal,
+                len_km: a.angle_between(b) * EARTH_RADIUS_M / 1000.0,
+                climate: shipped_table().biome(BiomeClass::TropicalRainforest),
+            }
+        }
+
+        fn course(&self) -> TodayRiver {
+            TodayRiver {
+                name: "canyon".into(),
+                points: self
+                    .polyline
+                    .iter()
+                    .map(|&d| geo_to_latlon(render_to_geo(RenderDir(d))))
+                    .collect(),
+            }
+        }
+
+        /// Kilometres from `d` to the course's polyline.
+        fn km_to_course(&self, d: DVec3) -> f64 {
+            let d = d.normalize();
+            self.polyline
+                .windows(2)
+                .map(|w| {
+                    let (p, q) = (w[0], w[1]);
+                    let n = p.cross(q).normalize();
+                    let s = d.dot(n);
+                    let foot = d - n * s;
+                    let inside = p.cross(foot).dot(n) >= 0.0 && foot.cross(q).dot(n) >= 0.0;
+                    if inside {
+                        s.abs().asin()
+                    } else {
+                        d.angle_between(p).min(d.angle_between(q))
+                    }
+                })
+                .fold(f64::INFINITY, f64::min)
+                * EARTH_RADIUS_M
+                / 1000.0
+        }
+
+        fn elevation(&self, d: DVec3) -> f64 {
+            let d = d.normalize();
+            let t = self.row_normal.cross(self.a);
+            let along = d.dot(t).atan2(d.dot(self.a)) * EARTH_RADIUS_M / 1000.0;
+            let cross = d.dot(self.row_normal).asin() * EARTH_RADIUS_M / 1000.0;
+            if along > self.len_km + 3.0 || along < -100.0 || cross.abs() > 250.0 {
+                return -2000.0;
+            }
+            let floor = 600.0 - 0.5 * along;
+            let km = self.km_to_course(d);
+            floor + 1200.0 * (km - 1.0).clamp(0.0, 1.0)
+        }
+    }
+
+    impl NodeSource for CanyonPlateau {
+        fn node(&self, dir: RenderDir) -> NodeSample {
+            NodeSample {
+                elevation_m: self.elevation(dir.0) as f32,
+                ice: 0.0,
+            }
+        }
+
+        fn data_lakes(&self) -> bool {
+            true
+        }
+
+        fn present_shift_m(&self, _dir: RenderDir) -> Option<f32> {
+            Some(0.0)
+        }
+    }
+
+    impl ClimateSource for CanyonPlateau {
+        fn climate(&self, _dir: RenderDir, _elevation_m: f32, _coast_km: f32) -> Climate {
+            self.climate
+        }
+    }
+
+    #[test]
+    fn a_burnt_course_is_refined_in_its_own_canyon() {
+        use crate::worldgen::REGION_SIZE_M;
+        use crate::worldgen::generate::rivers::RiverBuilder;
+        let canyon = CanyonPlateau::new();
+        let table = shipped_table();
+        let mut prep = HydroPrep::with_tables(CANYON_LATTICE, PRESENT, &[], &[])
+            .with_today_rivers(vec![canyon.course()]);
+        while !prep.step(&canyon, &canyon, &table, u32::MAX) {}
+        let h = prep.finish();
+        let l = CANYON_LATTICE;
+        let (c0, c1) = CANYON_COLS;
+        let course: Vec<u32> = (c0..=c1)
+            .map(|c| l.node(CubeFace::PosX, c, CANYON_ROW))
+            .collect();
+        // The lattice's nodes stand on the plateau, 15 km off the canyon.
+        let mid = course[course.len() / 2];
+        assert!((canyon.km_to_course(l.dir(mid).0) - 15.0).abs() < 1.0);
+        assert!(
+            canyon.elevation(l.dir(mid).0) > canyon.elevation(l.dir(course[0]).0) + 800.0,
+            "{} {} {}",
+            canyon.elevation(l.dir(mid).0),
+            canyon.elevation(l.dir(course[0]).0),
+            canyon.len_km
+        );
+        let to_sea: Vec<u32> = (c0..=c1 + 1)
+            .map(|c| l.node(CubeFace::PosX, c, CANYON_ROW))
+            .collect();
+        follows(&h, &to_sea).unwrap();
+        // The region at the course's middle.
+        let floor = |d: RenderDir| canyon.elevation(d.0);
+        let key = |d: RenderDir| (d.0 * EARTH_RADIUS_M, 11);
+        let mut b = RiverBuilder::new(
+            &h,
+            &RegionFrame { center: l.dir(mid) },
+            REGION_SIZE_M / 2.0,
+            SUBPOINT_M,
+            RIVER_MIN_DISCHARGE_M3S as f32,
+        );
+        while !b.step(&floor, &key, 997) {}
+        let rivers = b.finish();
+        let on_course = |river: u32| {
+            let n = &h.rivers.nodes()[river as usize];
+            let inner = &course[4..course.len() - 4];
+            inner.contains(&n.node) && inner.contains(&down_node(&h.rivers, n))
+        };
+        let mut checked = 0;
+        let (mut worst_km, mut worst_cut) = (0.0f64, 0.0f64);
+        for sp in rivers.subpoints().iter().filter(|sp| on_course(sp.river)) {
+            worst_km = worst_km.max(canyon.km_to_course(sp.dir));
+            worst_cut = worst_cut.max(canyon.elevation(sp.dir) - f64::from(sp.level_m));
+            checked += 1;
+        }
+        assert!(checked > 100, "{checked} sub-points on the course");
+        assert!(
+            worst_km <= 1.0,
+            "the river leaves its canyon by {worst_km:.1} km"
+        );
+        assert!(
+            worst_cut < 50.0,
+            "the river runs {worst_cut:.0} m below the ground"
+        );
     }
 
     #[test]
@@ -2554,20 +2791,32 @@ mod tests {
         let valley = hump_valley();
         let nodes = valley.nodes();
         let h = valley.pass(PAST, true);
-        // The bed along the course is the running minimum of the era's own elevations, not the
-        // burnt routing level 10 m below it.
+        // The bed along the course is the burn's bed: the running minimum of the era's own
+        // elevations (sloped across the hump, fix round 2), not the burnt routing level 10 m
+        // below it. Where the course sets a new minimum it is that minimum exactly.
+        let beds = valley.burnt_beds(PAST);
         let mut level = f32::INFINITY;
-        let mut checked = 0;
-        for &v in &nodes {
+        let (mut checked, mut setters) = (0, 0);
+        for (&v, &(b, bed)) in nodes.iter().zip(&beds) {
+            assert_eq!(b, v);
             if h.is_ocean(v) {
                 break;
             }
-            level = level.min(valley.node(PLAIN_LATTICE.dir(v)).elevation_m);
+            let e = valley.node(PLAIN_LATTICE.dir(v)).elevation_m;
             let k = h.rivers.index_of(v).expect("a river node");
-            assert_eq!(h.rivers.nodes()[k as usize].bed_m, level, "node {v}");
+            assert_eq!(h.rivers.nodes()[k as usize].bed_m, bed, "node {v}");
+            if e < level {
+                assert_eq!(bed, e, "node {v} sets the minimum");
+                setters += 1;
+            }
+            level = level.min(e);
+            assert!(
+                bed <= level && bed > level - 20.0,
+                "node {v}: {bed} against {level}"
+            );
             checked += 1;
         }
-        assert!(checked > 40, "{checked}");
+        assert!(checked > 40 && setters > 30, "{checked} {setters}");
         // The burnt levels are those running minima, the sea's nodes included.
         let burnt = valley.burnt(PAST);
         assert_eq!(burnt.len(), nodes.len());
@@ -2622,7 +2871,7 @@ mod tests {
         use crate::hydrology::today_rivers::course_beds;
         let mut valley = hump_valley();
         valley.ice_north_of = 16.0;
-        let burnt = valley.burnt(PAST);
+        let burnt = valley.burnt_beds(PAST);
         let beds = course_beds(&PLAIN_LATTICE, &[valley.course()], &valley);
         let got: Vec<(u32, f32)> = beds.iter().map(|b| (b.node, b.bed_m)).collect();
         assert_eq!(got, burnt);

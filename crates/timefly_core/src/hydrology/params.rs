@@ -23,6 +23,11 @@ pub const ICE_NODE_FRACTION: f64 = 0.5;
 /// era's node elevations along each course. Routing only: the river graph's bed there is the
 /// running minimum itself.
 pub const TODAY_RIVER_BURN_M: f64 = 10.0;
+/// A burnt course's river node is relaxed by the regions to its anchor, the nearest point on
+/// its course, held within this many mean lattice spacings of the node (Task 11b, fix round 2).
+/// The course passes through every one of its nodes' texels, so its anchors lie within a
+/// texel's half-diagonal; the regions' reach allows for this.
+pub const TODAY_RIVER_ANCHOR_MAX_SPACINGS: f64 = 0.75;
 
 // Data lakes.
 

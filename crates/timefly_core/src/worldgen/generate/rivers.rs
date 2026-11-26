@@ -22,7 +22,7 @@
 //!   summed from the mouth up). Sub-point k of K = ceil(len / subpoint) sits at t = k / K,
 //!   m = m_down + (1 − t)·len.
 //! Gather: R = refined segments whose coarse arc comes within
-//!   half_size + V(w, 2·subpoint) + 1.5·max(w, w_down) + C(1 + √2) + 2·subpoint
+//!   half_size + V(w, 2·subpoint) + 1.5·max(w, w_down) + relax + 2·subpoint (relax below)
 //!   of the region's square; D = the refined segments up to 500 m downstream of R; then every
 //!   refined segment upstream of R ∪ D whose end lies within L + 500 m of path above the
 //!   start of an R or D segment.
@@ -31,6 +31,10 @@
 //!   |i|, |j| ≤ 2 (off the border) strictly lower than both row neighbours (i ± 1) or both
 //!   column neighbours (j ± 1) (ties: smaller i² + j², then grid index (j + 3)·7 + (i + 3),
 //!   i east, j north); none: the node stays put. Ocean, lake and ice end nodes stay put.
+//!   A node on one of today's burnt courses relaxes to its anchor instead
+//!   ([`EraHydrology::anchor`], Task 11b fix round 2): the nearest point on its course, within
+//!   [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`] spacings, so a canyon narrower than the lattice keeps
+//!   its river. The gather's relaxation reach is max(C√2, that bound) + C.
 //!   Sub-point k (0 < k < K): the 13 samples at offsets ±C across the great circle between the
 //!   relaxed ends; its raw offset is the lowest interior local minimum (|j| ≤ 5, strictly
 //!   lower than samples j ± 1; ties: smaller |offset|, then the negative side, the right
@@ -91,8 +95,8 @@ use crate::hydrology::params::{
     DEPTH_EXP, INCISION_WINDOW_M, LEVEL_BELOW_BED, LOWLAND_SPEED_MS, MANNING_N,
     MAX_CHANNEL_DISCHARGE_M3S, MEANDER_AMPLITUDE_PER_WIDTH, MEANDER_FLAT_SLOPE,
     MEANDER_MIN_WAVELENGTH_M, MEANDER_WAVELENGTH_PER_WIDTH, NODE_SEARCH_GRID, RAPID_SLOPE,
-    RAPID_SPEED_BASE_MS, RAPID_SPEED_GAIN_MS, VALLEY_HALF_WIDTH_PER_WIDTH, VALLEY_WALL_SLOPE,
-    WIDTH_COEFF, WIDTH_EXP,
+    RAPID_SPEED_BASE_MS, RAPID_SPEED_GAIN_MS, TODAY_RIVER_ANCHOR_MAX_SPACINGS,
+    VALLEY_HALF_WIDTH_PER_WIDTH, VALLEY_WALL_SLOPE, WIDTH_COEFF, WIDTH_EXP,
 };
 use crate::hydrology::{CubeLattice, Down, EraHydrology, HydroGraph, RiverNode};
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
@@ -185,12 +189,34 @@ fn gather_reach_m(w: f64, w_down: f64, relax_m: f64, subpoint_m: f64) -> f64 {
 /// widest at [`MAX_CHANNEL_DISCHARGE_M3S`]. About 111 km on the recent lattice at
 /// [`SUBPOINT_M`](crate::hydrology::params::SUBPOINT_M).
 pub fn river_read_reach_m(lattice: &CubeLattice, subpoint_m: f64) -> f64 {
-    let relax = corridor_m(lattice) * (1.0 + SQRT_2);
+    let relax = relax_reach_m(lattice);
     let w = width_m(f32::MAX);
     let gather =
         gather_reach_m(w, w, relax, subpoint_m) * LOCAL_SLACK + 0.5 * GATHER_SAMPLE_M + 1.0;
     let step = MAX_STEP_SPACINGS * lattice.mean_spacing_m();
     LOCAL_SLACK * (gather + 2.0 * step + INCISION_WINDOW_M + 2.0 * SLOPE_HALF_M + relax)
+}
+
+/// How far a relaxed point can lie from its coarse chord: a node moves at most `C√2` (the
+/// search grid's corner) or, on one of today's burnt courses, to its anchor (at most
+/// [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`] spacings), and a sub-point's offset adds up to `C`.
+fn relax_reach_m(lattice: &CubeLattice) -> f64 {
+    let corridor = corridor_m(lattice);
+    let node = (corridor * SQRT_2).max(TODAY_RIVER_ANCHOR_MAX_SPACINGS * lattice.mean_spacing_m());
+    node + corridor
+}
+
+/// A river node relaxed for the refinement: to its anchor on one of today's burnt courses
+/// ([`EraHydrology::anchor`]), otherwise onto the valley floor ([`relax_node`]).
+fn relax_river_node(
+    hydro: &EraHydrology,
+    node: u32,
+    floor_at: &impl Fn(RenderDir) -> f64,
+) -> DVec3 {
+    match hydro.anchor(node) {
+        Some(a) => a,
+        None => relax_node(&hydro.lattice, node, floor_at),
+    }
 }
 
 fn angle(a: DVec3, b: DVec3) -> f64 {
@@ -383,9 +409,9 @@ pub fn relaxed_centreline(
     let n = &nodes[river as usize];
     let end = end_node(n, nodes);
     let (c0, c1) = (lattice.dir(n.node).0, lattice.dir(end).0);
-    let p0 = relax_node(&lattice, n.node, floor_at);
+    let p0 = relax_river_node(hydro, n.node, floor_at);
     let p1 = if matches!(n.down, Down::River(_)) {
-        relax_node(&lattice, end, floor_at)
+        relax_river_node(hydro, end, floor_at)
     } else {
         c1
     };
@@ -641,7 +667,7 @@ impl<'a> RiverBuilder<'a> {
         let nodes = graph.nodes();
         let basis = frame.basis();
         let corridor = corridor_m(&lattice);
-        let relax = corridor * (1.0 + SQRT_2);
+        let relax = relax_reach_m(&lattice);
         let step = MAX_STEP_SPACINGS * lattice.mean_spacing_m();
         let refined = |i: u32| nodes[i as usize].discharge_m3s >= min_q;
         let refined_down = |i: u32| match nodes[i as usize].down {
@@ -836,7 +862,7 @@ impl<'a> RiverBuilder<'a> {
                         continue;
                     }
                     let node = self.relaxed[i].0;
-                    self.relaxed[i].1 = relax_node(&self.hydro.lattice, node, floor_at);
+                    self.relaxed[i].1 = relax_river_node(self.hydro, node, floor_at);
                     used = used.saturating_add(NODE_UNITS);
                     self.phase = Phase::Relax(i + 1);
                 }
@@ -2673,6 +2699,43 @@ mod tests {
         let only_one = a.keys().filter(|r| !b.contains_key(r)).count()
             + b.keys().filter(|r| !a.contains_key(r)).count();
         (shared, only_one)
+    }
+
+    /// Task 11b, fix round 2: a node on one of today's burnt courses relaxes to its anchor, as
+    /// far as the anchor bound from its node, and regions still agree on every segment they
+    /// share (the gather allows for the anchors' reach).
+    #[test]
+    fn anchored_nodes_relax_to_their_anchors_from_any_region() {
+        let base = tree(3e-4);
+        let spacing = LAT.mean_spacing_m();
+        let north = |v: u32, frac: f64| {
+            let c = LAT.dir(v).0;
+            offset_point(c, DVec3::Y - c * c.y, frac * spacing)
+        };
+        let anchors: Vec<(u32, DVec3)> = (395..=425)
+            .map(|c| (eq(c), north(eq(c), TODAY_RIVER_ANCHOR_MAX_SPACINGS)))
+            .collect();
+        let hydro = base.clone().with_anchors(&anchors);
+        let floor = |d: RenderDir| {
+            2030.0 - 3e-4 * (along_m(d.0) - col_along(380)) + 0.02 * north_m(d.0).abs()
+        };
+        let k = hydro.rivers.index_of(eq(410)).unwrap();
+        let line = relaxed_centreline(&hydro, k, SUBPOINT_M, &floor);
+        assert_eq!(line[0], anchors[15].1);
+        assert!(
+            (metres_between(line[0], LAT.dir(eq(410)).0) / spacing
+                - TODAY_RIVER_ANCHOR_MAX_SPACINGS)
+                .abs()
+                < 1e-6
+        );
+        // Unanchored, the same node stays near its lattice point on this valley-less floor.
+        let plain = relaxed_centreline(&base, k, SUBPOINT_M, &floor);
+        assert!(metres_between(plain[0], LAT.dir(eq(410)).0) < 0.5 * spacing);
+        let east = RegionFrame { center: centre() }.local_to_dir(100_000.0, 0.0);
+        let a = by_river(&build_at(&hydro, centre(), &floor, 997));
+        let b = by_river(&build_at(&hydro, east, &floor, u32::MAX));
+        let (shared, only_one) = agree(&a, &b);
+        assert!(shared >= 15 && only_one > 0, "{shared} {only_one}");
     }
 
     #[test]

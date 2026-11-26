@@ -87,6 +87,11 @@ pub struct EraHydrology {
     ocean: Vec<u64>,
     /// Lake footprint nodes, sorted by node.
     lake_nodes: Vec<LakeNode>,
+    /// The river nodes on today's burnt courses ([`today_rivers`]), sorted by node, each with
+    /// its anchor: the nearest point on its course (unit, era frame), at most
+    /// [`TODAY_RIVER_ANCHOR_MAX_SPACINGS`](params::TODAY_RIVER_ANCHOR_MAX_SPACINGS) mean
+    /// spacings from the node. The regions relax such a node to its anchor.
+    anchors: Vec<(u32, [f64; 3])>,
 }
 
 impl EraHydrology {
@@ -100,6 +105,14 @@ impl EraHydrology {
             .taps(dir)
             .iter()
             .any(|&(node, _)| self.is_ocean(node))
+    }
+
+    /// The anchor of a river node on one of today's courses: where the regions relax it.
+    pub fn anchor(&self, node: u32) -> Option<bevy_math::DVec3> {
+        self.anchors
+            .binary_search_by_key(&node, |a| a.0)
+            .ok()
+            .map(|k| bevy_math::DVec3::from_array(self.anchors[k].1))
     }
 
     fn lake_node(&self, node: u32) -> Option<&LakeNode> {
@@ -171,7 +184,17 @@ impl EraHydrology {
             unplaced_lake_levels: Vec::new(),
             ocean: vec![0; lattice.len().div_ceil(64) as usize],
             lake_nodes: Vec::new(),
+            anchors: Vec::new(),
         }
+    }
+
+    /// This result with `anchors` (`(node, anchor)`, any order). For the refinement's fixtures.
+    #[cfg(test)]
+    pub(crate) fn with_anchors(mut self, anchors: &[(u32, bevy_math::DVec3)]) -> EraHydrology {
+        let mut a: Vec<(u32, [f64; 3])> = anchors.iter().map(|&(v, d)| (v, d.to_array())).collect();
+        a.sort_by_key(|x| x.0);
+        self.anchors = a;
+        self
     }
 
     /// This result with lake footprints `nodes` (`(node, lake)`), shore steps 1 on nodes with a
@@ -213,5 +236,6 @@ impl EraHydrology {
             + self.rivers.bytes()
             + 8 * self.ocean.capacity()
             + self.lake_nodes.capacity() * std::mem::size_of::<LakeNode>()
+            + self.anchors.capacity() * std::mem::size_of::<(u32, [f64; 3])>()
     }
 }

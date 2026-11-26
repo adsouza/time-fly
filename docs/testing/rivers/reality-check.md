@@ -31,23 +31,28 @@ today's (`data/hydrology/rivers_today.json`, `timefly_core::hydrology::today_riv
 made in Task 11b" below). The Python reference does not burn: the check now compares two
 independent sources of today's rivers, a 1′ DEM and Natural Earth.
 
-The figures below are from Task 11b's fix round 1: the river graph alone takes the courses'
-levels, and the outlet points are cited (see "Outlet points" below). The binary was the `dev`
-profile (opt-level 1 for the workspace, 3 for dependencies), not `target/release`: release was
-not built, to save disk. Pass time at 0 ka: 1.23 s (0.20 s sampling), against 1.22 s before.
-The lattice is n = 900, with 118,792 river nodes (121,263 before) and 861 lakes (861).
+The figures below are from Task 11b's fix round 2:
+- The river graph alone takes the courses' levels.
+- The outlet points are cited (see "Outlet points" below), and the Amazon's allowance is 160 km.
+- The regions relax a burnt course's nodes to the course itself (its anchors).
+- The graph's beds slope across held stretches.
 
-**hydro check: FAIL.** The Indus box's share now passes, but 10 links are still missed: the Shyok
-and the Arghandab are not in Natural Earth 1:10m, and the rest are mostly rivers outside its rank
-≤ 7 courses, or short reaches. The Amazon's outlet fails: it ends 152 km from its cited mouth on
-the North Channel, against 150 km allowed. That bar is the owner's call; it is reported
-unchanged.
+The binary was the `dev` profile (opt-level 1 for the workspace, 3 for dependencies), not
+`target/release`: release was not built, to save disk. Pass time at 0 ka: 1.30 s (0.20 s
+sampling), against 1.22 s before. The lattice is n = 900, with 118,792 river nodes (121,263
+before) and 861 lakes (861).
+
+**hydro check: FAIL.** The Indus box's share now passes, but 11 links are still missed:
+- The Shyok and the Arghandab are not in Natural Earth 1:10m.
+- The rest are mostly rivers outside its rank ≤ 7 courses, or short reaches.
+
+Every other bar passes.
 
 | Bar | Needs (brief, or † set in Task 11) | Before (Task 11) | After (Task 11b) | Verdict |
 |---|---|---|---|---|
-| Indus box, relaxed (judged) | ≥ 80% within 10 km, every link | 76.4%, 70/84 links, worst 134.6 km | 81.4%, 74/84 links, worst 77.2 km | **FAIL** (links only) |
+| Indus box, relaxed (judged) | ≥ 80% within 10 km, every link | 76.4%, 70/84 links, worst 134.6 km | 81.6%, 73/84 links, worst 77.5 km | **FAIL** (links only) |
 | Indus box, coarse graph | (informative) | 75.0%, 69/84, worst 137.5 km | 80.5%, 72/84, worst 77.7 km | |
-| Amazon flats (< 300 m), relaxed | ≥ 80% within 25 km | 91.7%, 456/482 links, worst 144.3 km | 91.8%, 458/482, worst 144.3 km | PASS |
+| Amazon flats (< 300 m), relaxed | ≥ 80% within 25 km | 91.7%, 456/482 links, worst 144.3 km | 91.6%, 458/482, worst 145.9 km | PASS |
 | Amazon flats, coarse graph | (informative) | 91.1%, 454/482, worst 142.6 km | 91.3%, 455/482, worst 142.6 km | |
 | Caspian Sea (42.0, 50.5) | within 5 m of the table (−28.0) | −28.0 m | −28.0 m | PASS |
 | Dead Sea (31.5, 35.5) | within 5 m of the map's fine surface (−427.0) | −427.0 m | −427.0 m | PASS |
@@ -57,7 +62,7 @@ unchanged.
 | Danube from Budapest | through the Iron Gate to the Black Sea; † within 15 km of the gate, ocean within 150 km of the delta | 0.5 km from the gate; ends at (45.16, 29.23), 37 km from the delta | 0.3 km from the cited gate; ends at (45.16, 29.23), 42 km from the cited mouth | PASS |
 | Jhelum from Srinagar | out of the Kashmir valley at Baramulla; † within 15 km of it, then the sea within 150 km of the Indus mouth | 4.0 km from Baramulla; the sea 144 km from the Indus mouth | 1.1 km from the cited Baramulla; through one lake, then the Indus to the sea at (23.96, 67.49), 7 km from the cited mouth | PASS |
 | Indus from Skardu | its sea; † ocean within 150 km of its mouth | ends at (24.16, 68.80), 144 km off | ends at (23.96, 67.49), 7 km from the cited mouth | PASS |
-| Amazon from Iquitos | its sea; † ocean within 150 km of its mouth | through one floodplain lake; ends at (−0.54, −50.76), 140 km from (−0.5, −49.5) | through no lake; ends at (−0.25, −51.07), 152 km from the cited North Channel mouth (177 km from the old point) | **FAIL** |
+| Amazon from Iquitos | its sea; † ocean within 150 km of its mouth, 160 km for the Amazon (owner, 2026-11-26) | through one floodplain lake; ends at (−0.54, −50.76), 140 km from (−0.5, −49.5) | through no lake; ends at (−0.25, −51.07), 152 km from the cited North Channel mouth (177 km from the old point) | PASS |
 | Arid basins | no lake ≥ 1,000 km² where the basin averages < 250 mm/yr, in either network († basin = lake plus upstream river nodes) | game 0 of 3 (750, 1,942 and 386 mm/yr); reference 0 of 2 | game 0 of 3 (750, 1,942 and 378 mm/yr); reference 0 of 2 | PASS |
 
 `TODAY_RIVER_BURN_M` = 10 m was enough: the lower Indus now follows the reference by Sehwan, so
@@ -88,22 +93,23 @@ tolerances are unchanged: start 30 km, via 15 km, mouth 150 km.
 
 Margins on this run: the Danube passes 0.3 km from the gate (14.7 km margin) and ends 42 km
 from its mouth (108 km); the Jhelum passes 1.1 km from Baramulla (13.9 km) and ends 7 km from
-the Indus mouth (143 km), as does the Indus; the Amazon ends 152 km from its mouth (2 km over).
+the Indus mouth (143 km), as does the Indus; the Amazon ends 152 km from its mouth (8 km under
+its own 160 km allowance).
 
-### The Amazon's outlet (for the owner)
+### The Amazon's outlet (owner, 2026-11-26: "Raise the Amazon's allowance to 160 km")
 
 Natural Earth's Amazonas course ends at Gurupá (−1.58, −52.71), above the estuary; the delta's
 channels are not among the rank ≤ 7 rivers. The burnt course carries the Amazon to Gurupá, and the
 lattice routes the last 200 km or so: east, then north to the coast by Macapá at (−0.25, −51.07).
 That is 152 km from the cited North Channel mouth (0.71, −50.09), 2 km over the 150 km allowed,
 and 177 km from the old point (−0.5, −49.5); before the burn the lattice reached the coast at
-(−0.54, −50.76), 140 km from the old point. Nothing was tuned for it: the bar fails only by
-where the sourced point sits relative to where the lattice meets the sea, and goes to the owner
-with these numbers.
+(−0.54, −50.76), 140 km from the old point. Nothing was tuned for it. The owner raised the
+Amazon's own allowance to 160 km; every other outlet keeps 150 km.
 
 ### What the Indus box misses
 
-The check prints each unmatched reference link. After the burn (10 links, all missed before too):
+The check prints each unmatched reference link. After fix round 2 (11 links: the 10 of fix round 1,
+all missed before the burn too, and the 2 km reach at Muzaffarabad):
 
 | Reference link | Length | Within 10 km | Why |
 |---|---|---|---|
@@ -113,12 +119,13 @@ The check prints each unmatched reference link. After the burn (10 links, all mi
 | Sindh (Madhya Pradesh), (25.77, 78.29) to (26.44, 79.22) | 151 km | 13% | Not among the rank ≤ 7 courses. |
 | Thar's edge to the Rann, (23.59, 71.09) to (24.56, 71.04) | 140 km | 22% | Not among the rank ≤ 7 courses. |
 | 5 more | 5–87 km | 0–40% | Ladakh's valleys, the Swat, two short reaches. |
+| Jhelum at Muzaffarabad, (34.34, 73.46) to (34.33, 73.47) | 2 km | 33% | Matched before fix round 2 (and before the burn): anchoring the hairpin to Natural Earth's line moved the game's river up to 10.9 km from the reference's confluence reach. |
 
 Now matched: the lower Indus (939 km, 18% before), the lower Jhelum from Mangla to the Chenab
 (329 km, 34%), a 178 km link at (36.99, 72.38) to (37.49, 71.51) (7%) and a 2 km reach at
-Muzaffarabad. No link matched before is missed now; the first run of the burn missed the Jhelum
-from Muzaffarabad to Mangla and a reach of the Chambal, until course nodes kept their hairpins
-(see "Choices made in Task 11b").
+Muzaffarabad (that one missed again after fix round 2's anchors). The first run of the burn
+missed the Jhelum from Muzaffarabad to Mangla and a reach of the Chambal, until course nodes kept
+their hairpins (see "Choices made in Task 11b").
 
 ### Before Task 11b
 
@@ -203,14 +210,15 @@ choices below were made while building it.
   table above (80.7% and 72/84 links before, 81.4% and 74/84 after).
 - **Every era with today's terrain**, not 0 ka only (the brief's ruling): an ice-age river follows
   today's course where it may then have run elsewhere.
-- **Time-boxed.** The table is read a course at a time, each course's nodes found in blocks, the
-  burnt nodes lowered and their beds set back in blocks (stages `today_rivers` and `beds`). Nothing
+- **Time-boxed.** The table is read a course at a time, each course's nodes found in blocks, and
+  the burnt nodes lowered in blocks (stage `today_rivers`; fix round 1 removed the `beds` stage:
+  the graph build reads the beds). Nothing
   is cached between passes, so every pass does the same units. On the synthetic recent lattice
   (`time_the_today_rivers_stage`, dev build) the stage takes 45 steps of 8,192 units, the longest
   0.53 ms. On the real bake (`real_continental_pass_timing`, dev build; release was not built)
   the time-boxed runs give the same result as `run_parallel`, bit for bit, at 0 and 21 ka. Their
   longest steps are 1.39 ms (walk→rivers) and 1.64 ms (runoff→walk) at 0 ka, at 6 and 12 ms
-  budgets, and 1.52 ms (walk) and 2.03 ms (sample) at 21 ka: none in `today_rivers` or `beds`.
+  budgets, and 1.52 ms (walk) and 2.03 ms (sample) at 21 ka: none in `today_rivers`.
   The dev build runs the workspace at opt-level 1, so release steps are shorter (Task 10: 1.1–1.3
   ms).
 - **Where the courses end.** A course that stops short of the sea or its trunk leaves a pit at its
@@ -235,6 +243,9 @@ choices below were made while building it.
   below sea level (the Danube's Sulina arm, the Lek and the Waal, the Lena, the Sacramento, the
   Suez Canal, the Sénégal, the Volga and one unnamed course).
 
+  After fix round 2's sloped beds: at most 1,362 m, 439 m at the 99th percentile, and over 50 m
+  at 4,446 nodes. The beds now fall across held stretches, below the held level.
+
   A `region_tour` render of the worst node (Hells Canyon, 45.28° N, 116.59° W, 0 ka, 6,000 m
   above the ground, looking north and 45° down;
   [hells-canyon-burn-down.jpg](hells-canyon-burn-down.jpg)) shows the following:
@@ -246,6 +257,22 @@ choices below were made while building it.
 
   No render without the burn was made to compare, and the rule was not changed: the owner
   decides.
+- **Anchors and sloped beds** (fix round 2, after the Hells Canyon investigation).
+  - Each burnt node records its anchor: the nearest point to its centre on the course's polyline
+    segments that sampled it. It is held within `TODAY_RIVER_ANCHOR_MAX_SPACINGS` = 0.75 mean
+    spacings, and the regions relax the node there instead of searching the coarse floor.
+  - The anchors are pass data, stored with the river nodes (`EraHydrology::anchor`), so regions
+    still agree. The gather's relaxation reach grows from C(1 + √2) to max(C√2, 0.75 spacings) +
+    C.
+  - Across a held stretch (a run of nodes above the running minimum), the river graph's bed now
+    falls linearly by path length to the next lower level. Routing keeps the plain running
+    minimum.
+  - On the real bake at Hells Canyon:
+    - The refined channel now follows the canyon instead of the chord over the plateau.
+    - The ground stands 70–324 m above the water along the stretch, not 1,100–1,500 m.
+    - The water runs at 1.09 m/s, not 0.30.
+    - The ridge notch to the north-east remains: a capture of the eastern river into the course.
+      It is cut 826–1,146 m deep and 375–875 m wide. It goes to the owner.
 - **The reference does not burn** (the brief's ruling), so the check compares two independent
   sources. The fixtures under `crates/timefly/tests/fixtures/hydro_reference` are unchanged.
 

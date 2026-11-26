@@ -17,7 +17,8 @@
 //!   surface there.
 //! - **Outlets:** the river of the largest discharge within [`OUTLET_START_KM`] of a point flows
 //!   within [`OUTLET_VIA_KM`] of its real gorge (when one is named) and ends in the ocean within
-//!   [`OUTLET_SEA_KM`] of its real mouth ([`trace_outlet`]).
+//!   [`OUTLET_SEA_KM`] of its real mouth, or its own allowance ([`OutletBar::sea_km`];
+//!   the Amazon's is 160 km) ([`trace_outlet`]).
 //! - **Arid basins:** no lake of at least `LARGE_LAKE_KM2` touching a box whose basin (the lake
 //!   and the river nodes upstream of it) averages under [`ARID_PRECIP_MM`] of precipitation, in
 //!   the game's network or the reference's.
@@ -129,6 +130,16 @@ pub struct OutletBar {
     #[serde(default)]
     pub via: Option<(String, (f64, f64))>,
     pub sea: (f64, f64),
+    /// This river's own allowance at its mouth (km), in place of [`OUTLET_SEA_KM`].
+    #[serde(default)]
+    pub sea_km: Option<f64>,
+}
+
+impl OutletBar {
+    /// How far from its mouth the river may end (km).
+    pub fn sea_allowance_km(&self) -> f64 {
+        self.sea_km.unwrap_or(OUTLET_SEA_KM)
+    }
 }
 
 /// What the check judges.
@@ -155,6 +166,7 @@ impl CheckSpec {
             from,
             via: via.map(|(n, p)| (n.to_string(), p)),
             sea,
+            sea_km: None,
         };
         CheckSpec {
             recent_n: None,
@@ -206,8 +218,12 @@ impl CheckSpec {
                 // From Skardu ("Skardu") to the Arabian Sea ("Indus River", infobox mouth).
                 outlet("Indus", (35.29028, 75.64444), None, (23.99500, 67.43500)),
                 // From Iquitos ("Iquitos") to the Atlantic by the North Channel, north of Marajó
-                // past Macapá ("Amazon River", infobox mouth).
-                outlet("Amazon", (-3.750, -73.250), None, (0.70778, -50.08944)),
+                // past Macapá ("Amazon River", infobox mouth). Its allowance is 160 km (owner,
+                // 2026-11-26): its estuary is about 300 km across.
+                OutletBar {
+                    sea_km: Some(160.0),
+                    ..outlet("Amazon", (-3.750, -73.250), None, (0.70778, -50.08944))
+                },
             ],
         }
     }
@@ -433,11 +449,13 @@ pub fn judge_outlet(hydro: &EraHydrology, outlet: &OutletBar) -> BarResult {
                 Down::River(_) => "a river",
             };
             (
-                ocean && via_ok && sea_km <= OUTLET_SEA_KM,
+                ocean && via_ok && sea_km <= outlet.sea_allowance_km(),
                 format!(
                     "{} river nodes through {} lakes, {via_text}ends in {end} at ({lat:.2}, \
-                     {lon:.2}), {sea_km:.0} km from its mouth ({OUTLET_SEA_KM} km allowed)",
-                    t.nodes, t.lakes
+                     {lon:.2}), {sea_km:.0} km from its mouth ({} km allowed)",
+                    t.nodes,
+                    t.lakes,
+                    outlet.sea_allowance_km()
                 ),
             )
         }
@@ -1012,5 +1030,21 @@ mod tests {
             burn_depth_lines(&lattice, &[], &[]),
             ["today's courses: nothing burnt"]
         );
+    }
+
+    /// Owner, 2026-11-26: the Amazon alone may end 160 km from its mouth; the rest keep
+    /// `OUTLET_SEA_KM`.
+    #[test]
+    fn the_amazon_alone_allows_160_km_from_its_mouth() {
+        let spec = CheckSpec::standard();
+        for o in &spec.outlets {
+            let want = if o.name == "Amazon" {
+                160.0
+            } else {
+                OUTLET_SEA_KM
+            };
+            assert_eq!(o.sea_allowance_km(), want, "{}", o.name);
+        }
+        assert_eq!(OUTLET_SEA_KM, 150.0);
     }
 }

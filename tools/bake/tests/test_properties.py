@@ -294,7 +294,11 @@ def test_dilation_grows_monotonically(case):
 def latlon_grids(draw):
     rows = draw(st.integers(1, 6))
     cols = draw(st.integers(1, 8))
-    lat = np.sort(draw(st.lists(st.floats(-90, 90), min_size=rows, max_size=rows, unique=True)))
+    # Whole thousandths of a degree: distinct latitudes then differ by far more than the pole
+    # snap (`paleodem._SEAM_TOL_DEG`), so `LatLonGrid.normalized` never snaps two onto one
+    # pole (as [-90, -90 + 1e-7] did, then failed as not strictly ascending).
+    millis = st.lists(st.integers(-90_000, 90_000), min_size=rows, max_size=rows, unique=True)
+    lat = np.sort(np.array(draw(millis), dtype=np.float64) / 1000.0)
     lon_step = 360.0 / cols
     lon = -180.0 + lon_step * np.arange(cols)
     values = draw(hnp.arrays(np.float32, (rows, cols), elements=st.floats(-1e4, 1e4, width=32)))

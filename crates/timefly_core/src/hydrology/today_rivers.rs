@@ -183,6 +183,31 @@ pub struct RiverNodes {
     nodes: Vec<u32>,
     /// Each node's position in `nodes`.
     at: HashMap<u32, usize>,
+    /// Each node's anchor so far: the nearest point to its centre on the polyline segments
+    /// whose samples fell in it, and that point's angle from the centre.
+    anchors: HashMap<u32, (f64, DVec3)>,
+}
+
+/// The point of the minor arc `a`–`b` nearest to `c` (unit vectors).
+fn nearest_on_arc(c: DVec3, a: DVec3, b: DVec3) -> DVec3 {
+    let n = a.cross(b);
+    let len = n.length();
+    if len > 1e-15 {
+        let n = n / len;
+        let foot = c - n * c.dot(n);
+        let fl = foot.length();
+        if fl > 1e-15 {
+            let f = foot / fl;
+            if a.cross(f).dot(n) >= 0.0 && f.cross(b).dot(n) >= 0.0 {
+                return f;
+            }
+        }
+    }
+    if c.angle_between(a) <= c.angle_between(b) {
+        a
+    } else {
+        b
+    }
 }
 
 impl RiverNodes {
@@ -199,6 +224,25 @@ impl RiverNodes {
             k: 0,
             nodes: Vec::new(),
             at: HashMap::new(),
+            anchors: HashMap::new(),
+        }
+    }
+
+    /// Offers the segment `a`–`b` as `v`'s anchor: kept when it passes nearer `v`'s centre
+    /// (ties: the first).
+    fn offer_anchor(&mut self, lattice: &CubeLattice, v: u32, a: DVec3, b: DVec3) {
+        let c = lattice.dir(v).0;
+        let p = nearest_on_arc(c, a, b);
+        let angle = c.angle_between(p);
+        match self.anchors.entry(v) {
+            Entry::Occupied(mut o) => {
+                if angle < o.get().0 {
+                    o.insert((angle, p));
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert((angle, p));
+            }
         }
     }
 
@@ -243,10 +287,9 @@ impl RiverNodes {
                 self.samples = (a.angle_between(b) / self.step).ceil().max(1.0) as u32;
             }
             let t = f64::from(self.k) / f64::from(self.samples);
-            self.push(
-                lattice,
-                lattice.nearest(RenderDir(a.lerp(b, t).normalize())),
-            );
+            let v = lattice.nearest(RenderDir(a.lerp(b, t).normalize()));
+            self.push(lattice, v);
+            self.offer_anchor(lattice, v, a, b);
             used += 1;
             self.k += 1;
             if self.k > self.samples {
@@ -263,9 +306,19 @@ impl RiverNodes {
         self.nodes
     }
 
+    /// The course's nodes, upstream first, each with its anchor: the nearest point to its
+    /// centre on the polyline's segments that sampled it.
+    pub fn finish_with_anchors(self) -> Vec<(u32, DVec3)> {
+        let anchors = self.anchors;
+        self.nodes.into_iter().map(|v| (v, anchors[&v].1)).collect()
+    }
+
     /// The bytes held, by capacity.
     pub fn bytes(&self) -> usize {
-        24 * self.dirs.capacity() + 4 * self.nodes.capacity() + 16 * self.at.capacity()
+        24 * self.dirs.capacity()
+            + 4 * self.nodes.capacity()
+            + 16 * self.at.capacity()
+            + 36 * self.anchors.capacity()
     }
 }
 
@@ -279,21 +332,79 @@ pub fn today_river_nodes(lattice: &CubeLattice, river: &TodayRiver) -> Vec<u32> 
     nodes.finish()
 }
 
-/// The levels along one course's nodes (upstream first): the running minimum of `elevation`,
-/// never below 0 m on a node at or above sea level. `add(node, level)` gets each node that
-/// `burnable` allows; the others still feed the running minimum.
+/// One node's burn along a course ([`course_levels`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct CourseLevel {
+    node: u32,
+    /// Routing's level: the running minimum.
+    level: f32,
+    /// The river graph's bed: the running minimum, sloped across held stretches.
+    bed: f32,
+    anchor: DVec3,
+}
+
+/// The levels along one course's nodes (upstream first, with their anchors), never below 0 m on
+/// a node at or above sea level:
+/// - routing's level is the running minimum of `elevation`;
+/// - the bed is that level, except across a held stretch (the nodes after one that set the
+///   minimum, up to the next that lowers it): there it falls linearly by path length (`dist`
+///   between consecutive nodes) from the held level toward the next lower one, so it never
+///   rises and never stands above the level. After the last lowering it stays level.
+///
+/// `add` gets each node that `burnable` allows; the others still feed the running minimum.
 fn course_levels(
-    nodes: &[u32],
+    nodes: &[(u32, DVec3)],
     elevation: impl Fn(u32) -> f32,
     burnable: impl Fn(u32) -> bool,
-    mut add: impl FnMut(u32, f32),
+    dist: impl Fn(u32, u32) -> f64,
+    mut add: impl FnMut(CourseLevel),
 ) {
-    let mut level = f32::INFINITY;
-    for &v in nodes {
-        let e = elevation(v);
-        level = level.min(e);
+    let e: Vec<f32> = nodes.iter().map(|&(v, _)| elevation(v)).collect();
+    // The running minimum, and the nodes that lowered it (the first included).
+    let mut level = Vec::with_capacity(e.len());
+    let mut setters = Vec::new();
+    let mut run = f32::INFINITY;
+    for (k, &ek) in e.iter().enumerate() {
+        if ek < run {
+            run = ek;
+            setters.push(k);
+        }
+        level.push(run);
+    }
+    // Path length from the first node.
+    let mut path = Vec::with_capacity(e.len());
+    let mut m = 0.0;
+    for (k, &(v, _)) in nodes.iter().enumerate() {
+        if k > 0 {
+            m += dist(nodes[k - 1].0, v);
+        }
+        path.push(m);
+    }
+    let mut next = 0;
+    for (k, &(v, anchor)) in nodes.iter().enumerate() {
+        while next < setters.len() && setters[next] <= k {
+            next += 1;
+        }
+        let land = e[k] >= 0.0;
+        let clamp = |x: f32| if land { x.max(0.0) } else { x };
+        let held = level[k];
+        let bed = match setters.get(next) {
+            Some(&t) if setters[next - 1] != k => {
+                let s = setters[next - 1];
+                let target = clamp(level[t]);
+                let from = clamp(held);
+                let frac = (path[k] - path[s]) / (path[t] - path[s]);
+                (f64::from(from) + (f64::from(target) - f64::from(from)) * frac) as f32
+            }
+            _ => clamp(held),
+        };
         if burnable(v) {
-            add(v, if e >= 0.0 { level.max(0.0) } else { level });
+            add(CourseLevel {
+                node: v,
+                level: clamp(held),
+                bed: bed.min(clamp(held)),
+                anchor,
+            });
         }
     }
 }
@@ -342,13 +453,19 @@ pub fn course_beds<S: NodeSource>(
     let mut out: Vec<CourseBed> = Vec::new();
     let mut at: HashMap<u32, usize> = HashMap::new();
     for (k, river) in rivers.iter().enumerate() {
-        let nodes = today_river_nodes(lattice, river);
-        let own: Vec<(f32, bool)> = nodes.iter().map(|&v| sampled(v)).collect();
+        let mut course = RiverNodes::new(lattice, river);
+        while !course.step(lattice, u32::MAX).0 {}
+        let nodes = course.finish_with_anchors();
+        let own: Vec<(f32, bool)> = nodes.iter().map(|&(v, _)| sampled(v)).collect();
         let routed = |v: u32, e: f32| strait.get(&v).map_or(e, |&l| e.min(l));
-        let index: HashMap<u32, usize> = nodes.iter().enumerate().map(|(i, &v)| (v, i)).collect();
+        let index: HashMap<u32, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &(v, _))| (v, i))
+            .collect();
         let mut below_sea = false;
         let mut levels: Vec<(u32, f32, bool)> = Vec::new();
-        for (i, &v) in nodes.iter().enumerate() {
+        for (i, &(v, _)) in nodes.iter().enumerate() {
             let e = routed(v, own[i].0);
             let pinned = below_sea && e >= 0.0;
             below_sea |= e < 0.0;
@@ -358,7 +475,9 @@ pub fn course_beds<S: NodeSource>(
             &nodes,
             |v| levels[index[&v]].1,
             |v| !own[index[&v]].1 && source.todays_terrain(lattice.dir(v)),
-            |v, level| {
+            |a, b| lattice.distance_m(a, b),
+            |c| {
+                let (v, level) = (c.node, c.bed);
                 let i = index[&v];
                 let bed = CourseBed {
                     node: v,
@@ -381,18 +500,35 @@ pub fn course_beds<S: NodeSource>(
     out
 }
 
-/// Per-node bed levels gathered from many courses: each node once, in the order first burnt, at
-/// the lowest level any course gave it.
+/// Per-node levels gathered from many courses: each node once, in the order first burnt, with
+/// the lowest routing level any course gave it, and the lowest bed with that bed's course's
+/// anchor (ties: the first).
 #[derive(Default)]
 pub(crate) struct BurntNodes {
     list: Vec<(u32, f32)>,
+    beds: Vec<(f32, DVec3)>,
     at: HashMap<u32, u32>,
 }
 
 impl BurntNodes {
-    /// The level burnt at `v`, if any course burnt it.
+    /// The river graph's bed at `v`, if any course burnt it.
     pub(crate) fn get(&self, v: u32) -> Option<f32> {
-        self.at.get(&v).map(|&k| self.list[k as usize].1)
+        self.at.get(&v).map(|&k| self.beds[k as usize].0)
+    }
+
+    /// The anchor of `v`, if any course burnt it.
+    pub(crate) fn anchor(&self, v: u32) -> Option<DVec3> {
+        self.at.get(&v).map(|&k| self.beds[k as usize].1)
+    }
+
+    /// The burnt nodes and their beds, in the order first burnt.
+    #[cfg(test)]
+    pub(crate) fn beds(&self) -> Vec<(u32, f32)> {
+        self.list
+            .iter()
+            .zip(&self.beds)
+            .map(|(&(v, _), &(bed, _))| (v, bed))
+            .collect()
     }
 
     /// The burnt nodes and their levels, in the order first burnt.
@@ -401,21 +537,26 @@ impl BurntNodes {
         &self.list
     }
 
-    fn add(&mut self, v: u32, level: f32) {
-        match self.at.entry(v) {
+    fn add(&mut self, c: CourseLevel) {
+        match self.at.entry(c.node) {
             Entry::Occupied(o) => {
-                let l = &mut self.list[*o.get() as usize].1;
-                *l = l.min(level);
+                let k = *o.get() as usize;
+                let l = &mut self.list[k].1;
+                *l = l.min(c.level);
+                if c.bed < self.beds[k].0 {
+                    self.beds[k] = (c.bed, c.anchor);
+                }
             }
             Entry::Vacant(e) => {
                 e.insert(self.list.len() as u32);
-                self.list.push((v, level));
+                self.list.push((c.node, c.level));
+                self.beds.push((c.bed, c.anchor));
             }
         }
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        8 * self.list.capacity() + 12 * self.at.capacity()
+        8 * self.list.capacity() + 32 * self.beds.capacity() + 12 * self.at.capacity()
     }
 }
 
@@ -514,7 +655,7 @@ impl TodayBurn {
                 if !done {
                     continue;
                 }
-                let nodes = self.course.take().expect("a course").finish();
+                let nodes = self.course.take().expect("a course").finish_with_anchors();
                 used += LEVEL_UNITS * nodes.len() as u32;
                 let burnable = |v: u32| !is_ice(v) && source.todays_terrain(lattice.dir(v));
                 let burnt = &mut self.burnt;
@@ -522,7 +663,8 @@ impl TodayBurn {
                     &nodes,
                     |v| elevation[v as usize],
                     burnable,
-                    |v, level| burnt.add(v, level),
+                    |a, b| lattice.distance_m(a, b),
+                    |c| burnt.add(c),
                 );
                 continue;
             }
