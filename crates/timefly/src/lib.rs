@@ -6,6 +6,7 @@ use bevy::window::{PresentMode, WindowResolution};
 pub mod args;
 pub mod art;
 pub mod bench;
+pub mod boulders;
 pub mod build_features;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
@@ -21,6 +22,7 @@ pub mod globe_flight;
 pub mod gpu;
 pub mod hydro;
 pub mod region;
+pub mod scatter;
 pub mod sky;
 pub mod terrain;
 pub mod time;
@@ -161,7 +163,11 @@ pub fn app(session: &Session) -> App {
         (RegionPlugin, HydroPlugin),
         TerrainCdlodPlugin,
         sky::SkyPlugin,
-        water::WaterPlugin,
+        (
+            water::WaterPlugin,
+            scatter::ScatterPlugin,
+            boulders::BoulderPlugin,
+        ),
         terrain::warmup::RegionWarmupPlugin,
         GlobeFlightPlugin,
         RegionNavigationPlugin,
