@@ -16,6 +16,11 @@ pub const PRESENT_FRAME_MAX_MYR: f64 = 0.2;
 pub const OCEAN_STRAIT_M: f64 = 25_000.0;
 /// A node is in a depression when the filled surface stands more than this above it.
 pub const DEPRESSION_EPS_M: f64 = 0.01;
+/// A burnt course's corridor (Task 11d fix round 3) ends at its first interior node that the
+/// ocean rule makes sea and that samples below this (m): open sea, not the channel and lagoon
+/// floors (−0.2 to −7 m) ETOPO stores up estuaries. Natural Earth's lines sometimes run past the
+/// coast; that node then serves as the course's end, and the sea beyond stays sea.
+pub const OPEN_SEA_M: f32 = -10.0;
 /// A node at or above this ice fraction carries no flow.
 pub const ICE_NODE_FRACTION: f64 = 0.5;
 /// Where the terrain is today's, the pass routes along today's major river courses

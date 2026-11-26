@@ -27,6 +27,107 @@ Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (162
 
 ## Result, 2026-11-26 (Task 11d: the world's major river systems)
 
+### Fix round 3 (2026-11-26)
+
+The controller's rulings:
+
+- **1. The course corridor.** This is the owner's "corridor now, mask later".
+  - A burnt course's interior nodes (every node but its last) that the ocean rule would make sea become land, at their land chain's routing elevation (`Routing::with_corridor`, applied when the ocean is settled, before the fill).
+  - No interior course node takes an ocean receiver. That holds in the steepest-descent choice and in `pick_receiver`'s parent fallback. The flood does not grow the ocean into an interior node either; a course end may still take the sea.
+  - A below-zero interior node routes on the course's ε chain toward its end, so it never becomes a basin.
+  - Polders and coastlines off the courses are unchanged.
+- **The guard.** A course's corridor ends at its first interior node that is open sea: ocean by the unmodified rule and sampled below `OPEN_SEA_M` (−10 m). That node ends the course, and the nodes after it follow the ocean rule. Natural Earth lines that run out past the coast build no spit.
+  - ETOPO's channel and lagoon floors up estuaries sample −0.2 to −7 m. Open sea is deeper.
+- **2. Rule B's junction hole.** Only a node that is no course's interior node is exempt from the inland rule. A course that ends on another's interior node (a tributary's mouth beside a lagoon) no longer opens the through course to the sea.
+- **3. River parts are oriented like lake parts** (`orient_by_connections`, one rule set for every part). Each part's candidates are taken surest first, by a priority queue:
+  - **ETOPO:** as sure as the ends' height difference. The end heights read a mapped lake's cells as its surface (the table's level for the lakes in `lake_levels.json`), so the Angara no longer reads Baikal's bed at Listvyanka.
+  - **A tributary's mouth** (an end on another part's interior vertex): as sure as 1 m (`MOUTH_VOTE_M`).
+  - **A junction,** once every other part meeting there is decided:
+    - an end where a part starts and none ends flows into it;
+    - an end where all the others end is their outflow;
+    - a fork or a confluence with a known inflow gives no vote.
+
+    Where two parts meet (a chain), the vote is as sure as the last decision there. Where three or more meet, a part's role is only inferred, so its vote is capped at `MOUTH_VOTE_M`.
+  - **Ends within the table's 1 km simplification (`SIMPLIFY_M`) are one junction,** and a part shorter than that joins nothing. Natural Earth leaves streams unjoined by 30 m (the Danube's Sulina arm) to 350 m (the Xun at Guiping).
+  - **The hand-added channels in `rivers_extra.json` join as fixed, certain parts.** They are cited upstream first, so they orient the arms that feed them, such as the Mekong's Tiền.
+
+**Fixes beyond the rulings, all in the orientation.**
+
+| Change | Case | Why |
+|---|---|---|
+| A junction votes only once every other part meeting there is decided. | The Mekong at Phnom Penh. | The Bassac arm was decided first while the stem's short link part was still unknown, so the fork showed an outflow and no inflow, and the Tiền arm counted as a tributary and ran backwards. |
+| Junction ends are clustered, and inferred roles are capped (both above). | The Chilia arm and the You/Yong/Yu. | Each was reversed by a junction that looked like a chain: the Chilia flowed in from the Black Sea, and the You/Yong/Yu ran 127 m uphill from Guiping past Nanning to Baise. |
+
+Twenty river parts whose direction is known from geography were used to compare the variants: 12, 11 and 16 right for the intermediate rules, 19 for the rule shipped. The one still wrong is the Lena delta's Olenek channel, where ETOPO's ends differ by 2.8 m of noise. The list was assembled during this work, so it is evidence, not an independent test.
+
+**Orientation counts.** Topology 607, ETOPO 844, ambiguous 0. River parts: 432, 836 and 0. Lake parts: 175, 8 and 0 (round 2: 149, 27 and 7). The baked table reverses 208 Natural Earth parts (216 before). Against round 2's table, 26 parts changed direction:
+- Now right: St. Clair (Port Huron to Lake St. Clair), the Albert Nile out of Lake Albert, the Columbia at Pasco, the Niger's delta arm, the Tarim (west to east), the Green through Flaming Gorge, the Angara from Listvyanka, and two Volga parts.
+- The Volga's Saratov–Balakovo part now runs downstream, (52.07, 47.77) → (51.74, 46.78). Both its ends read the Saratov reservoir's surface, so ETOPO is flat there and its connections decide.
+- Now wrong: one Ganges-delta part near Chandpur, (22.78, 90.39) → (23.19, 90.21). It follows by chain a part ETOPO misorients by 1.1 m on flat ground.
+- Unverified: 2- to 5-point lake-chain parts of the Churchill (4), the Albany (2), the Caniapiscau (2) and the Bell (2), and one part each of the Athabasca, the Yuan, the Wujia, the Yangtze and the Indus.
+
+The table is 964,421 bytes (unchanged). Run: `dev` profile. Pass time at 0 ka 1.45 s (0.20 s sampling); 118,983 river nodes (118,963 before the round), 861 lakes.
+
+**The guard on real data.** 33 courses have corridor nodes, and the corridor makes 167 nodes land. The guard cuts 3 courses, each at its first below-sea interior node, which is open sea, so no corridor land comes before it:
+
+| Course | Where | Sampled |
+|---|---|---|
+| Sénégal | Saint-Louis (16.10, −16.52) | −11.1 m |
+| Pánuco | Tampico (22.21, −97.91) | −10.5 m |
+| Clarence | New Zealand (−42.14, 173.97) | −16.8 m |
+
+**Seas.** The Black Sea, the Baltic (and the Gulf of Bothnia), the Mediterranean, the Aegean and the Sea of Azov are still ocean; the Caspian is not. This was probed at one node each, with a temporary probe that is not committed. The reference fixtures `indus.json` and `amazon.json` re-bake byte-identical, because `hydro_ref.py` burns no courses, so its `ocean_mask` is unchanged.
+
+**hydro check: FAIL.** 20 of 22 outlets pass:
+- **Yangtze:** now passes.
+- **Nile:** now fails, on its tolerance only.
+- **Mississippi:** still fails, on its New Orleans via.
+- **Indus box:** fails on its links, as before.
+
+| Bar | Before this round (round 2) | After | Verdict |
+|---|---|---|---|
+| Indus box, relaxed | 81.3%, 73/84, worst 77.5 km | the same | FAIL (links only) |
+| Amazon flats | 91.6%, 458/482 | the same | PASS |
+| The five lakes | exact | exact | PASS |
+| Arid basins | 0 of 3, 0 of 2 | the same | PASS |
+| Danube | 0.3 km; 42 km | 0.3 km; 7 km (the Chilia arm runs to the sea) | PASS |
+| Jhelum / Indus | 1.1 km; 21 km | 1.1 km; 8 km | PASS |
+| Ganges / Brahmaputra | 95 km | 110 km | PASS |
+| Pearl | 20 km | 31 km | PASS |
+| Orinoco | 11 km | 14 km | PASS |
+| Amazon, Yellow, Mekong, Congo, Niger, Hudson, Yenisei, Ob, Paraná, Lena, Volga, Mackenzie | — | the same distances | PASS |
+| **Yangtze** | 162 km | **121 km** | **PASS** |
+| **Nile** | 138 km | **161 km** | **FAIL** (11 km over) |
+| **Mississippi** | 137 km; New Orleans 23.1 km | 141 km; New Orleans 37.2 km | **FAIL** (the via) |
+| Discharge | Nile 5.11 flagged | identical, all 18 gauges | |
+| Endorheic surplus | the Caspian 3,449 of 12,853 m³/s | the same | |
+| Burnt nodes | 31,987; p99 439 m; 4,638 over 50 m | 31,986; p99 446 m; 4,621 over 50 m | |
+| Pinned at 0 m | 19 nodes on 10 courses | 32 nodes on 11 courses (the Angara added; the Chilia, pinned in this round's first run, left) | |
+
+- **The Yangtze** reaches the coast at (31.85, 120.82), 121 km from its cited outer mouth. Its estuary course is no longer ocean.
+- **The Nile** now runs down the Damietta branch to the sea at (31.49, 31.84). Before, Lake Manzala's lagoon was ocean, so the trace stopped 26 km short. Its cited "mouth" is the delta's head (the infobox's 30.17 N, 31.14 E), 161 km from the sea, so reaching the sea fails the 150 km allowance. It fails on its tolerance only and goes to the owner.
+- **The Mississippi** still leaves its course 37 km short of New Orleans, by a mechanism the corridor cannot reach (probe below). Its course is no longer ocean anywhere.
+
+**The lakes, diffed** against round 2's dump. 853 of 861 are identical. 8 changed flows, none its kind:
+- **Baikal:** 35,544 → 35,343 km², inflow 3,956 → 3,968 m³/s. Its footprint changed at the Angara's outlet.
+- **A flat at −328 m in Baikal's northern bed** (55.36, 109.83): inflow 28.4 → 25.3.
+- **A data lake at −0.1 m beside New Orleans** (29.78, −90.19): inflow 2.6 → 12.9. The Mississippi's course node at New Orleans drains into it.
+- **Michigan–Huron, Erie and Ontario:** under 0.2 m³/s each, and Michigan–Huron's area +78 km². The St. Clair was reversed to its true direction.
+- **Two data lakes at 207 m in the Athabasca delta:** about 1 m³/s each.
+
+**The Mississippi, probed.** Node by node near New Orleans, every course node is land. None drains straight to the ocean: the inland rule holds.
+- The course's routing elevation is its land chain: 0 m on land plus 0.01 m per node from its end. It stands 0.19, 0.18, 0.17 … 0.08 m over its last 12 nodes here.
+- The marsh beside it samples 0.06–0.11 m. At (30.06, −90.70) the course node (0.17 m) has an off-course neighbour at 0.11 m, the steepest drop, so the river leaves the course there. It reaches the sea at (29.87, −90.45), Barataria's ocean component.
+- Keeping the course off the ocean cannot fix this, because the course is higher than the land beside it.
+- **Options for the owner:**
+  - Interior course nodes take their next course node as their receiver.
+  - The corridor's beds may go below 0 m, down to `level − 10 m`, since corridor nodes can no longer become ocean.
+  - Accept it, as a via tolerance.
+
+Pictures: [Mississippi](hydro-check-outlet-mississippi.svg), [Nile](hydro-check-outlet-nile.svg), [Yangtze, now passing](hydro-check-outlet-yangtze.svg) (round 1's [before](hydro-check-outlet-yangtze-before.svg)), and the [Danube](hydro-check-outlet-danube.svg). The Indus box picture is refreshed.
+
+**Pinned at 0 m, the Angara.** Now that it is oriented right, its first part starts at Listvyanka on Baikal's shore. That point is not in the lake map, but its 5′ sample mixes in Baikal's bed (the 1′ cells within 5′ have a mean of 126 m and a minimum of −978 m). The running minimum falls below 0 m, so the course down to Irkutsk is burnt at 0 m. Reading mapped lakes at their surface in the burn does not reach it (tried: the point is outside the map). Left for the owner.
+
 ### Fix round 2 (2026-11-26)
 
 The controller's rulings:

@@ -17,10 +17,12 @@ routing wherever the terrain is today's (``timefly_core::hydrology::today_rivers
   ``data/hydrology/rivers_extra.json`` holds a delta's main channel where Natural Earth's course
   stops above it, each entry cited (:func:`read_extras`). They are appended after Natural
   Earth's courses as given: already upstream first and simplified.
-- **Orient lake centrelines by their connections** (Task 11d fix round 2): a reservoir's ends
-  are flat water, so the oriented courses it joins decide (:func:`orient_lake_parts`); ETOPO
-  only where neither end connects, or the ends disagree.
-- **Orient:** upstream first. Each end's height is the lowest ETOPO 2022 60″ surface cell whose
+- **Orient every part, the most certain first** (Task 11d fix rounds 2 and 3;
+  :func:`orient_by_connections`): ETOPO's end heights and how the parts join both vote, each as
+  sure as its evidence, and the surest decides; a decided part's junctions then vote for the
+  parts they join. A reservoir's or a delta arm's ends are flat water, so a clearer neighbour
+  decides it.
+- **Orient** (ETOPO's vote): upstream first. Each end's height is the lowest ETOPO 2022 60″ surface cell whose
   centre lies within :data:`ORIENT_CELLS` cells (2′) of the end's cell, in both rows and columns;
   the higher end goes first. Ties keep Natural Earth's order.
 - **Simplify:** Ramer–Douglas–Peucker with great-circle distances, :data:`SIMPLIFY_M` (1 km), so
@@ -35,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,6 +117,36 @@ class CellGrid:
         return float(np.nanmin(np.ma.filled(np.asarray(window, dtype=np.float64), np.nan)))
 
 
+@traced
+def end_height(grid: CellGrid, lat: float, lon: float, ids, surfaces) -> float:
+    """A part end's height for orienting it: :meth:`CellGrid.lowest_near`, but a cell inside a
+    mapped lake (``ids``, the 0.05-degree lake map) reads as the lake's surface
+    (``surfaces[id]``): ETOPO holds the bed of the deep lakes (Baikal's is about -1,000 m), and an
+    outlet's end would read it (Task 11d fix round 3)."""
+    from timefly_bake.lakemap import cell_of
+
+    height, width = ids.shape
+    cells = ORIENT_CELLS
+    i = min(grid.rows - 1, max(0, math.floor((lat - grid.lat_s) * grid.per_deg)))
+    j = min(grid.cols - 1, max(0, math.floor((lon - grid.lon_w) * grid.per_deg)))
+    rows = range(max(0, i - cells), min(grid.rows, i + cells + 1))
+    cols = range(max(0, j - cells), min(grid.cols, j + cells + 1))
+    window = np.ma.filled(
+        np.asarray(grid.z[rows.start : rows.stop, cols.start : cols.stop], dtype=np.float64),
+        np.nan,
+    )
+    lowest = math.inf
+    for a, r in enumerate(rows):
+        for b, c in enumerate(cols):
+            la = grid.lat_s + (r + 0.5) / grid.per_deg
+            lo = grid.lon_w + (c + 0.5) / grid.per_deg
+            lake = int(ids[cell_of(la, lo, width, height)])
+            value = surfaces.get(lake, window[a, b]) if lake else window[a, b]
+            if not math.isnan(value):
+                lowest = min(lowest, float(value))
+    return lowest
+
+
 def _rank(properties) -> int:
     return int(round(float(properties["scalerank"])))
 
@@ -176,52 +209,168 @@ def select(features, cover=None) -> list[Polyline]:
     return out
 
 
+def _junctions(ends) -> Callable[[np.ndarray], tuple[float, float]]:
+    """A point's junction among ``ends``: ends within :data:`SIMPLIFY_M` of each other, chained,
+    are one junction, named by its least key. The table keeps no detail finer than its
+    simplification, and Natural Earth leaves streams unjoined by less (at Guiping the Xun ends
+    350 m from the point the Quan and the Yu share)."""
+    keys = sorted({_key(e) for e in ends})
+    root = {k: k for k in keys}
+
+    def find(k):
+        while root[k] != k:
+            root[k] = root[root[k]]
+            k = root[k]
+        return k
+
+    band = math.degrees(SIMPLIFY_M / EARTH_RADIUS_M)
+    bands: dict[int, list[tuple[float, float]]] = {}
+    for k in keys:
+        bands.setdefault(math.floor(k[0] / band), []).append(k)
+    xyz = {k: _unit(np.array([k]))[0] for k in keys}
+    for b, members in bands.items():
+        near = members + bands.get(b + 1, [])
+        for x, a in enumerate(members):
+            for c in near[x + 1 :]:
+                if float(_angle(xyz[a][None, :], xyz[c])[0]) * EARTH_RADIUS_M <= SIMPLIFY_M:
+                    ra, rc = find(a), find(c)
+                    if ra != rc:
+                        root[max(ra, rc)] = min(ra, rc)
+    return lambda point: find(_key(point))
+
+
 def _key(point) -> tuple[float, float]:
-    return (round(float(point[0]), 6), round(float(point[1]), 6))
+    """A point as the table stores it (:data:`ROUND_DIGITS`): ends the table cannot tell apart
+    are one junction (Natural Earth's Sulina arm starts 30 m from the Chilia's end and the Sfantu
+    Gheorghe's start; the table writes all three as one point)."""
+    return (round(float(point[0]), ROUND_DIGITS) + 0.0, round(float(point[1]), ROUND_DIGITS) + 0.0)
+
+
+#: How sure a tributary-mouth vote is (an end on another part's interior vertex), as a fall in
+#: metres: it decides a part flatter than this, and a clearer fall overrules it (a distributary
+#: leaves another part's interior too).
+MOUTH_VOTE_M = 1.0
 
 
 @traced
-def orient_lake_parts(lakes, rivers, fallback) -> tuple[list[Polyline], dict]:
-    """The lake centreline parts ``lakes`` upstream first, by their connections to the oriented
-    ``rivers``: an end at a course's first point (its upstream end) is the part's downstream end,
-    an end at a course's last point its upstream end. Repeated, so a chain of parts resolves from
-    the courses it joins. A part whose ends disagree, or which touches nothing, takes
-    ``fallback(part)`` (ETOPO). Returns the parts in their order and the counts by rule:
-    ``{"topology", "etopo", "ambiguous"}``."""
-    firsts = {_key(p.points[0]) for p in rivers}
-    lasts = {_key(p.points[-1]) for p in rivers}
-    done: dict[int, Polyline] = {}
-    ambiguous: set[int] = set()
-    changed = True
-    while changed:
-        changed = False
-        for k, part in enumerate(lakes):
-            if k in done or k in ambiguous:
-                continue
-            a, b = _key(part.points[0]), _key(part.points[-1])
-            keep = (a in lasts) or (b in firsts)
-            flip = (a in firsts) or (b in lasts)
-            if keep and flip:
-                ambiguous.add(k)
-                continue
-            if not (keep or flip):
-                continue
-            out = part
-            if flip:
-                out = Polyline(part.name, part.scalerank, part.points[::-1].copy(), True)
-            done[k] = out
-            firsts.add(_key(out.points[0]))
-            lasts.add(_key(out.points[-1]))
-            changed = True
-    counts = {"topology": len(done), "etopo": 0, "ambiguous": len(ambiguous)}
-    result = []
-    for k, part in enumerate(lakes):
-        if k in done:
-            result.append(done[k])
+def orient_by_connections(parts, heights, fixed=(), rules=None) -> tuple[list[Polyline], dict]:
+    """``parts`` upstream first, the most certain first (Task 11d fix rounds 2 and 3).
+
+    ``fixed`` are parts already oriented (certain); ``heights(part)`` gives ETOPO's ``(first,
+    last)`` end heights of a raw part. Each undecided part has candidates, each a direction and
+    how sure it is:
+
+    - **ETOPO**: reversed when the last end stands higher; sure by the ends' height difference.
+    - **A tributary's mouth**: an end on another part's interior vertex is its downstream end;
+      sure as a fall of :data:`MOUTH_VOTE_M`.
+    - **A junction**, once every other part meeting there is decided: an end where one starts and
+      none ends is downstream (it flows into that part); an end where they all end is upstream
+      (it is their outflow); a fork or a confluence with a known inflow gives no vote. Where two
+      parts meet (a chain), as sure as the last decision there; where three or more meet, the
+      part's role is inferred, as sure as :data:`MOUTH_VOTE_M` at most.
+
+    The surest candidate of any part is taken first, and its junctions offer candidates to the
+    parts they join. Candidates of one part equally sure in opposite directions are "ambiguous":
+    ETOPO decides. Returns the parts in their order and the counts by rule (``{"topology",
+    "etopo", "ambiguous"}``); ``rules`` (a list) gets each part's rule."""
+    import heapq
+
+    n = len(parts)
+    every = list(parts) + list(fixed)
+    junc = _junctions([e for p in every for e in (p.points[0], p.points[-1])])
+    # A part shorter than the junction reach (both ends one junction) joins nothing.
+    short = [junc(p.points[0]) == junc(p.points[-1]) for p in every]
+    ends_at: dict[tuple[float, float], list[int]] = {}
+    interior_at: dict[tuple[float, float], set[int]] = {}
+    for i, p in enumerate(every):
+        if not short[i]:
+            for end in (p.points[0], p.points[-1]):
+                ends_at.setdefault(junc(end), []).append(i)
+        for pt in p.points[1:-1]:
+            interior_at.setdefault(_key(pt), set()).add(i)
+    state: list[bool | None] = [None] * n + [True] * len(fixed)
+    how: list[str] = [""] * n
+    h = [heights(p) for p in parts]
+    etopo = [not h[i][1] > h[i][0] for i in range(n)]
+    heap: list[tuple[float, int, int, bool, str]] = []
+    seq = 0
+    pending: dict[int, list[tuple[float, bool]]] = {}
+
+    def offer(i, sure, keep, kind):
+        nonlocal seq
+        pending.setdefault(i, []).append((sure, keep))
+        heapq.heappush(heap, (-sure, seq, i, keep, kind))
+        seq += 1
+
+    def first(i):
+        return junc(every[i].points[0] if state[i] else every[i].points[-1])
+
+    def last(i):
+        return junc(every[i].points[-1] if state[i] else every[i].points[0])
+
+    def junction(j, at):
+        """The direction a decided junction at ``at`` gives undecided part ``j``, if any, and
+        whether it is only inferred (a junction of three or more parts)."""
+        others = [k for k in ends_at.get(at, ()) if k != j]
+        if not others or any(state[k] is None for k in others):
+            # A junction votes once every other part meeting there is known: an outflow seen
+            # before an undecided inflow would make a fork's arm (the Mekong's Tien at Phnom
+            # Penh) look like a tributary.
+            return None
+        starts = any(first(k) == at for k in others)
+        inflow = any(last(k) == at for k in others)
+        if starts and not inflow:
+            # The outflow is known and no inflow: this part flows in. With an inflow too, a third
+            # part may be a tributary or a distributary (a fork): no vote.
+            down = True
+        elif not starts:
+            down = False
         else:
-            counts["etopo"] += k not in ambiguous
-            result.append(fallback(part))
-    return result, counts
+            return None
+        raw_first = junc(parts[j].points[0]) == at
+        # Downstream at its raw first end, or upstream at its raw last end: reverse it. Two
+        # parts meeting are a chain and the direction carries over; at three or more, the part's
+        # role (a fork's missing inflow, a confluence's missing outflow) is only inferred, and
+        # Natural Earth often leaves a stem unjoined (the Danube 12 km short of the fork of the
+        # Chilia, Sulina and Sfantu Gheorghe arms).
+        return not (down == raw_first), len(others) > 1
+
+    def decided(i, sure):
+        for at in {first(i), last(i)}:
+            for j in ends_at.get(at, ()):
+                if j < n and state[j] is None:
+                    vote = junction(j, at)
+                    if vote is not None:
+                        keep, inferred = vote
+                        offer(j, min(sure, MOUTH_VOTE_M) if inferred else sure, keep, "topology")
+
+    for i in range(n):
+        offer(i, abs(h[i][0] - h[i][1]), etopo[i], "etopo")
+        a, b = _key(parts[i].points[0]), _key(parts[i].points[-1])
+        at_a = any(j != i for j in interior_at.get(a, ()))
+        at_b = any(j != i for j in interior_at.get(b, ()))
+        if at_a != at_b:
+            offer(i, MOUTH_VOTE_M, at_b, "topology")
+    for k in range(n, len(every)):
+        state[k] = True
+        decided(k, float("inf"))
+    while heap:
+        sure, _, i, keep, kind = heapq.heappop(heap)
+        if state[i] is not None:
+            continue
+        rivals = [c for c in pending.get(i, ()) if c[0] == -sure and c[1] != keep]
+        if rivals:
+            keep, kind = etopo[i], "ambiguous"
+        state[i] = keep
+        how[i] = kind
+        decided(i, -sure)
+    out = []
+    for i, p in enumerate(parts):
+        out.append(p if state[i] else Polyline(p.name, p.scalerank, p.points[::-1].copy(), p.lake))
+    counts = {k: how.count(k) for k in ("topology", "etopo", "ambiguous")}
+    if rules is not None:
+        rules.extend(how)
+    return out, counts
 
 
 @traced
@@ -346,7 +495,16 @@ def bake(
     features = json.loads(Path(geojson_path).read_text(encoding="utf-8"))["features"]
     from timefly_bake import lakemap
 
-    ids, _ = lakemap.decode(Path(lake_map_path).read_bytes())
+    ids, map_levels = lakemap.decode(Path(lake_map_path).read_bytes())
+    surfaces = {k + 1: float(x) for k, x in enumerate(map_levels)}
+    # The level table's lakes: ETOPO holds their beds, so the map's median is no surface.
+    table = json.loads((Path(lake_map_path).parent / "lake_levels.json").read_text())["lakes"]
+    for lake in table:
+        from timefly_bake.lakemap import cell_of
+
+        lake_id = int(ids[cell_of(lake["lat"], lake["lon"], ids.shape[1], ids.shape[0])])
+        if lake_id:
+            surfaces[lake_id] = float(lake["level_m"])
     lake_parts: dict[str, list] = {"added": [], "covered": []}
 
     def cover(name, points):
@@ -359,6 +517,7 @@ def bake(
         return share
 
     selected = select(features, cover=cover)
+    index = {id(p): k for k, p in enumerate(selected)}
     raw_points = sum(len(p.points) for p in selected)
     with netCDF4.Dataset(Path(etopo_path)) as ds:
         z = ds.variables["z"]
@@ -369,18 +528,24 @@ def bake(
         if abs(float(lon[0]) + 180.0 - 0.5 / 60) > 1e-6:
             raise ValueError(f"{Path(etopo_path).name}: longitudes do not start at -180")
         grid = CellGrid(z, lat_s=-90.0, lon_w=-180.0, per_deg=60)
-        rivers = [orient(p, grid) for p in selected if not p.lake]
-        lakes = [p for p in selected if p.lake]
-        lakes_oriented, orient_counts = orient_lake_parts(
-            lakes, rivers, lambda p: orient(p, grid)
+        ends = [
+            (
+                end_height(grid, *p.points[0], ids, surfaces),
+                end_height(grid, *p.points[-1], ids, surfaces),
+            )
+            for p in selected
+        ]
+        rules: list[str] = []
+        # The hand-added channels are cited upstream first: certain, and they decide the arms
+        # that feed them.
+        extras = read_extras(Path(extra_path).read_text(encoding="utf-8"))
+        oriented, orient_counts = orient_by_connections(
+            selected, lambda p: ends[index[id(p)]], fixed=extras, rules=rules
         )
-        by_kind = {False: iter(rivers), True: iter(lakes_oriented)}
-        oriented = [next(by_kind[p.lake]) for p in selected]
     reversed_count = sum(
         1 for a, b in zip(selected, oriented) if a.points[0].tolist() != b.points[0].tolist()
     )
     simple = [simplify(p, SIMPLIFY_M) for p in oriented]
-    extras = read_extras(Path(extra_path).read_text(encoding="utf-8"))
     simple += extras
     text = table_text(simple)
     size = len(text.encode("utf-8"))
@@ -397,7 +562,13 @@ def bake(
         "points_out": sum(len(r["points"]) for r in table["rivers"]),
         "bytes": size,
         "extras": [p.name for p in extras],
-        "lake_orientation": orient_counts,
+        "orientation": orient_counts,
+        "orientation_rivers": {
+            k: sum(1 for p, r in zip(selected, rules) if r == k and not p.lake) for k in orient_counts
+        },
+        "orientation_lakes": {
+            k: sum(1 for p, r in zip(selected, rules) if r == k and p.lake) for k in orient_counts
+        },
         "lake_centrelines_added": lake_parts["added"],
         "lake_centrelines_covered": lake_parts["covered"],
     }
@@ -435,13 +606,15 @@ def main(argv=None) -> int:
 __all__ = [
     "ARTIFICIAL_NAME_WORDS",
     "CellGrid",
+    "end_height",
     "Polyline",
     "bake",
     "is_artificial",
     "lake_cover",
     "main",
     "orient",
-    "orient_lake_parts",
+    "MOUTH_VOTE_M",
+    "orient_by_connections",
     "read_extras",
     "select",
     "simplify",

@@ -344,6 +344,10 @@ struct CourseLevel {
     route: f32,
     /// The course's last burnable node: the only one that may meet the sea.
     last: bool,
+    /// An interior node below the sea: `(its routing elevation if routing finds it joined to the
+    /// ocean (the course corridor, Task 11d fix round 3): the land chain, never below 0 m; its
+    /// own elevation, for the open-sea guard)`.
+    corridor: Option<(f32, f32)>,
     /// The river graph's bed: the running minimum, sloped across held stretches.
     bed: f32,
     anchor: DVec3,
@@ -390,21 +394,29 @@ fn course_levels(
         }
         path.push(m);
     }
-    // Routing's elevation, from the course's end upstream.
+    // Routing's elevation, from the course's end upstream: the land chain treats every node as
+    // land (never below 0 m, at least DEPRESSION_EPS_M above the next); a node below the sea
+    // keeps `level − burn`, unless routing finds it an interior node joined to the ocean (the
+    // corridor), when it takes the chain.
     let burn = TODAY_RIVER_BURN_M as f32;
     let eps = DEPRESSION_EPS_M as f32;
-    let mut route = vec![0.0f32; e.len()];
+    let mut chain = vec![0.0f32; e.len()];
     for k in (0..e.len()).rev() {
-        route[k] = if e[k] >= 0.0 {
-            let raw = (level[k] - burn).max(0.0);
-            match route.get(k + 1) {
-                Some(&down) => raw.max(down + eps),
-                None => raw,
-            }
-        } else {
-            level[k] - burn
+        let raw = (level[k] - burn).max(0.0);
+        chain[k] = match chain.get(k + 1) {
+            Some(&down) => raw.max(down + eps),
+            None => raw,
         };
     }
+    let route: Vec<f32> = (0..e.len())
+        .map(|k| {
+            if e[k] >= 0.0 {
+                chain[k]
+            } else {
+                level[k] - burn
+            }
+        })
+        .collect();
     let last = nodes.iter().rposition(|&(v, _)| burnable(v));
     let mut next = 0;
     for (k, &(v, anchor)) in nodes.iter().enumerate() {
@@ -430,6 +442,7 @@ fn course_levels(
                 level: clamp(held),
                 route: route[k],
                 last: last == Some(k),
+                corridor: (last != Some(k) && e[k] < 0.0).then_some((chain[k], e[k])),
                 bed: bed.min(clamp(held)),
                 anchor,
             });
@@ -541,6 +554,11 @@ pub(crate) struct BurntNodes {
     at: HashMap<u32, u32>,
     /// The nodes that end a course (its last burnable node), which alone may meet the sea.
     ends: Vec<u32>,
+    /// The nodes inside some course (any but its last).
+    interior: Vec<u32>,
+    /// Each course's interior nodes below the sea, in course order: `(node, land-chain
+    /// elevation, own elevation)`.
+    corridor: Vec<Vec<(u32, f32, f32)>>,
 }
 
 impl BurntNodes {
@@ -570,24 +588,56 @@ impl BurntNodes {
         &self.list
     }
 
-    /// The burnt nodes that end no course, sorted: routing never drains them into the ocean
-    /// (Task 11d fix round 2: a course meets the sea only at its own end).
+    /// The nodes inside some course (any node but a course's last), sorted: routing never
+    /// drains them into the ocean (Task 11d fix rounds 2 and 3: a course meets the sea only at
+    /// its own end, and a node that ends one course but lies inside another is inland).
     pub(crate) fn inland(&self) -> Vec<u32> {
+        let mut out = self.interior.clone();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Each course's interior nodes below the sea, in course order, `(node, land-chain
+    /// elevation, own elevation)`: routing keeps them out of the ocean up to the first open-sea
+    /// node (Task 11d fix round 3).
+    pub(crate) fn corridor(&self) -> Vec<Vec<(u32, f32, f32)>> {
+        self.corridor
+            .iter()
+            .filter(|c| !c.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Starts the next course's corridor.
+    pub(crate) fn begin_course(&mut self) {
+        if self.corridor.last().is_none_or(|c| !c.is_empty()) {
+            self.corridor.push(Vec::new());
+        }
+    }
+
+    /// The nodes that end some course, sorted.
+    pub(crate) fn ends(&self) -> Vec<u32> {
         let mut ends = self.ends.clone();
         ends.sort_unstable();
-        let mut out: Vec<u32> = self
-            .list
-            .iter()
-            .map(|&(v, _)| v)
-            .filter(|v| ends.binary_search(v).is_err())
-            .collect();
-        out.sort_unstable();
-        out
+        ends.dedup();
+        ends
     }
 
     fn add(&mut self, c: CourseLevel) {
         if c.last {
             self.ends.push(c.node);
+        } else {
+            self.interior.push(c.node);
+        }
+        if let Some((r, e)) = c.corridor {
+            if self.corridor.is_empty() {
+                self.corridor.push(Vec::new());
+            }
+            self.corridor
+                .last_mut()
+                .expect("a course")
+                .push((c.node, r, e));
         }
         match self.at.entry(c.node) {
             Entry::Occupied(o) => {
@@ -614,6 +664,12 @@ impl BurntNodes {
             + 32 * self.beds.capacity()
             + 12 * self.at.capacity()
             + 4 * self.ends.capacity()
+            + 4 * self.interior.capacity()
+            + self
+                .corridor
+                .iter()
+                .map(|c| 24 + 12 * c.capacity())
+                .sum::<usize>()
             + 4 * self.routes.capacity()
     }
 }
@@ -714,6 +770,7 @@ impl TodayBurn {
                 used += LEVEL_UNITS * nodes.len() as u32;
                 let burnable = |v: u32| !is_ice(v) && source.todays_terrain(lattice.dir(v));
                 let burnt = &mut self.burnt;
+                burnt.begin_course();
                 course_levels(
                     &nodes,
                     |v| elevation[v as usize],

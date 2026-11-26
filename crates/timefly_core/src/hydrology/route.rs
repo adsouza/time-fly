@@ -9,6 +9,15 @@
 //!   (ties: the lowest node id). Repeat until nothing changes: dilate the ocean by
 //!   `ceil(OCEAN_STRAIT_M / spacing)` graph steps through any node, and add every below-zero
 //!   component the dilation touches. Dilated land stays land.
+//! - **The course corridor** ([`Routing::with_corridor`], Task 11d fix round 3): a burnt
+//!   course's interior node that the rules above make ocean is land after all, at its course's
+//!   land-chain elevation (never below 0 m): ETOPO's channel and lagoon floors otherwise carry
+//!   the sea up estuaries. The labelling itself is unchanged. Each course's corridor ends at its
+//!   first such node below [`OPEN_SEA_M`] (open sea: a line drawn past the coast), which
+//!   becomes one of the ends an inland node may drain to.
+//! - **Inland nodes** ([`Routing::with_inland`]): an ocean node that ends no course pushes no
+//!   inland neighbour in the flood, so an inland node's parent is never such an ocean node.
+//!   Should the flood run out with nodes unreached, the lowest of them seeds it again.
 //! - **Sinks** ([`Routing::with_sinks`], Task 11d fix round 2): for each `(node, level)` of an
 //!   endorheic lake, the non-ocean nodes with `e ≤ level` 8-connected to `node` (none if `node`
 //!   is ocean or above `level`) are pushed first, keyed `(level, seq)`, with `filled = level` and
@@ -21,16 +30,16 @@
 //!   at all, seed the lowest node (ties: the lowest id).
 //! - **Receiver:** the neighbour with a strictly lower filled level and the largest
 //!   `(filled[i] − filled[j]) / distance` (ties: first in neighbour order); with none strictly
-//!   lower, the parent. A burnt course's node that ends no course ([`Routing::with_inland`])
-//!   takes no ocean neighbour as its receiver: a course meets the sea only at its own end (Task
-//!   11d fix round 2).
+//!   lower, the parent. A burnt course's interior node ([`Routing::with_inland`]) takes no ocean
+//!   neighbour as its receiver unless that neighbour ends a course: a course meets the sea only
+//!   at its own end (Task 11d fix rounds 2 and 3).
 //! - **Basins:** 8-connected components of nodes with `filled > e + DEPRESSION_EPS_M`. The exit
 //!   is the basin node popped first; the rim is its parent. Every other basin node whose receiver
 //!   leaves the basin is redirected to the exit, so pop order is a topological order (receiver
 //!   before node).
 
 use super::HydroGraph;
-use super::params::{DEPRESSION_EPS_M, OCEAN_STRAIT_M};
+use super::params::{DEPRESSION_EPS_M, OCEAN_STRAIT_M, OPEN_SEA_M};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
@@ -185,6 +194,15 @@ pub struct Routing {
     units: u64,
     /// Nodes (sorted) that take no ocean neighbour as their receiver.
     inland: Vec<u32>,
+    /// Nodes (sorted) that end a burnt course: the only ocean an inland node may drain to.
+    ends: Vec<u32>,
+    /// Each course's interior nodes below the sea, in course order: `(node, land elevation,
+    /// own elevation)`.
+    corridor: Vec<Vec<(u32, f32, f32)>>,
+    /// Non-ocean nodes the flood has reached.
+    reached: u32,
+    /// The corridor's nodes made land (sorted), while it is applied.
+    made_land: Vec<u32>,
     /// Endorheic lakes' `(node, level)`, and once grown, each node's sink flag (empty with none).
     sink_points: Vec<(u32, f32)>,
     sink: Vec<bool>,
@@ -229,9 +247,29 @@ impl Routing {
             open: None,
             units: 0,
             inland: Vec::new(),
+            ends: Vec::new(),
+            corridor: Vec::new(),
+            reached: 0,
+            made_land: Vec::new(),
             sink_points: Vec::new(),
             sink: Vec::new(),
         }
+    }
+
+    /// The router, with each burnt course's interior nodes below the sea in course order,
+    /// `(node, land elevation, own elevation)`: any the rules make ocean stays land at its land
+    /// elevation, up to the course's first open-sea node (Task 11d fix round 3).
+    pub fn with_corridor(mut self, corridor: Vec<Vec<(u32, f32, f32)>>) -> Self {
+        self.corridor = corridor;
+        self
+    }
+
+    fn is_inland(&self, i: u32) -> bool {
+        self.inland.binary_search(&i).is_ok()
+    }
+
+    fn is_end(&self, i: u32) -> bool {
+        self.ends.binary_search(&i).is_ok()
     }
 
     /// The router, with each endorheic lake's `(node, level)` seeding the flood like the sea at
@@ -243,9 +281,10 @@ impl Routing {
 
     /// The router, with `inland` (sorted node ids) never draining into an ocean neighbour: a
     /// burnt course's nodes other than its end (Task 11d fix round 2).
-    pub fn with_inland(mut self, inland: Vec<u32>) -> Self {
-        debug_assert!(inland.is_sorted());
+    pub fn with_inland(mut self, inland: Vec<u32>, ends: Vec<u32>) -> Self {
+        debug_assert!(inland.is_sorted() && ends.is_sorted());
         self.inland = inland;
+        self.ends = ends;
         self
     }
 
@@ -290,6 +329,9 @@ impl Routing {
             + self.order.capacity()
             + self.basin_of.capacity()
             + self.inland.capacity()
+            + self.ends.capacity()
+            + self.made_land.capacity()
+            + 3 * self.corridor.iter().map(Vec::capacity).sum::<usize>()
             + 2 * self.sink_points.capacity())
             + self.sink.capacity()
             + self.component_ocean.capacity()
@@ -468,6 +510,33 @@ impl Routing {
     }
 
     fn end_ocean(&mut self) {
+        // The course corridor: interior course nodes the sea reached are land, up to each
+        // course's first open-sea node, which ends it. A node another course already made land
+        // keeps the lower land elevation.
+        for course in std::mem::take(&mut self.corridor) {
+            for (v, r, e) in course {
+                let i = v as usize;
+                if !self.ocean[i] {
+                    if self.made_land.binary_search(&v).is_ok() {
+                        self.elevation[i] = self.elevation[i].min(r);
+                    }
+                    continue;
+                }
+                if e < OPEN_SEA_M {
+                    if let Err(at) = self.ends.binary_search(&v) {
+                        self.ends.insert(at, v);
+                    }
+                    break;
+                }
+                self.ocean[i] = false;
+                self.ocean_count -= 1;
+                self.elevation[i] = r;
+                if let Err(at) = self.made_land.binary_search(&v) {
+                    self.made_land.insert(at, v);
+                }
+            }
+        }
+        self.made_land = Vec::new();
         self.component = Vec::new();
         self.component_start = Vec::new();
         self.component_nodes = Vec::new();
@@ -497,6 +566,7 @@ impl Routing {
             }
             let mut queue = VecDeque::from([node]);
             self.visited[n] = true;
+            self.reached += 1;
             while let Some(v) = queue.pop_front() {
                 cost = cost.saturating_add(1);
                 self.sink[v as usize] = true;
@@ -506,6 +576,7 @@ impl Routing {
                     let uu = u as usize;
                     if !self.ocean[uu] && !self.visited[uu] && self.elevation[uu] <= level {
                         self.visited[uu] = true;
+                        self.reached += 1;
                         queue.push_back(u);
                     }
                 }
@@ -528,6 +599,7 @@ impl Routing {
         if !self.any_ocean {
             if self.len() > 0 {
                 self.visited[self.lowest as usize] = true;
+                self.reached += 1;
                 self.push(self.lowest);
             }
             self.phase = Phase::Flood;
@@ -550,6 +622,22 @@ impl Routing {
     }
 
     fn flood(&mut self, g: &impl HydroGraph) -> u32 {
+        if self.heap.is_empty() && self.reached < self.len() - self.ocean_count {
+            // Nodes the flood could not reach (an inland node walled in by ocean that ends no
+            // course): the lowest seeds it again. One scan; never seen on real data.
+            let lowest = (0..self.len())
+                .filter(|&i| !self.ocean[i as usize] && !self.visited[i as usize])
+                .min_by(|&a, &b| {
+                    self.elevation[a as usize]
+                        .total_cmp(&self.elevation[b as usize])
+                        .then(a.cmp(&b))
+                })
+                .expect("an unreached node");
+            self.visited[lowest as usize] = true;
+            self.reached += 1;
+            self.push(lowest);
+            return self.len();
+        }
         let Some(Reverse((_, _, c))) = self.heap.pop() else {
             self.heap = BinaryHeap::new();
             self.visited = Vec::new();
@@ -561,12 +649,15 @@ impl Routing {
             self.order.push(c);
         }
         let level = self.filled[c as usize];
+        // An ocean node that ends no course reaches no inland node.
+        let shut = self.ocean[c as usize] && !self.inland.is_empty() && !self.is_end(c);
         for u in g.neighbours(c).into_iter().flatten() {
             let uu = u as usize;
-            if self.ocean[uu] || self.visited[uu] {
+            if self.ocean[uu] || self.visited[uu] || (shut && self.is_inland(u)) {
                 continue;
             }
             self.visited[uu] = true;
+            self.reached += 1;
             self.filled[uu] = max_total(self.elevation[uu], level);
             self.parent[uu] = back_index(g, u, c);
             self.push(u);
@@ -583,11 +674,11 @@ impl Routing {
         let i = next as usize;
         if !self.ocean[i] && !self.is_sink(next) {
             let level = self.filled[i];
-            let inland = self.inland.binary_search(&next).is_ok();
+            let inland = self.is_inland(next);
             let mut best: Option<(u8, f64)> = None;
             for (k, j) in g.neighbours(next).into_iter().enumerate() {
                 let Some(j) = j else { continue };
-                if inland && self.ocean[j as usize] {
+                if inland && self.ocean[j as usize] && !self.is_end(j) {
                     continue;
                 }
                 let other = self.filled[j as usize];
@@ -703,6 +794,42 @@ mod tests {
     /// Rivers and lakes Task 10, fix round 1: the largest ocean component turns ocean (and the
     /// dilation's step counts fill) over several steps, not in one unit (6.8 ms natively at
     /// n = 900), with the same result.
+    /// Task 11d fix round 3: an inland node (a burnt course's interior) never takes an ocean
+    /// receiver, even when its only lower neighbour is the sea and the flood reached it from
+    /// the sea (`pick_receiver`'s parent fallback).
+    #[test]
+    fn an_inland_node_never_takes_an_ocean_receiver() {
+        let g = GridGraph {
+            rows: 3,
+            cols: 5,
+            spacing_m: 1000.0,
+        };
+        // Ocean in column 0; (1, 1) at 1 m between the sea and 5 m land.
+        let elevation: Vec<f32> = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (1, 1) => 1.0,
+                _ => 5.0,
+            })
+            .collect();
+        let inland = g.node(1, 1);
+        let run = |inland: Vec<u32>| {
+            let mut routing = Routing::new(elevation.clone()).with_inland(inland, Vec::new());
+            while !routing.step(&g, 3) {}
+            routing.finish()
+        };
+        // The hazard: alone, it drains to the sea.
+        let plain = run(Vec::new());
+        let to = receiver_of(&g, &plain, inland).unwrap();
+        assert!(plain.ocean[to as usize]);
+        let r = run(vec![inland]);
+        assert!(receiver_of(&g, &r, inland).is_none_or(|j| !r.ocean[j as usize]));
+        // Every other node routes as before.
+        for v in (0..g.len()).filter(|&v| v != inland) {
+            assert_eq!(r.ocean[v as usize], plain.ocean[v as usize]);
+        }
+    }
+
     #[test]
     fn the_largest_ocean_is_marked_over_several_steps() {
         // An 80 × 80 grid, its western half sea (3,200 nodes, one component).

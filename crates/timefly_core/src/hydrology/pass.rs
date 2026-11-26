@@ -674,7 +674,8 @@ impl HydroPrep {
         };
         Stage::Route(Box::new(
             Routing::new(std::mem::take(&mut self.elevation))
-                .with_inland(self.beds.inland())
+                .with_inland(self.beds.inland(), self.beds.ends())
+                .with_corridor(self.beds.corridor())
                 .with_sinks(sinks),
         ))
     }
@@ -2658,6 +2659,172 @@ mod tests {
 
     /// Task 11d fix round 2 (rule B, the Hudi's case): a course crossing another's 0 m flat
     /// keeps its own direction past the crossing, though the other's sea is nearer.
+    /// Whether each interior node of `course` (all but its last) is land and drains to the next
+    /// (the last may be ocean); the first that does not, otherwise.
+    fn runs_to_its_end(h: &EraHydrology, course: &[u32]) -> Result<(), String> {
+        for w in course.windows(2) {
+            if h.is_ocean(w[0]) {
+                return Err(format!("interior node {} is ocean", w[0]));
+            }
+            let k = h
+                .rivers
+                .index_of(w[0])
+                .ok_or(format!("{} carries no river", w[0]))?;
+            let n = h.rivers.nodes()[k as usize];
+            match n.down {
+                Down::Ocean(j) if j == w[1] => {}
+                Down::Ocean(j) => {
+                    return Err(format!("{n:?} meets the sea at {j}, not at {}", w[1]));
+                }
+                _ if down_node(&h.rivers, &n) == w[1] => {}
+                _ => return Err(format!("{n:?} does not drain to {}", w[1])),
+            }
+        }
+        Ok(())
+    }
+
+    /// An estuary 3 m below the sea 0.6 degrees either side of the course from 5° N down to its
+    /// end at 0.2° N, open to the sea (the Yangtze below Zhenjiang).
+    fn estuary_plain() -> Plain {
+        estuary_plain_to(0.2)
+    }
+
+    /// [`estuary_plain`] with the course ending at `end_lat` degrees N.
+    fn estuary_plain_to(end_lat: f64) -> Plain {
+        Plain::new([(10.0, 10.0), (end_lat, 10.0)], |lat, lon, _| {
+            if lat < 5.0 && (lon - 10.0).abs() < 0.6 {
+                -3.0
+            } else {
+                0.5 + 0.05 * lat.clamp(0.0, 10.0)
+            }
+        })
+    }
+
+    /// Task 11d fix round 3 (the course corridor): ETOPO's estuary floors made the sea start up
+    /// the estuary, where a river met it 160 km short of its mouth. A course's interior nodes
+    /// are never ocean, and the river runs along it to its own end.
+    #[test]
+    fn an_estuary_course_runs_to_its_own_end() {
+        let plain = estuary_plain();
+        let nodes = plain.nodes();
+        // The hazard: without the course the estuary is ocean up to 5° N.
+        let bare = plain.pass(PRESENT, false);
+        let sunk = nodes[..nodes.len() - 1]
+            .iter()
+            .filter(|&&v| bare.is_ocean(v))
+            .count();
+        assert!(sunk >= 10, "{sunk}");
+        let h = plain.pass(PRESENT, true);
+        runs_to_its_end(&h, &nodes).unwrap();
+        // The rest of the estuary is still the sea.
+        let beside: Vec<u32> = (0..PLAIN_LATTICE.len())
+            .filter(|&v| bare.is_ocean(v) && !nodes.contains(&v))
+            .collect();
+        assert!(beside.len() >= 10);
+        assert!(beside.iter().all(|&v| h.is_ocean(v)));
+    }
+
+    /// Task 11d fix round 3 (the corridor's guard): a course drawn a degree out into the open
+    /// sea (Natural Earth's lines sometimes run past the coast) builds no spit: its corridor ends
+    /// at its first open-sea node, which then serves as its end. The estuary above still holds.
+    #[test]
+    fn a_course_run_out_to_sea_builds_no_spit() {
+        let plain = estuary_plain_to(-1.0);
+        let nodes = plain.nodes();
+        let bare = plain.pass(PRESENT, false);
+        let h = plain.pass(PRESENT, true);
+        // The hazard: the course runs on over the -2000 m sea south of 0° N.
+        let lat = |v: u32| latlon_of(v).0;
+        let out: Vec<u32> = nodes.iter().copied().filter(|&v| lat(v) < -0.2).collect();
+        assert!(out.len() >= 2, "{out:?}");
+        // No spit: the sea beyond the coast is the sea, as without the course.
+        for v in 0..PLAIN_LATTICE.len() {
+            if lat(v) < -0.2 {
+                assert_eq!(h.is_ocean(v), bare.is_ocean(v), "{v}");
+            }
+        }
+        // The estuary's course nodes stay land, and the river runs down them to the coast.
+        let estuary: Vec<u32> = nodes
+            .iter()
+            .copied()
+            .filter(|&v| (0.3..5.0).contains(&lat(v)))
+            .collect();
+        assert!(estuary.len() >= 10);
+        assert!(estuary.iter().all(|&v| !h.is_ocean(v)));
+        follows(&h, &nodes).unwrap();
+    }
+
+    /// Task 11d fix round 3 (rule B's junction hole): a node that ends one course but lies inside
+    /// another is that course's interior, so the other course never meets the sea there.
+    #[test]
+    fn a_junction_beside_a_lagoon_keeps_the_through_course() {
+        let plain = laplace_plain();
+        let main = plain.nodes();
+        // A tributary from the west ending on the main course beside the lagoon (5-8° N).
+        let tributary = TodayRiver {
+            name: "tributary".into(),
+            points: vec![(6.5, 6.0), (6.5, 10.0)],
+        };
+        let joined = crate::hydrology::today_rivers::today_river_nodes(&PLAIN_LATTICE, &tributary);
+        let at = *joined.last().unwrap();
+        assert!(main.contains(&at), "the tributary ends on the main course");
+        let table = shipped_table();
+        let mut prep = HydroPrep::with_tables(PLAIN_LATTICE, PRESENT, &[], &[])
+            .with_today_rivers(vec![plain.course(), tributary]);
+        while !prep.step(&plain, &plain, &table, u32::MAX) {}
+        let h = prep.finish();
+        // The hazard: the junction is beside the lagoon's ocean.
+        assert!(
+            PLAIN_LATTICE
+                .neighbours(at)
+                .into_iter()
+                .flatten()
+                .any(|u| h.is_ocean(u))
+        );
+        follows(&h, &main).unwrap();
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(6))]
+
+        /// Task 11d fix round 3: whatever the estuary and lagoons beside it, no interior burnt
+        /// node drains to the ocean, and none is ocean.
+        #[test]
+        fn no_interior_burnt_node_drains_to_the_ocean(
+            top in 1.0f64..8.0,
+            half in 0.2f64..1.0,
+            // Estuary floors (ETOPO's −0.2 to −7 m); below OPEN_SEA_M a course's corridor ends.
+            depth in 0.2f64..9.5,
+            lagoon in 2.0f64..8.0,
+        ) {
+            static PARAMS: std::sync::Mutex<(f64, f64, f64, f64)> =
+                std::sync::Mutex::new((0.0, 0.0, 0.0, 0.0));
+            *PARAMS.lock().unwrap() = (top, half, depth, lagoon);
+            let plain = Plain::new([(10.0, 10.0), (0.2, 10.0)], |lat, lon, _| {
+                let (top, half, depth, lagoon) = *PARAMS.lock().unwrap();
+                // The estuary, and a lagoon beside the course.
+                let estuary = lat < top && (lon - 10.0).abs() < half;
+                let beside = (lagoon..lagoon + 1.5).contains(&lat) && lon > 10.0 + half + 0.1;
+                if estuary || beside {
+                    -depth
+                } else {
+                    0.5 + 0.05 * lat.clamp(0.0, 10.0)
+                }
+            });
+            let nodes = plain.nodes();
+            let h = plain.pass(PRESENT, true);
+            for &v in &nodes[..nodes.len() - 1] {
+                proptest::prop_assert!(!h.is_ocean(v), "interior node {} is ocean", v);
+                if let Some(k) = h.rivers.index_of(v) {
+                    let n = h.rivers.nodes()[k as usize];
+                    if let Down::Ocean(j) = n.down {
+                        proptest::prop_assert_eq!(j, nodes[nodes.len() - 1], "{:?}", n);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_crossing_course_never_runs_backwards_along_a_flat() {
         let plain = Plain::new([(10.0, 10.0), (-1.0, 10.0)], |lat, _, _| {

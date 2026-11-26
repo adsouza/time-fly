@@ -128,9 +128,14 @@ def test_read_extras_refuses_an_uncited_entry():
 
 def test_lake_parts_are_oriented_by_their_connections_first():
     # Task 11d fix round 2: a reservoir's ends are flat water, so ETOPO cannot tell its
-    # direction; the oriented river courses it joins can.
+    # direction; the oriented river courses it joins can. (Fix round 3: one rule set for every
+    # part, rivers given here as already decided.)
     line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
-    rivers = [line("above", (0, 0), (1, 0)), line("below", (5, 0), (6, 0))]
+    rivers = [
+        line("above", (0, 0), (1, 0)),
+        line("below", (5, 0), (6, 0)),
+        line("beyond", (7, 0), (8, 0)),
+    ]
     lakes = [
         # Its first end touches the river above's last point: it already runs downstream.
         line("first", (1, 0), (2, 0)),
@@ -139,24 +144,151 @@ def test_lake_parts_are_oriented_by_their_connections_first():
         # Touches only the chain's other parts once they are oriented: (2, 0) is "first"'s end.
         line("between", (3, 0), (2, 0)),
         # Both ends at a course's first point, so each says the other way: ambiguous, ETOPO's.
-        line("both", (0, 0), (5, 0)),
+        line("both", (0, 0), (7, 0)),
         # Touches nothing: ETOPO's.
         line("alone", (9, 9), (8, 8)),
     ]
-    by_etopo = []
-
-    def fallback(p):
-        by_etopo.append(p.name)
-        return Polyline(p.name, p.scalerank, p.points[::-1].copy())
-
-    got, counts = rivers_today.orient_lake_parts(lakes, rivers, fallback)
+    # ETOPO's heights of each part's (first, last) end: both "both" and "alone" reverse.
+    heights = {"first": (0, 9), "chained": (9, 0), "between": (9, 0), "both": (0, 1), "alone": (0, 1)}
+    got, counts = rivers_today.orient_by_connections(
+        lakes, lambda p: heights[p.name], fixed=rivers
+    )
     ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
     assert ends["first"] == ((1, 0), (2, 0))
     assert ends["chained"] == ((3, 0), (5, 0))
     assert ends["between"] == ((2, 0), (3, 0))
-    assert sorted(by_etopo) == ["alone", "both"]
+    assert ends["both"] == ((7, 0), (0, 0))
+    assert ends["alone"] == ((8, 8), (9, 9))
     assert counts == {"topology": 3, "etopo": 1, "ambiguous": 1}
     assert [p.name for p in got] == [p.name for p in lakes]
+
+
+def test_ends_within_the_simplification_reach_are_one_junction():
+    # Task 11d fix round 3: Guiping, where the Quan (carrying the Hongshui's clear fall) and the Yu
+    # meet and the Xun leaves. Natural Earth ends the Xun 350 m from the point the other two
+    # share. Read as two junctions, the Quan and the Yu looked like a chain, and the Hongshui's
+    # 340 m carried the Yu backwards, up past Nanning.
+    line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
+    parts = [
+        line("hongshui", (0, 0), (1, 0)),
+        line("quan", (1, 0), (2, 0)),
+        line("yu", (2, -1), (2, 0)),
+        line("xun", (3, 0), (2.003, 0)),  # drawn from its mouth, ending 330 m from the others
+    ]
+    heights = {"hongshui": (400, 60), "quan": (60, 34), "yu": (64, 34), "xun": (22, 34)}
+    got, _ = rivers_today.orient_by_connections(parts, lambda p: heights[p.name])
+    ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
+    assert ends["yu"] == ((2, -1), (2, 0))
+    assert ends["xun"] == ((2.003, 0), (3, 0))
+
+
+def test_an_inferred_role_never_overrules_a_clear_fall():
+    # Task 11d fix round 3: the Danube's delta. Natural Earth ends the Danube 12 km short of the
+    # fork where the Sfantu Gheorghe and Sulina arms start and the Chilia arm ends, drawn from
+    # the sea. With two outflows and no inflow known, the Chilia looks like the fork's inflow;
+    # that role is only inferred, so its own 2.5 m fall to the sea decides.
+    line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
+    parts = [
+        line("danube", (0, 0), (0.9, 0)),
+        line("gheorghe", (1, 0), (2, -1)),
+        line("sulina", (1.0002, 0.0002), (2, 1)),
+        line("chilia", (2, 0.5), (1, 0)),
+    ]
+    heights = {
+        "danube": (26, 1.2),
+        "gheorghe": (0.83, -8.69),
+        "sulina": (0.83, -9.31),
+        "chilia": (-1.62, 0.83),
+    }
+    got, _ = rivers_today.orient_by_connections(parts, lambda p: heights[p.name])
+    ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
+    assert ends["chilia"] == ((1, 0), (2, 0.5))
+
+
+def test_a_fork_votes_only_once_all_its_parts_are_known():
+    # Task 11d fix round 3: the Mekong at Phnom Penh. The stem reaches the fork through a short
+    # link part; the Bassac arm's clear fall is decided first. Had the fork voted then, with the
+    # link still unknown, it would have seen an outflow and no inflow and turned the Tien arm
+    # into a tributary flowing in, overruling the Tien's own weaker fall.
+    line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
+    parts = [
+        line("stem", (0, 0), (0.9, 0)),
+        line("link", (0.95, 0), (1, 0)),
+        line("bassac", (1, 0), (2, 1)),
+        line("tien", (1, 0), (2, -1)),
+    ]
+    heights = {"stem": (90, 2), "link": (2, 2), "bassac": (2, -4), "tien": (2, -0.3)}
+    got, _ = rivers_today.orient_by_connections(parts, lambda p: heights[p.name])
+    ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
+    assert ends["tien"] == ((1, 0), (2, -1))
+    assert ends["bassac"] == ((1, 0), (2, 1))
+
+
+def test_river_parts_are_oriented_by_their_connections():
+    # Task 11d fix round 3: Natural Earth river parts by how they join, ETOPO only where nothing
+    # decides. A main stem in two parts, the second drawn backwards across flat ground (ETOPO
+    # would keep it reversed), and a tributary drawn from its mouth, which lies on the second
+    # part's interior vertex.
+    line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
+    parts = [
+        line("upper", (0, 0), (1, 0)),
+        line("lower", (2, 0), (1.5, 0), (1, 0)),
+        line("tributary", (1.5, 0), (1.5, 1)),
+    ]
+    # The tributary's own ends are nearly flat and read the wrong way.
+    heights = {"upper": (100, 50), "lower": (0.1, 0.2), "tributary": (40.5, 40.0)}
+    got, counts = rivers_today.orient_by_connections(parts, lambda p: heights[p.name])
+    ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
+    # The tributary's mouth is on the lower part's interior: it flows there (the mouth's vote,
+    # 1 m sure, beats its own 0.5 m of contrary fall).
+    assert ends["tributary"] == ((1.5, 1), (1.5, 0))
+    # ETOPO's clearest part first (the upper, 50 m of fall), then the lower part continues it
+    # at (1, 0), where every other part is decided and ends: it flows on from there.
+    assert ends["upper"] == ((0, 0), (1, 0))
+    assert ends["lower"] == ((1, 0), (2, 0))
+    assert counts == {"topology": 2, "etopo": 1, "ambiguous": 0}
+
+
+def test_a_clear_fall_is_never_overruled_by_a_weaker_join():
+    # Task 11d fix round 3's first cut decided by joins alone, and a misread fork turned whole
+    # chains uphill. The surest evidence decides: a part falling 300 m keeps ETOPO's direction,
+    # though a join from a flat neighbour says the opposite.
+    line = lambda name, *pts: Polyline(name, 3, np.array(pts, float))  # noqa: E731
+    parts = [
+        line("steep", (0, 0), (1, 0)),
+        # A flat part (0.2 m) whose start, by ETOPO, is the steep part's end...
+        line("flat", (1, 0), (2, 0)),
+        # ... and a part drawn from the steep part's interior: a distributary, not a mouth.
+        line("arm", (0.5, 0), (0.5, 1)),
+    ]
+    steep = Polyline("steep", 3, np.array([(0, 0), (0.5, 0), (1, 0)], float))
+    parts[0] = steep
+    heights = {"steep": (400, 100), "flat": (5.2, 5.0), "arm": (300.0, 299.9)}
+    got, counts = rivers_today.orient_by_connections(parts, lambda p: heights[p.name])
+    ends = {p.name: (tuple(p.points[0]), tuple(p.points[-1])) for p in got}
+    assert ends["steep"] == ((0, 0), (1, 0))
+    assert ends["flat"] == ((1, 0), (2, 0))
+    # The arm's own fall is 0.1 m, less sure than its "mouth" vote: the vote decides it.
+    assert ends["arm"] == ((0.5, 1), (0.5, 0))
+    assert counts["etopo"] == 1
+
+
+def test_an_end_reads_a_mapped_lake_as_its_surface():
+    # Task 11d fix round 3: the Angara's start reads Baikal's bed (about -1,000 m in ETOPO), so
+    # ETOPO said it flowed into Baikal. An end's lowest nearby cell reads a mapped lake's cells as
+    # the lake's surface (the level table's, for the deep lakes whose bed ETOPO holds).
+    rows, cols = 120, 120
+    z = np.full((rows, cols), 500.0)
+    z[60:, :] = -1000.0  # the lake's bed, north of 11 N (rows from the south)
+    grid = CellGrid(z, lat_s=10.0, lon_w=20.0, per_deg=60)
+    ids = np.zeros((3600, 7200), dtype=np.uint16)
+    ids[1560:1580, 4000:4040] = 3  # 11..12 N, 20..22 E on the 0.05-degree map (rows from the north)
+    surfaces = {3: 455.5}
+    # Just south of the shore: its window holds lake cells, read as 455.5 m, not -1000 m.
+    assert rivers_today.end_height(grid, 10.99, 21.0, ids, surfaces) == 455.5
+    assert grid.lowest_near(10.99, 21.0) == -1000.0
+    # Away from the lake: ETOPO's lowest cell.
+    assert rivers_today.end_height(grid, 10.5, 21.0, ids, surfaces) == 500.0
 
 
 def test_orient_puts_the_higher_end_first():
