@@ -11,13 +11,14 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Terrain and bathymetry (region worlds) | ETOPO 2022 60″ surface, NOAA NCEI; see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | NOAA NCEI public data; cite doi:10.25921/fd45-gt74 | M2 Task 1 (`timefly_bake.etopo`, `tiles`) |
 | Climate classes (region worlds) | Köppen-Geiger 1991–2020, Beck et al. (2023); see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | CC BY 4.0 | M2 Task 1 (`timefly_bake.koppen`) |
 | Past climate, 0–120 ka (rivers) | Beyer, Krapp & Manica (2020), figshare 12293345; see [Past climate](#past-climate-beyer-et-al-2020) | CC BY 4.0 | Rivers and lakes Task 1 (`timefly_bake.beyer`) |
+| Present-day lakes (rivers, recent eras) | Natural Earth 1:10m lakes 5.0.0; see [Present-day lake map](#present-day-lake-map-natural-earth) | Public domain | Rivers and lakes Task 8b (`timefly_bake.lakemap`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
 ## Pinned downloads (`data/sources.json`)
 
 `data/sources.json` lists every raw file the bake reads, with its URL, path under `data/raw/`,
 SHA-256, size in bytes and licence: the PaleoDEM archive, the two plate-model archives, the 27
-ICE-6G_C slices, the sea-level file, ETOPO 2022 and the Köppen-Geiger archive (33 files). The URLs and checksums are
+ICE-6G_C slices, the sea-level file, ETOPO 2022, the Köppen-Geiger archive and the Natural Earth lakes (34 files). The URLs and checksums are
 the ones in the tables below (`tools/bake/tests/test_fetch.py` checks that they agree). The
 PaleoDEM report PDF is reference reading for the age table, not a bake input, so it is not
 listed and CI never downloads it.
@@ -273,7 +274,7 @@ the sea-level curve, so glacial coastlines are approximated but Pleistocene ice 
 
 ## Region tiles: ETOPO 2022 and Köppen-Geiger
 
-Inputs (both pinned in `data/sources.json`; 33 files in all):
+Inputs (both pinned in `data/sources.json`):
 
 | File | Size (bytes) | SHA-256 |
 |---|---|---|
@@ -348,6 +349,33 @@ every file's age, byte size and SHA-256, the figshare file id, the SHA-256 of ea
 bytes in 66 requests (about 40 s); the 35 grids total 2,486,321 bytes. The tiny test fixture
 `crates/timefly/tests/assets/data/climate/` is written by
 `tools/bake/scripts/write_climate_fixture.py` through the same code on a synthetic file.
+
+## Present-day lake map: Natural Earth
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `data/raw/naturalearth/ne_10m_lakes.zip` | 2,349,685 | `0803a06f9c3cb4671d89b68c48b142aad9366ba40f665245e12a913fbc61722a` |
+
+Natural Earth 1:10m physical vectors, lakes, version 5.0.0, URL
+`https://naciscdn.org/naturalearth/10m/physical/ne_10m_lakes.zip` (public domain; no permission
+needed, credit appreciated). The zip holds a polygon shapefile in lon/lat degrees with 1,355
+features: 1,056 `Lake`, 69 `Alkaline Lake` and 230 `Reservoir` (`featurecla`). The Caspian is not
+among them (Natural Earth maps it as sea; the lake level table holds it).
+
+The rivers' continental pass checks lakes against it where the terrain is today's (recent eras;
+rivers and lakes Task 8b, owner ruling 2026-11-25): an open lake the map does not hold is cut
+through, and one standing above its mapped surface drops to it.
+
+`cd tools/bake && uv run timefly-bake lakemap --zip <ne_10m_lakes.zip> --etopo ../../data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc --out ../../data/hydrology/lake_map.bin`
+(`timefly_bake.lakemap`) reads the shapefile straight from the zip with its own small reader,
+keeps the lakes (`Lake`, `Alkaline Lake`; reservoirs are dropped, since dams are not in the
+terrain and the game spans the past), rasterises them at cell centres onto a 3′ equirectangular
+grid (7,200 × 3,600, row 0 north; islands are holes) and gives each lake the median of the ETOPO
+2022 60″ surface cells whose centres lie inside it. Lakes that hold no 3′ cell are left out:
+1,059 lakes, 54,152 cells, a 74,562-byte file (row run-lengths; the format is in the module's
+docstring, and `timefly_core::hydrology::lakemap` decodes it). Levels read: Titicaca 3,808.5 m,
+Victoria 1,133 m, the Great Salt Lake 1,278 m, the Dead Sea −427 m (the 10 km overview reads
+about −276 m there), Tanganyika 770 m, Malawi 474.5 m, Issyk-Kul 1,606.5 m.
 
 ## Performance and memory (Task 10)
 

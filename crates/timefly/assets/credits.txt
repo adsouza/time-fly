@@ -66,6 +66,13 @@ Past climate for rivers, 120,000 years ago to the present
   Changes: annual mean temperature (BIO1) and annual precipitation (BIO12) regridded
   to 1 degree.
 
+Present-day lakes for rivers
+  Natural Earth, 1:10m physical vectors, lakes (version 5.0.0).
+  Made with Natural Earth. Free vector and raster map data @ naturalearthdata.com.
+  Terms: public domain.
+  Changes: reservoirs dropped, lakes rasterised to 3 arc-minutes, surface levels from
+  ETOPO 2022.
+
 Data notes
   Biomes in deep-time eras are zonal approximations, not reconstructions.
   Biomes in ice-age eras use the present-day climate.

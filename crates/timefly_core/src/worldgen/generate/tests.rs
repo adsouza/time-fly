@@ -2754,4 +2754,153 @@ mod water {
             wide - now
         );
     }
+
+    // ---- Lake walls (Task 8b). ----
+
+    /// A lake on a tilted plane: footprint = the n = 300 lattice's nodes within `radius_m` of a
+    /// point `offset` (east, north m) from the region's centre, at `rise_m` over the plane there.
+    #[derive(Copy, Clone, Debug)]
+    struct TiltedLake {
+        offset: (f64, f64),
+        radius_m: f64,
+        rise_m: f64,
+        slope: f64,
+        bearing: f64,
+        data: bool,
+    }
+
+    /// The region (inner and apron at 129 x 129) over a tilted lake: `(grid, lake level, the
+    /// same region without the pass)`.
+    fn tilted_lake_region(t: TiltedLake) -> (RegionGrid, f32, RegionGrid) {
+        use crate::hydrology::{Lake, LakeKind};
+        let centre = dir(12.0, 21.0);
+        let frame = RegionFrame { center: centre };
+        let (north, east) = frame.north_east();
+        let (c, s) = (t.bearing.cos(), t.bearing.sin());
+        let plane = move |d: RenderDir| {
+            let p = d.0.normalize();
+            let (x, z) = (p.dot(east) * EARTH_RADIUS_M, p.dot(north) * EARTH_RADIUS_M);
+            900.0 + t.slope * (x * c + z * s)
+        };
+        let middle = frame.local_to_dir(t.offset.0, -t.offset.1);
+        let level = (plane(middle) + t.rise_m) as f32;
+        let lattice = CubeLattice { n: 300 };
+        let nodes: Vec<(u32, u16)> = (0..lattice.len())
+            .filter(|&v| lattice.dir(v).0.angle_between(middle.0) * EARTH_RADIUS_M < t.radius_m)
+            .map(|v| (v, 0))
+            .collect();
+        assert!(!nodes.is_empty(), "{t:?}");
+        let lake = Lake {
+            level_m: level,
+            spill_m: level,
+            kind: if t.data {
+                LakeKind::Data
+            } else {
+                LakeKind::Open
+            },
+            inflow_m3s: 100.0,
+            evaporation_m3s: 10.0,
+            outflow_m3s: 90.0,
+            area_km2: 1000.0,
+            exit: nodes[0].0,
+        };
+        let hydro = river_hydro(lattice, &[], vec![lake]).with_lake_nodes(&nodes);
+        let field = FnField {
+            f: plane,
+            spacing_m: 1852.0,
+            koppen: Some(8),
+        };
+        let spec = spec_at(centre, 0.0, 129, 129);
+        let grid = RegionGenerator::new(spec, &field, Some(&hydro)).finish();
+        let bare = RegionGenerator::new(spec, &field, None).finish();
+        (grid, level, bare)
+    }
+
+    /// Lake texels (water at `level`) with a 4-neighbour that is dry with ground below
+    /// `level − 0.5 m`, over both fields, as `(field, row, col)`; and how many lake texels and
+    /// texels whose ground the pass raised above the bare region's there are.
+    fn lake_walls(
+        grid: &RegionGrid,
+        level: f32,
+        bare: &RegionGrid,
+    ) -> (Vec<(u8, u32, u32)>, usize, usize) {
+        let (mut walls, mut lake, mut raised) = (Vec::new(), 0, 0);
+        for (k, (f, b)) in [(&grid.inner, &bare.inner), (&grid.apron, &bare.apron)]
+            .into_iter()
+            .enumerate()
+        {
+            let n = f.res;
+            let at = |r: u32, c: u32| (r * n + c) as usize;
+            for r in 0..n {
+                for c in 0..n {
+                    let i = at(r, c);
+                    raised += usize::from(f.elevation_m[i] > b.elevation_m[i] + 0.25);
+                    if f.water_level_m[i] != level {
+                        continue;
+                    }
+                    lake += 1;
+                    let near = [
+                        (r.wrapping_sub(1), c),
+                        (r + 1, c),
+                        (r, c.wrapping_sub(1)),
+                        (r, c + 1),
+                    ];
+                    for (rr, cc) in near.into_iter().filter(|&(rr, cc)| rr < n && cc < n) {
+                        let j = at(rr, cc);
+                        let h = f.elevation_m[j];
+                        let dry = f.water_level_m[j] == h - NO_WATER_DROP_M as f32;
+                        if dry && h < level - 0.5 {
+                            walls.push((k as u8, r, c));
+                        }
+                    }
+                }
+            }
+        }
+        (walls, lake, raised)
+    }
+
+    #[test]
+    fn a_lake_edge_over_lower_ground_is_dammed() {
+        // 3 m per km toward the east: the lake's east reach ends 100+ m above the ground.
+        let t = TiltedLake {
+            offset: (-20_000.0, 7_000.0),
+            radius_m: 60_000.0,
+            rise_m: 120.0,
+            slope: 0.003,
+            bearing: 0.2,
+            data: false,
+        };
+        let (grid, level, bare) = tilted_lake_region(t);
+        let (walls, lake, raised) = lake_walls(&grid, level, &bare);
+        println!("{lake} lake texels, {raised} raised, {} walls", walls.len());
+        assert!(lake > 500, "{lake} lake texels");
+        // The hazard: ground below the level beyond the lake's reach, so the dam engages.
+        assert!(raised > 20, "{raised} texels raised");
+        assert!(
+            walls.is_empty(),
+            "walls at {:?}",
+            &walls[..walls.len().min(10)]
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn lake_water_never_stands_beside_lower_dry_ground(
+            ox in -60_000.0f64..60_000.0,
+            oz in -60_000.0f64..60_000.0,
+            radius_m in 36_000.0f64..110_000.0,
+            rise_m in -40.0f64..300.0,
+            slope in 0.0005f64..0.008,
+            bearing in 0.0f64..std::f64::consts::TAU,
+            data in any::<bool>(),
+        ) {
+            let t = TiltedLake { offset: (ox, oz), radius_m, rise_m, slope, bearing, data };
+            let (grid, level, bare) = tilted_lake_region(t);
+            let (walls, _, _) = lake_walls(&grid, level, &bare);
+            prop_assert!(walls.is_empty(), "{:?}: {} walls, first {:?}", t, walls.len(),
+                &walls[..walls.len().min(5)]);
+        }
+    }
 }

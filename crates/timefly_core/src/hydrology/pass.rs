@@ -12,6 +12,7 @@ use std::ops::Range;
 
 use super::climate::{Climate, ClimateSource, ClimateTable, SECONDS_PER_YEAR};
 use super::graph::{Down, RiverGraph};
+use super::lakemap::shipped_lake_map;
 use super::lakes::{Accumulation, Flats, place_levels};
 use super::levels::{LakeLevel, shipped_lake_levels};
 use super::params::{
@@ -41,6 +42,20 @@ pub trait NodeSource: Sync {
     /// Whether the elevation holds present-day lake surfaces as flats (ETOPO), so the pass looks
     /// for lakes the data already holds.
     fn data_lakes(&self) -> bool;
+
+    /// The surface of the present-day mapped lake at `dir` ([`lakemap`](super::lakemap)), in
+    /// the frame of [`NodeSource::node`]'s elevation. `None` where the map holds no lake, and
+    /// everywhere unless [`NodeSource::data_lakes`] holds (the terrain is today's). The pass
+    /// reads it only with data lakes.
+    fn mapped_surface_m(&self, _dir: RenderDir) -> Option<f32> {
+        None
+    }
+
+    /// Whether the present-day map holds a lake at `dir` (Task 8b): false unless
+    /// [`NodeSource::data_lakes`] holds.
+    fn mapped_lake(&self, dir: RenderDir) -> bool {
+        self.mapped_surface_m(dir).is_some()
+    }
 }
 
 /// How [`SnapshotSource`] reads an era.
@@ -168,6 +183,22 @@ impl NodeSource for SnapshotSource<'_> {
     fn data_lakes(&self) -> bool {
         self.mode != SourceMode::Reference
     }
+
+    /// The shipped map's level, moved as the node's elevation moves from the present-day
+    /// overview there (the era's sea-level anomaly, the recent field's ICE-6G change or the
+    /// bridge's crossfade; nothing at 0 ka in recent mode).
+    fn mapped_surface_m(&self, dir: RenderDir) -> Option<f32> {
+        if !self.data_lakes() {
+            return None;
+        }
+        let (lat, lon) = geo_to_latlon(render_to_geo(dir));
+        let level = f64::from(shipped_lake_map().level_at(lat, lon)?);
+        let shift = match self.tiles.sample_overview(lat, lon) {
+            Some((present, _)) => f64::from(self.node(dir).elevation_m) - f64::from(present),
+            None => 0.0,
+        };
+        Some((level + shift) as f32)
+    }
 }
 
 /// How far beyond a region's inner field its river refinement reads the terrain (m), for
@@ -185,6 +216,9 @@ pub struct NodeBlock {
     pub start: u32,
     pub samples: Vec<NodeSample>,
     pub data_lakes: bool,
+    /// `(node, mapped surface m)` for the block's nodes the lake map holds, ascending; empty
+    /// without data lakes.
+    pub mapped: Vec<(u32, f32)>,
 }
 
 /// A chamfer distance from the ocean, resumable.
@@ -289,6 +323,9 @@ pub struct HydroPrep {
     elevation: Vec<f32>,
     /// One bit per node: ice fraction ≥ [`ICE_NODE_FRACTION`].
     ice: Vec<u64>,
+    /// `(node, mapped surface m)`, ascending, with data lakes only
+    /// ([`NodeSource::mapped_surface_m`]); moved into the accumulation.
+    mapped: Vec<(u32, f32)>,
     stage: Stage,
 }
 
@@ -335,6 +372,7 @@ impl HydroPrep {
             first_flat: 0,
             elevation: Vec::with_capacity(len as usize),
             ice: vec![0; len.div_ceil(64) as usize],
+            mapped: Vec::new(),
             stage: Stage::Sample,
         }
     }
@@ -363,8 +401,13 @@ impl HydroPrep {
                     let start = self.elevation.len() as u32;
                     let end = start.saturating_add(left).min(len);
                     for i in start..end {
-                        let s = source.node(lattice.dir(i));
-                        self.push_sample(i, s);
+                        let dir = lattice.dir(i);
+                        self.push_sample(i, source.node(dir));
+                        if self.data_lakes
+                            && let Some(level) = source.mapped_surface_m(dir)
+                        {
+                            self.mapped.push((i, level));
+                        }
                     }
                     used += (end - start).max(1);
                     if end == len {
@@ -514,9 +557,10 @@ impl HydroPrep {
         }
     }
 
-    fn new_accumulation(&self) -> Accumulation {
+    fn new_accumulation(&mut self) -> Accumulation {
         let mut acc = Accumulation::new(self.lattice.len(), self.first_flat);
         acc.set_levels(self.placed_levels.clone());
+        acc.set_mapped(std::mem::take(&mut self.mapped));
         acc
     }
 
@@ -572,10 +616,20 @@ impl HydroPrep {
         source: &S,
         range: Range<u32>,
     ) -> NodeBlock {
+        let data_lakes = source.data_lakes();
+        let mapped = if data_lakes {
+            range
+                .clone()
+                .filter_map(|i| source.mapped_surface_m(lattice.dir(i)).map(|l| (i, l)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         NodeBlock {
             start: range.start,
             samples: range.clone().map(|i| source.node(lattice.dir(i))).collect(),
-            data_lakes: source.data_lakes(),
+            data_lakes,
+            mapped,
         }
     }
 
@@ -596,6 +650,9 @@ impl HydroPrep {
         if self.elevation.is_empty() {
             self.data_lakes = block.data_lakes;
         }
+        if self.data_lakes {
+            self.mapped.extend_from_slice(&block.mapped);
+        }
         self.units += block.samples.len() as u64;
         for (k, s) in block.samples.iter().enumerate() {
             self.push_sample(block.start + k as u32, *s);
@@ -612,7 +669,8 @@ impl HydroPrep {
 
     /// The bytes the pass holds now, by capacity.
     pub fn working_bytes(&self) -> usize {
-        let own = 4 * self.elevation.capacity() + 8 * self.ice.capacity();
+        let own =
+            4 * self.elevation.capacity() + 8 * (self.ice.capacity() + self.mapped.capacity());
         own + match &self.stage {
             Stage::Sample | Stage::Moving => 0,
             Stage::Route(r) => r.working_bytes(),
@@ -791,6 +849,9 @@ mod tests {
         /// set (so the coast phase matters).
         coast_scale: Option<f32>,
         data_lakes: bool,
+        /// Today's lake map: `(island, radius km, surface m)`, a mapped lake within the radius
+        /// of the island's centre (read only with data lakes).
+        map: Vec<(usize, f64, f32)>,
     }
 
     impl World {
@@ -899,6 +960,13 @@ mod tests {
                 islands,
                 coast_scale: None,
                 data_lakes: true,
+                // The humid bowl's lake at its crest, the Caspian-like flat and the
+                // Victoria-like shelf are today's lakes.
+                map: vec![
+                    (HUMID, 150.0, 500.0),
+                    (CASPIAN, 150.0, -28.0),
+                    (VICTORIA, 137.0, 600.0),
+                ],
             }
         }
 
@@ -1036,6 +1104,15 @@ mod tests {
 
         fn data_lakes(&self) -> bool {
             self.data_lakes
+        }
+
+        /// Read even without data lakes, so tests see that the pass ignores it then.
+        fn mapped_surface_m(&self, dir: RenderDir) -> Option<f32> {
+            let (k, (r, _, _)) = self.nearest(dir.0);
+            self.map
+                .iter()
+                .find(|&&(island, radius, _)| island == k && r < radius)
+                .map(|&(_, _, level)| level)
         }
     }
 
@@ -1875,6 +1952,34 @@ mod tests {
     }
 
     #[test]
+    fn reference_eras_ignore_the_map() {
+        let lattice = CubeLattice { n: 75 };
+        let table = shipped_table();
+        let mut mapped = World::new();
+        // A map that would drop the humid bowl's lake 300 m and keep the wet dome's.
+        mapped.map[0].2 = 200.0;
+        mapped.map.push((WET, 1000.0, 100.0));
+        let mut unmapped = mapped.clone();
+        unmapped.map.clear();
+        let pass = |w: &World| run(lattice, w, w, &table, u32::MAX);
+        // The test bites: with data lakes, the map changes the result.
+        assert_ne!(pass(&mapped), pass(&unmapped));
+        // A reference era (no data lakes) ignores it, whatever the source reads.
+        mapped.data_lakes = false;
+        unmapped.data_lakes = false;
+        let reference = pass(&unmapped);
+        assert_eq!(pass(&mapped), reference);
+        assert!(!reference.lakes.is_empty());
+        // Sampled in blocks too.
+        let mut prep = HydroPrep::new(lattice, YearsBp(0.0));
+        let block = HydroPrep::sample_range(&lattice, &mapped, 0..lattice.len());
+        assert!(block.mapped.is_empty());
+        prep.add_samples(block);
+        while !prep.step(&mapped, &mapped, &table, u32::MAX) {}
+        assert_eq!(prep.finish(), reference);
+    }
+
+    #[test]
     fn the_pass_is_the_same_for_any_step_size() {
         // 75 is not a power of two; the coast-scaled climate makes the coast phase run.
         let lattice = CubeLattice { n: 75 };
@@ -2150,6 +2255,25 @@ mod tests {
             let source = SnapshotSource::new(&field, &tiles, &s, age, mode);
             assert_eq!(source.data_lakes(), mode != SourceMode::Reference);
             let anomaly = snapshot_sea_level_anomaly_m(&s, age);
+            // Today's lake map, in the era's frame, only where the terrain is today's.
+            let titicaca = dir(-15.8, -69.4);
+            let manaus = dir(-3.1, -60.0);
+            assert_eq!(source.mapped_lake(titicaca), source.data_lakes());
+            assert!(!source.mapped_lake(manaus));
+            if source.data_lakes() {
+                // Moved as the node is from the present overview.
+                let (lat, lon) = latlon(titicaca);
+                let present = f64::from(tiles.sample_overview(lat, lon).unwrap().0);
+                let shift = f64::from(source.node(titicaca).elevation_m) - present;
+                let want = f64::from(shipped_lake_map().level_at(-15.8, -69.4).unwrap()) + shift;
+                let got = f64::from(source.mapped_surface_m(titicaca).unwrap());
+                assert!((got - want).abs() < 1e-3, "{age}: {got} vs {want}");
+                if mode == SourceMode::PresentFrame {
+                    assert!((shift + anomaly).abs() < 1e-3, "{shift} vs {anomaly}");
+                }
+            } else {
+                assert_eq!(source.mapped_surface_m(titicaca), None);
+            }
             let mut iced = 0;
             for &d in &dirs {
                 let got = source.node(d);

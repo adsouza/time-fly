@@ -2,7 +2,10 @@
 //!
 //! The rules, which the golden fixture (`tests/fixtures/hydro_golden.json`) and the Python
 //! reference (Task 11) pin. `e` is a node's elevation, `c` its evaporation capacity (net
-//! evaporation × area, m³/s; 0 on ice), "tol" is `DATA_LAKE_FLAT_TOL_M`.
+//! evaporation × area, m³/s; 0 on ice), "tol" is `DATA_LAKE_FLAT_TOL_M`. "Mapped" nodes are
+//! those today's lake map holds ([`super::lakemap`]), each with its lake's baked surface; only
+//! with data lakes (the terrain is today's): without, no node is mapped and the map rules below
+//! never apply.
 //!
 //! ```text
 //! Data flats (only if data_lakes), before discharge, after routing:
@@ -36,18 +39,29 @@
 //!   (outflow = Q_in − Σc, evaporation = Σc, and the exit then joins the footprint as its
 //!   outlet unless ice), else Terminal (outflow 0, evaporation = Q_in). It overrides every rule
 //!   below.
-//! A flat basin: if Q_in ≥ DATA_LAKE_MIN_BALANCE × Σc: Data lake at level = spill = min e,
-//!   footprint = all its nodes, outflow = max(0, Q_in − Σc), evaporation = Q_in − outflow.
-//!   Otherwise no lake (it passes Q_in on). Either way it routes as a spilling basin (below).
+//! A flat basin: if Q_in ≥ DATA_LAKE_MIN_BALANCE × Σc and at least DATA_LAKE_MIN_NODES of its
+//!   nodes are mapped: Data lake at level = spill = min e, footprint = all its nodes, outflow =
+//!   max(0, Q_in − Σc), evaporation = Q_in − outflow. Otherwise no lake (it passes Q_in on).
+//!   Either way it routes as a spilling basin (below).
 //! A depression basin:
 //!   - Data (only if data_lakes): F = the connected non-ice basin nodes within tol of the basin
 //!     minimum (ties: lowest id), grown by BFS from it. If |F| ≥ DATA_LAKE_MIN_NODES and
 //!     DATA_LAKE_MIN_BALANCE × Σ_F c ≤ Q_in ≤ DATA_LAKE_MAX_BALANCE × Σ_F c: level = median e of F
-//!     (mean of the middle two for an even count); footprint = (F ∪ {e < level}) minus ice;
-//!     outflow = max(0, Q_in − Σ_footprint c) if level ≥ spill − tol, else 0.
+//!     (mean of the middle two for an even count); candidate = F ∪ {e < level}; it is a lake only
+//!     if at least DATA_LAKE_MIN_NODES candidate nodes are mapped (else the balance decides):
+//!     footprint = candidate minus ice; outflow = max(0, Q_in − Σ_footprint c) if level ≥
+//!     spill − tol, else 0.
 //!   - Otherwise the balance: group basin nodes by distinct e, ascending; C_g = Σc through g.
-//!     C_last < Q_in: Open, level = spill, evaporation = C_last, outflow = Q_in − C_last,
-//!       footprint = all non-ice basin nodes; no lake if spill − min e < MIN_LAKE_DEPTH_M.
+//!     C_last < Q_in: Open. S = the highest mapped surface among the basin's nodes (any node,
+//!       ice included), if any.
+//!       - Data lakes and no mapped node: no lake (breached: the lattice dammed a valley that
+//!         holds no lake today; Q_in passes through the spill).
+//!       - spill > S + OPEN_LAKE_MAP_TOL_M: Data lake at level = S, footprint = non-ice basin
+//!         nodes with e < S (no lake if none), evaporation = Σ_footprint c, outflow = Q_in −
+//!         evaporation (the real outlet is a gorge below the lattice; the exit is not added to
+//!         the footprint).
+//!       - Otherwise: level = spill, evaporation = C_last, outflow = Q_in − C_last, footprint =
+//!         all non-ice basin nodes; no lake if spill − min e < MIN_LAKE_DEPTH_M.
 //!     Else Terminal: g = first group with C_g ≥ Q_in, level = e_g + (Q_in − C_{g−1}) /
 //!       (C_g − C_{g−1}) × (e_{g+1} − e_g) (0 when that step is 0; e_{last+1} = spill),
 //!       evaporation = Q_in, outflow = 0; sinks = nodes with e ≤ e_g; footprint = sinks minus
@@ -74,7 +88,7 @@ use std::collections::VecDeque;
 use super::params::{
     DATA_LAKE_FLAT_MAX_OUTLETS, DATA_LAKE_FLAT_MIN_NODES, DATA_LAKE_FLAT_TOL_M,
     DATA_LAKE_MAX_BALANCE, DATA_LAKE_MIN_BALANCE, DATA_LAKE_MIN_NODES, MIN_LAKE_DEPTH_M,
-    RIVER_MIN_DISCHARGE_M3S,
+    OPEN_LAKE_MAP_TOL_M, RIVER_MIN_DISCHARGE_M3S,
 };
 use super::{HydroGraph, NO_BASIN, RECEIVER_EXIT, RECEIVER_NONE, Routed};
 
@@ -196,6 +210,9 @@ pub(crate) struct Accumulation {
     first_flat: u32,
     /// `(basin, level)` from the lake level table, sorted by basin ([`place_levels`]).
     levels: Vec<(u32, f32)>,
+    /// `(node, surface m)` of the nodes a present-day mapped lake holds, sorted by node
+    /// ([`Accumulation::set_mapped`]). Empty without data lakes.
+    mapped: Vec<(u32, f32)>,
 }
 
 /// Places lake level table points `(nearest node, level)`: each point whose node lies in a
@@ -509,6 +526,7 @@ impl Accumulation {
         Self {
             first_flat,
             levels: Vec::new(),
+            mapped: Vec::new(),
             q: vec![0.0; len as usize],
             area_km2: vec![0.0; len as usize],
             lakes: Vec::new(),
@@ -524,8 +542,24 @@ impl Accumulation {
         self.levels = levels;
     }
 
+    /// Sets the nodes the present-day lake map holds, `(node, mapped surface m)` sorted by
+    /// node (only used with data lakes).
+    pub fn set_mapped(&mut self, mapped: Vec<(u32, f32)>) {
+        debug_assert!(mapped.windows(2).all(|w| w[0].0 < w[1].0));
+        self.mapped = mapped;
+    }
+
+    /// The mapped surface at `node`, if the map holds it.
+    fn mapped_at(&self, node: u32) -> Option<f32> {
+        self.mapped
+            .binary_search_by_key(&node, |&(n, _)| n)
+            .ok()
+            .map(|k| self.mapped[k].1)
+    }
+
     pub fn working_bytes(&self) -> usize {
-        4 * (self.q.capacity() + self.area_km2.capacity())
+        8 * self.mapped.capacity()
+            + 4 * (self.q.capacity() + self.area_km2.capacity())
             + self.lakes.capacity() * std::mem::size_of::<Lake>()
             + self.lake_nodes.capacity() * std::mem::size_of::<LakeNode>()
     }
@@ -653,6 +687,15 @@ impl Accumulation {
         let spill = basin.spill_m;
         let lake_id = self.lakes.len();
         let is_flat = b as u32 >= self.first_flat;
+        // The present-day map, only where the terrain is today's.
+        let mapped: Vec<Option<f32>> = if data_lakes {
+            nodes.iter().map(|&v| self.mapped_at(v)).collect()
+        } else {
+            vec![None; m]
+        };
+        let mapped_in = |set: &[bool]| (0..m).filter(|&k| set[k] && mapped[k].is_some()).count();
+        let on_map = |set: &[bool]| mapped_in(set) >= DATA_LAKE_MIN_NODES as usize;
+        let mapped_surface = mapped.iter().flatten().copied().reduce(f32::max);
         let make_lake = |kind, level: f64, evaporation, outflow, footprint: &[bool]| {
             let area: f64 = (0..m)
                 .filter(|&k| footprint[k])
@@ -699,7 +742,12 @@ impl Accumulation {
                 } else {
                     0.5 * (levels[h - 1] + levels[h])
                 };
-                data = Some((level, flat));
+                // A candidate the map does not hold is no lake: the balance decides.
+                let candidate: Vec<bool> =
+                    (0..m).map(|k| flat[k] || f64::from(e[k]) < level).collect();
+                if on_map(&candidate) {
+                    data = Some((level, flat));
+                }
             }
         }
 
@@ -744,7 +792,7 @@ impl Accumulation {
             // its surface evaporates, if the inflow meets the veto. Its nodes are never ice.
             let footprint = vec![true; m];
             let capacity: f64 = cap.iter().sum();
-            if q_in >= DATA_LAKE_MIN_BALANCE * capacity {
+            if q_in >= DATA_LAKE_MIN_BALANCE * capacity && on_map(&footprint) {
                 let outflow = (q_in - capacity).max(0.0);
                 let lake = make_lake(LakeKind::Data, e_min, q_in - outflow, outflow, &footprint);
                 Outcome::Spill {
@@ -778,8 +826,34 @@ impl Accumulation {
             }
         } else {
             let bal = balance(&e, &cap, spill, q_in);
-            match bal.kind {
-                LakeKind::Open => {
+            let tol = OPEN_LAKE_MAP_TOL_M as f32;
+            match (bal.kind, mapped_surface) {
+                // Today's terrain and no mapped lake: the lattice dammed the valley. Breached:
+                // the inflow passes through the spill.
+                (LakeKind::Open, None) if data_lakes => Outcome::Spill { lake: None },
+                // Above the mapped lake: it stands at the mapped surface over the basin's nodes
+                // below it, and passes the rest of its inflow on (the real outlet is a gorge
+                // below the lattice).
+                (LakeKind::Open, Some(surface)) if spill > surface + tol => {
+                    let level = f64::from(surface);
+                    let footprint: Vec<bool> = (0..m)
+                        .map(|k| !iced[k] && f64::from(e[k]) < level)
+                        .collect();
+                    let evaporation: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
+                    Outcome::Spill {
+                        lake: footprint.contains(&true).then(|| {
+                            let lake = make_lake(
+                                LakeKind::Data,
+                                level,
+                                evaporation,
+                                q_in - evaporation,
+                                &footprint,
+                            );
+                            (lake, footprint)
+                        }),
+                    }
+                }
+                (LakeKind::Open, _) => {
                     let footprint: Vec<bool> = iced.iter().map(|&i| !i).collect();
                     let deep = f64::from(spill) - e_min >= MIN_LAKE_DEPTH_M;
                     Outcome::Spill {
@@ -795,7 +869,7 @@ impl Accumulation {
                         }),
                     }
                 }
-                _ => {
+                (_, _) => {
                     let sinks: Vec<bool> = e.iter().map(|&x| x <= bal.wet_through_m).collect();
                     let footprint: Vec<bool> = (0..m).map(|k| sinks[k] && !iced[k]).collect();
                     let playa =
@@ -958,11 +1032,12 @@ mod tests {
         data_lakes: bool,
         budget: u32,
     ) -> Accumulation {
-        accumulate_with(g, routed, own, capacity, ice, data_lakes, budget, &[]).0
+        accumulate_with(g, routed, own, capacity, ice, data_lakes, budget, &[], &[]).0
     }
 
     /// [`accumulate`] with lake level table points `(node, level)`, placed only with data
-    /// lakes. Also returns the placed `(basin, level)` pairs and the unplaced point indices.
+    /// lakes, and mapped nodes `(node, surface)`. Also returns the placed `(basin, level)` pairs
+    /// and the unplaced point indices.
     #[allow(clippy::too_many_arguments)]
     fn accumulate_with(
         g: &impl HydroGraph,
@@ -973,6 +1048,7 @@ mod tests {
         data_lakes: bool,
         budget: u32,
         points: &[(u32, f32)],
+        mapped: &[(u32, f32)],
     ) -> (Accumulation, Vec<(u32, f32)>, Vec<usize>) {
         let first_flat = if data_lakes {
             let mut flats = Flats::new(g.len());
@@ -988,6 +1064,11 @@ mod tests {
         };
         let mut acc = Accumulation::new(g.len(), first_flat);
         acc.set_levels(placed.clone());
+        // Set even without data lakes: the pass must then ignore them.
+        let mut mapped = mapped.to_vec();
+        mapped.sort_by_key(|&(n, _)| n);
+        mapped.dedup_by_key(|m| m.0);
+        acc.set_mapped(mapped);
         while !acc.init_step(g, routed, |i, _| own(i), budget).0 {}
         while !acc
             .walk_step(g, routed, &ice, |i, _, _| capacity(i), data_lakes, budget)
@@ -1165,6 +1246,7 @@ mod tests {
             ice in prop::collection::vec(0u8..10, 132),
             data_lakes in any::<bool>(),
             table in prop::collection::vec((0u32..132, -3i32..14), 0..4),
+            mapped in prop::collection::vec((0u32..132, -3i32..14), 0..24),
         ) {
             // An 11 x 12 grid at 10 km: flats, pits, ice and several outlets.
             let g = GridGraph { rows: 11, cols: 12, spacing_m: 10_000.0 };
@@ -1174,8 +1256,11 @@ mod tests {
             // Lake level table points, off the 3 m grid of elevations.
             let points: Vec<(u32, f32)> =
                 table.iter().map(|&(n, l)| (n, l as f32 * 3.0 + 0.7)).collect();
+            // Mapped lake surfaces, off the 3 m grid too.
+            let mapped: Vec<(u32, f32)> =
+                mapped.iter().map(|&(n, l)| (n, l as f32 * 3.0 + 0.4)).collect();
             let (acc, placed, _) = accumulate_with(&g, &mut r, |i| 1.0 + (i % 3) as f32,
-                |i| evap[i as usize], iced, data_lakes, 5, &points);
+                |i| evap[i as usize], iced, data_lakes, 5, &points, &mapped);
             let table_exits: Vec<u32> =
                 placed.iter().map(|&(b, _)| r.basins[b as usize].exit).collect();
             let mut own = 0.0;
@@ -1262,7 +1347,19 @@ mod tests {
             let mut r = route(&g, elevation);
             // The hazard: the shelf is no depression; it drains through the channel.
             assert!(r.basins.is_empty());
-            let acc = accumulate(&g, &mut r, |_| 1.0, |_| 0.1, |_| false, data_lakes, 4);
+            // A lake on today's map.
+            let mapped: Vec<(u32, f32)> = flat.iter().map(|&v| (v, 50.0)).collect();
+            let (acc, _, _) = accumulate_with(
+                &g,
+                &mut r,
+                |_| 1.0,
+                |_| 0.1,
+                |_| false,
+                data_lakes,
+                4,
+                &[],
+                &mapped,
+            );
             let lakes = &acc.lakes;
             assert_eq!(
                 lakes.len(),
@@ -1324,7 +1421,7 @@ mod tests {
         let (g, elevation) = deep_bowl();
         let centre = g.node(4, 6);
         let (rim, sea) = (g.node(4, 1), g.node(4, 0));
-        let run = |capacity: f64, points: &[(u32, f32)]| {
+        let run_mapped = |capacity: f64, points: &[(u32, f32)], mapped: &[(u32, f32)]| {
             let mut r = route(&g, elevation.clone());
             let (acc, _, unplaced) = accumulate_with(
                 &g,
@@ -1335,11 +1432,14 @@ mod tests {
                 true,
                 7,
                 points,
+                mapped,
             );
             (r, acc, unplaced)
         };
-        // Humid: the balance alone fills the bowl to its 50 m spill.
-        let (r, balance, _) = run(0.1, &[]);
+        let run = |capacity: f64, points: &[(u32, f32)]| run_mapped(capacity, points, &[]);
+        // Humid: the balance alone fills the bowl to its 50 m spill (a lake the map holds at
+        // that level; table lakes need no map).
+        let (r, balance, _) = run_mapped(0.1, &[], &[(centre, 50.0)]);
         assert_eq!(r.basins.len(), 1);
         assert_eq!(r.basins[0].spill_m, 50.0);
         let open = &balance.lakes[0];
@@ -1453,7 +1553,18 @@ mod tests {
         for (capacity, lakes) in [(10.0, 0), (0.01, 2)] {
             let mut r = route(&g, elevation.clone());
             assert!(r.basins.is_empty());
-            let acc = accumulate(&g, &mut r, |_| 1.0, |_| capacity, |_| false, true, 3);
+            let mapped: Vec<(u32, f32)> = flat.iter().map(|&v| (v, 50.0)).collect();
+            let (acc, _, _) = accumulate_with(
+                &g,
+                &mut r,
+                |_| 1.0,
+                |_| capacity,
+                |_| false,
+                true,
+                3,
+                &[],
+                &mapped,
+            );
             assert_eq!(acc.lakes.len(), lakes, "{:?}", acc.lakes);
             // The 70 m plateau is a flat too, but with a long downhill edge: never a lake.
             assert!(acc.lake_nodes.iter().all(|n| flat.contains(&n.node)));
@@ -1565,5 +1676,307 @@ mod tests {
         );
         // The pit gathers the whole basin's water: its inflow is the lake's.
         assert_eq!(f64::from(acc.q[pit as usize]), lake.inflow_m3s);
+    }
+
+    // ---- Lakes checked against today's map (Task 8b). ----
+
+    /// The dam's column in [`dammed_valley`].
+    const DAM: u32 = 8;
+
+    /// A 7 x 34 grid at 10 km: ocean in column 0; a one-node-wide valley floor along row 3
+    /// rising 10 m per column, its walls sloping down to it from both sides; and at column
+    /// [`DAM`] a one-node rim 200 m above the floor. Upstream of the rim the floor is a
+    /// depression of 19 nodes, columns `DAM + 1 ..= DAM + 19`, spilling at `10 DAM + 200` m.
+    fn dammed_valley() -> (GridGraph, Vec<f32>) {
+        let g = GridGraph {
+            rows: 7,
+            cols: 34,
+            spacing_m: 10_000.0,
+        };
+        let elevation = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (3, DAM) => 10.0 * DAM as f32 + 200.0,
+                (3, c) => 10.0 * c as f32,
+                (r, c) => 10.0 * c as f32 + 300.0 + 200.0 * (r as f32 - 3.0).abs(),
+            })
+            .collect();
+        (g, elevation)
+    }
+
+    const VALLEY_SPILL: f32 = 10.0 * DAM as f32 + 200.0;
+
+    /// The valley's floor nodes below `level` m in the basin.
+    fn floor_below(g: &GridGraph, level: f32) -> Vec<u32> {
+        (DAM + 1..=DAM + 19)
+            .map(|c| g.node(3, c))
+            .filter(|&v| 10.0 * (g.row_col(v).1 as f32) < level)
+            .collect()
+    }
+
+    /// The valley's pass with capacity `capacity` per node, data lakes on or off, and `mapped`
+    /// nodes. Own runoff is 1 m3/s per node.
+    fn valley(capacity: f64, data_lakes: bool, mapped: &[(u32, f32)]) -> (Routed, Accumulation) {
+        let (g, elevation) = dammed_valley();
+        let mut r = route(&g, elevation);
+        assert_eq!(r.basins.len(), 1);
+        assert_eq!(r.basins[0].spill_m, VALLEY_SPILL);
+        assert_eq!(r.basins[0].nodes, floor_below(&g, f32::INFINITY));
+        let (acc, _, _) = accumulate_with(
+            &g,
+            &mut r,
+            |_| 1.0,
+            |_| capacity,
+            |_| false,
+            data_lakes,
+            4,
+            &[],
+            mapped,
+        );
+        (r, acc)
+    }
+
+    #[test]
+    fn a_dammed_humid_valley_is_cut_through() {
+        let (g, _) = dammed_valley();
+        let rim = g.node(3, DAM);
+        // The hazard: by the balance alone (a reference era) the valley fills to the rim.
+        let (_, filled) = valley(0.01, false, &[]);
+        let lake = &filled.lakes[0];
+        assert_eq!((lake.kind, lake.level_m), (LakeKind::Open, VALLEY_SPILL));
+        assert!(lake.inflow_m3s > 100.0, "{lake:?}");
+
+        // Today's terrain, and no lake on the map: no lake.
+        let (r, acc) = valley(0.01, true, &[]);
+        assert!(acc.lakes.is_empty(), "{:?}", acc.lakes);
+        assert!(acc.lake_nodes.is_empty());
+        // A river chain along the floor from the valley head through the spill to the sea.
+        let mut at = g.node(3, g.cols - 1);
+        let mut chain = vec![at];
+        while let Some(j) = receiver_of(&g, &r, at) {
+            assert!(g.neighbours(at).contains(&Some(j)), "{at} -> {j} jumps");
+            at = j;
+            chain.push(j);
+        }
+        let floor: Vec<u32> = (0..g.cols).rev().map(|c| g.node(3, c)).collect();
+        assert_eq!(chain, floor);
+        for w in chain.windows(2).filter(|w| !r.ocean[w[1] as usize]) {
+            assert!(acc.q[w[1] as usize] > acc.q[w[0] as usize], "{w:?}");
+        }
+        assert!(f64::from(acc.q[g.node(3, DAM + 1) as usize]) >= RIVER_MIN_DISCHARGE_M3S);
+        // Below the rim: the whole inflow, nothing evaporated.
+        let want = 1.0 + lake.inflow_m3s;
+        let got = f64::from(acc.q[rim as usize]);
+        assert!((got - want).abs() <= 1e-4 * want, "{got} vs {want}");
+        assert_eq!(acc.evaporated_m3s, 0.0);
+    }
+
+    #[test]
+    fn an_open_lake_above_its_mapped_surface_drops_to_it() {
+        let (g, _) = dammed_valley();
+        let rim = g.node(3, DAM);
+        // The map's lake covers the floor up to 30 m under the spill; its surface 50 m under.
+        let surface = VALLEY_SPILL - 50.0;
+        let mapped: Vec<(u32, f32)> = floor_below(&g, VALLEY_SPILL - 30.0)
+            .into_iter()
+            .map(|v| (v, surface))
+            .collect();
+        let (_, open) = valley(0.01, false, &[]);
+        let q_in = open.lakes[0].inflow_m3s;
+        let (r, acc) = valley(0.01, true, &mapped);
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let lake = &acc.lakes[0];
+        assert_eq!(lake.kind, LakeKind::Data);
+        assert!((lake.level_m - surface).abs() <= 0.01, "{lake:?}");
+        assert_eq!(lake.spill_m, VALLEY_SPILL);
+        // The footprint: the basin's nodes below the surface, and only those.
+        let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+        let below = floor_below(&g, surface);
+        assert_eq!(footprint, below);
+        assert!(below.len() < mapped.len());
+        // It passes its inflow less what the footprint evaporates over the rim.
+        assert_eq!(lake.inflow_m3s, q_in);
+        assert!((lake.evaporation_m3s - 0.01 * below.len() as f64).abs() < 1e-9);
+        assert_eq!(lake.outflow_m3s, lake.inflow_m3s - lake.evaporation_m3s);
+        assert_eq!(receiver_of(&g, &r, lake.exit), Some(rim));
+        let got = f64::from(acc.q[rim as usize]);
+        assert!(
+            (got - (1.0 + lake.outflow_m3s)).abs() < 1e-3,
+            "{got} {lake:?}"
+        );
+    }
+
+    #[test]
+    fn a_mapped_open_lake_keeps_its_spill() {
+        let (g, _) = dammed_valley();
+        let (_, open) = valley(0.01, false, &[]);
+        for surface in [VALLEY_SPILL - 9.5, VALLEY_SPILL, VALLEY_SPILL + 30.0] {
+            let mapped: Vec<(u32, f32)> = floor_below(&g, 1e9)
+                .into_iter()
+                .map(|v| (v, surface))
+                .collect();
+            let (_, acc) = valley(0.01, true, &mapped);
+            assert_eq!(acc.lakes, open.lakes, "{surface}");
+            assert_eq!(acc.lake_nodes, open.lake_nodes);
+        }
+    }
+
+    #[test]
+    fn an_arid_closed_basin_still_fills_by_balance() {
+        let (_, reference) = valley(20.0, false, &[]);
+        assert_eq!(reference.lakes.len(), 1);
+        assert_eq!(reference.lakes[0].kind, LakeKind::Terminal);
+        // Unmapped on today's terrain: a terminal lake stays (Mega-Chad, Bonneville).
+        let (_, acc) = valley(20.0, true, &[]);
+        assert_eq!(acc.lakes, reference.lakes);
+        assert_eq!(acc.lake_nodes, reference.lake_nodes);
+    }
+
+    /// A 6 x 24 grid at 10 km: ocean in column 0; a river along rows 2..=3 rising 8 m per column
+    /// from the sea to a flat at exactly 50 m in columns 7..=16 (20 nodes, 2 x 10), rising 5 m
+    /// per column above it; banks 150 m above the channel. The flat drains by its two
+    /// downstream nodes, like a wide river's flats in F16 data.
+    fn river_flat() -> (GridGraph, Vec<f32>, Vec<u32>) {
+        let g = GridGraph {
+            rows: 6,
+            cols: 24,
+            spacing_m: 10_000.0,
+        };
+        let mut flat = Vec::new();
+        let elevation = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (2..=3, 7..=16) => {
+                    flat.push(i);
+                    50.0
+                }
+                (2..=3, c @ 1..=6) => 8.0 * c as f32,
+                (2..=3, c) => 50.0 + 5.0 * (c as f32 - 16.0),
+                (_, c) => 8.0 * c as f32 + 150.0,
+            })
+            .collect();
+        (g, elevation, flat)
+    }
+
+    fn river_flat_lakes(mapped: &[(u32, f32)]) -> (Accumulation, Vec<u32>) {
+        let (g, elevation, flat) = river_flat();
+        let mut r = route(&g, elevation);
+        assert!(r.basins.is_empty());
+        let (acc, _, _) = accumulate_with(
+            &g,
+            &mut r,
+            |_| 1.0,
+            |_| 0.1,
+            |_| false,
+            true,
+            6,
+            &[],
+            mapped,
+        );
+        (acc, flat)
+    }
+
+    #[test]
+    fn an_unmapped_flat_is_not_a_lake() {
+        let (g, _, flat) = river_flat();
+        assert_eq!(flat.len(), 20);
+        let (acc, _) = river_flat_lakes(&[]);
+        assert!(acc.lakes.is_empty(), "{:?}", acc.lakes);
+        // One mapped node (a small lake beside the river) is not enough.
+        let (acc, _) = river_flat_lakes(&[(g.node(2, 12), 50.0)]);
+        assert!(acc.lakes.is_empty(), "{:?}", acc.lakes);
+    }
+
+    #[test]
+    fn a_mapped_flat_is_a_lake() {
+        let (g, _, _) = river_flat();
+        let mapped = [(g.node(2, 12), 50.0), (g.node(3, 13), 50.0)];
+        let (acc, flat) = river_flat_lakes(&mapped);
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let lake = &acc.lakes[0];
+        assert_eq!((lake.kind, lake.level_m), (LakeKind::Data, 50.0));
+        let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+        assert_eq!(footprint, flat);
+        assert!(lake.outflow_m3s > 0.0);
+    }
+
+    #[test]
+    fn a_depression_data_lake_needs_the_map() {
+        // A 7 x 8 grid at 10 km: ocean in column 0, 90 m walls with a 50 m gap at (3, 1), a
+        // 30 m basin bed and a 6-node floor at exactly 5 m: the data's lake surface, if the map
+        // holds a lake there.
+        let g = GridGraph {
+            rows: 7,
+            cols: 8,
+            spacing_m: 10_000.0,
+        };
+        let mut floor = Vec::new();
+        let elevation: Vec<f32> = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (3, 1) => 50.0,
+                (2..=4, 3..=4) => {
+                    floor.push(i);
+                    5.0
+                }
+                (1..=5, 2..=6) => 30.0,
+                _ => 90.0,
+            })
+            .collect();
+        let lakes = |mapped: &[(u32, f32)]| {
+            let mut r = route(&g, elevation.clone());
+            assert_eq!(r.basins.len(), 1);
+            let (acc, _, _) = accumulate_with(
+                &g,
+                &mut r,
+                |_| 1.0,
+                |_| 2.0,
+                |_| false,
+                true,
+                5,
+                &[],
+                mapped,
+            );
+            acc.lakes
+        };
+        let data = |l: &Vec<Lake>| l.iter().any(|l| l.kind == LakeKind::Data);
+        assert!(!data(&lakes(&[])), "{:?}", lakes(&[]));
+        assert!(!data(&lakes(&[(floor[0], 5.0)])));
+        let two = lakes(&[(floor[0], 5.0), (floor[5], 5.0)]);
+        assert_eq!(two.len(), 1);
+        assert_eq!(
+            (two[0].kind, two[0].level_m),
+            (LakeKind::Data, 5.0),
+            "{two:?}"
+        );
+    }
+
+    #[test]
+    fn reference_eras_ignore_the_map_in_the_golden_cases() {
+        // Golden cases A-C (data lakes off) with every node mapped far below its ground: the
+        // map changes nothing.
+        let fx: Value = serde_json::from_str(GOLDEN).unwrap();
+        let (g, elevation) = golden_grid(&fx);
+        let mapped: Vec<(u32, f32)> = (0..g.len()).map(|v| (v, -500.0)).collect();
+        for capacity in [0.0, 2.0, 5.0] {
+            let mut a = route(&g, elevation.clone());
+            let plain = accumulate(&g, &mut a, |_| 1.0, |_| capacity, |_| false, false, 3);
+            let mut b = route(&g, elevation.clone());
+            let (with_map, _, _) = accumulate_with(
+                &g,
+                &mut b,
+                |_| 1.0,
+                |_| capacity,
+                |_| false,
+                false,
+                3,
+                &[],
+                &mapped,
+            );
+            assert_eq!(plain.lakes, with_map.lakes);
+            assert_eq!(plain.lake_nodes, with_map.lake_nodes);
+            assert_eq!(plain.q, with_map.q);
+            assert_eq!(a, b);
+        }
     }
 }

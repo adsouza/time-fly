@@ -1,6 +1,7 @@
 use super::*;
 use crate::deep_time::YearsBp;
 use crate::geo::RenderDir;
+use crate::hydrology::params::NO_WATER_DROP_M;
 use crate::worldgen::generate::RegionSpec;
 use crate::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
 use bevy_math::DVec3;
@@ -669,6 +670,71 @@ fn converging_rivers_leave_no_ribbon_between_them() {
     let col = ((divide + REGION_SIZE_M / 2.0) / texel).floor() as usize;
     let (a, b) = (offsets[512 * 1025 + col], offsets[512 * 1025 + col + 1]);
     assert!(a > 400.0 && b < -400.0, "{a}, {b}");
+}
+
+/// A lake at 100 m on a sloping shore (Task 8b): lake texels store the level, dry ones
+/// `h − NO_WATER_DROP_M`. The wet/dry boundary must follow the ground's own `h = L` contour, as
+/// the terrain mesh shows it, not the zero contour of a level dropping across the dry texels.
+#[test]
+fn a_lake_shore_follows_the_ground_contour() {
+    const L: f32 = 100.0;
+    let mut grid = test_grid();
+    // About 3 m per texel, at an angle to the texel rows.
+    let (c, s) = (0.31f64.cos(), 0.31f64.sin());
+    let ground = move |x: f64, z: f64| 100.0 + 0.01 * (x * c + z * s);
+    for f in [&mut grid.inner, &mut grid.apron] {
+        f.elevation_m = texels_of(f, |x, z| ground(x, z) as f32);
+        f.water_level_m = f
+            .elevation_m
+            .iter()
+            .map(|&h| if h < L { L } else { h - NO_WATER_DROP_M as f32 })
+            .collect();
+    }
+    // The hazard: the same grid read with the level blended over every tap.
+    let mut levels = grid.clone();
+    for f in [&mut levels.inner, &mut levels.apron] {
+        f.elevation_m = f.water_level_m.clone();
+    }
+    let texel = grid.inner.spacing_m();
+    let (mut worst, mut worst_plain, mut lines) = (0.0f64, 0.0f64, 0);
+    for k in 0..40 {
+        // Lines across the shore (along the slope), through the inner field.
+        let t0 = -30_000.0 + 1_517.3 * f64::from(k);
+        let (ox, oz) = (-s * t0, c * t0);
+        let along = |u: f64| (ox + c * u, oz + s * u);
+        let crossing = |f: &dyn Fn(f64, f64) -> f32| {
+            let mut last = None;
+            for j in 0..=4000 {
+                let u = -2.0 * texel + 4.0 * texel * f64::from(j) / 4000.0;
+                let (x, z) = along(u);
+                let wet = f(x, z) > 0.0;
+                if last == Some(true) && !wet {
+                    return u;
+                }
+                last = Some(wet);
+            }
+            panic!("no shore on line {k}");
+        };
+        let shore = crossing(&|x, z| blended_water(&grid, x, z).thickness_m);
+        let contour = crossing(&|x, z| L - blended_height_m(&grid, x, z));
+        let plain =
+            crossing(&|x, z| blended_height_m(&levels, x, z) - blended_height_m(&grid, x, z));
+        worst = worst.max((shore - contour).abs() / texel);
+        worst_plain = worst_plain.max((plain - contour).abs() / texel);
+        lines += 1;
+        // The fly's floor stands at the level over the water, on the ground beyond it.
+        let (x, z) = along(contour - 0.3 * texel);
+        assert!(
+            (blended_surface_m(&grid, x, z) - L).abs() < 1e-3,
+            "line {k}"
+        );
+    }
+    println!("{lines} lines: shore within {worst:.4} texel; a plain blend {worst_plain:.3}");
+    assert!(worst <= 0.05, "the shore is {worst} texel from h = L");
+    assert!(
+        worst_plain > 0.2,
+        "the fixture creates the hazard: {worst_plain}"
+    );
 }
 
 /// Once a grid's river texels are on the GPU the shell frees them (`Field::free_rivers`): the

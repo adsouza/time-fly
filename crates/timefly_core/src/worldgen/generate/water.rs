@@ -9,6 +9,11 @@
 //! h1    = h0 − s × max(0, h0 − cap) for a Data lake, else h0,
 //!         cap = L − 1 − DATA_LAKE_MAX_DEPTH_M × min(1, shore_steps / DATA_LAKE_DEPTH_RAMP_NODES)
 //!         (= min(h0, cap) wherever shore_steps ≥ 1; the depth fades in over the shore cell)
+//! edge  = the lake's reach ends within LAKE_EDGE_TEXELS texels (lake_edge): some tap is off the
+//!         lake, and one of eight probes LAKE_EDGE_TEXELS × texel_m away (E, NE, N, NW, W, SW,
+//!         S, SE in the texel's own frame) has no tap on it
+//! h1    = max(h1, L + BANK_FREEBOARD_M) on an edge (the dam: a lake's water never ends on a
+//!         lattice-cell line over lower ground), and the lake is no candidate there
 //! rt    = rivers[field].texel(dir, h1, texel_m); h = rt.h_m   (the stored height)
 //! candidates (level, river texel):
 //!   sea   if any corner < 0 and (no pass, or an ocean node among the hydro taps, or a tap's
@@ -33,11 +38,11 @@ use half::f16;
 use super::rivers::{RegionRivers, RiverHit, across, chord_point, offset_point};
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
-    BOULDER_RADIUS_M, BOULDERS_PER_SUBPOINT_MAX, DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M,
-    MAX_BOULDERS, NO_WATER_DROP_M, OCEAN_STRAIT_M, RIBBON_NONE_M,
+    BANK_FREEBOARD_M, BOULDER_RADIUS_M, BOULDERS_PER_SUBPOINT_MAX, DATA_LAKE_DEPTH_RAMP_NODES,
+    DATA_LAKE_MAX_DEPTH_M, MAX_BOULDERS, NO_WATER_DROP_M, OCEAN_STRAIT_M, RIBBON_NONE_M,
 };
 use crate::hydrology::{EraHydrology, HydroGraph, LakeKind, LakeTap};
-use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis};
+use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
 use crate::worldgen::noise::hash3;
 
 /// The river texel of water that is not a river: `[RIBBON_NONE_M, 0, 0, 0]` as f16 bits.
@@ -83,6 +88,48 @@ pub(super) fn lake_bed_m(h0: f64, lake: Option<&LakeTap>) -> f64 {
     let ramp = (steps / DATA_LAKE_DEPTH_RAMP_NODES).min(1.0);
     let cap = f64::from(tap.level_m) - 1.0 - DATA_LAKE_MAX_DEPTH_M * ramp;
     h0 - steps.min(1.0) * (h0 - cap).max(0.0)
+}
+
+/// How far (texels) [`lake_edge`] probes for the end of a lake's reach: more than one texel,
+/// so a texel's grid neighbours, a little off its own east and north, are covered.
+pub const LAKE_EDGE_TEXELS: f64 = 1.5;
+
+/// Whether `dir` lies within [`LAKE_EDGE_TEXELS`] texels of the end of lake `lake`'s reach
+/// (the cells with a tap on its footprint): some tap at `dir` is off the lake, and one of eight
+/// probes that far away has no tap on it. A texel there is the lake's dam ([`dam_m`]), so the
+/// lake's water never ends on a lattice-cell line while the ground beyond is lower (Task 8b).
+pub(super) fn lake_edge(hydro: &EraHydrology, dir: RenderDir, lake: u16, texel_m: f64) -> bool {
+    let on = |d: RenderDir| {
+        hydro
+            .lattice
+            .taps(d)
+            .iter()
+            .filter(|&&(v, _)| hydro.lake_of(v) == Some(lake))
+            .count()
+    };
+    if on(dir) == 4 {
+        return false;
+    }
+    let (north, east) = RegionFrame { center: dir }.north_east();
+    let r = LAKE_EDGE_TEXELS * texel_m / EARTH_RADIUS_M;
+    let d = std::f64::consts::FRAC_1_SQRT_2;
+    [
+        (1.0, 0.0),
+        (d, d),
+        (0.0, 1.0),
+        (-d, d),
+        (-1.0, 0.0),
+        (-d, -d),
+        (0.0, -1.0),
+        (d, -d),
+    ]
+    .iter()
+    .any(|&(e, n)| on(RenderDir((dir.0 + (east * e + north * n) * r).normalize())) == 0)
+}
+
+/// The ground on a lake's dam: at least `BANK_FREEBOARD_M` above the lake's level.
+pub(super) fn dam_m(h: f64, lake: &LakeTap) -> f64 {
+    h.max(f64::from(lake.level_m) + BANK_FREEBOARD_M)
 }
 
 /// Whether an ocean node is among the hydro lattice's four taps at `dir`, or is a neighbour of

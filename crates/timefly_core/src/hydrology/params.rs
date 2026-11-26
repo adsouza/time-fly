@@ -42,6 +42,10 @@ pub const DATA_LAKE_DEPTH_RAMP_NODES: f64 = 2.0;
 /// inflow through, and a terminal one is a dry playa unless a river reaches it
 /// ([`RIVER_MIN_DISCHARGE_M3S`]).
 pub const MIN_LAKE_DEPTH_M: f64 = DATA_LAKE_FLAT_TOL_M;
+/// Where the terrain is today's, an open lake whose level stands more than this above the
+/// surface of the present-day mapped lake it overlaps drops to that surface (Task 8b): the
+/// lattice dammed it above the real lake.
+pub const OPEN_LAKE_MAP_TOL_M: f64 = 10.0;
 
 // Rivers.
 

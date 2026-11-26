@@ -172,6 +172,8 @@ mod tests {
             "Krapp",
             "10.1038/s41597-020-0552-1",
             "10.6084/m9.figshare.12293345",
+            "Natural Earth",
+            "naturalearthdata.com",
             "Bevy",
         ] {
             assert!(CREDITS_TEXT.contains(needle), "credits.txt lacks {needle}");

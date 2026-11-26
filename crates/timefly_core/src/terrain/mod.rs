@@ -11,8 +11,9 @@ mod cdlod;
 
 pub use cdlod::{LodSettings, Patch, morph_factor, morph_vertex, select_patches};
 
+use crate::hydrology::params::NO_WATER_DROP_M;
 use crate::worldgen::frame::EARTH_RADIUS_M;
-use crate::worldgen::generate::water::decode_river;
+use crate::worldgen::generate::water::{RIVER_NONE, decode_river};
 use crate::worldgen::generate::{Field, RegionGrid};
 
 /// Quads per patch side (33 × 33 vertices).
@@ -28,6 +29,10 @@ pub const BLEND_APRON_TEXELS: f64 = 4.0;
 /// the offsets' f16 rounding. Taps whose offsets differ in sign by more belong to different
 /// rivers ([`blended_water`]'s crossing guard). Mirrored in `terrain_cdlod.wesl`.
 pub const CROSSING_REACH_TEXELS: f32 = 1.5;
+/// A texel whose water level stands more than this below its ground is dry: dry texels store
+/// `h − NO_WATER_DROP_M` ([`blended_water`]'s standing-water rule). Mirrored in
+/// `terrain_cdlod.wesl`.
+pub const DRY_BELOW_M: f32 = -(NO_WATER_DROP_M as f32) / 2.0;
 
 /// Terrain height (m above sea level) at local `(x, z)` metres: the inner field near the centre,
 /// the apron outside it, and a smoothstep between the two.
@@ -88,10 +93,16 @@ pub struct WaterSample {
 /// confluence or a sharp bend). The interpolated offset would pass through 0 between them and
 /// rebuild a ribbon of `hw` where no river is, so that field contributes its interpolated
 /// ribbons instead, as `hw` with `o = 0`.
+///
+/// Standing water (Task 8b): where none of a field's four taps is a river texel (its bits other
+/// than [`RIVER_NONE`]'s ribbon and offset), the level is interpolated over the taps that are
+/// wet, `level − h > `[`DRY_BELOW_M`], alone ([`field_level`]): a lake's or the sea's flat
+/// level, not one dropping toward the dry texels' `h − NO_WATER_DROP_M`. The shoreline is then
+/// the terrain's own `h = L` contour. Rivers keep the plain blend.
 pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
     let s = blend_weight(grid, x_m, z_m);
     let read = |f: &Field| {
-        let level = sample_field(f, x_m, z_m, |i| f.water_level_m[i]);
+        let level = field_level(f, x_m, z_m, true);
         let decoded = |i: usize| decode_river(f.river_at(i));
         let hw = sample_field(f, x_m, z_m, |i| {
             let [ribbon, _, _, offset] = decoded(i);
@@ -124,13 +135,60 @@ pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
 }
 
 /// The drawn surface at local `(x, z)` metres: the higher of the ground ([`blended_height_m`])
-/// and the water ([`blended_water`]'s level). The fly's floor: it reads only the levels, not the
-/// river texels, since the fly steps call it once per substep.
+/// and the water. The fly's floor: it reads the levels and heights, not the river texels (they
+/// are freed after the upload, and the fly steps call it once per substep), so every wet tap
+/// counts as standing water ([`field_level`] without rivers). That is [`blended_water`]'s level
+/// wherever no river tap is near, and never below it beside a river.
 pub fn blended_surface_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
     let s = blend_weight(grid, x_m, z_m);
-    let level = |f: &Field| sample_field(f, x_m, z_m, |i| f.water_level_m[i]);
+    let level = |f: &Field| field_level(f, x_m, z_m, false);
     let (i, a) = (level(&grid.inner), level(&grid.apron));
     blended_height_m(grid, x_m, z_m).max(i + (a - i) * s)
+}
+
+/// One field's water level at local `(x, z)`: the bilinear level of [`sample_clamped`], except
+/// over standing water. A tap is wet when `level − h > `[`DRY_BELOW_M`]; with `rivers`, a tap
+/// whose river texel's ribbon and offset are not [`RIVER_NONE`]'s is a river. Where no tap is a
+/// river and some taps are wet and some dry:
+/// - if every wet tap holds the same level, that level (exactly: a lake is flat);
+/// - else `n / d`, in f32: with the bilinear weights `w = [(1 − fu)(1 − fv), fu (1 − fv),
+///   (1 − fu) fv, fu fv]` in tap order, `n` sums `w_k × level_k` and `d` sums `w_k` over the wet
+///   taps, in tap order (all terms positive, so a small wet share loses no precision), when
+///   `d > 0`.
+///
+/// With every tap wet, or none, the plain bilinear level.
+fn field_level(f: &Field, x_m: f64, z_m: f64, rivers: bool) -> f32 {
+    let plain = sample_field(f, x_m, z_m, |i| f.water_level_m[i]);
+    let (taps, fu, fv) = taps(f, x_m, z_m);
+    let wet = |i: usize| f.water_level_m[i] - f.elevation_m[i] > DRY_BELOW_M;
+    let river = |i: usize| {
+        let r = f.river_at(i);
+        r[0] != RIVER_NONE[0] || r[3] != RIVER_NONE[3]
+    };
+    let wet_taps = taps.iter().filter(|&&i| wet(i)).count();
+    if (rivers && taps.iter().any(|&i| river(i))) || wet_taps == 0 || wet_taps == 4 {
+        return plain;
+    }
+    let mut levels = taps
+        .iter()
+        .filter(|&&i| wet(i))
+        .map(|&i| f.water_level_m[i]);
+    let first = levels.next().expect("a wet tap");
+    if levels.all(|l| l == first) {
+        return first;
+    }
+    let w = [
+        (1.0 - fu) * (1.0 - fv),
+        fu * (1.0 - fv),
+        (1.0 - fu) * fv,
+        fu * fv,
+    ];
+    let (mut n, mut d) = (0.0f32, 0.0f32);
+    for (k, &i) in taps.iter().enumerate().filter(|&(_, &i)| wet(i)) {
+        n += w[k] * f.water_level_m[i];
+        d += w[k];
+    }
+    if d > 0.0 { n / d } else { plain }
 }
 
 /// How far the ground has dropped below the tangent plane at a horizontal distance from the

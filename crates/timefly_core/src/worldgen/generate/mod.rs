@@ -985,7 +985,15 @@ impl<F: CoarseField> Sampler<'_, F> {
         };
         if let Some(hydro) = self.hydro {
             carved.lake = hydro.lake_tap(dir);
-            let h1 = water::lake_bed_m(h0, carved.lake.as_ref());
+            let mut h1 = water::lake_bed_m(h0, carved.lake.as_ref());
+            // The lake's dam where its reach ends: no water, and ground above its level.
+            if let Some(lake) = carved
+                .lake
+                .filter(|l| water::lake_edge(hydro, dir, l.lake, layer.texel_m))
+            {
+                h1 = water::dam_m(h1, &lake);
+                carved.lake = None;
+            }
             let (h, hit) = match &self.rivers[kind.index()] {
                 Some(rivers) => {
                     let t = rivers.texel(dir, h1, layer.texel_m);

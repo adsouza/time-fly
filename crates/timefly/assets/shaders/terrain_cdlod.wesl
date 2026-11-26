@@ -146,6 +146,17 @@ struct FieldWater {
 // `CROSSING_REACH_TEXELS` in timefly_core::terrain: taps whose centreline offsets differ in sign
 // by more than this many texels belong to different rivers.
 const CROSSING_REACH_TEXELS: f32 = 1.5;
+// `DRY_BELOW_M` in timefly_core::terrain: a texel whose level - h is at or below this is dry
+// (dry texels store h - NO_WATER_DROP_M, 64 m under the ground).
+const DRY_BELOW_M: f32 = -32.0;
+// Word 2 of a water texel that is no river: `RIVER_NONE`'s ribbon (RIBBON_NONE_M = 1,000 m as
+// f16, 0x63D0) and offset (0).
+const RIVER_NONE_WORD: u32 = 0x63D0u;
+
+// 1 where a water texel stands (no river, its level above DRY_BELOW_M under its ground), else 0.
+fn standing(w: vec4<u32>) -> f32 {
+    return select(0.0, 1.0, w.z == RIVER_NONE_WORD && bitcast<f32>(w.y) > DRY_BELOW_M);
+}
 
 // A water texel (`water_image`): (level, level - h, ribbon + |offset|, offset).
 fn water_texel(w: vec4<u32>) -> vec4<f32> {
@@ -156,6 +167,8 @@ fn water_texel(w: vec4<u32>) -> vec4<f32> {
 // One field's water at xz, read as `field_height` reads heights, with `blended_water`'s
 // crossing guard: offsets of both signs further apart than CROSSING_REACH_TEXELS texels are two
 // rivers, so the field gives its interpolated ribbons (as the half-width, offset 0) instead.
+// Standing water (`field_level`): where no tap is a river and some tap is wet, the level is
+// interpolated over the wet taps alone (n / d), and the thickness moves with it.
 fn field_water(tex: texture_2d<u32>, field: vec4<f32>, xz: vec2<f32>) -> FieldWater {
     let last = field.z - 1.0;
     let uv = clamp((xz + vec2<f32>(field.x * 0.5)) / field.y, vec2<f32>(0.0), vec2<f32>(last));
@@ -180,6 +193,36 @@ fn field_water(tex: texture_2d<u32>, field: vec4<f32>, xz: vec2<f32>) -> FieldWa
     let flow_top = q00 + (q10 - q00) * f.x;
     let flow_bottom = q01 + (q11 - q01) * f.x;
     let flow = flow_top + (flow_bottom - flow_top) * f.y;
+    let any_river = w00.z != RIVER_NONE_WORD || w10.z != RIVER_NONE_WORD
+        || w01.z != RIVER_NONE_WORD || w11.z != RIVER_NONE_WORD;
+    let m00 = standing(w00);
+    let m10 = standing(w10);
+    let m01 = standing(w01);
+    let m11 = standing(w11);
+    let wet = m00 + m10 + m01 + m11;
+    // The wet taps' levels, dry taps standing in with the first wet level: all equal when the
+    // wet taps share one level.
+    let first = select(select(select(a11.x, a01.x, m01 > 0.0), a10.x, m10 > 0.0), a00.x, m00 > 0.0);
+    let l00 = select(first, a00.x, m00 > 0.0);
+    let l10 = select(first, a10.x, m10 > 0.0);
+    let l01 = select(first, a01.x, m01 > 0.0);
+    let l11 = select(first, a11.x, m11 > 0.0);
+    let flat = l00 == first && l10 == first && l01 == first && l11 == first;
+    if !any_river && wet > 0.0 && wet < 4.0 && flat {
+        a = vec4<f32>(first, a.y + (first - a.x), a.z, a.w);
+    } else if !any_river && wet > 0.0 && wet < 4.0 {
+        // Positive weights only, so a small wet share loses no precision.
+        let k00 = m00 * ((1.0 - f.x) * (1.0 - f.y));
+        let k10 = m10 * (f.x * (1.0 - f.y));
+        let k01 = m01 * ((1.0 - f.x) * f.y);
+        let k11 = m11 * (f.x * f.y);
+        let n = k00 * a00.x + k10 * a10.x + k01 * a01.x + k11 * a11.x;
+        let d = k00 + k10 + k01 + k11;
+        if d > 0.0 {
+            let level = n / d;
+            a = vec4<f32>(level, a.y + (level - a.x), a.z, a.w);
+        }
+    }
     let lo = min(min(a00.w, a10.w), min(a01.w, a11.w));
     let hi = max(max(a00.w, a10.w), max(a01.w, a11.w));
     if lo < 0.0 && hi > 0.0 && hi - lo > CROSSING_REACH_TEXELS * field.y {

@@ -224,6 +224,7 @@ pub fn run_parallel(inputs: &HydroInputs, cancel: &AtomicBool) -> Result<PassOut
                         start: range.start,
                         samples: Vec::new(),
                         data_lakes: false,
+                        mapped: Vec::new(),
                     };
                 }
                 HydroPrep::sample_range(&lattice, shared, range)

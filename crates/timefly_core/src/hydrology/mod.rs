@@ -10,6 +10,7 @@
 
 pub mod climate;
 mod graph;
+pub mod lakemap;
 mod lakes;
 mod lattice;
 pub mod levels;
@@ -167,6 +168,38 @@ impl EraHydrology {
             ocean: vec![0; lattice.len().div_ceil(64) as usize],
             lake_nodes: Vec::new(),
         }
+    }
+
+    /// This result with lake footprints `nodes` (`(node, lake)`), shore steps 1 on nodes with a
+    /// neighbour off their lake and 2 inside. For the generator's fixtures.
+    #[cfg(test)]
+    pub(crate) fn with_lake_nodes(mut self, nodes: &[(u32, u16)]) -> EraHydrology {
+        let mut nodes = nodes.to_vec();
+        nodes.sort_unstable();
+        nodes.dedup_by_key(|n| n.0);
+        let lake_of = |v: u32| {
+            nodes
+                .binary_search_by_key(&v, |n| n.0)
+                .ok()
+                .map(|k| nodes[k].1)
+        };
+        self.lake_nodes = nodes
+            .iter()
+            .map(|&(node, lake)| {
+                let inside = self
+                    .lattice
+                    .neighbours(node)
+                    .iter()
+                    .flatten()
+                    .all(|&u| lake_of(u) == Some(lake));
+                LakeNode {
+                    node,
+                    lake,
+                    shore_steps: if inside { 2 } else { 1 },
+                }
+            })
+            .collect();
+        self
     }
 
     /// The bytes the result holds, by capacity.

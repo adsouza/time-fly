@@ -1642,6 +1642,34 @@ fn tap_indices(field: &Field, x: f64, z: f64) -> [usize; 4] {
     [i, i + 1, i + n, i + n + 1]
 }
 
+/// Whether a field's level at `(x, z)` comes from its standing water alone
+/// (`timefly_core::terrain::blended_water`'s rule: no tap is a river texel, some tap is wet),
+/// and if so the wet taps' share `d` of the bilinear weight (0 when none has weight), and
+/// whether some tap is dry (a shore cell).
+fn standing_share(field: &Field, x: f64, z: f64) -> Option<(f32, bool)> {
+    use timefly_core::terrain::DRY_BELOW_M;
+    use timefly_core::worldgen::generate::water::RIVER_NONE;
+    let taps = tap_indices(field, x, z);
+    let river = |i: usize| field.river[i][0] != RIVER_NONE[0] || field.river[i][3] != 0;
+    let wet = |i: usize| field.water_level_m[i] - field.elevation_m[i] > DRY_BELOW_M;
+    if taps.iter().any(|&i| river(i)) || !taps.iter().any(|&i| wet(i)) {
+        return None;
+    }
+    let last = f64::from(field.res - 1);
+    let spacing = field.spacing_m();
+    let u = ((x + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let v = ((z + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let (fu, fv) = (u - u.floor().min(last - 1.0), v - v.floor().min(last - 1.0));
+    let w = [
+        (1.0 - fu) * (1.0 - fv),
+        fu * (1.0 - fv),
+        (1.0 - fu) * fv,
+        fu * fv,
+    ];
+    let d: f64 = (0..4).filter(|&k| wet(taps[k])).map(|k| w[k]).sum();
+    Some((d as f32, taps.iter().any(|&i| !wet(i))))
+}
+
 /// The largest magnitude and the spread (max − min) of `value` over both fields' taps at
 /// `(x, z)`.
 fn tap_range(
@@ -1771,6 +1799,8 @@ struct WaterParity {
     guarded: usize,
     blended: usize,
     in_river: usize,
+    /// Points whose level came from a shore cell's wet taps alone (some taps dry).
+    shore: usize,
 }
 
 /// Compares the GPU's `blended_water` with the Rust reference at `points`. `weight_error` bounds
@@ -1798,9 +1828,19 @@ fn check_water_parity(grid: &RegionGrid, points: &[[f32; 4]], weight_error: f32)
         let east = tap_range(grid, x, z, |f, i| river(f, i)[1]);
         let north = tap_range(grid, x, z, |f, i| river(f, i)[2]);
 
+        // Standing water's level is `n / d` over the wet taps: two more ulps for the division,
+        // and the weight error divided by the wet taps' share `d`.
+        let shares: Vec<(f32, bool)> = [&grid.inner, &grid.apron]
+            .iter()
+            .filter_map(|f| standing_share(f, x, z))
+            .collect();
+        let standing = shares
+            .iter()
+            .map(|&(d, _)| 2.0 * ulp(level.0) + slack * level.1 / d.max(1e-6))
+            .fold(0.0f32, f32::max);
         let d = (g[0] - r.level_m).abs();
         assert!(
-            d <= tol(2.0, level),
+            d <= tol(2.0, level) + standing,
             "level at ({x}, {z}): gpu {} vs rust {} ({} ulps)",
             g[0],
             r.level_m,
@@ -1812,7 +1852,7 @@ fn check_water_parity(grid: &RegionGrid, points: &[[f32; 4]], weight_error: f32)
         let both = (level.0.max(heights.0), level.1 + heights.1);
         let d = (g[1] - r.thickness_m).abs();
         assert!(
-            d <= tol(4.0, both),
+            d <= tol(4.0, both) + 2.0 * standing,
             "thickness at ({x}, {z}): gpu {} vs rust {}",
             g[1],
             r.thickness_m
@@ -1851,6 +1891,7 @@ fn check_water_parity(grid: &RegionGrid, points: &[[f32; 4]], weight_error: f32)
         let a = x.abs().max(z.abs());
         parity.blended += usize::from(a > e0 && a < e1);
         parity.in_river += usize::from(r.ribbon_m > 0.0 && r.ribbon_m < 100.0);
+        parity.shore += usize::from(shares.iter().any(|&(d, dry)| dry && d > 0.0));
     }
     parity
 }
@@ -1936,6 +1977,11 @@ fn wesl_water_matches_rust() {
             p.in_river >= 100,
             "{name}: only {} points in a river",
             p.in_river
+        );
+        assert!(
+            p.shore >= 100,
+            "{name}: only {} points on standing water's shore",
+            p.shore
         );
     }
 }
