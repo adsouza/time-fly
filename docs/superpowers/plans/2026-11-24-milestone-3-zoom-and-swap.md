@@ -42,7 +42,7 @@
   - `CHASE_DISTANCE_PER_AGL = 0.5`
   - `CHASE_MIN_DISTANCE_M = 60.0`
   - `CHASE_ELEVATION_DEG = 20.0`
-  - `CHASE_GLOBE_TOP_PITCH_DEG = 70.0` (the look-down pitch at `GLOBE_MAX_ALTITUDE_KM`)
+  - `CHASE_GLOBE_TOP_PITCH_DEG = 83.8` (the look-down pitch at `GLOBE_MAX_ALTITUDE_KM`; 70.0 until Task 14's framing A, see its rulings)
   - `FLY_SCREEN_FRACTION = 0.05` (5% of the view's height)
 - **Cloud timings** *(call)*:
   - `CLOUD_GATHER_S = 0.6`
@@ -548,6 +548,7 @@ Owner, 2026-11-26: on the globe the camera sat straight over the fly (its eye el
 **Files:** `crates/timefly_core/src/flight/{chase.rs,altitudes.rs}`, `crates/timefly/src/globe_flight.rs`, the key mapping (`fly_camera.rs` or wherever `KeyInput` is built), `docs/testing/m3/manual-checks.md`.
 
 - **Globe camera:** behind and above the fly at every altitude: cap the eye's elevation at about 45–50° (decide and justify from renders). At the top altitude, aim the view past the fly so the whole globe fits in the frame with the fly in its lower part. The dive framing is unchanged (ground fills at least the lower two-thirds, landscape or portrait). The drag range stays sensible.
+  - *As built:* the owner's framing A ("globe centred", 2026-11-26) replaced the 45–50° cap: the eye rises to 70° at the top with the globe centred and the fly over its upper part (Task 14's rulings below).
 - **Descend key:** on macOS, descend is `Option` (`Alt`) in place of `Ctrl`; `Q` unchanged. Not `Cmd` (`⌘Q` quits and `Q` is the descend key). Other platforms keep `Ctrl`. Update the controls text.
 - [ ] **Step 1: Write the failing tests:** `the_globe_chase_stays_behind_the_fly` (elevation ≤ the cap at every altitude), `the_whole_globe_is_in_frame_at_the_top` (the globe's limb inside the view for a 16:9 and a 9:16 window), the existing dive-framing test kept, `descend_is_option_on_macos_and_ctrl_elsewhere`.
 - [ ] **Steps 2–4:** RED, implement, GREEN.
@@ -646,3 +647,15 @@ left out on purpose: they belong to that branch, not to this plan.
 - Degree signs are drawn as small rings between text pieces (`DegreeText`). Why: Bevy's built-in UI font is a 95-glyph ASCII subset, so `°` drew as a missing-glyph box. Cost if wrong: ship a fuller font (licence and credits) and drop the rings.
 - A `--from-shot` repro holds the camera at the saved transform (to the bit) until the first input other than `F12`; `F12` does not wake the faded slider either. Why: the chase's glide at the shot is not re-derivable, and the shot should show the screen as the player had it. Cost if wrong: a held camera that feels stuck until a key is pressed.
 - The sidecar's JSON needs serde_json's `float_roundtrip`: without it, f64s read back 1 ulp off (caught by `the_sidecar_round_trips`). Cost: slightly slower JSON parsing everywhere in the crate.
+
+**Task 13 (wings that read as wings)**
+- Each wing is pitched `WING_INCIDENCE_DEG` = 20° about its own span, leading edge up. Why: in a descent the fly's 20° nose-down pitch (`MAX_PITCH_DEG`) met the chase's 20° elevation, so the camera looked straight along the body axis and the flat wings were edge-on whatever the flap, which turns them about that axis. Pitched, they show at least 20° to that view and about twice it in level flight. Cost if wrong: one constant.
+- The flap advances `FLAP_CYCLES_PER_FRAME` = 0.4 cycle per frame, not by time. Why: a 25 Hz beat sampled at the frame rate aliased into a slow flutter; a fixed fraction per frame always reads as a fast beat. So the beat follows the frame rate, and it keeps going while virtual time pauses. Cost if wrong: a beat that slows with a slow frame rate; a time-based flap with a motion-blur fan instead.
+
+**Task 14 (the globe camera, descend on Option)**
+- `GLOBE_CHASE_MIN_ELEVATION_DEG` goes from 5° to 20° (the region's `CHASE_ELEVATION_DEG`). Why: at 5° a fly descending nose down showed the eye its wings edge-on on the globe (2° of wing). Cost if wrong: a drag up stops higher (15° down at and below the dive, 33.8° at the top).
+- Framing A (owner, 2026-11-26, "A: globe centred") replaces the plan's 45–50° cap: the eye's elevation rises from 55° at the dive to 70° at the top (a drag may raise it to 75°); the look from 50° to 83.8° (`CHASE_GLOBE_TOP_PITCH_DEG`), capped at 85°; and the globe fly is sized by its depth along the view, not its distance. Why: from an eye at elevation `E` behind a fly at radius `r` the fly is seen over the globe only when `r·cos E < R` (64° at the top), so a 45–50° cap put the fly against space; at 70° and 83.8° the whole globe is in a 16:9 or 9:16 view with the fly over its upper part; off the view's centre perspective draws the fly 1 / cos larger. Cost if wrong: retune three constants.
+- Descend is `Option` (`Alt`) on a Mac, including Mac browsers (the web build reads `navigator.platform`), `Ctrl` elsewhere, and `Q` everywhere. Why: `Ctrl+↑` opens Mission Control on macOS and `⌘Q` quits. Cost if wrong: one key mapping.
+
+**Task 15 (benches stop at the first failure)**
+- The journey bench also stops on a failed hop memory or route check, besides the plan's holds and swap frames: each is final once its hop ends. In the region bench a web R11 failure still flies that region: the run ends after the failing region's block, as for its other gates. Why: a gate decided within a stop cannot change later, so the rest of the run is wasted time (the owner's ask); a stop is the whole region, so its block reports every gate it decided. Cost if wrong: a stopped run hides later stops' results (`--keep-going` flies them).

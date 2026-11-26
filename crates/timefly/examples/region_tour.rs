@@ -112,7 +112,11 @@
 //! `--from-shot <json>` (or `--from-shot=<json>`), anywhere among the arguments, starts the game
 //! at a bug shot's pose (the game's own `--from-shot`): the window is the shot's size unless
 //! `WxH` is given, the region and mode arguments are ignored, and once the pose is restored and
-//! [`SETTLE_SECS`] have passed it saves `<prefix>-repro.png`, to compare with the shot.
+//! [`SETTLE_SECS`] have passed it saves `<prefix>-repro.png`, to compare with the shot. The
+//! shot's size is its logical size: a game shot at 2× (Retina, 2560 × 1440) replays at
+//! 1280 × 720, and the tour renders offscreen at that size, so the repro PNG has half the shot's
+//! pixels on each side. Pass the shot's pixel size as `WxH` (here `2560x1440`) for a PNG of the
+//! shot's size, the same view (the aspect is unchanged), to diff against it.
 //!
 //! A fifth argument `time` measures frame times instead of taking shots (art pass, ruling R8: the
 //! region bench never flies over a sand sea). The region camera draws to the window, vsync is off

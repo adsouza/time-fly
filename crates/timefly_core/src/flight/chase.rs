@@ -17,8 +17,10 @@ pub const CHASE_START_LOOK_DEG: f64 = CHASE_ELEVATION_DEG - CHASE_FLY_BELOW_CENT
 /// portrait (controller ruling, Task 4 fix round 1; the horizon dips about 38° from the eye).
 pub const GLOBE_CHASE_DIVE_LOOK_DEG: f64 = 50.0;
 /// The lowest the globe's chase eye may sit above the fly's horizon (degrees): the region's
-/// [`CHASE_ELEVATION_DEG`], so a drag up stops with the view looking 15° down, the region's
-/// start look. Lower, a fly descending nose down shows the eye its wings edge-on (M3 Task 14:
+/// [`CHASE_ELEVATION_DEG`]. A drag moves the eye and the look together, so at and below
+/// [`DIVE_ALTITUDE_KM`] a drag up stops with the view looking 15° down, the region's start look;
+/// higher it stops steeper, up to 33.8° at the top ([`CHASE_GLOBE_TOP_PITCH_DEG`] − 50°). Lower,
+/// a fly descending nose down shows the eye its wings edge-on (M3 Task 14:
 /// below about 15°; 2° of wing at the old floor of 5°, `creature`'s edge-on test).
 pub const GLOBE_CHASE_MIN_ELEVATION_DEG: f64 = CHASE_ELEVATION_DEG;
 /// The globe chase eye's elevation above the fly's horizon at and below [`DIVE_ALTITUDE_KM`]
@@ -222,9 +224,11 @@ pub fn lift_above_ground(
 }
 
 /// Uniform scale for the fly model (1 unit tall) so it spans `FLY_SCREEN_FRACTION` of the view
-/// height at `eye_to_fly`, for a vertical field of view of `vfov_rad`.
-pub fn fly_scale(eye_to_fly: f64, vfov_rad: f64) -> f64 {
-    2.0 * eye_to_fly * (vfov_rad / 2.0).tan() * FLY_SCREEN_FRACTION
+/// height at `view_depth` along the view's axis, for a vertical field of view of `vfov_rad`.
+/// Regions pass the eye-to-fly distance (the fly is near the view's centre); the globe passes
+/// the depth, since off the centre perspective draws the fly 1 / cos larger.
+pub fn fly_scale(view_depth: f64, vfov_rad: f64) -> f64 {
+    2.0 * view_depth * (vfov_rad / 2.0).tan() * FLY_SCREEN_FRACTION
 }
 
 #[cfg(test)]

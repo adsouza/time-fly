@@ -5,6 +5,10 @@ The cloud cost re-measure and the web build used `e3bd6e9`, Task 11's code commi
 tilt-shift (see "Cloud pass cost"). On 2026-11-25 the owner asked for the tilt-shift back, and it
 is back in the game (about 1.8 ms, inside the owner's accepted 2 ms).
 
+**2026-11-26:** the native numbers (`4b79f08`) and the Chrome numbers (`73696b4`) predate Tasks
+12–15: the globe framing, the HUD readout and rose, and the frame-locked flap. The region and
+journey benches will re-run on the merged rivers branch (ruled: not re-run here).
+
 | | |
 |---|---|
 | Machine | Apple M4, 16 GB, macOS 27.2.1 (26B131) |
@@ -663,6 +667,5 @@ Grand Canyon, Mt Fuji, then the Andes again.
   - Fixed: each wing is pitched 20° leading edge up, so it shows at least 20° to that view
     (`wings-after-descent.jpg`, `wings-after-descent-cloud.jpg`) and 40° in level flight
     (`wings-after-level.jpg`).
-  - Fix queued on this branch, after a render that shows which.
 - **The cloud over near geometry** (the Chrome side of the check above): not reported. Still to
   check in Chrome.

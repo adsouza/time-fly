@@ -160,7 +160,8 @@ Run the game normally (`cargo run -p timefly`, or the release build). Wait for t
 - [ ] A slow double-click (more than about a third of a second between the clicks) or one
       where the pointer moves between the clicks does not enter a region.
 - [ ] `W` `A` `S` `D` move (forward follows the view), dragging looks around, `Space` / `E`
-      climb, `Ctrl` / `Q` descend. Higher up the camera moves faster.
+      climb, `Option` / `Q` descend (`Ctrl` / `Q` on Windows and Linux, since M3 Task 14).
+      Higher up the camera moves faster.
 - [ ] The arrow keys fly too: `↑` / `↓` forward and back, `←` / `→` turn left and right, and
       with `Shift` held `←` / `→` fly sideways instead of turning.
 - [ ] `Shift` + `↑` (or `Shift` + `W`) boosts forward. `Shift` alone, or with `↓`, sideways or

@@ -43,6 +43,7 @@ use timefly_core::worldgen::generate::RegionSpec;
 
 use super::position::{FlyPlace, Place, ShotWorld, spawn_position, update_fly_place};
 use super::{BlocksCamera, PANEL_COLOR, TEXT_COLOR};
+use crate::clock::{LoadClock, add_load_clock};
 use crate::diagnostics::SessionInfo;
 use crate::diagnostics::session::UtcTime;
 use crate::fly_camera::{FlyChase, FlyState, FlySystems, apply_fly};
@@ -492,6 +493,7 @@ pub struct ShotRestorePlugin;
 
 impl Plugin for ShotRestorePlugin {
     fn build(&self, app: &mut App) {
+        add_load_clock(app);
         app.add_message::<RegionRequested>()
             .add_systems(
                 PreUpdate,
@@ -831,6 +833,35 @@ pub enum RestoreStage {
     Requested,
     /// The pose is restored and the camera held.
     Placed,
+    /// The region failed to load or never came ([`RESTORE_GIVE_UP_S`]); logged once.
+    GaveUp,
+}
+
+/// How long a repro waits, after asking for its region, to be flying in it (seconds of the
+/// [`LoadClock`], so a hidden tab does not count). A web first entry takes about 10 s, each load
+/// may take [`crate::region::LOAD_TIMEOUT_S`] before it fails, and the descent cloud follows.
+pub const RESTORE_GIVE_UP_S: f64 = 120.0;
+
+/// The largest angle (radians) between a shot's region centre and the generated region's that
+/// still counts as the same region: about 6 mm on the Earth. `spec_for` normalises the saved
+/// centre again, which moves about a third of unit vectors in their last bits.
+pub const SAME_CENTRE_RAD: f64 = 1e-9;
+
+/// Whether two region centres are the same direction up to rounding. `atan2(|a × b|, a · b)`
+/// resolves angles near 0; glam's `angle_between` (an `acos`) jumps from 0 to about 1.5e-8.
+pub fn same_centre(a: RenderDir, b: RenderDir) -> bool {
+    let (a, b) = (a.0, b.0);
+    a.cross(b).length().atan2(a.dot(b)) < SAME_CENTRE_RAD
+}
+
+/// Whether a generated region's spec is a shot's: the centre up to rounding
+/// ([`same_centre`]), every other field exactly.
+pub fn same_spec(generated: &RegionSpec, saved: &RegionSpec) -> bool {
+    same_centre(generated.center, saved.center)
+        && RegionSpec {
+            center: saved.center,
+            ..*generated
+        } == *saved
 }
 
 /// A `--from-shot` repro: the sidecar and its progress.
@@ -838,6 +869,11 @@ pub enum RestoreStage {
 pub struct ShotRestore {
     pub pose: ShotPose,
     pub stage: RestoreStage,
+    /// The [`LoadClock`] when the region was asked for.
+    requested_at_s: f64,
+    /// Whether the region has been generating since it was asked for (so a return to the globe
+    /// is a failed load, not the request still waiting to be read).
+    generating_seen: bool,
 }
 
 impl ShotRestore {
@@ -845,6 +881,8 @@ impl ShotRestore {
         ShotRestore {
             pose,
             stage: RestoreStage::WaitGlobe,
+            requested_at_s: 0.0,
+            generating_seen: false,
         }
     }
 
@@ -874,10 +912,12 @@ struct RestoreWorlds<'w> {
 }
 
 /// Steps a repro: the globe pose once the globe is interactive; or the region asked for, and
-/// the fly placed once it is entered.
+/// the fly placed once it is entered. A region that fails to load, or is not flown in within
+/// [`RESTORE_GIVE_UP_S`], ends the repro with a warning.
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn restore_shot(
     mut restore: ResMut<ShotRestore>,
+    clock: Res<LoadClock>,
     status: Option<Res<GlobeRenderStatus>>,
     region: Option<Res<ActiveRegion>>,
     state: Option<Res<State<RegionState>>>,
@@ -910,6 +950,8 @@ fn restore_shot(
                         purpose: RequestPurpose::Enter,
                     });
                     restore.stage = RestoreStage::Requested;
+                    restore.requested_at_s = clock.elapsed_s;
+                    restore.generating_seen = false;
                 }
                 _ => {
                     let g = &pose.globe;
@@ -931,16 +973,40 @@ fn restore_shot(
                 return;
             };
             let want = saved.spec();
+            // By angle: `spec_for` normalises the saved centre again (see `same_centre`).
             let entered = region.as_ref().is_some_and(|r| {
-                r.grid.spec.center == want.center && r.grid.spec.snapshot == want.snapshot
+                same_centre(r.grid.spec.center, want.center)
+                    && r.grid.spec.snapshot == want.snapshot
             });
-            let flying = state.is_none_or(|s| *s.get() == RegionState::InRegion)
+            let now = state.map(|s| *s.get());
+            let flying = now.is_none_or(|s| s == RegionState::InRegion)
                 && nav.is_none_or(|n| n.phase == NavPhase::Flying);
             if !(entered && flying) {
+                let generating_seen =
+                    restore.generating_seen || now == Some(RegionState::Generating);
+                // Generating, then the globe again: the load failed (`job::fail`).
+                let failed = generating_seen && now == Some(RegionState::Globe);
+                let waited_s = clock.elapsed_s - restore.requested_at_s;
+                if failed || waited_s > RESTORE_GIVE_UP_S {
+                    warn!(
+                        file = pose.file,
+                        saved = ?want,
+                        generated = ?region.as_ref().map(|r| r.grid.spec),
+                        waited_s,
+                        "from shot: giving up; {}",
+                        if failed {
+                            "the region failed to load"
+                        } else {
+                            "the region never came"
+                        }
+                    );
+                    restore.stage = RestoreStage::GaveUp;
+                }
+                restore.generating_seen = generating_seen;
                 return;
             }
             if let Some(r) = &region
-                && r.grid.spec != want
+                && !same_spec(&r.grid.spec, &want)
             {
                 warn!(
                     saved = ?want,
@@ -954,7 +1020,7 @@ fn restore_shot(
             info!(file = pose.file, "from shot: in its region");
             restore.stage = RestoreStage::Placed;
         }
-        RestoreStage::Placed => {}
+        RestoreStage::Placed | RestoreStage::GaveUp => {}
     }
 }
 
@@ -1219,12 +1285,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn region_centres_match_up_to_rounding() {
+        let c = DVec3::new(0.1, 0.7, -0.3).normalize();
+        assert_ne!(c.normalize(), c);
+        assert!(same_centre(RenderDir(c), RenderDir(c.normalize())));
+        // 10 m on the Earth is another region.
+        let moved = (c + c.any_orthonormal_vector() * (10.0 / 6_371_000.0)).normalize();
+        assert!(!same_centre(RenderDir(c), RenderDir(moved)));
+        // So is the antipode, and a spec differing in anything else.
+        assert!(!same_centre(RenderDir(c), RenderDir(-c)));
+        let saved = region_pose().region.unwrap().spec();
+        let generated = RegionSpec {
+            center: RenderDir(saved.center.0.normalize()),
+            ..saved
+        };
+        assert!(same_spec(&generated, &saved));
+        assert!(!same_spec(
+            &RegionSpec {
+                inner_res: saved.inner_res + 1,
+                ..generated
+            },
+            &saved
+        ));
+    }
+
     mod apps {
+        use std::sync::Arc;
         use std::time::Duration;
 
         use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
         use bevy::time::TimeUpdateStrategy;
         use timefly_core::flight::globe::{GlobeInput, globe_fly_step};
+        use timefly_core::worldgen::generate::{Field, RegionGrid};
+        use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 
         use super::*;
         use crate::diagnostics::DiagnosticsContext;
@@ -1439,6 +1533,113 @@ mod tests {
                 .press(KeyCode::KeyW);
             app.update();
             assert!(app.world().get_resource::<HeldCamera>().is_none());
+        }
+
+        /// The region pipeline's stand-in: an enter request becomes the region `spec_for` builds
+        /// (it normalises the direction again), with the shot's other fields. In `Last`: test
+        /// messages are read with a reader there.
+        fn enter_requested(
+            mut requests: MessageReader<RegionRequested>,
+            restore: Res<ShotRestore>,
+            mut commands: Commands,
+        ) {
+            let Some(saved) = restore.pose.region.as_ref() else {
+                return;
+            };
+            for request in requests.read() {
+                let spec = RegionSpec {
+                    center: RenderDir(request.era_dir.0.normalize_or_zero()),
+                    snapshot: request.snapshot,
+                    ..saved.spec()
+                };
+                let field = |size_m| Field {
+                    res: 2,
+                    size_m,
+                    elevation_m: vec![0.0; 4],
+                    surface: vec![[0; 4]; 4],
+                };
+                commands.insert_resource(ActiveRegion {
+                    grid: Arc::new(RegionGrid {
+                        spec,
+                        inner: field(REGION_SIZE_M),
+                        apron: field(APRON_SIZE_M),
+                    }),
+                    frame: spec.frame(),
+                });
+            }
+        }
+
+        #[test]
+        fn from_shot_enters_its_region() {
+            // A centre that `spec_for`'s second normalisation moves in the last bits (as about a
+            // third of unit vectors do): the region it generates is still the shot's.
+            let pose = region_pose();
+            let saved = pose.region.clone().expect("a region shot");
+            let c = DVec3::from_array(saved.center);
+            assert_ne!(
+                c.normalize(),
+                c,
+                "the fixture's centre must move when normalised again"
+            );
+            assert_eq!(pose.world, ShotWorld::Region);
+            let (mut app, _) = globe_app(false);
+            app.add_systems(Last, enter_requested)
+                .insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 })
+                .insert_resource(ShotRestore::new(pose.clone()));
+            for _ in 0..10 {
+                app.update();
+            }
+            let generated = app.world().resource::<ActiveRegion>().grid.spec.center.0;
+            assert_ne!(generated, c, "the stand-in must generate the moved centre");
+            assert!(
+                app.world().resource::<ShotRestore>().placed(),
+                "the repro never entered its region"
+            );
+            assert_eq!(*app.world().resource::<FlyState>(), saved.fly());
+            assert_eq!(
+                app.world().resource::<GlobeTime>().years,
+                YearsBp(pose.era_years)
+            );
+            let held = *app.world().resource::<HeldCamera>();
+            assert_eq!(held.world, ShotWorld::Region);
+            assert_eq!(held.transform, pose.camera.transform());
+        }
+
+        #[test]
+        fn from_shot_gives_up_on_a_region_that_does_not_come() {
+            let stage = |app: &App| app.world().resource::<ShotRestore>().stage;
+            let asked = |state: Option<RegionState>| {
+                let (mut app, _) = globe_app(false);
+                app.insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 })
+                    .insert_resource(ShotRestore::new(region_pose()));
+                if let Some(state) = state {
+                    app.insert_resource(State::new(state));
+                }
+                app.update();
+                assert_eq!(stage(&app), RestoreStage::Requested);
+                app
+            };
+            // On the globe before the request is read: still waiting.
+            let mut app = asked(Some(RegionState::Globe));
+            app.update();
+            assert_eq!(stage(&app), RestoreStage::Requested);
+            // Generating, then the globe again: the load failed.
+            app.insert_resource(State::new(RegionState::Generating));
+            app.update();
+            assert_eq!(stage(&app), RestoreStage::Requested);
+            app.insert_resource(State::new(RegionState::Globe));
+            app.update();
+            assert_eq!(stage(&app), RestoreStage::GaveUp);
+            assert!(app.world().get_resource::<HeldCamera>().is_none());
+            // No region at all: given up once the wait runs out, not before.
+            let mut app = asked(None);
+            let clock = app.world().resource::<LoadClock>().elapsed_s;
+            app.world_mut().resource_mut::<LoadClock>().elapsed_s = clock + RESTORE_GIVE_UP_S - 1.0;
+            app.update();
+            assert_eq!(stage(&app), RestoreStage::Requested);
+            app.world_mut().resource_mut::<LoadClock>().elapsed_s += 1.0;
+            app.update();
+            assert_eq!(stage(&app), RestoreStage::GaveUp);
         }
     }
 }

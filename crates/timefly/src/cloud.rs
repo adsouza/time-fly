@@ -260,9 +260,11 @@ fn spawn_cloud(
 
 /// The cloud's view depth: [`DEPTH_PAST_FLY`] × the distance from `eye` to the fly, for a
 /// camera with vertical field of view `vfov_rad` and near plane `near`. A pose whose distance
-/// does not match its drawn size (within [`POSE_MISMATCH`]; `crate::creature` sizes the fly by
-/// its distance) is not this camera's, and the cloud then sits [`FALLBACK_NEAR_PLANES`] near
-/// planes out, covering everything.
+/// does not match its drawn size (within [`POSE_MISMATCH`]) is not this camera's, and the cloud
+/// then sits [`FALLBACK_NEAR_PLANES`] near planes out, covering everything. Regions size the fly
+/// by its distance, the globe by its depth along the view (`globe_flight`): the two differ by
+/// 1 / cos of the fly's angle off the view's centre (under 1.05 at the globe's 13.8°), far
+/// inside the mismatch factor.
 pub fn fly_view_depth(eye: Vec3, fly: &FlyPose, vfov_rad: f32, near: f32) -> f32 {
     if pose_is_the_cameras(eye, fly, vfov_rad, near) {
         (fly.translation - eye).length() * DEPTH_PAST_FLY
