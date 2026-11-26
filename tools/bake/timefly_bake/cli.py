@@ -569,8 +569,8 @@ def _climate_main(argv) -> int:
 def main(argv=None) -> int:
     """Entry point of ``timefly-bake``; returns the process exit code. ``timefly-bake tiles ...``
     bakes the region-world tiles, ``timefly-bake climate ...`` the past-climate grids,
-    ``timefly-bake lakemap ...`` the present-day lake map; anything
-    else bakes the globe set."""
+    ``timefly-bake lakemap ...`` the present-day lake map, ``timefly-bake rivers-today ...``
+    today's major river courses; anything else bakes the globe set."""
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "tiles":
         return _tiles_main(argv[1:])
@@ -580,6 +580,10 @@ def main(argv=None) -> int:
         from timefly_bake import lakemap
 
         return lakemap.main(argv[1:])
+    if argv and argv[0] == "rivers-today":
+        from timefly_bake import rivers_today
+
+        return rivers_today.main(argv[1:])
     parser = _parser()
     args = parser.parse_args(argv)
     log.configure(args.out, args.log_level)

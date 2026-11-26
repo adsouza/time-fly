@@ -858,6 +858,91 @@ The test below pins the result.
   - If a bar fails, the constants are the builder's to tune (corridor, discharge threshold, runoff table). Ledger each change. A bar that still fails goes to the owner, unchanged.
 - [ ] **Step 7: Run the gate and commit** `feat: the reality check against a 1′ reference pass`. Stage the Python, both fixtures, `compare.rs`, `hydro_check.rs` and its test, `args.rs`, `main.rs`, `lib.rs` and `docs/testing/rivers/reality-check.md` with its SVGs.
 
+### Task 11b: Today's major river courses, burnt into today's terrain
+
+Owner, 2026-11-26: "Burn real courses". The reality check's Indus box fails (76.4% within 10 km against ≥ 80%) mostly because the lattice routes the lower Indus about 90 km east of Sehwan across the flat Sindh plain, where the river really runs on its own alluvial ridge. Straits and gorges were not meant for plains. This task burns Natural Earth's river centrelines into the pass's routing wherever the terrain is today's.
+
+**Files:**
+- Create:
+  - `tools/bake/timefly_bake/rivers_today.py` (`timefly-bake rivers-today`) and `tools/bake/tests/test_rivers_today.py`.
+  - `data/hydrology/rivers_today.json` (the baked table, committed, compiled in).
+  - `crates/timefly_core/src/hydrology/today_rivers.rs`.
+- Modify:
+  - `tools/bake/timefly_bake/cli.py` (the subcommand).
+  - `data/sources.json` (pin the raw file) and `data/README.md` (provenance, licence).
+  - `hydrology/params.rs`, `hydrology/mod.rs` and `hydrology/pass.rs` (the burn stage).
+  - `docs/testing/rivers/reality-check.md` (the re-run, with the burn disclosed).
+
+**Interfaces:**
+- Consumes:
+  - The raw file, already fetched by the controller: `/Users/adsouza/Code/time-fly/data/raw/naturalearth/ne_10m_rivers_lake_centerlines.geojson`, Natural Earth 1:10m "Rivers + lake centerlines" v5.1.2, from `https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_rivers_lake_centerlines.geojson`, 7,307,743 bytes, sha256 `bb854a900ecbd3b408df46d5e16e3e0f974ba55993f9d8b5c26e855273c0905a`, public domain. It holds 1,455 features (1,202 `River`, 253 `Lake Centerline`) with `scalerank` 0–10.
+  - ETOPO 2022 60″ (`/Users/adsouza/Code/time-fly/data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc`), to orient each line.
+  - Task 8b/11's strait and gorge burn (`straits.rs`, `HydroPrep::burn_straits`), and Task 10's resumable stages and the `continental pass done` log's `longest_step_stage`.
+- Produces:
+  - The bake: `select(features) -> list[polyline]` keeps `featurecla == "River"` with `scalerank <= TODAY_RIVER_MAX_SCALERANK` (7), each part of a MultiLineString its own polyline; `orient(polyline, etopo)` puts it upstream first, by the lowest ETOPO cell within 2′ of each end (ties keep Natural Earth's order); `simplify(polyline, 1 km)` (Ramer–Douglas–Peucker in metres). Coordinates are rounded to 0.001°.
+  - The table: `{ "comment", "source", "rivers": [{ "name", "scalerank", "points": [[lat, lon], …] }] }`, upstream first, ≤ 1 MB (the controller's estimate: about 1,275 polylines, 52,800 points, 0.87 MB).
+  - Core: `TodayRiver { name, points }`, `parse_today_rivers(&str) -> Result<Vec<TodayRiver>, String>`, `shipped_today_rivers()`. `today_river_nodes(lattice, river) -> Vec<u32>`: the nearest nodes to points a quarter of the mean spacing apart, consecutive neighbours, no repeats (as `strait_levels` does, without its O(n²) search).
+  - `params.rs`: `TODAY_RIVER_BURN_M = 10.0`.
+  - The burn, in every era with today's terrain (`data_lakes`, the same gate as the gorges), after the straits: along each river's nodes, upstream first, the level is the running minimum of the era's own node elevations, and the node's routing elevation becomes `level − TODAY_RIVER_BURN_M`.
+    - Routing only: the river graph's bed elevation along a burnt course is the level, not `level − TODAY_RIVER_BURN_M`, so the regions carve no 10 m trench.
+    - Ice nodes are not burnt. The burn never changes which nodes are ocean.
+    - Reference (PaleoDEM) eras burn nothing.
+
+**Rulings carried in (controller, 2026-11-26):**
+- Rivers only, rank ≤ 7: rank ≤ 7 includes the Jhelum, the reality check's third-longest miss; lake centrelines are left out because today's lakes are the map's (Task 8b). Neither the Shyok nor the Arghandab is in Natural Earth 1:10m, so the box's "every link matched" bar will still fail on them; report it.
+- The Python reference does not burn: it stays a 1′ DEM reference, independent of Natural Earth. The check then compares two independent sources of today's rivers.
+- The new committed table is shipped data beyond the Global Constraints' climate grids; ≤ 1 MB.
+- Every era with today's terrain, not 0 ka only: today's course is a better guess for the last 26 kyr than the lattice's route across a plain. Cost if wrong: an ice-age river follows today's course where it then ran elsewhere.
+
+- [ ] **Step 1: Write the failing tests:**
+  - Python: `test_select_keeps_ranked_rivers_only` (a lake centreline and a rank-8 river are dropped, a MultiLineString gives one polyline per part), `test_orient_puts_the_higher_end_first` (a synthetic grid), `test_simplify_stays_within_a_kilometre` (every dropped vertex within 1 km of the kept line), `test_table_schema_and_size`.
+  - Core, `today_rivers.rs`: `the_shipped_table_parses` (≥ 1,000 rivers; the Indus present; ≤ 1 MB), `river_nodes_run_node_to_node`, `the_lower_indus_runs_upstream_first` (the Indus's first point lies north of its last).
+  - Core, `pass.rs`:
+    - `a_burnt_course_routes_a_plain_river_along_its_line`: a synthetic plain where the unburnt route leaves the line (the line on a 3 m ridge); with the table, every line node drains to the next.
+    - `a_burnt_course_never_rises_downstream`.
+    - `the_burn_steers_routing_only`: the river graph's bed along the line is the running-minimum level.
+    - `a_burnt_coastal_plain_stays_land`: a line ending at a coast 2 m above the sea changes no ocean flag.
+    - `ice_nodes_and_reference_eras_are_not_burnt`.
+    - `the_time_boxed_pass_matches_run_parallel_with_todays_rivers`: bit for bit, as Task 10's equality test, with the shipped table.
+- [ ] **Step 2: Run them to check they fail.** `cd tools/bake && uv run pytest -q tests/test_rivers_today.py`; `cargo test -p timefly_core hydrology::`.
+- [ ] **Step 3: Implement.** No time-boxed step may grow past Task 10's bound: parsing the table and finding its nodes are done in resumable blocks (or before the pass, off the frame), and the node lists may be cached per lattice `n` for later passes.
+- [ ] **Step 4: Run the tests to check they pass.**
+- [ ] **Step 5: Bake the table:** `cd tools/bake && uv run timefly-bake rivers-today --geojson /Users/adsouza/Code/time-fly/data/raw/naturalearth/ne_10m_rivers_lake_centerlines.geojson --etopo /Users/adsouza/Code/time-fly/data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc --out ../../data/hydrology/rivers_today.json`. Expected: ≤ 1 MB, and the counts printed.
+- [ ] **Step 6: Re-run the reality check** as Task 11, Step 6 (the `dev` profile is acceptable, as Task 11 recorded). Expected: the lower Indus follows Sehwan, and the Indus box's share passes 80%; the Shyok and the Arghandab still unmatched. Record every bar before and after in `reality-check.md`, the pass time at 0 ka and the longest step (≤ 2 ms native), with the burn disclosed under "Choices made". If the lower Indus still leaves its line, try `TODAY_RIVER_BURN_M` = 20 and record both. Any bar that gets worse goes to the owner, unchanged.
+- [ ] **Step 7: Run the gate and commit** `feat: today's major river courses burnt into today's terrain`. If a region golden hash changes, the commit message says which region and why (a burnt course crosses it).
+
+### Task 11c: White water that sloshes over rocks
+
+Owner, 2026-11-26: "add a white-water look pass". The design's intent (the owner's words): "In places where there are rapids it should look like the water is sloshing over rocks." Today the rapids read as a flat cream stripe: isotropic broken foam scrolled downstream, and at most 6 boulders per 500 m sub-segment, mostly under the surface.
+
+**Files:**
+- Modify:
+  - `crates/timefly_core/src/hydrology/params.rs` and `worldgen/generate/water.rs` (denser, clustered boulders; foam sites).
+  - `crates/timefly/src/boulders.rs`, `scatter.rs`, `water.rs` (foam collars as a second scatter kind).
+  - `assets/shaders/water.wesl` and `assets/shaders/scatter.wesl`.
+  - `docs/testing/rivers/performance.md` (the GPU cost) and `docs/testing/rivers/*.png` (before and after).
+
+**Interfaces:**
+- Consumes: Task 6's `boulder_sites`/`boulder` (sub-segments with `rapid`, `half_width_m`, the hash cells), Task 8's water texture (level, thickness, ribbon, flow; speed ≥ 3 m/s marks rapids), Task 9's `ScatterPool`/`ScatterKind`, and Task 10's GPU pass timer (`GpuFrameTime`, per-pass readings).
+- Produces:
+  - **Rocks:** rapids hold clusters, not a sprinkle. `BOULDERS_PER_SUBPOINT_MAX` = 24; each sub-segment's boulders fall in clusters of up to 6 around hashed centres, members within 3 cluster radii, the largest at the centre; at `rapid` = 1 at least a third of a cluster's members break the surface (top above the level). `MAX_BOULDERS` may rise to 32,768 if Task 12's hop memory stays under the gate; ledger the number. Boulders stay wholly in the channel and remain a function of direction plus the pass (bit for bit across overlaps).
+  - **Foam collars:** `ScatterKind::FoamCollar`, one per boulder whose top lies within 0.5 m below to above the water level: a flat ring at the water level, stretched downstream into a wake about 4 radii long along the local flow, its edge broken by noise and churning with time, alpha-masked (no sorting). It applies the water surface's own depth pull, so the water never hides it.
+  - **The water's white water** (`water.wesl`, rivers only, `river_w` gated, lakes and the sea unchanged):
+    - Standing waves in rapids: a normal-only pattern that stays put while the foam moves through it, crests across the flow at the hydraulic wavelength λ = 2π·v²/g (v the texel's speed), its amplitude growing with `rapid`.
+    - Foam streaked along the flow (noise stretched about 4:1 along it), gathering on the standing waves' crests, with clumps that break and re-form; still fading to its mean where unresolved, so rapids read white from afar.
+  - **Cost:** the water and scatter passes together add at most 1.0 ms of GPU time at 2560×1440 on the M4 in the Indus tributaries region (Task 10's GPU timer, interleaved medians against the parent commit). Over budget, cut the collars' reach first, then the standing waves' octaves; ledger each.
+
+- [ ] **Step 1: Write the failing tests:**
+  - Core: `rapids_hold_clustered_boulders` (counts at `rapid` 1 and 0.5; every member within 3 cluster radii of its centre), `a_third_of_a_full_rapids_rocks_break_the_surface`, `clustered_boulders_stay_in_the_channel`, `foam_sites_mark_rocks_at_the_surface` (each site carries its level and flow direction), and the existing cube-corner agreement extended to foam sites.
+  - Shell: `collars_follow_the_active_region` (replace and teardown), `collars_share_one_mesh_and_material`, `collar_sets_reuse_their_pool`.
+  - Shader: the WESL constants mirrored from Rust stay equal (the existing mirror test pattern), and the water and scatter modules still compile for WebGPU (`cargo check -p timefly --target wasm32-unknown-unknown` plus the existing shader-load test).
+- [ ] **Step 2: Run them to check they fail.** `cargo test -p timefly_core worldgen::generate`; `cargo test -p timefly --lib boulders:: scatter::`.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run the tests to check they pass.**
+- [ ] **Step 5: Render before and after** (the parent commit's binary copied out first) with `region_tour` at the Indus gorge close-up of Task 8, Step 5, 3840×2160 cropped, at about 150 m above the water, plus one Amazon and one lake frame to show they are unchanged. Pass: rocks break the surface in clusters, water piles white on their upstream faces and trails downstream, standing waves hold still while the foam runs through them; the lake and the Amazon frames match the parent's.
+- [ ] **Step 6: Measure the GPU cost** as above and record it in `performance.md` with the commands.
+- [ ] **Step 7: Run the gate and commit** `feat: white water that sloshes over rocks`.
+
 ### Task 12: Verification and documentation
 
 **Files:**

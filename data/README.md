@@ -12,13 +12,14 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Climate classes (region worlds) | Köppen-Geiger 1991–2020, Beck et al. (2023); see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | CC BY 4.0 | M2 Task 1 (`timefly_bake.koppen`) |
 | Past climate, 0–120 ka (rivers) | Beyer, Krapp & Manica (2020), figshare 12293345; see [Past climate](#past-climate-beyer-et-al-2020) | CC BY 4.0 | Rivers and lakes Task 1 (`timefly_bake.beyer`) |
 | Present-day lakes (rivers, recent eras) | Natural Earth 1:10m lakes 5.0.0; see [Present-day lake map](#present-day-lake-map-natural-earth) | Public domain | Rivers and lakes Task 8b (`timefly_bake.lakemap`) |
+| Today's major river courses (rivers, recent eras) | Natural Earth 1:10m rivers + lake centerlines 5.1.2; see [Today's river courses](#todays-river-courses-natural-earth) | Public domain | Rivers and lakes Task 11b (`timefly_bake.rivers_today`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
 ## Pinned downloads (`data/sources.json`)
 
 `data/sources.json` lists every raw file the bake reads, with its URL, path under `data/raw/`,
 SHA-256, size in bytes and licence: the PaleoDEM archive, the two plate-model archives, the 27
-ICE-6G_C slices, the sea-level file, ETOPO 2022, the Köppen-Geiger archive and the Natural Earth lakes (34 files). The URLs and checksums are
+ICE-6G_C slices, the sea-level file, ETOPO 2022, the Köppen-Geiger archive, the Natural Earth lakes and the Natural Earth rivers (35 files). The URLs and checksums are
 the ones in the tables below (`tools/bake/tests/test_fetch.py` checks that they agree). The
 PaleoDEM report PDF is reference reading for the age table, not a bake input, so it is not
 listed and CI never downloads it.
@@ -385,6 +386,32 @@ the table's levels; in past recent eras the map only caps open lakes.
 Bosporus, sill about 35 m): with today's terrain the pass lowers their nodes to the sill, moved
 with the era's shift, so the Black Sea is sea at the present day and closed when the sea stood
 below the sill. Hand-made, like `lake_levels.json`; Task 11's Python reads it too.
+
+## Today's river courses: Natural Earth
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `data/raw/naturalearth/ne_10m_rivers_lake_centerlines.geojson` | 7,307,743 | `bb854a900ecbd3b408df46d5e16e3e0f974ba55993f9d8b5c26e855273c0905a` |
+
+Natural Earth 1:10m physical vectors, rivers + lake centerlines, version 5.1.2, URL
+`https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_rivers_lake_centerlines.geojson`
+(public domain; no permission needed, credit appreciated). 1,455 MultiLineString features: 1,202
+`River` and 253 `Lake Centerline` (`featurecla`), `scalerank` 0–10.
+
+`cd tools/bake && uv run timefly-bake rivers-today --geojson <ne_10m_rivers_lake_centerlines.geojson> --etopo ../../data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc --out ../../data/hydrology/rivers_today.json`
+(`timefly_bake.rivers_today`) keeps the `River` features of `scalerank` ≤ 7 (lake centrelines are
+left out: today's lakes are the lake map's), one polyline per line part (655 features, 1,275
+parts). It puts each part upstream first: the end whose lowest ETOPO 2022 60″ cell within 2′ (two
+cells either way) stands higher goes first, ties keeping Natural Earth's order (138 parts were
+reversed). It simplifies each part to 1 km (Ramer–Douglas–Peucker on great-circle distances) and
+rounds points to 0.001°, dropping parts that round to one point: 1,248 courses, 52,896 points
+(of 171,153), a 926,552-byte table, one course per line.
+
+Where the terrain is today's (recent eras; rivers and lakes Task 11b, owner ruling 2026-11-26),
+the continental pass burns each course into its routing: the running minimum of the era's node
+elevations along it, less 10 m (`TODAY_RIVER_BURN_M`), never below sea level on land. The river
+graph's bed there is the running minimum itself. Without it the lattice's routes across flat
+plains leave the real courses: the lower Indus ran about 90 km east of Sehwan.
 
 ## Performance and memory (Task 10)
 

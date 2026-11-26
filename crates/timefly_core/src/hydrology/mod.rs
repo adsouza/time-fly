@@ -20,6 +20,7 @@ mod pass;
 mod route;
 pub mod straits;
 mod today;
+pub mod today_rivers;
 
 pub use graph::{Down, NEAR_BUCKET_TEXELS, RiverGraph, RiverNode};
 pub use lakes::{Lake, LakeKind};

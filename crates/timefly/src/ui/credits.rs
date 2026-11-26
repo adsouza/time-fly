@@ -174,6 +174,7 @@ mod tests {
             "10.6084/m9.figshare.12293345",
             "Natural Earth",
             "naturalearthdata.com",
+            "rivers + lake centerlines",
             "Bevy",
         ] {
             assert!(CREDITS_TEXT.contains(needle), "credits.txt lacks {needle}");

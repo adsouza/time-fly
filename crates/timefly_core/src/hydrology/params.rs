@@ -18,6 +18,11 @@ pub const OCEAN_STRAIT_M: f64 = 25_000.0;
 pub const DEPRESSION_EPS_M: f64 = 0.01;
 /// A node at or above this ice fraction carries no flow.
 pub const ICE_NODE_FRACTION: f64 = 0.5;
+/// Where the terrain is today's, the pass routes along today's major river courses
+/// ([`today_rivers`](super::today_rivers), Task 11b) this far below the running minimum of the
+/// era's node elevations along each course. Routing only: the river graph's bed there is the
+/// running minimum itself.
+pub const TODAY_RIVER_BURN_M: f64 = 10.0;
 
 // Data lakes.
 
