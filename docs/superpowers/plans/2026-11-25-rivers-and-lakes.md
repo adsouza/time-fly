@@ -890,10 +890,10 @@ Each ruling is *what*; *why*; *cost if wrong*.
   - What: `SWELL_FADE_AGL_M` is measured from the vertex's water level, not from `y = 0`.
   - Why: with lakes at their own levels (Titicaca at 3,810 m), "above the sea" no longer means above the water. The sea is unchanged.
   - Cost if wrong: none for the sea. Lakes show the swell from as low as the sea does.
-- **Task 8: the swap frame binds `NO_WATER` and hides the water.**
-  - What: while `TerrainScene::inner_water` or `apron_water` is missing (the swap frame), the water's material binds `NO_WATER`, a handle no image is ever stored at, and the entity is `Visibility::Hidden`. Test: `the_sea_draws_nothing_while_its_water_is_missing`.
-  - Why: the scene's empty handle is `Handle::default()`, which Bevy's `ImagePlugin` fills with a float image. Bound to a `texture_2d<u32>` slot, it fails wgpu validation. Keeping the old handle would stop the render world freeing the old water (the hop-memory gate).
-  - Cost if wrong: none seen. The material retries its bind group each frame while hidden, which is a hash lookup.
+- **Task 8: the swap frame drops the water's entity and material (review fix round 1).**
+  - What: while `TerrainScene::inner_water` or `apron_water` is missing (the swap frame), the water entity is despawned and its material removed with every handle to it. The frame after, a new material is made over the new water. The mesh is kept. Test: `the_sea_draws_nothing_while_its_water_is_missing`.
+  - Why: the first version rebound the material to an image handle no image is stored at, and hid the entity. In Bevy 0.20.1 a material whose bind group can't be built (`RetryNextUpdate`) keeps its old binding until a new one succeeds. The old binding holds the old water's texture views, so old and new water coexisted. Only an unused material asset is unloaded (`unload_material`), which happens the frame after its handles drop: the same frame the old water images are freed. `Handle::default()` must still never be bound to a `texture_2d<u32>` slot (it is Bevy's float default image), so no material exists without water.
+  - Cost if wrong: one material and entity rebuilt per replace, which is negligible.
 - **Task 8: the GPU parity bound.**
   - What: `wesl_water_matches_rust` checks the level within 2 ulps of its taps on fields whose sizes make f32 bilinear weights exact (256 m and 2,048 m spacings). On the region's own sizes it allows the weights' few-ulp f32 error times each quantity's local spread. The brief's flat "2 ulps at 4,096 points" holds only where the weights are exact.
   - Why: WGSL computes the texel coordinate in f32, and the reference computes it in f64. On a 293 m spacing the weights differ by about 1e-4, which on rough random fields is hundreds of ulps of the level (measured 1,444).

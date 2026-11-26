@@ -745,11 +745,11 @@ fn a_replace_frees_the_old_water_before_making_the_new() {
     assert_eq!(m.extension.inner_height, s.inner_height);
     assert_eq!(m.extension.apron_surface, s.apron_surface);
     assert_eq!(s.height_range_m, height_range_m(&s.grid));
-    // The sea binds the new water (it reads no heights).
+    // The water binds the new water (it reads no heights).
     let water = world.resource::<RegionWater>();
     let wm = world
         .resource::<Assets<WaterMaterial>>()
-        .get(&water.material)
+        .get(&water.drawn.as_ref().unwrap().material)
         .unwrap();
     assert_eq!(wm.extension.inner_water, s.inner_water);
     assert_eq!(wm.extension.apron_water, s.apron_water);
@@ -761,13 +761,15 @@ fn a_replace_frees_the_old_water_before_making_the_new() {
     assert_eq!(images.len(), 7);
 }
 
-/// The swap frame binds no water (Task 7's stages), so the sea draws nothing until the new
-/// water is made (Task 8): it is hidden, and its material holds neither the old water (which the
-/// render world must free) nor the default image (a float texture where `texture_2d<u32>` is
-/// bound). The frame after, it shows the new water.
+/// The swap frame binds no water (Task 7's stages), so the water draws nothing until the new
+/// water is made (Task 8). Its material must go entirely, not be rebound: a material whose bind
+/// group can't be built keeps its old one in the render world (`RetryNextUpdate`), holding the
+/// old water's texture views, until the material asset is unused. So on the swap frame the water
+/// entity is despawned and the material removed with every handle to it; the frame after, a new
+/// material binds the new water. The mesh is kept.
 #[test]
 fn the_sea_draws_nothing_while_its_water_is_missing() {
-    use crate::water::{NO_WATER, RegionWater, WaterMaterial, add_water_systems};
+    use crate::water::{RegionWater, WaterMaterial, add_water_systems};
     let mut app = pool_app();
     app.init_asset::<crate::sky::SkyMaterial>()
         .init_asset::<WaterMaterial>();
@@ -777,49 +779,62 @@ fn the_sea_draws_nothing_while_its_water_is_missing() {
     for _ in 0..3 {
         app.update();
     }
-    let sea = |app: &App| {
-        let world = app.world();
+    // The drawn water: its entity, material id, the material's water textures and the mesh.
+    let sea = |app: &mut App| {
+        let world = app.world_mut();
+        let drawn: Vec<_> = world
+            .query::<(Entity, &MeshMaterial3d<WaterMaterial>, &Mesh3d)>()
+            .iter(world)
+            .map(|(e, m, mesh)| (e, m.0.id(), mesh.0.id()))
+            .collect();
+        let materials = world.resource::<Assets<WaterMaterial>>();
         let water = world.resource::<RegionWater>();
-        let m = world
-            .resource::<Assets<WaterMaterial>>()
-            .get(&water.material)
-            .unwrap();
-        (
-            *world.get::<Visibility>(water.entity).unwrap(),
-            m.extension.inner_water.id(),
-            m.extension.apron_water.id(),
-        )
+        let bound = water.drawn.as_ref().map(|d| {
+            let m = materials.get(&d.material).unwrap();
+            (
+                d.entity,
+                d.material.id(),
+                m.extension.inner_water.id(),
+                m.extension.apron_water.id(),
+            )
+        });
+        (drawn, materials.len(), bound, water.mesh.id())
     };
     let scene_water = |app: &App| {
         let s = app.world().resource::<TerrainScene>();
         (s.inner_water.id(), s.apron_water.id())
     };
     let old = scene_water(&app);
-    assert_eq!(sea(&app), (Visibility::Inherited, old.0, old.1));
+    let (drawn, count, bound, mesh) = sea(&mut app);
+    let (entity, old_material, inner, apron) = bound.expect("the water drawn");
+    assert_eq!(drawn, [(entity, old_material, mesh)]);
+    assert_eq!((count, inner, apron), (1, old.0, old.1));
     enter_owned(&mut app, wet_grid(500.0));
-    // The swap frame.
+    // The swap frame: no water entity, no material asset, no handle to the old one.
     app.update();
-    let (visibility, inner, apron) = sea(&app);
-    assert_eq!(
-        visibility,
-        Visibility::Hidden,
-        "the sea draws on the swap frame"
+    let (drawn, count, bound, kept_mesh) = sea(&mut app);
+    assert!(
+        drawn.is_empty(),
+        "the water is drawn on the swap frame: {drawn:?}"
     );
-    for id in [inner, apron] {
-        assert_eq!(id, NO_WATER.id());
-        assert!(id != old.0 && id != old.1, "the old water is still bound");
-        assert_ne!(id, Handle::<Image>::default().id());
-        assert!(app.world().resource::<Assets<Image>>().get(id).is_none());
-    }
-    // The next frame: the new water, shown.
+    assert_eq!(count, 0, "the old water's material is still an asset");
+    assert!(bound.is_none());
+    assert_eq!(kept_mesh, mesh, "the mesh is rebuilt");
+    assert!(app.world().get_entity(entity).is_err());
+    // The next frame: a new material over the new water.
     app.update();
     let new = scene_water(&app);
     assert_ne!(new, old);
-    assert_eq!(sea(&app), (Visibility::Inherited, new.0, new.1));
-    // And it stays bound through the heights' frames.
+    let (drawn, count, bound, _) = sea(&mut app);
+    let (entity, material, inner, apron) = bound.expect("the new water drawn");
+    assert_ne!(material, old_material);
+    assert_eq!(drawn, [(entity, material, mesh)]);
+    assert_eq!((count, inner, apron), (1, new.0, new.1));
+    // And it stays bound, the same material, through the heights' frames.
     for _ in 0..3 {
         app.update();
-        assert_eq!(sea(&app), (Visibility::Inherited, new.0, new.1));
+        let (_, count, again, _) = sea(&mut app);
+        assert_eq!((count, again), (1, Some((entity, material, new.0, new.1))));
     }
 }
 
@@ -906,7 +921,7 @@ fn sky_and_water_follow_the_scene() {
         // The water reads the terrain's own buffer and the fields' water textures.
         let m = world
             .resource::<Assets<WaterMaterial>>()
-            .get(&water.material)
+            .get(&water.drawn.as_ref().unwrap().material)
             .unwrap();
         assert_eq!(m.extension.patches, scene.buffer);
         assert_eq!(m.extension.inner_water, scene.inner_water);
@@ -925,10 +940,12 @@ fn sky_and_water_follow_the_scene() {
             .extension
             .look;
         assert_eq!(look, look_for(&grid, TerrainOptions::default()));
-        (sky.dome, water.entity)
+        (sky.dome, water.drawn.as_ref().unwrap().entity)
     };
 
-    // A snapshot change: the same entities, rebound to the new grid and retinted for its era.
+    // A snapshot change: the same sky dome, rebound to the new grid and retinted for its era. The
+    // water is rebuilt over the new water textures (its material can't outlive the old ones:
+    // `the_sea_draws_nothing_while_its_water_is_missing`).
     let mut deep = (*grid).clone();
     deep.spec.snapshot = YearsBp(540.0e6);
     let deep = Arc::new(deep);
@@ -942,7 +959,9 @@ fn sky_and_water_follow_the_scene() {
         let scene = world.resource::<TerrainScene>();
         let sky = world.resource::<RegionSky>();
         let water = world.resource::<RegionWater>();
-        assert_eq!((sky.dome, water.entity), (dome, sea));
+        let drawn = water.drawn.as_ref().unwrap();
+        assert_eq!(sky.dome, dome);
+        assert_ne!(drawn.entity, sea);
         assert_eq!(
             sky.era,
             timefly_core::worldgen::biome::VegetationEra::Barren
@@ -950,9 +969,10 @@ fn sky_and_water_follow_the_scene() {
         assert!(Arc::ptr_eq(&water.grid, &deep));
         let m = world
             .resource::<Assets<WaterMaterial>>()
-            .get(&water.material)
+            .get(&drawn.material)
             .unwrap();
         assert_eq!(m.extension.inner_water, scene.inner_water);
+        assert_eq!(m.extension.look, crate::water::water_look(&deep));
         let fog = world
             .entity(scene.camera)
             .get::<DistanceFog>()

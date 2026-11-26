@@ -41,8 +41,9 @@
 //!
 //! The camera never goes below the water (the fly's clearance over `blended_surface_m`), so there
 //! is no underwater view. The water is opaque: the depth tint already stands for the floor
-//! beneath it. On a region swap's first frame the scene binds no water: the sea is hidden and
-//! its material binds [`NO_WATER`] until the new water textures exist.
+//! beneath it. On a region swap's first frame the scene holds no water: the water's entity and
+//! material are dropped (so the render world frees the old water's bind group with its
+//! textures) and rebuilt the frame after, over the new water textures.
 
 use std::sync::Arc;
 
@@ -62,11 +63,6 @@ use crate::terrain::{TERRAIN_LAYER, TerrainScene, TerrainSceneSystems};
 
 /// `water.wesl`: the sea's vertex and fragment shaders.
 pub const WATER_SHADER: Handle<Shader> = uuid_handle!("6f2d0f0e-7a4b-4c2e-9d61-3b1f9a0c9e31");
-/// What the water's material binds while the scene has no water textures (a swap's first
-/// frame): a handle no image is ever stored at, so the material is never prepared (and the sea
-/// is hidden besides). Binding the scene's empty handle instead would bind Bevy's default
-/// image, a float texture where the shader declares `texture_2d<u32>`.
-pub const NO_WATER: Handle<Image> = uuid_handle!("0b6b6f61-5a52-4f3e-9c1e-77c2a1d4e8b5");
 
 /// The sea's fraction of the view distance by which it is pulled toward the camera (depth only).
 pub const WATER_DEPTH_PULL: f32 = 6.0e-4;
@@ -465,7 +461,7 @@ pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
 pub struct WaterExtension {
     #[storage(100, read_only)]
     pub patches: Handle<ShaderBuffer>,
-    /// `TerrainScene::inner_water` (`Rgba32Uint`, read with `textureLoad`), or [`NO_WATER`].
+    /// `TerrainScene::inner_water` (`Rgba32Uint`, read with `textureLoad`).
     #[texture(101, sample_type = "u_int")]
     pub inner_water: Handle<Image>,
     #[texture(102, sample_type = "u_int")]
@@ -520,11 +516,20 @@ pub fn water_material(
     }
 }
 
-/// The sea for the current region (present while its entity exists).
+/// The water for the current region (present while the terrain scene is).
 #[derive(Resource, Debug)]
 pub struct RegionWater {
-    /// The grid whose heights it reads.
+    /// The grid whose water it draws.
     pub grid: Arc<RegionGrid>,
+    /// [`water_mesh`], kept across swaps.
+    pub mesh: Handle<Mesh>,
+    /// The drawn water, while the scene has water textures to bind.
+    pub drawn: Option<DrawnWater>,
+}
+
+/// The water's entity and its material, over one set of water textures.
+#[derive(Debug)]
+pub struct DrawnWater {
     pub entity: Entity,
     pub material: Handle<WaterMaterial>,
 }
@@ -559,9 +564,13 @@ fn scene_water(scene: &TerrainScene, images: &Assets<Image>) -> Option<[Handle<I
         .then(|| [scene.inner_water.clone(), scene.apron_water.clone()])
 }
 
-/// Gathers the scene and the sea, decides (the sky's rule: build, rebind on a replaced grid,
-/// remove), and applies it. Whenever the sea exists it binds the scene's water textures, or
-/// [`NO_WATER`] and is hidden while the scene has none.
+/// Gathers the scene and the water, decides (the sky's rule: build, rebind on a replaced grid,
+/// remove), and applies it. The water is drawn while the scene has water textures, by a material
+/// made over them. On a replace's swap frame (no water textures) the entity is despawned and the
+/// material removed with every handle to it: a material that merely rebinds keeps its old bind
+/// group, and with it the old water's textures, in the render world until its new one can be
+/// built (`RetryNextUpdate`), so old and new water would coexist (the hop's memory, Task 7). An
+/// unused material is unloaded the frame after, with the old textures.
 fn sync_water(
     mut commands: Commands,
     scene: Option<Res<TerrainScene>>,
@@ -569,80 +578,93 @@ fn sync_water(
     images: Res<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
-    mut visibility: Query<&mut Visibility>,
 ) {
     use crate::sky::{SkyAction, sky_action};
     let action = sky_action(
         scene.as_ref().map(|s| &s.grid),
         water.as_ref().map(|w| &w.grid),
     );
-    let bound = scene.as_ref().and_then(|s| scene_water(s, &images));
-    let [inner, apron] = bound.clone().unwrap_or([NO_WATER, NO_WATER]);
-    let shown = if bound.is_some() {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
+    let drop_drawn = |commands: &mut Commands,
+                      materials: &mut Assets<WaterMaterial>,
+                      drawn: Option<DrawnWater>| {
+        if let Some(d) = drawn {
+            commands.entity(d.entity).despawn();
+            materials.remove(&d.material);
+        }
     };
     match (action, scene, water) {
         (SkyAction::Build, Some(scene), _) => {
-            let material = materials.add(water_material(
-                &scene.buffer,
-                &inner,
-                &apron,
-                water_look(&scene.grid),
-            ));
-            let entity = commands
-                .spawn((
-                    Name::new("Region water"),
-                    Mesh3d(meshes.add(water_mesh())),
-                    MeshMaterial3d(material.clone()),
-                    Transform::IDENTITY,
-                    shown,
-                    NoFrustumCulling,
-                    RenderLayers::layer(TERRAIN_LAYER),
-                ))
-                .id();
-            info!("region water built");
+            let mesh = meshes.add(water_mesh());
+            let drawn = scene_water(&scene, &images)
+                .map(|w| draw_water(&mut commands, &mut materials, &scene, &mesh, w));
+            info!(drawn = drawn.is_some(), "region water built");
             commands.insert_resource(RegionWater {
                 grid: scene.grid.clone(),
-                entity,
-                material,
+                mesh,
+                drawn,
             });
         }
-        (SkyAction::Teardown, _, Some(water)) => {
-            commands.entity(water.entity).despawn();
+        (SkyAction::Teardown, _, Some(mut water)) => {
+            drop_drawn(&mut commands, &mut materials, water.drawn.take());
             commands.remove_resource::<RegionWater>();
             info!("region water removed");
         }
         (action @ (SkyAction::Retint | SkyAction::Keep), Some(scene), Some(mut water)) => {
             if action == SkyAction::Retint {
-                if let Some(mut m) = materials.get_mut(&water.material) {
+                water.grid = scene.grid.clone();
+                if let Some(d) = &water.drawn
+                    && let Some(mut m) = materials.get_mut(&d.material)
+                {
                     m.extension.look = water_look(&scene.grid);
                 }
-                water.grid = scene.grid.clone();
-                info!("region water rebound to the replaced grid");
             }
-            // A replace frees the old water on its swap frame and makes the new one the frame
-            // after (`TerrainScene::steps_remaining`).
-            let stale = materials.get(&water.material).is_some_and(|m| {
-                m.extension.inner_water != inner || m.extension.apron_water != apron
+            let bound = scene_water(&scene, &images);
+            let current = water.drawn.as_ref().and_then(|d| {
+                materials
+                    .get(&d.material)
+                    .map(|m| [m.extension.inner_water.id(), m.extension.apron_water.id()])
             });
-            if stale && let Some(mut m) = materials.get_mut(&water.material) {
-                m.extension.inner_water = inner;
-                m.extension.apron_water = apron;
-                debug!(
-                    bound = bound.is_some(),
-                    "region water rebound to the scene's water"
+            let wanted = bound.as_ref().map(|[i, a]| [i.id(), a.id()]);
+            if current != wanted {
+                drop_drawn(&mut commands, &mut materials, water.drawn.take());
+                let mesh = water.mesh.clone();
+                water.drawn =
+                    bound.map(|w| draw_water(&mut commands, &mut materials, &scene, &mesh, w));
+                info!(
+                    drawn = water.drawn.is_some(),
+                    "region water rebuilt over the scene's water"
                 );
-            }
-            if let Ok(mut v) = visibility.get_mut(water.entity)
-                && *v != shown
-            {
-                *v = shown;
             }
         }
         _ => {}
     }
+}
+
+/// Spawns the water over the scene's water textures `[inner, apron]`.
+fn draw_water(
+    commands: &mut Commands,
+    materials: &mut Assets<WaterMaterial>,
+    scene: &TerrainScene,
+    mesh: &Handle<Mesh>,
+    [inner, apron]: [Handle<Image>; 2],
+) -> DrawnWater {
+    let material = materials.add(water_material(
+        &scene.buffer,
+        &inner,
+        &apron,
+        water_look(&scene.grid),
+    ));
+    let entity = commands
+        .spawn((
+            Name::new("Region water"),
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            Transform::IDENTITY,
+            NoFrustumCulling,
+            RenderLayers::layer(TERRAIN_LAYER),
+        ))
+        .id();
+    DrawnWater { entity, material }
 }
 
 #[cfg(test)]
@@ -1101,8 +1123,8 @@ mod tests {
     fn the_water_draws_both_faces() {
         let m = water_material(
             &Handle::default(),
-            &NO_WATER,
-            &NO_WATER,
+            &Handle::default(),
+            &Handle::default(),
             water_look(&look_grid()),
         );
         assert_eq!(m.base.cull_mode, None);
