@@ -608,6 +608,99 @@ water = the highest level (ties: lake, sea, river); none: (h − NO_WATER_DROP_M
   - Pass: water at true width; rapids white over rocks once Task 9 lands; Titicaca and the Caspian at their own levels with fractal shores; no water band at a rectangle's edge.
 - [ ] **Step 6: Run the gate and commit** `feat: rivers and lakes drawn from the water fields`.
 
+### Task 8b: Lakes checked against today's map
+
+Owner ruling (2026-11-25): "Check against today": a basin that would fill but holds no lake in
+today's data gets its river cut through the rim. Today's data is a present-day lake map. The
+renders behind the ruling (rivers Task 8) showed four defects:
+- false lakes dammed by the 10 km lattice (the Kashmir and Indus valleys filled to about 2,140 m);
+- the Amazon at Manaus as a standing lake (a river flat read as a data lake);
+- Titicaca missing;
+- water walls where a lake ends on a lattice-cell line with ground below its level beyond.
+
+**Files:**
+- Create: `tools/bake/timefly_bake/lakemap.py` (+ test in `tools/bake/tests/`), `data/hydrology/lake_map.bin`
+- Modify: `data/sources.json`, `crates/timefly_core/src/hydrology/{pass.rs,lakes.rs,levels.rs or a new lakemap.rs,params.rs}`, `crates/timefly_core/src/worldgen/generate/water.rs`, `crates/timefly/src/hydro/mod.rs` (the NodeSource impls)
+- Test: `crates/timefly_core/src/hydrology/` tests, `crates/timefly_core/src/worldgen/generate/tests.rs`, `tools/bake/tests/`
+
+**Interfaces:**
+- Consumes: Task 3's lake rules and `NodeSource`, Task 6's `lake_tap` use in `water.rs`.
+- Produces:
+  - `NodeSource::mapped_lake(&self, dir: RenderDir) -> bool`. It defaults to false, and is true only where `data_lakes()` holds and the shipped map has a lake at `dir`.
+  - `LAKE_MAP: &[u8]` embedded with `include_bytes!` from `data/hydrology/lake_map.bin`.
+  - `OPEN_LAKE_MAP_TOL_M = 10.0` in `params.rs`.
+- Task 11's Python mirror must follow the same rules (note in Task 11's brief).
+
+**The map.** Natural Earth 1:10m lakes (`ne_10m_lakes.zip`, about 2.35 MB, public domain), pinned
+in `data/sources.json`. Keep features whose `featurecla` is a lake (`Lake`, `Alkaline Lake`) and
+drop `Reservoir`: dams aren't in the terrain the game samples, and the game spans the past. The
+bake tool rasterises the polygons onto an equirectangular grid at 3′ (7,200 × 3,600, cell centres)
+and writes a compact format of the implementer's choosing (for example row run-lengths). Limits:
+- the committed file is at most 512 KB;
+- decoding needs no new core dependency;
+- the lookup is O(1) or O(log row).
+
+**Rules** (only where `data_lakes()` holds, i.e. the terrain is today's; `Reference` eras are unchanged):
+
+```text
+mapped surface of a basin = the baked surface level of the mapped lake its nodes overlap
+  (the highest, if several; none: unmapped). The bake takes each polygon's level as the median
+  of the finest ETOPO cells inside it (the 10 km overview reads the Dead Sea at about −276 m
+  against about −430 m).
+Table lakes (lake_levels.json): unchanged; they take precedence.
+Data flats and depression data lakes: a candidate becomes a lake only if it holds at least
+  DATA_LAKE_MIN_NODES mapped nodes. Otherwise no data lake; the water balance decides.
+Water-balance lakes:
+  - Terminal: unchanged (arid closed basins fill by balance in any era: Mega-Chad, Bonneville).
+  - Open, unmapped: breached. No lake; the basin passes its inflow through the spill as rivers
+    (the routing already runs through the spill; the footprint is empty, so its nodes become
+    river or dry nodes by the normal river rule).
+  - Open, mapped, level > mapped surface + OPEN_LAKE_MAP_TOL_M: a Data lake at the mapped
+    surface, with footprint = basin nodes below it and outflow = Q_in − evaporation over that
+    footprint (the real outlet is a gorge below the lattice).
+  - Open, mapped, level within the tolerance: unchanged.
+```
+
+**Shore scallops** (core `blended_water`, the WESL mirror, `wesl_water_matches_rust`): standing
+water interpolates its level over its wet taps only (a flat L), so the shoreline is the terrain's
+own h = L contour, not the zero contour of a level dropping across dry texels (h − 64). Rivers keep
+their current blend. Test: `a_lake_shore_follows_the_ground_contour` (core: along a sloping
+shore the wet/dry boundary lies within 0.05 texel of where h = L), plus the parity test.
+
+**Water walls** (`water.rs`): a lake's water must not end on a lattice-cell line while the
+ground beyond is below its level. The implementer picks the method. For example: let the lake
+reach one lattice step past the footprint, decide the shore by the texel's own ground against
+L, and raise the ground to just above L where the reach ends while the ground is still below L.
+The test below pins the result.
+
+- [ ] **Step 1: Bake the map.**
+  - Python test `test_lake_map_round_trips`: decode(encode(raster)) equals the raster. The mask is set at Titicaca (−15.8, −69.4), Victoria (−1.0, 33.0) and the Great Salt Lake (41.1, −112.5), and clear at Manaus (−3.1, −60.0) and Skardu (35.3, 75.6).
+  - The baked surface levels: the Dead Sea within 5 m of the fine ETOPO surface there (about −430 m, not the overview's −276), Titicaca within 5 m of 3,812 m.
+- Run the bake, commit the file, and pin the source. Report the download's size.
+- [ ] **Step 2: Write the failing core tests:**
+  - `a_dammed_humid_valley_is_cut_through`: a sloping valley closed by a one-node rim 200 m high, humid, unmapped. Expect no lake, a river chain through the spill, and discharge below the rim equal to the inflow.
+  - `an_open_lake_above_its_mapped_surface_drops_to_it`: the same valley with mapped floor nodes whose median sits 50 m below the spill. Expect a Data lake at that median ± 0.01, footprint below it only, outflow = Q_in − evaporation.
+  - `a_mapped_open_lake_keeps_its_spill`: a mapped surface within the tolerance of the spill leaves the level unchanged.
+  - `an_arid_closed_basin_still_fills_by_balance`: an unmapped Terminal basin keeps its balance lake.
+  - `an_unmapped_flat_is_not_a_lake` and `a_mapped_flat_is_a_lake`: a 20+ node elongated river flat.
+  - `reference_eras_ignore_the_map`: hydro_golden cases A–C and the no-pass golden hashes are unchanged.
+  - `lake_water_never_stands_beside_lower_dry_ground` (generator; proptest over lake levels and footprint edges, including an edge that cuts ground below L): no lake texel at level L has a 4-neighbour that is dry with ground below L − 0.5 m.
+  - Run them and watch each fail for the expected reason.
+- [ ] **Step 3: Implement** the map lookup, the rules and the wall fix.
+- [ ] **Step 4: Check the real data** with the present-day pass (probe binary or `#[ignore]` test on the real overview, as Task 11 will):
+  - Titicaca, Victoria, the Dead Sea and the Great Salt Lake within 5 m of the overview there; the Caspian within 5 m of the table.
+  - No lake at Manaus (−3.1, −60.0) or Skardu (35.3, 75.6).
+  - No lake above 1,600 m on the Kashmir valley floor (34.1, 74.8).
+  - Report lake counts and total area before and after.
+- [ ] **Step 5: Re-render**, before and after:
+  - indus-shaded, a Kashmir view, manaus-shaded, titicaca-shaded and andes-down;
+  - a low oblique Andes lake shore;
+  - a low oblique Dead Sea shore (31.5, 35.5): an inland lake at about −430 m between steep rift walls. Neither the sea plane nor a wall may show.
+- Big-river rapids check (real data, `#[ignore]` probe): reaches above the falls carry the rapid flag; no reach within 50 km of Manaus does.
+  - Victoria Falls: the rapid flag within 5 km upstream of (−17.925, 25.857).
+  - Iguazu Falls: the rapid flag within 5 km upstream of (−25.695, −54.437).
+- [ ] **Step 6: Run the gate and commit** `feat: lakes checked against today's lake map`.
+
 ### Task 9: Boulders, the first instanced scatter
 
 **Files:**
@@ -719,6 +812,7 @@ water = the highest level (ties: lake, sea, river); none: (h − NO_WATER_DROP_M
   - **Indus:** game rivers with area ≥ 10,000 km² within 10 km for ≥ 80% of the reference's length, and every link matched.
   - **Amazon flats** (reference elevation < 300 m): within 25 km for ≥ 80%.
   - **Lakes:** at the Caspian (42.0, 50.5), the Dead Sea (31.5, 35.5), Titicaca (−15.8, −69.4), the Great Salt Lake (41.1, −112.5) and Victoria (−1.0, 33.0), `lake_tap(..).level_m` is within 5 m of the overview's elevation there.
+    Task 8b amends this: mapped lakes compare against their baked fine-data surface level, not the overview (the overview reads the Dead Sea at about −276 m), and the Python mirror follows Task 8b's map rules (breached unmapped Open lakes, map-gated data flats, the mapped-surface cap).
   - **Arid basins:** no lake ≥ `LARGE_LAKE_KM2` where the basin's mean precipitation < 250 mm/yr, in either network inside the boxes.
   - It writes `hydro-check-{indus,amazon}.svg` (reference blue, game red, equirectangular, a 100 km scale bar) and prints the numbers. It exits 0 on PASS and `FAILED_RESULT_EXIT_CODE` on FAIL.
 
