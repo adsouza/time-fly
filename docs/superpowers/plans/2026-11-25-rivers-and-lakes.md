@@ -824,6 +824,7 @@ The test below pins the result.
     - At age 0 the map decides every lake (the present-mode overlay, `hydrology/today.rs`). Each mapped lake stands at its baked surface, or the table level for table lakes, over its own mapped nodes. Several lakes may share a basin. An unmapped closed basin holds no lake, and its rivers end in `Down::Sink`.
     - In past eras a capped lake's footprint is its mapped nodes only, with its outlet picked among them.
     - Straits (`data/hydrology/straits.json`, the Bosporus) join the Black Sea to the ocean.
+  - **Major river outlets** (controller ruling, 2026-11-25): at the 10 km lattice a narrow gorge can close, sending a river out of its basin by the wrong pass. Task 8b found the Danube leaving the Pannonian basin through the Moravian Gate, not the Iron Gate. Check that these rivers reach their real outlets: the Danube through the Iron Gate (44.67, 22.5) to the Black Sea; the Jhelum out of the Kashmir valley at Baramulla (34.2, 74.35); the Indus and the Amazon to their seas. Fix any misroute with a gorge entry in the strait table, generalised to passes, with a cited source, and a test per entry.
   - **Arid basins:** no lake ≥ `LARGE_LAKE_KM2` where the basin's mean precipitation < 250 mm/yr, in either network inside the boxes.
   - It writes `hydro-check-{indus,amazon}.svg` (reference blue, game red, equirectangular, a 100 km scale bar) and prints the numbers. It exits 0 on PASS and `FAILED_RESULT_EXIT_CODE` on FAIL.
 
