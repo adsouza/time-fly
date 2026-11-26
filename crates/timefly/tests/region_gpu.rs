@@ -22,6 +22,9 @@
 //!   imports stood in for) over an opaque quad nearer than 1.2 × the eye-to-fly distance, with
 //!   the game's blend and reverse-Z depth test, and checks the quad comes out veiled exactly as
 //!   far ground does (M3 Task 7's near-plane depth rule).
+//! - `the_gpu_frame_time_is_measured_on_this_gpu` times frames of 0, 1, 4 and 16 busy full-screen
+//!   passes with the game's `GpuTimer` (pass timestamps): positive, close to linear in the
+//!   passes, and not inflated when frames run back to back (rivers and lakes Task 10).
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -1984,4 +1987,221 @@ fn wesl_water_matches_rust() {
             p.shore
         );
     }
+}
+
+/// A full-screen triangle whose fragments each run a long dependent loop: a pass with a known,
+/// sizeable GPU cost.
+const BUSY_PASS: &str = r#"
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    var v = p.x * 0.001 + p.y * 0.002;
+    for (var k = 0; k < 128; k++) {
+        v = fract(sin(v * 12.9898 + f32(k)) * 43758.5453);
+    }
+    return vec4<f32>(v, v, v, 1.0);
+}
+"#;
+
+/// Frames timed by a fresh [`GpuTimer`](timefly::diagnostics::gpu_time::GpuTimer), each with
+/// `passes` busy passes between its begin and end timestamps, the busy target as the frame's
+/// output; then empty frames until every reading is in. With `wait`, each frame waits for its
+/// work before the next is submitted; without, they go back to back, as when GPU-bound. The
+/// readings, in frame order.
+fn timed_frames(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+    passes: &[u32],
+    wait: bool,
+) -> Vec<f32> {
+    let mut timer =
+        timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
+    let mut readings = Vec::new();
+    // A frame's reading arrives with the frame after it (its resolve waits for its work).
+    let flush = [0u32; 2];
+    for (i, &n) in passes.iter().chain(&flush).enumerate() {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let timed = timer.begin(&mut encoder);
+        // The flush frames may find every slot in flight (back to back).
+        assert!(timed || i >= passes.len(), "a free slot for frame {i}");
+        for _ in 0..n {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("busy"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.draw(0..3, 0..1);
+        }
+        timer.end(
+            &mut encoder,
+            device,
+            &[(view, wgpu::TextureFormat::Rgba8Unorm)],
+        );
+        queue.submit([encoder.finish()]);
+        timer.submitted(queue);
+        let poll = if wait {
+            wgpu::PollType::wait_indefinitely()
+        } else {
+            wgpu::PollType::Poll
+        };
+        device.poll(poll).expect("poll");
+        readings.extend(timer.harvest());
+    }
+    // Back to back, the last frames' readings are still on their way.
+    for _ in 0..4 {
+        if readings.len() >= passes.len() {
+            break;
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        timer.begin(&mut encoder);
+        timer.end(
+            &mut encoder,
+            device,
+            &[(view, wgpu::TextureFormat::Rgba8Unorm)],
+        );
+        queue.submit([encoder.finish()]);
+        timer.submitted(queue);
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        readings.extend(timer.harvest());
+    }
+    assert!(
+        readings.len() >= passes.len(),
+        "a reading per frame: {readings:?}"
+    );
+    readings
+        .into_iter()
+        .take(passes.len())
+        .map(|r| r.expect("a valid reading: begin and end written, end after begin"))
+        .collect()
+}
+
+/// Rivers and lakes Task 10: the GPU frame time read from pass-level timestamps (one-pixel
+/// marker passes around the frame, `TIMESTAMP_QUERY` only) is positive, grows with the GPU work
+/// between them, and is not inflated when frames run back to back (on Apple silicon a marker
+/// pass with no dependency overlaps other passes).
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn the_gpu_frame_time_is_measured_on_this_gpu() {
+    use timefly::diagnostics::gpu_time::GpuTimer;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    println!("adapter: {:?}", adapter.get_info());
+    assert!(
+        adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+        "this adapter offers no TIMESTAMP_QUERY: the game reports `gpu time: unavailable` here"
+    );
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::TIMESTAMP_QUERY,
+        ..Default::default()
+    }))
+    .expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("busy pass"),
+        source: wgpu::ShaderSource::Wgsl(BUSY_PASS.into()),
+    });
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("busy pass"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(format.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let view = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("busy target"),
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 1024,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    println!(
+        "timestamp period {} ns",
+        GpuTimer::new(&device, queue.get_timestamp_period()).period_ns()
+    );
+    // Warm up (pipeline compile, clocks), then the median of five frames per pass count.
+    timed_frames(&device, &queue, &pipeline, &view, &[4; 3], true);
+    let median = |passes: u32, wait: bool| {
+        let mut ms = timed_frames(&device, &queue, &pipeline, &view, &[passes; 3], wait);
+        ms.sort_by(f32::total_cmp);
+        println!(
+            "{passes} busy passes, {}: {ms:?} ms",
+            if wait { "waited" } else { "back to back" }
+        );
+        ms[1]
+    };
+    let (none, one, four, sixteen) = (
+        median(0, true),
+        median(1, true),
+        median(4, true),
+        median(16, true),
+    );
+    println!("medians: 0 {none} ms, 1 {one} ms, 4 {four} ms, 16 {sixteen} ms");
+    assert!(
+        (0.0..1.0).contains(&none),
+        "the timer's own passes: {none} ms"
+    );
+    assert!(one > 0.0, "{one} ms");
+    // Close to linear in the work: the end waits for the last busy pass.
+    assert!(four > 3.0 * one, "4 passes {four} ms vs 1 pass {one} ms");
+    assert!(
+        sixteen > 3.0 * four,
+        "16 passes {sixteen} ms vs 4 passes {four} ms"
+    );
+    // Back to back: each frame's span starts after the previous frame's end, not inside it.
+    let packed = median(4, false);
+    assert!(
+        (packed - four).abs() < 0.25 * four,
+        "back to back {packed} ms vs waited {four} ms"
+    );
 }

@@ -56,6 +56,9 @@
 //!   ([`Crossing`]: a coast by the neighbour's land share, a cube corner by its centre).
 //! - **Sites** (reported only): the canyon's depth and Fuji's height, read from the grid of the
 //!   hop's neighbour ([`read_site`]).
+//! - **Continental passes and GPU frame time** (reported only): each pass that finished during
+//!   the run ([`pass_lines`]), and the GPU frame times read on flight frames, per route
+//!   ([`gpu_frame_line`]; a reading arrives a few frames after the frame it times).
 //!
 //! A stage that does not finish within [`STAGE_TIMEOUT_SECS`] (the longest, the region's, is
 //! about 21 s of descent, 15 s and 25 s of flight and two holds: about 65 s natively), a dive that comes back out over
@@ -80,14 +83,17 @@ use super::region::{
 };
 use super::{
     MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
-    frame_budget_ms, frame_time_stats, header_lines_titled, missed_frames, passes, stall_count,
+    frame_budget_ms, frame_time_stats, gpu_available, gpu_frame_line, gpu_status_line,
+    header_lines_titled, missed_frames, pass_lines, passes, stall_count,
 };
 use crate::args::RegionArg;
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
+use crate::diagnostics::gpu_time::{GpuFrameMeasured, GpuFrameTime};
 use crate::fly_camera::FlyState;
 use crate::globe::GlobeRenderStatus;
 use crate::globe_flight::GlobeFlightState;
+use crate::hydro::HydroPassFinished;
 use crate::region::navigate::{LEAVE_KEY, NavPhase, Navigation, NavigationSystems, World};
 use crate::region::{ActiveRegion, RegionState};
 use crate::terrain::TerrainOptions;
@@ -918,6 +924,13 @@ pub struct JourneyBench {
     flight_ms: Vec<f32>,
     /// The journey of each of `flight_ms`.
     flight_cycle: Vec<u32>,
+    /// GPU frame times read on flight frames, and the journey of each.
+    gpu_ms: Vec<f32>,
+    gpu_cycle: Vec<u32>,
+    /// How frames were timed on the GPU, as last seen.
+    gpu: Option<GpuFrameTime>,
+    /// The continental passes that finished during the run, in order.
+    passes: Vec<HydroPassFinished>,
     holds: Vec<HoldRecord>,
     swaps: Vec<SwapRecord>,
     hops: Vec<HopRecord>,
@@ -939,6 +952,10 @@ impl JourneyBench {
             prev_phase: NavPhase::Globe,
             flight_ms: Vec::new(),
             flight_cycle: Vec::new(),
+            gpu_ms: Vec::new(),
+            gpu_cycle: Vec::new(),
+            gpu: None,
+            passes: Vec::new(),
             holds: Vec::new(),
             swaps: Vec::new(),
             hops: Vec::new(),
@@ -991,6 +1008,9 @@ pub struct JourneyBenchPlugin(pub JourneyBenchConfig);
 impl Plugin for JourneyBenchPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(JourneyBench::new(self.0.clone()))
+            // Read whether or not the pass and the GPU timer run in this app.
+            .add_message::<HydroPassFinished>()
+            .add_message::<GpuFrameMeasured>()
             .add_systems(
                 Update,
                 (
@@ -1100,8 +1120,14 @@ fn measure_journey(
     game: Game,
     mut controls: Controls,
     display: Screen,
+    mut passes: MessageReader<HydroPassFinished>,
+    mut gpu_frames: MessageReader<GpuFrameMeasured>,
+    gpu: Option<Res<GpuFrameTime>>,
 ) {
     let bench = &mut *bench;
+    bench.passes.extend(passes.read().copied());
+    bench.gpu = gpu.as_deref().cloned();
+    let gpu_ms: Vec<f32> = gpu_frames.read().map(|m| m.ms).collect();
     let now = game.real.elapsed_secs_f64();
     let frame_ms = game.real.delta_secs() * 1000.0;
     let phase = game.nav.as_ref().map_or(NavPhase::Globe, |n| n.phase);
@@ -1120,6 +1146,12 @@ fn measure_journey(
         return;
     }
     let swapped = is_swap(&before, &phase);
+    if let Some(cycle) = bench.stage.cycle()
+        && density == 0.0
+    {
+        bench.gpu_cycle.extend(gpu_ms.iter().map(|_| cycle));
+        bench.gpu_ms.extend(gpu_ms);
+    }
     if let Some(cycle) = bench.stage.cycle() {
         let frame = Frame {
             before,
@@ -1614,6 +1646,23 @@ fn finish(
             gate_word(flight_pass)
         ));
     }
+    // GPU frame times on the flight frames (reported only), per route.
+    let gpu_on = gpu_available(bench.gpu.as_ref());
+    for (r, route) in config.routes.iter().enumerate() {
+        let frames: Vec<f32> = bench
+            .gpu_ms
+            .iter()
+            .zip(&bench.gpu_cycle)
+            .filter(|&(_, &c)| config.journeys.get(c as usize) == Some(&r))
+            .map(|(&ms, _)| ms)
+            .collect();
+        let line = gpu_frame_line(route.region.name, &frames, gpu_on);
+        if !gpu_on {
+            out.push(line);
+            break;
+        }
+        out.push(if several { format!("  {line}") } else { line });
+    }
 
     // Swaps.
     let scope = format!(
@@ -1875,6 +1924,10 @@ fn finish(
             CYCLE_MEMORY_TOLERANCE * 100.0,
             gate_word(ok)
         ));
+    }
+    out.extend(pass_lines(&bench.passes));
+    if gpu_on {
+        out.push(gpu_status_line(bench.gpu.as_ref()));
     }
     out.push(match failure {
         Some(reason) => format!("result: FAIL ({reason})"),

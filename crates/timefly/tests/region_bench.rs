@@ -3,7 +3,8 @@
 //! update, the path plays in 6 s and the memory cycles are cut to two.
 //!
 //! The bench regions sit outside the fixture tiles, so they fall back to the overview (a `warn`
-//! each; in the tiny timeline even 250 Ma leans on the ETOPO-backed bridge frame).
+//! each; in the tiny timeline even 250 Ma leans on the ETOPO-backed bridge frame). The
+//! continental pass runs at test lattice sizes.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -18,13 +19,21 @@ use timefly::bench::region::banner::BenchBannerText;
 use timefly::bench::region::{BENCH_REGIONS, RegionBench, RegionBenchConfig, RegionBenchPlugin};
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::globe::GlobeRenderStatus;
+use timefly::hydro::{HydroPlugin, HydroSettings};
 use timefly::region::navigate::RegionNavigationPlugin;
 use timefly::region::{GenMode, RegionPlugin, RegionSettings};
 use timefly::terrain::TerrainOptions;
 use timefly::time::TimePlugin;
+use timefly_core::hydrology::LatticeSizes;
 
 const STEP: Duration = Duration::from_micros(16_667);
 const WALL_LIMIT: Duration = Duration::from_secs(120);
+/// Continental pass lattices small enough for a test: 6 × 16² nodes in recent eras, 6 × 8² in
+/// deep ones.
+const HYDRO_SIZES: LatticeSizes = LatticeSizes {
+    recent_n: 16,
+    deep_n: 8,
+};
 
 fn tiny_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets")
@@ -58,7 +67,12 @@ fn bench_app(config: RegionBenchConfig) -> App {
         TimePlugin,
         RegionNavigationPlugin,
         RegionBenchPlugin(config),
+        HydroPlugin,
     ))
+    .insert_resource(HydroSettings {
+        enabled: true,
+        sizes: HYDRO_SIZES,
+    })
     .insert_resource(RegionSettings {
         inner_res: 129,
         apron_res: 65,
@@ -121,6 +135,7 @@ fn region_bench_reports_all_regions() {
             "bake: manifest v2, sha256 ",
             "generation: ",
             " ms; tiles fetched ",
+            "\n  continental pass wait: ",
             "load (request to first path frame",
             "coast: ",
             "memory (",
@@ -142,10 +157,13 @@ fn region_bench_reports_all_regions() {
         "{}",
         reports[0]
     );
-    // None of the bench regions has a fixture tile; each reports its first-entry generation
-    // (gated on the web only).
-    for report in reports {
-        assert!(report.contains("tiles fetched 0 (0 bytes)"), "{report}");
+    // None of the bench regions has a fixture tile, except that Pangaea's tile reads (rotated
+    // to today's frame, and widened by the rivers' read margin) reach the four fixture tiles.
+    // Each reports its first-entry generation (gated on the web only).
+    for (report, region) in reports.iter().zip(&BENCH_REGIONS) {
+        if region.name != "Pangaea interior" {
+            assert!(report.contains("tiles fetched 0 (0 bytes)"), "{report}");
+        }
         assert!(
             report.contains("first-entry generation: reported only natively"),
             "{report}"
@@ -183,12 +201,19 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Pangaea interior PASS (flight PASS, reported only), Red Sea PASS (flight PASS, reported only), Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
+        "regions (R14 frame rate): Pangaea interior PASS (flight PASS, reported only), Red Sea PASS (flight PASS, reported only), Himalayas PASS, Indus tributaries PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Himalayas",
         "first entries (cold tiles; reported only natively): Pangaea interior ",
         "Himalayas load-window worst frame (cold tiles; reported only): ",
         "memory cycles",
+        // Every era the bench visits runs its pass: 250 Ma, 0 ka, 21 ka, 1 Ma and 3 Ma.
+        "\ncontinental pass (250 Ma): ",
+        "\ncontinental pass (0 ka): ",
+        "\ncontinental pass (21 ka): ",
+        "\ncontinental pass (1 Ma): ",
+        "\ncontinental pass (3 Ma): ",
+        "\ngpu time: unavailable\n",
         "result: ",
     ] {
         assert!(summary.contains(line), "missing {line:?} in\n{summary}");
@@ -204,11 +229,12 @@ fn region_bench_reports_all_regions() {
     // The banner followed the stops, the pan and the result, and kept the result.
     let shown = &app.world().resource::<BannerTexts>().0;
     for text in [
-        "Next: Pangaea interior · 250 million years ago · 1 of 9",
-        "Pangaea interior · 250 million years ago · 1 of 9",
-        "Sundaland · 21 thousand years ago · 4 of 9",
+        "Next: Pangaea interior · 250 million years ago · 1 of 10",
+        "Pangaea interior · 250 million years ago · 1 of 10",
+        "Indus tributaries · Present · 4 of 10",
+        "Sundaland · 21 thousand years ago · 5 of 10",
         "Globe · Beringia → Rockies ice margin",
-        "Panama · 3 million years ago · 9 of 9",
+        "Panama · 3 million years ago · 10 of 10",
         "Memory cycles · Himalayas · 1 of 2",
     ] {
         assert!(
@@ -303,7 +329,33 @@ fn a_single_region_run_reaches_the_summary() {
             .any(|s| s == "Chosen region · Present · 1 of 1"),
         "{shown:#?}"
     );
-    assert!(!shown.iter().any(|s| s.contains("of 9")), "{shown:#?}");
+    assert!(!shown.iter().any(|s| s.contains("of 10")), "{shown:#?}");
+}
+
+#[test]
+fn the_region_bench_reports_the_continental_pass() {
+    let (app, _) = run_single(None);
+    let bench = app.world().resource::<RegionBench>();
+    let summary = bench.summary().unwrap();
+    let line = summary
+        .lines()
+        .find(|l| l.starts_with("continental pass (0 ka): "))
+        .unwrap_or_else(|| panic!("no 0 ka pass line in\n{summary}"));
+    assert!(
+        line.contains(" ms wall, ") && line.contains(" ms CPU, "),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(" slices on native (target <= 1000 ms, reported)"),
+        "{line}"
+    );
+    // The region's block keeps the pass wait out of its generation, on a line of its own.
+    let block = &bench.reports()[0];
+    assert!(block.contains("\n  continental pass wait: "), "{block}");
+    // No renderer here, so no GPU timestamps.
+    for text in [block.as_str(), summary] {
+        assert!(text.contains("\ngpu time: unavailable\n"), "{text}");
+    }
 }
 
 #[test]

@@ -155,7 +155,12 @@ pub fn app(session: &Session) -> App {
     #[cfg(target_arch = "wasm32")]
     let plugins = plugins.disable::<bevy::app::PanicHandlerPlugin>();
     app.add_plugins(plugins).add_plugins((
-        clusters::NoClusteringPlugin,
+        (
+            // GPU frame time from pass timestamps, where the device has them (the benches
+            // report it).
+            diagnostics::gpu_time::GpuTimePlugin,
+            clusters::NoClusteringPlugin,
+        ),
         time::TimePlugin,
         GlobeDataPlugin::default(),
         GlobePlugin,

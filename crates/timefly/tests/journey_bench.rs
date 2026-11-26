@@ -24,14 +24,21 @@ use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::fly_camera::FlyCameraPlugin;
 use timefly::globe::GlobeRenderStatus;
 use timefly::globe_flight::GlobeFlightPlugin;
+use timefly::hydro::{HydroPlugin, HydroSettings};
 use timefly::region::navigate::RegionNavigationPlugin;
 use timefly::region::{GenMode, RegionPlugin, RegionSettings};
 use timefly::time::TimePlugin;
 use timefly_core::flight::altitudes::HOP_ALTITUDE_M;
 use timefly_core::geo::{geo_to_render, latlon_to_geo};
+use timefly_core::hydrology::LatticeSizes;
 
 const STEP: Duration = Duration::from_micros(16_667);
 const WALL_LIMIT: Duration = Duration::from_secs(240);
+/// Continental pass lattices small enough for a test.
+const HYDRO_SIZES: LatticeSizes = LatticeSizes {
+    recent_n: 16,
+    deep_n: 8,
+};
 
 fn tiny_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets")
@@ -71,7 +78,12 @@ fn journey_app(config: JourneyBenchConfig) -> App {
         GlobeFlightPlugin,
         FlyCameraPlugin,
         JourneyBenchPlugin(config),
+        HydroPlugin,
     ))
+    .insert_resource(HydroSettings {
+        enabled: true,
+        sizes: HYDRO_SIZES,
+    })
     .insert_resource(RegionSettings {
         inner_res: 129,
         apron_res: 65,
@@ -278,6 +290,24 @@ fn a_route_set_flies_each_route_its_own_way_and_compares_like_with_like() {
     }
     assert!(summary.contains("\nresult: PASS\n"), "{summary}");
     assert_eq!(exit, vec![bench_exit(true)], "{summary}");
+}
+
+#[test]
+fn a_journey_run_reports_the_continental_pass() {
+    let mut config = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    config.journeys.truncate(1);
+    let mut app = journey_app(config);
+    let (summary, _) = run_to_summary(&mut app);
+    let line = summary
+        .lines()
+        .find(|l| l.starts_with("continental pass (0 ka): "))
+        .unwrap_or_else(|| panic!("no 0 ka pass line in\n{summary}"));
+    assert!(
+        line.ends_with(" slices on native (target <= 1000 ms, reported)"),
+        "{line}"
+    );
+    // No renderer here, so no GPU timestamps.
+    assert!(summary.contains("\ngpu time: unavailable\n"), "{summary}");
 }
 
 #[test]

@@ -34,9 +34,11 @@ use timefly_core::deep_time::{YearsBp, slider_to_years};
 use timefly_core::surface::FrameSource;
 
 use crate::data::GlobeData;
+use crate::diagnostics::gpu_time::GpuFrameTime;
 use crate::diagnostics::session::FAILED_RESULT_EXIT_CODE;
 use crate::diagnostics::{FirstInteractiveFrame, SessionInfo};
 use crate::globe::GlobeRenderStatus;
+use crate::hydro::HydroPassFinished;
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 
 /// Seconds per scrub direction.
@@ -206,6 +208,107 @@ pub fn bridge_target_bytes(size: UVec2) -> (u64, u64) {
 
 pub(crate) fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// The continental pass's wall-time target natively and on the web (reported, not gated).
+pub const NATIVE_PASS_TARGET_MS: u32 = 1_000;
+pub const WEB_PASS_TARGET_MS: u32 = 5_000;
+
+/// An era's age as the pass lines name it: `0 ka`, `21 ka`, `1 Ma`, `2.5 Ma`, `250 Ma`.
+pub fn pass_age(age: YearsBp) -> String {
+    // At most one decimal, trailing zeros dropped.
+    let short = |v: f64| {
+        let tenths = (v * 10.0).round() / 10.0;
+        format!("{tenths}")
+    };
+    if age.0 < 1.0e6 {
+        format!("{} ka", short(age.0 / 1.0e3))
+    } else {
+        format!("{} Ma", short(age.0 / 1.0e6))
+    }
+}
+
+/// One continental pass's summary line (rivers and lakes Task 10):
+/// `continental pass (<age>): <wall> ms wall, <cpu> ms CPU, <slices> slices on <platform>
+/// (target <= 1000|5000 ms, reported)`.
+pub fn pass_line(pass: &HydroPassFinished) -> String {
+    let target = if pass.platform == "web" {
+        WEB_PASS_TARGET_MS
+    } else {
+        NATIVE_PASS_TARGET_MS
+    };
+    format!(
+        "continental pass ({}): {} ms wall, {} ms CPU, {} slices on {} (target <= {target} ms, reported)",
+        pass_age(pass.age),
+        pass.wall_ms,
+        pass.cpu_ms,
+        pass.slices,
+        pass.platform
+    )
+}
+
+/// The summary's pass lines, one per pass in the order they finished.
+pub fn pass_lines(passes: &[HydroPassFinished]) -> Vec<String> {
+    if passes.is_empty() {
+        return vec!["continental pass: none finished during the run".to_string()];
+    }
+    passes.iter().map(pass_line).collect()
+}
+
+/// `1820` as `1,820`.
+pub(crate) fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A segment's or route's GPU frame times (reported only): `gpu frame time (<name>): median
+/// 4.12 / p95 5.80 / worst 9.31 ms over 1,820 frames (timestamp-query)`, or `gpu time:
+/// unavailable` where the device has no timestamps ([`GpuFrameTime`]).
+pub fn gpu_frame_line(name: &str, frames_ms: &[f32], available: bool) -> String {
+    if !available {
+        return "gpu time: unavailable".to_string();
+    }
+    let s = frame_time_stats(frames_ms);
+    if s.frames == 0 {
+        return format!("gpu frame time ({name}): no readings (timestamp-query)");
+    }
+    format!(
+        "gpu frame time ({name}): median {:.2} / p95 {:.2} / worst {:.2} ms over {} frames (timestamp-query)",
+        s.median_ms,
+        s.p95_ms,
+        s.worst_ms,
+        thousands(s.frames)
+    )
+}
+
+/// Whether the run's frames were timed on the GPU.
+pub fn gpu_available(gpu: Option<&GpuFrameTime>) -> bool {
+    gpu.is_some_and(|g| g.available)
+}
+
+/// The summary's GPU timing line: how frames were timed and what was dropped, or `gpu time:
+/// unavailable`.
+pub fn gpu_status_line(gpu: Option<&GpuFrameTime>) -> String {
+    match gpu.filter(|g| g.available) {
+        None => "gpu time: unavailable".to_string(),
+        Some(g) => format!(
+            "gpu time: pass timestamps (timestamp-query, period {} ns), reported only; {} readings dropped{}",
+            g.period_ns,
+            g.dropped,
+            if cfg!(target_arch = "wasm32") {
+                "; Chrome rounds timestamps to 100 µs unless the WebGPU Developer Features flag is on"
+            } else {
+                ""
+            }
+        ),
+    }
 }
 
 /// Which part of the run a frame belongs to.
@@ -883,6 +986,87 @@ mod tests {
         app.update();
         assert!(exits(&app).is_empty());
         assert!(app.world().resource::<ScrubBench>().report().is_none());
+    }
+
+    #[test]
+    fn pass_lines_name_the_era_and_the_platform_target() {
+        for (years, label) in [
+            (0.0, "0 ka"),
+            (21_000.0, "21 ka"),
+            (500.0, "0.5 ka"),
+            (1.0e6, "1 Ma"),
+            (2.5e6, "2.5 Ma"),
+            (250.0e6, "250 Ma"),
+        ] {
+            assert_eq!(pass_age(YearsBp(years)), label);
+        }
+        let pass = HydroPassFinished {
+            age: YearsBp(0.0),
+            wall_ms: 1_402,
+            cpu_ms: 1_210,
+            slices: 1,
+            nodes: 6 * 512 * 512,
+            river_nodes: 10_000,
+            lakes: 861,
+            platform: "native",
+        };
+        assert_eq!(
+            pass_line(&pass),
+            "continental pass (0 ka): 1402 ms wall, 1210 ms CPU, 1 slices on native (target <= 1000 ms, reported)"
+        );
+        let web = HydroPassFinished {
+            age: YearsBp(21_000.0),
+            slices: 340,
+            platform: "web",
+            ..pass
+        };
+        assert!(
+            pass_line(&web).ends_with("340 slices on web (target <= 5000 ms, reported)"),
+            "{}",
+            pass_line(&web)
+        );
+        assert_eq!(pass_lines(&[pass, web]).len(), 2);
+        assert_eq!(
+            pass_lines(&[]),
+            ["continental pass: none finished during the run"]
+        );
+    }
+
+    #[test]
+    fn gpu_frame_lines_report_median_p95_and_worst() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_820), "1,820");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        let mut frames = vec![4.12_f32; 1_700];
+        frames.extend([5.80; 110]);
+        frames.extend([9.31; 10]);
+        assert_eq!(
+            gpu_frame_line("Indus tributaries", &frames, true),
+            "gpu frame time (Indus tributaries): median 4.12 / p95 5.80 / worst 9.31 ms over 1,820 frames (timestamp-query)"
+        );
+        assert_eq!(
+            gpu_frame_line("Alps", &[], true),
+            "gpu frame time (Alps): no readings (timestamp-query)"
+        );
+        assert_eq!(
+            gpu_frame_line("Alps", &frames, false),
+            "gpu time: unavailable"
+        );
+        assert_eq!(gpu_status_line(None), "gpu time: unavailable");
+        let mut gpu = GpuFrameTime::unavailable();
+        assert_eq!(gpu_status_line(Some(&gpu)), "gpu time: unavailable");
+        assert!(!gpu_available(Some(&gpu)));
+        gpu.available = true;
+        gpu.dropped = 3;
+        assert!(gpu_available(Some(&gpu)));
+        assert!(
+            gpu_status_line(Some(&gpu)).starts_with(
+                "gpu time: pass timestamps (timestamp-query, period 1 ns), reported only; 3 readings dropped"
+            ),
+            "{}",
+            gpu_status_line(Some(&gpu))
+        );
     }
 
     #[test]
