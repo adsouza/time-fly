@@ -25,6 +25,8 @@
 //! - **Arid basins:** no lake of at least `LARGE_LAKE_KM2` touching a box whose basin (the lake
 //!   and the river nodes upstream of it) averages under [`ARID_PRECIP_MM`] of precipitation, in
 //!   the game's network or the reference's.
+//! - **Ridged joins** (Task 11g): no joining link's step climbs more than `JOIN_RIDGE_M` over
+//!   the 60″ tiles ([`judge_ridged_joins`]).
 //!
 //! It also prints a discharge table (informative, never a bar; Task 11d): at each
 //! [`DischargeGauge`], the game's discharge ([`game_discharge`]) against the published long-term
@@ -57,7 +59,8 @@ use timefly_core::hydrology::compare::{
 };
 use timefly_core::hydrology::lakemap::{LakeMap, LakeRing, shipped_lake_map};
 use timefly_core::hydrology::levels::shipped_lake_levels;
-use timefly_core::hydrology::params::{HYDRO_RECENT_N, LARGE_LAKE_KM2, SUBPOINT_M};
+use timefly_core::hydrology::params::{HYDRO_RECENT_N, JOIN_RIDGE_M, LARGE_LAKE_KM2, SUBPOINT_M};
+use timefly_core::hydrology::ridged::{shipped_ridged_steps, step_crest_above};
 use timefly_core::hydrology::today_rivers::{
     CourseBed, CourseStep, course_beds, course_steps, shipped_today_rivers,
 };
@@ -80,6 +83,7 @@ use crate::diagnostics::session::FAILED_RESULT_EXIT_CODE;
 use crate::hydro::climate::{CLIMATE_MANIFEST_PATH, ClimateManifest, climate_table};
 use crate::hydro::job::{HydroInputs, run_parallel};
 use crate::region::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileManifest, tile_path};
+use crate::ridged_bake::FineTerrain;
 
 /// The committed reference fixtures (a dev build's source tree).
 pub const REFERENCE_DIR: &str = concat!(
@@ -1504,6 +1508,11 @@ pub fn hydro_check(
     let arid = judge_arid(&large_lakes(hydro, &boxes, &precip_at), &references);
     pass &= arid.pass;
     lines.push(arid.line);
+    // Task 11g: no tributary drains into a burnt course across a ridge.
+    let ridged = judge_ridged_joins(hydro, &FineTerrain::open(root)?);
+    pass &= ridged.pass;
+    lines.push(ridged.line);
+    lines.extend(ridged.details);
     // Informative (Task 11b, fix round 1): how far today's burnt courses' beds lie below the
     // era's own terrain.
     let (_, mode) = hydro_lattice_for(&timeline, 0.0, sizes);
@@ -1519,16 +1528,15 @@ pub fn hydro_check(
     // Informative (Task 11d fix round 5): the lake map's surfaces against their shores.
     let map = shipped_lake_map();
     let shore_height = |lat: f64, lon: f64| field.sample_overview(dir_render(lat, lon)).elevation_m;
+    // The pass's lakes holding the map lake's nodes (Task 11g: not those whose exit lies in it;
+    // Baikal's exit, its Angara outlet, can lie a node off the map's footprint).
     let game_lakes = |id: u16| -> String {
-        let found: Vec<String> = hydro
-            .lakes
+        let found: Vec<String> = holders_of(&holders, id)
             .iter()
-            .enumerate()
-            .filter(|(_, l)| {
-                let (la, lo) = latlon(hydro.lattice.dir(l.exit).0);
-                map.lake_at(la, lo) == Some(id)
+            .map(|&(_, k, nodes)| {
+                let l = &hydro.lakes[usize::from(k)];
+                format!("{k} {:?} {:.1} m, {nodes} nodes", l.kind, l.level_m)
             })
-            .map(|(k, l)| format!("{k} {:?} {:.1} m", l.kind, l.level_m))
             .collect();
         found.join(", ")
     };
@@ -1553,6 +1561,75 @@ pub fn hydro_check(
     fs::write(&tsv, lakes_tsv(hydro)).map_err(|e| format!("{}: {e}", tsv.display()))?;
     lines.push(format!("hydro check {}", verdict(pass)));
     Ok(HydroCheckReport { lines, pass, svgs })
+}
+
+/// The ridged-joins bar (Task 11g): every joining link (a river node off today's courses, so
+/// unanchored, whose down node is anchored) that is a lattice step climbs at most
+/// [`JOIN_RIDGE_M`] above the higher of its nodes' unburnt elevations over the 60″ tiles
+/// ([`step_crest_above`]), as the shipped ridged steps were baked. Checked only on the lattice
+/// the steps were baked for; elsewhere it passes and says so.
+pub fn judge_ridged_joins(hydro: &EraHydrology, fine: &FineTerrain) -> BarResult {
+    let lattice = &hydro.lattice;
+    let baked = shipped_ridged_steps().n;
+    if lattice.n != baked {
+        return BarResult {
+            pass: true,
+            line: format!(
+                "ridged joins: not checked (lattice n = {}, the steps are baked at n = {baked})",
+                lattice.n
+            ),
+            details: Vec::new(),
+        };
+    }
+    let nodes = hydro.rivers.nodes();
+    let (mut joins, mut off_step) = (0usize, 0usize);
+    let mut over: Vec<(f64, u32, u32)> = Vec::new();
+    for n in nodes {
+        let Down::River(j) = n.down else { continue };
+        let c = nodes[j as usize].node;
+        if hydro.anchor(c).is_none() || hydro.anchor(n.node).is_some() {
+            continue;
+        }
+        if !lattice.neighbours(n.node).contains(&Some(c)) {
+            off_step += 1;
+            continue;
+        }
+        joins += 1;
+        let (a, b) = (lattice.dir(n.node).0, lattice.dir(c).0);
+        let ends = fine.overview_at(a).max(fine.overview_at(b));
+        let above = step_crest_above(a, b, ends, &|d| fine.at(d));
+        if above > JOIN_RIDGE_M {
+            over.push((above, n.node, c));
+        }
+    }
+    over.sort_by(|x, y| y.0.total_cmp(&x.0));
+    let pass = over.is_empty() && fine.error().is_none();
+    let worst = over.first().map_or(String::new(), |&(m, u, _)| {
+        let (la, lo) = latlon(lattice.dir(u).0);
+        format!(", worst {m:.0} m from ({la:.3}, {lo:.3})")
+    });
+    let mut line = format!(
+        "ridged joins: {} of {joins} joining steps climb more than {JOIN_RIDGE_M} m over the 60″ \
+         tiles{worst} ({off_step} joins are no lattice step) - {}",
+        over.len(),
+        verdict(pass)
+    );
+    if let Some(e) = fine.error() {
+        line.push_str(&format!("; a tile failed to read: {e}"));
+    }
+    let details = over
+        .iter()
+        .take(10)
+        .map(|&(m, u, c)| {
+            let ((la, lo), (lb, lob)) = (latlon(lattice.dir(u).0), latlon(lattice.dir(c).0));
+            format!("  ridged join ({la:.3}, {lo:.3}) -> ({lb:.3}, {lob:.3}): {m:.0} m")
+        })
+        .collect();
+    BarResult {
+        pass,
+        line,
+        details,
+    }
 }
 
 /// A lake-map lake whose baked surface stands more than this below the lowest cell of its
@@ -1632,7 +1709,7 @@ fn dir_render(lat: f64, lon: f64) -> RenderDir {
 /// Informative (Task 11d fix round 5), never a failure: the lake map's lakes whose surface
 /// stands more than [`LAKE_MAP_GAP_M`] below their shoreline ring's lowest cell
 /// ([`LakeMap::rings`], the heights from `height_at(lat, lon)`), the largest gap first, each
-/// with `game(id)` (the pass's lakes whose exit lies in it); then [`AUDITED_LAKES`], flagged or
+/// with `game(id)` (the pass's lakes holding its nodes, Task 11g); then [`AUDITED_LAKES`], flagged or
 /// not. The surface is the level `stands_at(id)` gives (a table lake's, where the pass joined
 /// the map lake to one: Task 11f), else the baked one.
 pub fn lake_map_audit_lines(

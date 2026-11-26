@@ -33,6 +33,14 @@ pub const TODAY_RIVER_BURN_M: f64 = 10.0;
 /// lattice spacings from the node's centre, and the regions' gather and read reach allow for
 /// it.
 pub const TODAY_RIVER_ANCHOR_MAX_SPACINGS: f64 = 0.75;
+/// A node off today's courses may not drain into a course node across a step whose 60″ terrain
+/// climbs more than this above the higher of the two nodes' unburnt elevations
+/// ([`ridged`](super::ridged), Task 11g). Chosen from the 0 ka census of the 4,645 joining links
+/// (the 11g probe): at 100 m the rule stops 76 of the 81 links whose region chord cut more than
+/// 500 m (Hells Canyon's Salmon among them, 726 m) and 241 of the 739 over 50 m, while it stops
+/// 36 of the 3,906 joins that cut 50 m or less; re-routed, the joins over 500 m fall to 24, every
+/// outlet bar still passes and no lake changes. At 300 m it stops only 48 of the 81; at 500 m, 16.
+pub const JOIN_RIDGE_M: f64 = 100.0;
 
 // Data lakes.
 

@@ -25,6 +25,92 @@ checkout's real data.
 Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (1620 × 1920 nodes).
 `indus.json` is 95,668 bytes and `amazon.json` 503,031 bytes.
 
+## Result, 2026-11-26 (Task 11g: no tributary drains into a burnt course across a ridge)
+
+The burn makes a course the lowest ground for a lattice spacing around, so steepest descent
+pulled neighbouring nodes into it, even across ridges the 10 km nodes do not resolve. At Hells
+Canyon the Salmon's node (45.480, −116.362) drained west into the burnt Snake node
+(45.509, −116.536) over an unbroken ridge, and the region carved a gash 1,167 m deep and up to
+875 m wide through it (Task 11e's probe at d06f13b). The real Salmon runs 40 km north first.
+
+**The rule** (owner, 2026-11-26: option 1). A step from a node off the courses into a course node
+is *ridged* when the 60″ terrain along it climbs more than `JOIN_RIDGE_M` = 100 m above the higher
+of the two nodes' unburnt elevations. Routing's flood never reaches the node from the course
+node across such a step, its receiver is never that course node, and the lakes' basin rewrites
+take none where they have another way. The 5′ overview the pass reads cannot see these ridges
+(Task 11g Step 1: along the 25 deepest joins its crest is typically 0.15 of the 60″ one, and 9 of
+25 show none), so the steps are baked from the region tiles: `data/hydrology/ridged_steps.bin`,
+18,894 steps, 151,180 bytes, stamped with the course table's hash ([data/README.md](../../../data/README.md#ridged-steps-into-todays-courses)).
+
+**Why 100 m** (the 0 ka census of the 4,645 joining links, rerouted on a scratch build): it
+stopped 76 of the 81 joins whose region chord cut more than 500 m and 241 of the 739 over 50 m,
+while stopping 36 of the 3,906 that cut 50 m or less. 300 m stopped 48 of the 81, 500 m 16. The
+alternative, allowing a join only where the receiver's unburnt elevation is no higher than its
+feeder's, did not stop Hells (the Snake node stands 16 m lower than the Salmon's), stopped at most
+29 of the 81, and its reroutes broke up to four outlets (the Yellow River, the Nile, the Yangtze,
+the Niger).
+
+**The joining-link census, before (d06f13b) → after:**
+
+| | Before | After |
+|---|---|---|
+| Joining links (q ≥ 20 m³/s) | 4,645 | 4,714 |
+| Region chord cuts more than 50 m | 739 | 687 |
+| Region chord cuts more than 500 m | 81 | 23 |
+| Steps whose 60″ crest climbs more than 100 m (the new bar) | (not measured) | **0** |
+| Hells Canyon region: joins deeper than 50 m, worst | 1 (the Salmon), 1,167 m deep, 875 m wide | 0, worst 29 m |
+| Indus tributaries region: joins deeper than 50 m | 0 | 0 |
+
+The re-route makes new joins elsewhere (4,645 → 4,714), and some of them cut more than 50 m
+through a spur under the threshold: Task 11e's corridor search is for those.
+
+**Every bar, before (d06f13b) → after** (`hydro check`, release build, both runs on the same
+bake):
+
+| Bar | Before | After |
+|---|---|---|
+| Indus box, relaxed | 83.0%, 74/84 links, worst 81.3 km - FAIL (links) | 82.8%, 74/84 links, worst 81.3 km - FAIL (links) |
+| Indus box, coarse (informative) | 82.0%, 73/84 | 81.7%, 73/84 |
+| Amazon flats | 91.8%, 457/482 - PASS | unchanged - PASS |
+| Lakes (8) | all PASS | unchanged, digit for digit |
+| Outlets (22) | all PASS | unchanged, digit for digit |
+| Arid basins | PASS | unchanged |
+| **Ridged joins** (new) | – | 0 of 4,714 joining steps over 100 m - PASS |
+
+- Both Indus shares fall slightly; the same links match, and one missed link's worst distance
+  falls (77.5 → 70.8 km).
+- **The discharge table** moves by under 0.2%, except the Mekong at Kratié (9,857 → 9,542 m³/s,
+  −3%); the Nile stays the one flag.
+- **The courses' order** (informative): 2,663 → 2,738 interior course nodes carry no river, and
+  Follows 28,704 → 28,628. A tributary that no longer crosses a ridge into its course reaches it
+  further down, so a few headwater stretches fall below the river threshold.
+- **Pass time** 0.93 → 0.94 s (release). A first version spent 0.28 s more searching the steps at
+  every flood visit; a bit per node (a step leads into it) now settles almost every check.
+- **Region generation** (native, release, the web's 256-unit prep steps): Hells Canyon prep
+  403–408 → 417–419 ms, longest step 1.09 → 1.12 ms; Indus 210–212 → 216–218 ms, longest step
+  1.46 → 1.53 ms.
+
+**The lake dump** (`hydro-check-lakes.tsv`): 849 lakes before and after, no kind or level changes;
+52 lakes' inflows move, most by under 1%. The largest are in the Clark Fork–Pend Oreille system:
+Pend Oreille (lake 63) 882 → 596 m³/s, its exit
+moving 8 km to (48.27, −116.41), and Flathead (52) 354 → 435 m³/s. Borneo's lake 625 2,460 → 2,374
+m³/s, the Caspian 12,853 → 12,882 m³/s.
+
+**Baikal** (lake 0): its footprint takes one more node (34,385 → 34,483 km²), and its outlet, the
+footprint's node of the largest discharge, moves 11 km west to (51.89, 104.69). Its outflow is
+unchanged (3,597.2 → 3,596.2 m³/s) and its level is the table's 455.5 m. The lake-map audit had
+listed the pass's lakes whose *exit* lies in a map lake, and the new outlet node lies just off
+the map's footprint, so Baikal's audit line read "the pass's lakes there []" while its verdict
+(judged by the table lakes holding the map lake's nodes) stayed "ok". The audit now lists the
+pass's lakes holding the map lake's nodes, with their node counts: Baikal reads
+"[0 Open 455.5 m, 304 nodes] - ok", Superior "[1 Open 183.4 m, 996 nodes] - ok", and so on.
+
+**Hells Canyon** (`region_tour <out> 1920x1080 45.28,-116.59,0 hells high 6000`, looking 45°
+down): before, the eastern river crossed the ridge to the north-east in a black-floored notch
+([hells-canyon-ridge-before.jpg](hells-canyon-ridge-before.jpg), Task 11b fix round 2's build;
+Task 11e's probe measured the same gash at d06f13b). After, the notch is gone and the Salmon runs
+north in its own valley at the top right ([hells-canyon-ridge-after.jpg](hells-canyon-ridge-after.jpg)).
+
 ## Result, 2026-11-26 (Task 11f: lakes baked at their bed)
 
 The lake map bakes Baikal and the Great Lakes at their bed (fix round 5's audit). The table already set their levels, but each map lake's nodes outside its table lake's footprint were a separate Data lake at the bed level. Those Data lakes took the table lake's flow: Baikal's 384 at −328 m took the whole Angara, 3,597 m³/s. The shipped map was not re-baked, as ruled. Re-baking it from water surfaces is the follow-up.

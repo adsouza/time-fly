@@ -29,6 +29,9 @@
 //!   is ocean or above `level`) are pushed first, keyed `(level, seq)`, with `filled = level` and
 //!   no parent: they seed the flood like the sea at that level, and have no receiver. They make
 //!   one basin together (whatever `e − level`), its exit the first popped, its rim the exit.
+//! - **Ridged steps** ([`Routing::with_blocked`], Task 11g): a blocked `(u, c)` (a node off
+//!   today's courses and a course node across a ridge, [`super::ridged`]) is no step for `u`: the
+//!   flood never reaches `u` from `c`, and `u` never takes `c` as its receiver.
 //! - **Flood:** push every ocean node with a non-ocean neighbour, in ascending id, keyed
 //!   `(e, seq)`. Pop the minimum `(filled, seq)`; for each unvisited non-ocean neighbour `n`, in
 //!   neighbour order: `filled[n] = max(e[n], filled[c])`, `parent[n] = c`, push
@@ -48,6 +51,7 @@
 
 use super::HydroGraph;
 use super::params::{DEPRESSION_EPS_M, OCEAN_STRAIT_M, OPEN_SEA_M};
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
@@ -101,6 +105,9 @@ pub struct Routed {
     /// The nodes held to their course successors ([`Routing::with_courses`]), sorted: a basin's
     /// rewrite keeps such a receiver where it leads a step closer to the basin's lake.
     pub held: Vec<u32>,
+    /// The ridged steps ([`Routing::with_blocked`]), sorted: a basin's rewrite takes none of
+    /// them where it has another way (Task 11g).
+    pub blocked: Vec<(u32, u32)>,
 }
 
 /// The node `i` drains to, or `None` for the ocean and a no-ocean graph's seed.
@@ -229,6 +236,11 @@ pub struct Routing {
     /// Endorheic lakes' `(node, level)`, and once grown, each node's sink flag (empty with none).
     sink_points: Vec<(u32, f32)>,
     sink: Vec<bool>,
+    /// Ridged `(node, course node)` steps neither the flood nor the receivers take, sorted.
+    blocked: Cow<'static, [(u32, u32)]>,
+    /// One bit per node: some ridged step leads into it (empty with none), so most checks are a
+    /// bit test.
+    blocked_into: Vec<u64>,
 }
 
 impl Routing {
@@ -278,7 +290,35 @@ impl Routing {
             held: Vec::new(),
             sink_points: Vec::new(),
             sink: Vec::new(),
+            blocked: Cow::Borrowed(&[]),
+            blocked_into: Vec::new(),
         }
+    }
+
+    /// The router, with ridged steps `(node, course node)`, sorted (Task 11g; the module's
+    /// rules): `node` neither is reached from the course node nor drains to it.
+    pub fn with_blocked(mut self, blocked: impl Into<Cow<'static, [(u32, u32)]>>) -> Self {
+        let blocked = blocked.into();
+        debug_assert!(blocked.is_sorted());
+        self.blocked_into = if blocked.is_empty() {
+            Vec::new()
+        } else {
+            let mut bits = vec![0u64; self.elevation.len().div_ceil(64)];
+            for &(_, c) in blocked.iter() {
+                bits[(c / 64) as usize] |= 1 << (c % 64);
+            }
+            bits
+        };
+        self.blocked = blocked;
+        self
+    }
+
+    /// Whether the step from `u` to `c` is ridged ([`Routing::with_blocked`]).
+    fn is_blocked(&self, u: u32, c: u32) -> bool {
+        self.blocked_into
+            .get((c / 64) as usize)
+            .is_some_and(|w| w >> (c % 64) & 1 == 1)
+            && self.blocked.binary_search(&(u, c)).is_ok()
     }
 
     /// The router, with each burnt course's interior nodes below the sea in course order,
@@ -375,6 +415,11 @@ impl Routing {
             + self.parent.capacity()
             + self.receiver.capacity()
             + self.heap.capacity() * size_of::<Reverse<(u32, u64, u32)>>()
+            + match &self.blocked {
+                Cow::Owned(v) => 8 * v.capacity(),
+                Cow::Borrowed(_) => 0,
+            }
+            + 8 * self.blocked_into.capacity()
             + basins
     }
 
@@ -390,6 +435,7 @@ impl Routing {
             basins: self.basins,
             basin_of: self.basin_of,
             held: self.held,
+            blocked: self.blocked.into_owned(),
         }
     }
 
@@ -725,7 +771,11 @@ impl Routing {
         let shut = self.ocean[c as usize] && !self.inland.is_empty() && !self.is_end(c);
         for u in g.neighbours(c).into_iter().flatten() {
             let uu = u as usize;
-            if self.ocean[uu] || self.visited[uu] || (shut && self.is_inland(u)) {
+            if self.ocean[uu]
+                || self.visited[uu]
+                || (shut && self.is_inland(u))
+                || self.is_blocked(u, c)
+            {
                 continue;
             }
             // A node held to its course successor is reached from it alone.
@@ -757,7 +807,8 @@ impl Routing {
             let mut best: Option<(u8, f64)> = None;
             for (k, j) in g.neighbours(next).into_iter().enumerate() {
                 let Some(j) = j else { continue };
-                if inland && self.ocean[j as usize] && !self.is_end(j) {
+                if (inland && self.ocean[j as usize] && !self.is_end(j)) || self.is_blocked(next, j)
+                {
                     continue;
                 }
                 let other = self.filled[j as usize];
@@ -1282,6 +1333,129 @@ mod tests {
         for i in 0..g.len() {
             assert_eq!(*path(&g, &r, i).last().unwrap(), 4);
         }
+    }
+
+    /// [`ridge_fixture`]'s lattice, routing elevation, course and ridged steps.
+    type RidgeFixture = (CubeLattice, Vec<f32>, Vec<u32>, Vec<(u32, u32)>);
+
+    /// Task 11g's fixture: on +X of an n = 101 lattice (about 100 km steps), a burnt trench
+    /// along row 50 from column 30 east to the sea past column 75, on a plateau that falls away
+    /// from it north and south (1 m/km) and gently east (5 cm/km). Routing reads the trench at 300 m, its
+    /// unburnt height the plateau's; a fine ridge 1,500 m high runs half a spacing off the
+    /// trench on both sides, missing north of column `saddle` (when given), where the land
+    /// between the plateau and the trench stays below both. Returns the lattice, routing's
+    /// elevation, the course and its ridged steps at [`JOIN_RIDGE_M`].
+    fn ridge_fixture(saddle: Option<u32>) -> RidgeFixture {
+        use crate::hydrology::params::JOIN_RIDGE_M;
+        use crate::hydrology::ridged::ridged_steps;
+        use crate::worldgen::frame::EARTH_RADIUS_M;
+        let lattice = CubeLattice { n: 101 };
+        let at = |col: u32, row: u32| lattice.node(CubeFace::PosX, col, row);
+        let east = |d: DVec3| (-d.z).atan2(d.x) * EARTH_RADIUS_M;
+        let north = |d: DVec3| d.y.clamp(-1.0, 1.0).asin() * EARTH_RADIUS_M;
+        let east0 = east(lattice.dir(at(30, 50)).0);
+        let half_row = 0.5 * north(lattice.dir(at(50, 49)).0);
+        let saddle_east = saddle.map(|c| east(lattice.dir(at(c, 49)).0));
+        let spacing = lattice.mean_spacing_m();
+        let course: Vec<u32> = (30..=75).map(|c| at(c, 50)).collect();
+        let mut sorted = course.clone();
+        sorted.sort_unstable();
+        let land = |v: u32| {
+            let (face, col, row) = lattice.face_col_row(v);
+            face == CubeFace::PosX && (25..=75).contains(&col) && (25..=75).contains(&row)
+        };
+        // The plateau before any burn, as a surface.
+        let plateau = |d: DVec3| 1000.0 - 0.001 * north(d).abs() - 0.00005 * (east(d) - east0);
+        let elevation: Vec<f32> = (0..lattice.len())
+            .map(|v| {
+                let d = lattice.dir(v).0;
+                if sorted.binary_search(&v).is_ok() {
+                    (300.0 - 0.00001 * (east(d) - east0)) as f32
+                } else if land(v) {
+                    plateau(d) as f32
+                } else {
+                    -500.0
+                }
+            })
+            .collect();
+        let unburnt = |v: u32| plateau(lattice.dir(v).0);
+        let fine = |d: DVec3| {
+            let ridge = (north(d).abs() - half_row).abs() < 1000.0
+                && !saddle_east
+                    .is_some_and(|s| north(d) > 0.0 && (east(d) - s).abs() < 0.6 * spacing);
+            if ridge {
+                plateau(d).max(1500.0)
+            } else {
+                plateau(d)
+            }
+        };
+        let blocked = ridged_steps(&lattice, &sorted, &unburnt, &fine, JOIN_RIDGE_M);
+        (lattice, elevation, course, blocked)
+    }
+
+    fn route_blocked(
+        g: &CubeLattice,
+        elevation: Vec<f32>,
+        blocked: Vec<(u32, u32)>,
+        budget: u32,
+    ) -> Routed {
+        let mut routing = Routing::new(elevation).with_blocked(blocked);
+        while !routing.step(g, budget) {}
+        routing.finish()
+    }
+
+    /// Task 11g: a plateau node beside a burnt trench, a fine ridge between them, drains the way
+    /// its own land falls, not over the ridge into the trench.
+    #[test]
+    fn a_tributary_never_drains_into_a_course_across_a_ridge() {
+        let (lattice, elevation, course, blocked) = ridge_fixture(None);
+        let at = |col: u32, row: u32| lattice.node(CubeFace::PosX, col, row);
+        let on_course = |v: u32| course.contains(&v);
+        let beside: Vec<u32> = (32..=70).flat_map(|c| [at(c, 49), at(c, 51)]).collect();
+        // Every step from the plateau into the trench crosses the ridge.
+        for &u in &beside {
+            for c in lattice
+                .neighbours(u)
+                .into_iter()
+                .flatten()
+                .filter(|&c| on_course(c))
+            {
+                assert!(blocked.binary_search(&(u, c)).is_ok(), "{u} -> {c}");
+            }
+        }
+        // The hazard: without the rule, the trench captures the plateau beside it.
+        let plain = route(&lattice, elevation.clone(), u32::MAX);
+        let into = |r: &Routed, u: u32| receiver_of(&lattice, r, u).is_some_and(on_course);
+        assert!(beside.iter().all(|&u| into(&plain, u)));
+        // With it, none of them drains into the trench, and each drains away from it.
+        let r = route_blocked(&lattice, elevation.clone(), blocked.clone(), u32::MAX);
+        for &u in &beside {
+            let to = receiver_of(&lattice, &r, u).expect("a receiver");
+            assert!(!on_course(to), "{u} -> {to}");
+            let row = lattice.face_col_row(u).2;
+            let to_row = lattice.face_col_row(to).2;
+            assert!(to_row.abs_diff(50) > row.abs_diff(50), "{u} -> {to}");
+        }
+        // The trench still runs to the sea, and the result is the same for any budget.
+        let end = *path(&lattice, &r, course[0]).last().unwrap();
+        assert!(r.ocean[end as usize]);
+        assert_eq!(route_blocked(&lattice, elevation, blocked, 7), r);
+    }
+
+    /// Task 11g: where the land between them stays low (a saddle below the threshold), the
+    /// plateau node still joins the trench.
+    #[test]
+    fn a_tributary_through_a_saddle_still_joins() {
+        let (lattice, elevation, course, blocked) = ridge_fixture(Some(52));
+        let at = |col: u32, row: u32| lattice.node(CubeFace::PosX, col, row);
+        let (u, c) = (at(52, 49), at(52, 50));
+        assert!(blocked.binary_search(&(u, c)).is_err());
+        // Away from the saddle the ridge still blocks.
+        assert!(blocked.binary_search(&(at(40, 49), at(40, 50))).is_ok());
+        let r = route_blocked(&lattice, elevation, blocked, u32::MAX);
+        let to = receiver_of(&lattice, &r, u).expect("a receiver");
+        assert!(course.contains(&to), "{u} -> {to}");
+        assert!(!course.contains(&receiver_of(&lattice, &r, at(40, 49)).unwrap()));
     }
 
     /// Times one full route on the recent lattice (6 × 900²) over synthetic elevation. Not a

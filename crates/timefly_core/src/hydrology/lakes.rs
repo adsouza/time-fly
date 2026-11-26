@@ -85,7 +85,8 @@
 //!   (Terminal, a playa, Data lake without outflow, a Terminal table lake), its sinks (Data and
 //!   table lakes: the nodes in the footprint or with e below the level, ice included). BFS from the sources over the
 //!   basin's nodes. Every other node routes to the neighbour one step closer with the lowest e
-//!   (ties: neighbour order); re-accumulate q and area in descending distance, ties ascending id.
+//!   (ties: neighbour order). A ridged step (`Routed::blocked`, Task 11g) is no step for the BFS
+//!   or the choice, unless a node can be reached no other way. Re-accumulate q and area in descending distance, ties ascending id.
 //!   A basin that passes water on then adds each other source's q and area to the exit
 //!   (ascending id) and redirects it to the exit; the outflow (the lake's, or q[exit] with no
 //!   lake) and the exit's area go to the exit's receiver (the rim, or a lower neighbour outside),
@@ -878,6 +879,7 @@ impl Accumulation {
             receiver,
             basins,
             held,
+            blocked,
             ..
         } = routed;
         let basin = &basins[b];
@@ -1152,16 +1154,32 @@ impl Accumulation {
                 evaporation_m3s,
             } => (lake, sinks, false, evaporation_m3s),
         };
+        // The step from basin node `k` to `j` is ridged (Task 11g): the BFS takes it only for a
+        // node it cannot reach otherwise.
+        let ridged = |k: usize, j: usize| {
+            !blocked.is_empty() && blocked.binary_search(&(nodes[k], nodes[j])).is_ok()
+        };
         let mut dist = vec![u32::MAX; m];
         let mut queue: VecDeque<usize> = (0..m).filter(|&k| sources[k]).collect();
         for &k in &queue {
             dist[k] = 0;
         }
-        while let Some(k) = queue.pop_front() {
-            for j in neighbours_in(k).into_iter().flatten() {
-                if dist[j] == u32::MAX {
-                    dist[j] = dist[k] + 1;
-                    queue.push_back(j);
+        for allow_ridged in [false, true] {
+            if allow_ridged {
+                if !dist.contains(&u32::MAX) {
+                    break;
+                }
+                let mut reached: Vec<usize> = (0..m).filter(|&k| dist[k] < u32::MAX).collect();
+                reached.sort_by_key(|&k| (dist[k], k));
+                queue = reached.into();
+            }
+            while let Some(k) = queue.pop_front() {
+                for j in neighbours_in(k).into_iter().flatten() {
+                    // `j` would drain to `k`.
+                    if dist[j] == u32::MAX && (allow_ridged || !ridged(j, k)) {
+                        dist[j] = dist[k] + 1;
+                        queue.push_back(j);
+                    }
                 }
             }
         }
@@ -1176,10 +1194,19 @@ impl Accumulation {
                 .and_then(|slot| neighbours_in(k)[slot].map(|j| (slot, j)))
                 .filter(|&(_, j)| dist[j] < dist[k]);
             let mut best: Option<(usize, usize)> = kept;
-            for (slot, j) in neighbours_in(k).into_iter().enumerate() {
-                let Some(j) = j else { continue };
-                if kept.is_none() && dist[j] < dist[k] && best.is_none_or(|(_, b)| e[j] < e[b]) {
-                    best = Some((slot, j));
+            // Unridged steps first; a node the BFS reached only by a ridged step takes one.
+            for any in [false, true] {
+                if best.is_some() {
+                    break;
+                }
+                for (slot, j) in neighbours_in(k).into_iter().enumerate() {
+                    let Some(j) = j else { continue };
+                    if dist[j] < dist[k]
+                        && (any || !ridged(k, j))
+                        && best.is_none_or(|(_, b)| e[j] < e[b])
+                    {
+                        best = Some((slot, j));
+                    }
                 }
             }
             let (slot, j) = best.expect("a basin is connected to its sources");
@@ -2173,6 +2200,95 @@ mod tests {
         );
         // The pit gathers the whole basin's water: its inflow is the lake's.
         assert_eq!(f64::from(acc.q[pit as usize]), lake.inflow_m3s);
+    }
+
+    /// Task 11g: a basin's rewrite takes no ridged step ([`Routed::blocked`]) where it has
+    /// another way. On [`a_dry_basin_routes_to_its_lake_by_bfs`]'s basin, a dry node whose lowest
+    /// closer neighbour lies across a ridged step takes its next lowest, and one whose every
+    /// closer neighbour does goes round; every node still reaches the pit.
+    #[test]
+    fn a_basins_rewrite_takes_no_ridged_step() {
+        let g = GridGraph {
+            rows: 7,
+            cols: 11,
+            spacing_m: 1_000.0,
+        };
+        let elevation: Vec<f32> = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (3, 7) => 2.0,
+                (3, 1) => 50.0,
+                (r, c) if (1..=5).contains(&r) && (2..=9).contains(&c) => {
+                    10.0 + c as f32 + r as f32 * 0.5
+                }
+                _ => 90.0,
+            })
+            .collect();
+        let pit = g.node(3, 7);
+        let mut plain = route(&g, elevation.clone());
+        accumulate(
+            &g,
+            &mut plain,
+            |_| 30.0,
+            |_| 1e6,
+            |_| false,
+            false,
+            u32::MAX,
+        );
+        let nodes = plain.basins[0].nodes.clone();
+        let mut dist = std::collections::HashMap::from([(pit, 0u32)]);
+        let mut queue = VecDeque::from([pit]);
+        while let Some(v) = queue.pop_front() {
+            for j in g.neighbours(v).into_iter().flatten() {
+                if nodes.contains(&j) && !dist.contains_key(&j) {
+                    dist.insert(j, dist[&v] + 1);
+                    queue.push_back(j);
+                }
+            }
+        }
+        let closer = |v: u32| -> Vec<u32> {
+            let mut c: Vec<u32> = g
+                .neighbours(v)
+                .into_iter()
+                .flatten()
+                .filter(|j| dist.get(j).is_some_and(|&d| d < dist[&v]))
+                .collect();
+            c.sort_by(|a, b| elevation[*a as usize].total_cmp(&elevation[*b as usize]));
+            c
+        };
+        // A node with a choice, its lowest closer neighbour across a ridge; and a node whose
+        // every closer neighbour is.
+        let v = g.node(2, 4);
+        let w = g.node(4, 5);
+        let (cv, cw) = (closer(v), closer(w));
+        assert!(cv.len() > 1 && !cw.is_empty(), "{cv:?} {cw:?}");
+        assert_eq!(receiver_of(&g, &plain, v), Some(cv[0]));
+        assert!(cw.contains(&receiver_of(&g, &plain, w).unwrap()));
+        let mut blocked: Vec<(u32, u32)> = std::iter::once((v, cv[0]))
+            .chain(cw.iter().map(|&j| (w, j)))
+            .collect();
+        blocked.sort_unstable();
+        let mut r = route(&g, elevation);
+        r.blocked = blocked.clone();
+        let acc = accumulate(&g, &mut r, |_| 30.0, |_| 1e6, |_| false, false, u32::MAX);
+        assert_eq!(acc.lakes.len(), 1);
+        assert_eq!(receiver_of(&g, &r, v), Some(cv[1]));
+        let to_w = receiver_of(&g, &r, w).unwrap();
+        assert!(!cw.contains(&to_w), "{to_w}");
+        for &u in &nodes {
+            let mut at = u;
+            let mut steps = 0;
+            while let Some(next) = receiver_of(&g, &r, at) {
+                assert!(
+                    blocked.binary_search(&(at, next)).is_err(),
+                    "{at} -> {next}"
+                );
+                at = next;
+                steps += 1;
+                assert!(steps < 50);
+            }
+            assert_eq!(at, pit, "{:?}", g.row_col(u));
+        }
     }
 
     // ---- Lakes checked against today's map (Task 8b). ----

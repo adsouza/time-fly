@@ -17,6 +17,7 @@ mod lattice;
 pub mod levels;
 pub mod params;
 mod pass;
+pub mod ridged;
 mod route;
 pub mod straits;
 mod today;

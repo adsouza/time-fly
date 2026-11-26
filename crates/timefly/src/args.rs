@@ -39,6 +39,9 @@ pub struct LaunchArgs {
     /// Hidden `--hydro-check[=OUT_DIR]` (native only): the rivers' reality check, headless
     /// ([`crate::hydro_check`]).
     pub hydro_check: Option<HydroCheck>,
+    /// Hidden `--bake-ridged-steps[=OUT_FILE]` (native only): bake the ridged steps from the
+    /// region tiles ([`crate::ridged_bake`]).
+    pub bake_ridged_steps: Option<RidgedBake>,
     /// `--region=LAT,LON,AGE_YEARS` (web: `?region=LAT,LON,AGE_YEARS`): enter the region centred
     /// there once the globe data is ready.
     pub region: Option<RegionArg>,
@@ -55,6 +58,14 @@ pub struct DataCheck {
     pub dir: Option<String>,
 }
 
+/// What `--bake-ridged-steps[=OUT_FILE]` asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RidgedBake {
+    /// Where the file goes, relative to the working directory; `None` for the source tree's
+    /// `data/hydrology/ridged_steps.bin`.
+    pub out: Option<String>,
+}
+
 /// What `--hydro-check[=OUT_DIR]` asks for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HydroCheck {
@@ -64,6 +75,7 @@ pub struct HydroCheck {
 
 const CHECK_DATA_FLAG: &str = "--check-data";
 const HYDRO_CHECK_FLAG: &str = "--hydro-check";
+const BAKE_RIDGED_FLAG: &str = "--bake-ridged-steps";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const REGION_BENCH_FLAG: &str = "--region-bench";
@@ -147,6 +159,23 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
         }
         if arg == HYDRO_CHECK_FLAG {
             parsed.hydro_check = Some(HydroCheck::default());
+            continue;
+        }
+        if arg == BAKE_RIDGED_FLAG {
+            parsed.bake_ridged_steps = Some(RidgedBake::default());
+            continue;
+        }
+        if let Some(out) = arg
+            .strip_prefix(BAKE_RIDGED_FLAG)
+            .and_then(|r| r.strip_prefix('='))
+        {
+            if out.is_empty() {
+                parsed.unknown.push(arg);
+            } else {
+                parsed.bake_ridged_steps = Some(RidgedBake {
+                    out: Some(out.to_string()),
+                });
+            }
             continue;
         }
         if let Some(dir) = arg
@@ -497,6 +526,25 @@ mod tests {
         for bad in ["--hydro-check=", "--hydro-checks"] {
             let parsed = parse_launch_args(args(&[bad]));
             assert_eq!(parsed.hydro_check, None);
+            assert_eq!(parsed.unknown, args(&[bad]));
+        }
+    }
+
+    #[test]
+    fn bake_ridged_steps_flag() {
+        let parsed = parse_launch_args(args(&["--bake-ridged-steps"]));
+        assert_eq!(parsed.bake_ridged_steps, Some(RidgedBake { out: None }));
+        assert!(parsed.unknown.is_empty());
+        let parsed = parse_launch_args(args(&["--bake-ridged-steps=/tmp/r.bin"]));
+        assert_eq!(
+            parsed.bake_ridged_steps,
+            Some(RidgedBake {
+                out: Some("/tmp/r.bin".into())
+            })
+        );
+        for bad in ["--bake-ridged-steps=", "--bake-ridged-stepss"] {
+            let parsed = parse_launch_args(args(&[bad]));
+            assert_eq!(parsed.bake_ridged_steps, None);
             assert_eq!(parsed.unknown, args(&[bad]));
         }
     }

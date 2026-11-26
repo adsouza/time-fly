@@ -13,6 +13,7 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Past climate, 0–120 ka (rivers) | Beyer, Krapp & Manica (2020), figshare 12293345; see [Past climate](#past-climate-beyer-et-al-2020) | CC BY 4.0 | Rivers and lakes Task 1 (`timefly_bake.beyer`) |
 | Present-day lakes (rivers, recent eras) | Natural Earth 1:10m lakes 5.0.0; see [Present-day lake map](#present-day-lake-map-natural-earth) | Public domain | Rivers and lakes Task 8b (`timefly_bake.lakemap`) |
 | Today's major river courses (rivers, recent eras) | Natural Earth 1:10m rivers + lake centerlines 5.1.2; see [Today's river courses](#todays-river-courses-natural-earth) | Public domain | Rivers and lakes Task 11b (`timefly_bake.rivers_today`) |
+| Ridged steps into today's courses (rivers, recent eras) | Derived from the region tiles (ETOPO 2022 60″) and the river courses above; see [Ridged steps](#ridged-steps-into-todays-courses) | NOAA NCEI public data; cite doi:10.25921/fd45-gt74 | Rivers and lakes Task 11g (`timefly --bake-ridged-steps`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
 ## Pinned downloads (`data/sources.json`)
@@ -412,6 +413,32 @@ the continental pass burns each course into its routing: the running minimum of 
 elevations along it, less 10 m (`TODAY_RIVER_BURN_M`), never below sea level on land. The river
 graph's bed there is the running minimum itself. Without it the lattice's routes across flat
 plains leave the real courses: the lower Indus ran about 90 km east of Sehwan.
+
+## Ridged steps into today's courses
+
+| File | Size (bytes) | Steps |
+|---|---|---|
+| `data/hydrology/ridged_steps.bin` | 151,180 | 18,894 |
+
+The steps a tributary may not take into a burnt course (rivers and lakes Task 11g, owner ruling
+2026-11-26): every lattice step from a node off the shipped courses into a course node, at the
+recent lattice (n = 900), whose terrain climbs more than `JOIN_RIDGE_M` = 100 m above the higher
+of the two nodes' unburnt elevations. The terrain along a step is the region tiles' 60″ lattice
+(ETOPO 2022 60″, see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger)) sampled every
+250 m between the node centres; a node's unburnt elevation is the 5′ overview at its centre (what
+the pass samples at the present day). The course nodes are those of `rivers_today.json` at the
+lattice. Without it the burnt trench pulls neighbouring nodes into it across ridges the 10 km
+nodes do not see: Hells Canyon's Salmon drained west into the Snake over a 726 m crest, and the
+regions carved a gash 1,167 m deep through it.
+
+`timefly --bake-ridged-steps` (native, hidden; run from the source tree with the bake's assets,
+e.g. `BEVY_ASSET_ROOT=<a folder holding assets/data> target/release/timefly --bake-ridged-steps`)
+writes it (`crates/timefly/src/ridged_bake.rs`): it reads the 574 tiles the steps cross, takes
+about 2 s, and gives the same bytes on every run. The file is stamped with the course table's
+FNV-1a hash, the lattice size and the threshold; `the_shipped_ridged_steps_match_the_course_table`
+fails when the table changes, so a course change forces a re-bake. Format and rule:
+`timefly_core::hydrology::ridged`. The pass forbids a step only where that era burnt its course
+node, in routing and in the lakes' basin rewrites.
 
 ## Performance and memory (Task 10)
 

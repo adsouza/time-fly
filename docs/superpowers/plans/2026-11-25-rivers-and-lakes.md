@@ -951,6 +951,25 @@ Owner, 2026-11-26: "Table entries now". Task 11d's lake-map audit found the lake
 - [ ] **Step 5: Re-run the check.** Record the lake bar, the audit line, every outlet (unchanged or better) and the lake-dump diff in reality-check.md.
 - [ ] **Step 6: Run the gate and commit** `fix: the Great Lakes and Baikal stand at their table levels, fragments included`.
 
+### Task 11g: No tributary drains into a burnt course across a ridge
+
+Owner, 2026-11-26: "Both, pass rule first". Task 11e's probes showed the Hells Canyon gash comes from the pass: the burnt Snake trench is the lowest ground within a lattice spacing, so the Salmon's node (45.480, −116.362) drains west into the burnt node (45.509, −116.536) at 119 m³/s across an unbroken ridge (lowest crest within ±1 spacing 1,492 m against water at 621–731 m); the real Salmon joins the Snake about 40 km north. Of 4,645 joining links at 0 ka, 81 cut more than 500 m. No region-side search can fix those; this task stops the pass making them. Task 11e's corridor search follows for the shallower joins.
+
+**Files:** `crates/timefly_core/src/hydrology/{route.rs,today_rivers.rs,params.rs}` (and the pass's stage plumbing), `docs/testing/rivers/reality-check.md`.
+
+**Interfaces and decisions:**
+- **The rule.** A node that is not on a burnt course may not take a burnt course node as its receiver (nor be reached from it in the flood) when the terrain along the step between them climbs more than `JOIN_RIDGE_M` above the higher of the two nodes' unburnt elevations. Such a step is treated as absent for that pair; the node drains the way its own land falls.
+- **What "the terrain along the step" is.** The pass reads the 5′ overview, not the fine tiles. Step 1 first measures whether the overview resolves the ridges in question (the Hells Canyon pair and a sample of the 81 deep joins): sample the overview along each step at overview-texel spacing and report the crest against the end heights. If the overview does not resolve them, stop and report (NEEDS_CONTEXT) with the numbers.
+- **Determinism.** The ridged steps are a function of the lattice, the overview and the shipped course table: compute them once per lattice with the course nodes (cached as the course node lists are), in resumable blocks, and keep the time-boxed pass equal to `run_parallel` bit for bit.
+- **`JOIN_RIDGE_M`** in params.rs, chosen from the measurements (justify: low enough to catch the 81, high enough not to cut joins through gentle saddles).
+
+- [ ] **Step 1: Measure** (no rule yet): the overview crest along the Hells Canyon step and the 81 deepest joins; report.
+- [ ] **Step 2: Write the failing tests:** `a_tributary_never_drains_into_a_course_across_a_ridge` (fixture: a ridge between a plateau node and a burnt trench; the node drains its own way), `a_tributary_through_a_saddle_still_joins` (a low saddle below the threshold keeps the join), the time-boxed equality on a fixture with ridged steps, and a real-table property: no joining link's step crest exceeds `JOIN_RIDGE_M` above its ends.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run the tests to check they pass.**
+- [ ] **Step 5: Re-run the reality check** (every bar before and after, the lake dump) and the joining-link census (count over 50 m and over 500 m before and after); render Hells Canyon (`region_tour <out> 1920x1080 45.28,-116.59,0 hells high 6000`): pass when the ridge gash is gone and the Salmon reaches the Snake its own way.
+- [ ] **Step 6: Run the gate and commit** `fix: no tributary drains into a burnt course across a ridge`.
+
 ### Task 11e: Tributaries find their canyons
 
 Owner, 2026-11-26: "Tributaries find canyons". With today's courses burnt in (Task 11b), a burnt canyon is the lowest ground for a lattice spacing around, so plateau tributaries drain into it, which is right in kind. But the region refines the joining link as a node-to-node chord, and where a fine ridge stands between the tributary's node and the canyon, the incision carves a gash through it: in Hells Canyon, 826–1,146 m deep and 375–875 m wide. This task routes such a link down the fine terrain instead.

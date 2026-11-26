@@ -21,6 +21,7 @@ use super::params::{
     HYDRO_DEEP_N, HYDRO_RECENT_N, ICE_NODE_FRACTION, PRESENT_FRAME_MAX_MYR,
     RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M, TODAY_RIVER_ANCHOR_MAX_SPACINGS,
 };
+use super::ridged::shipped_ridged_steps;
 use super::straits::{Strait, shipped_straits, strait_levels};
 #[cfg(test)]
 use super::today_rivers::TodayRiver;
@@ -394,6 +395,8 @@ pub struct HydroPrep {
     beds: BurntNodes,
     /// The river nodes' anchors on today's courses, ascending (gathered with the river nodes).
     anchors: Vec<(u32, [f64; 3])>,
+    /// Tests' own ridged steps in place of the shipped ones ([`super::ridged`]).
+    ridged: Option<Vec<(u32, u32)>>,
     stage: Stage,
 }
 
@@ -447,6 +450,7 @@ impl HydroPrep {
             today: TodayTable::Shipped,
             beds: BurntNodes::default(),
             anchors: Vec::new(),
+            ridged: None,
             stage: Stage::Sample,
         }
     }
@@ -680,8 +684,31 @@ impl HydroPrep {
                 .with_inland(self.beds.inland(), self.beds.ends())
                 .with_corridor(self.beds.corridor())
                 .with_courses(self.beds.successors())
-                .with_sinks(sinks),
+                .with_sinks(sinks)
+                .with_blocked(self.blocked_steps()),
         ))
+    }
+
+    /// The ridged steps routing forbids (Task 11g, [`super::ridged`]): the shipped ones where the
+    /// lattice is theirs and the shipped courses burn (tests may give their own), each kept only
+    /// where this era burnt its course node.
+    fn blocked_steps(&self) -> Vec<(u32, u32)> {
+        let shipped = || {
+            let s = shipped_ridged_steps();
+            (matches!(self.today, TodayTable::Shipped) && s.n == self.lattice.n)
+                .then_some(s.steps.as_slice())
+        };
+        let steps = match &self.ridged {
+            Some(given) => Some(given.as_slice()),
+            None => shipped(),
+        };
+        steps.map_or_else(Vec::new, |steps| {
+            steps
+                .iter()
+                .copied()
+                .filter(|&(_, c)| self.beds.get(c).is_some())
+                .collect()
+        })
     }
 
     /// The lake level table's points as `(nearest node, level)`, in table order.
@@ -806,6 +833,13 @@ impl HydroPrep {
     #[cfg(test)]
     pub(crate) fn with_today_rivers(mut self, rivers: Vec<TodayRiver>) -> Self {
         self.today = TodayTable::Given(rivers);
+        self
+    }
+
+    /// This pass with other ridged steps in place of the shipped ones (tests; sorted).
+    #[cfg(test)]
+    pub(crate) fn with_ridged_steps(mut self, steps: Vec<(u32, u32)>) -> Self {
+        self.ridged = Some(steps);
         self
     }
 
@@ -3592,6 +3626,58 @@ mod tests {
         }
         while !parallel.step(&today, &today, &table, 1 << 18) {}
         assert_eq!(parallel.units_done(), units);
+        assert_eq!(parallel.finish(), whole);
+    }
+
+    /// Task 11g: with ridged steps, the time-boxed pass still matches the native one bit for
+    /// bit, and the steps change the routing. The steps are the shipped courses' at n = 75 over
+    /// a fine terrain with ridges on the synthetic one.
+    #[test]
+    fn the_time_boxed_pass_matches_run_parallel_with_ridged_steps() {
+        use crate::hydrology::params::JOIN_RIDGE_M;
+        use crate::hydrology::ridged::{course_nodes, ridged_steps};
+        use crate::hydrology::today_rivers::shipped_today_rivers;
+        let lattice = CubeLattice { n: 75 };
+        let today = Today(Synthetic(1450.0));
+        let table = shipped_table();
+        let course = course_nodes(&lattice, shipped_today_rivers());
+        let unburnt = |v: u32| f64::from(today.node(lattice.dir(v)).elevation_m);
+        let fine = |d: DVec3| {
+            f64::from(today.node(RenderDir(d)).elevation_m)
+                + 400.0 * ((97.0 * d.x).sin() * (89.0 * d.z).cos()).max(0.0)
+        };
+        let steps = ridged_steps(&lattice, &course, &unburnt, &fine, JOIN_RIDGE_M);
+        assert!(steps.len() > 50, "{}", steps.len());
+        let run = |steps: Vec<(u32, u32)>, budget: u32| {
+            let mut prep = HydroPrep::new(lattice, PRESENT).with_ridged_steps(steps);
+            while !prep.step(&today, &today, &table, budget) {}
+            (prep.units_done(), prep.finish())
+        };
+        let (_, whole) = run(steps.clone(), u32::MAX);
+        // The steps are taken: the result differs without them.
+        assert_ne!(run(Vec::new(), u32::MAX).1, whole);
+        // Step by step, as the web's time-boxed run does.
+        let (stepped_units, stepped) = run(steps.clone(), 7);
+        assert_eq!(stepped, whole);
+        // Sampled in parallel blocks, as the native task does, then stepped.
+        let len = lattice.len();
+        let blocks: Vec<NodeBlock> = std::thread::scope(|scope| {
+            let handles: Vec<_> = [0, len / 2, len]
+                .windows(2)
+                .map(|w| {
+                    let (lattice, today) = (&lattice, &today);
+                    let range = w[0]..w[1];
+                    scope.spawn(move || HydroPrep::sample_range(lattice, today, range))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut parallel = HydroPrep::new(lattice, PRESENT).with_ridged_steps(steps);
+        for block in blocks {
+            parallel.add_samples(block);
+        }
+        while !parallel.step(&today, &today, &table, 1 << 18) {}
+        assert_eq!(parallel.units_done(), stepped_units);
         assert_eq!(parallel.finish(), whole);
     }
 
