@@ -1047,11 +1047,12 @@ pub(crate) fn host_stall_line(window: &str, frames: &[f32]) -> String {
     )
 }
 
-/// A region's generation time (ms) without its wait for the era's continental pass
-/// (`RegionGenerated::hydro_wait_ms`), which the summary reports on its own pass lines. The
-/// warm-generation and first-entry gates read this.
+/// A region's generation time (ms) without its wait for the era's continental pass, which the
+/// block reports on its own line (`RegionGenerated::hydro_wait_ms`) and the summary on its pass
+/// lines. The region job already takes the wait out of `RegionGenerated::millis` (rivers and
+/// lakes Task 4), so this is `millis`; the warm-generation and first-entry gates read it here.
 pub fn generation_ms(g: &RegionGenerated) -> u32 {
-    g.millis.saturating_sub(g.hydro_wait_ms)
+    g.millis
 }
 
 /// A region's first-entry generation (`millis`) against the web's [`WEB_GEN_TARGET_MS`]: `None`
@@ -1692,32 +1693,24 @@ mod tests {
     fn generation_excludes_the_pass_wait() {
         use timefly_core::geo::{geo_to_render, latlon_to_geo};
         use timefly_core::worldgen::generate::RegionSpec;
+        // The region job already takes the wait out of `millis` (Task 4): the Red Sea's first
+        // entry in a release session read `millis: 517, hydro_wait_ms: 1000`, so subtracting
+        // the wait again reported 0 ms.
         let g = RegionGenerated {
-            spec: RegionSpec::new(geo_to_render(latlon_to_geo(32.5, 74.5)), YearsBp(0.0), 1),
-            millis: 1_900,
-            tiles_fetched: 4,
-            bytes_fetched: 1 << 20,
+            spec: RegionSpec::new(geo_to_render(latlon_to_geo(20.0, 37.5)), YearsBp(0.0), 1),
+            millis: 517,
+            tiles_fetched: 6,
+            bytes_fetched: 733_137,
             frames_fetched: 1,
             fallback: false,
-            hydro_wait_ms: 1_400,
+            hydro_wait_ms: 1_000,
             hydrology: true,
         };
-        assert_eq!(generation_ms(&g), 500);
-        assert_eq!(
-            generation_ms(&RegionGenerated {
-                hydro_wait_ms: 0,
-                ..g
-            }),
-            1_900
-        );
-        // The wait is rounded up to whole milliseconds, so it may read a little over.
-        assert_eq!(
-            generation_ms(&RegionGenerated {
-                hydro_wait_ms: 1_901,
-                ..g
-            }),
-            0
-        );
+        assert_eq!(generation_ms(&g), 517);
+        // The wait never changes the figure.
+        for hydro_wait_ms in [0, 400, 5_000] {
+            assert_eq!(generation_ms(&RegionGenerated { hydro_wait_ms, ..g }), 517);
+        }
     }
 
     #[test]
