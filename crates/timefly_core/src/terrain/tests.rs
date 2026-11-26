@@ -616,6 +616,61 @@ fn blended_water_mirrors_blended_height() {
     }
 }
 
+/// Two rivers 1.5 km apart, each 22 m wide, converging side by side (ruling 2 of Task 8): the
+/// texels west of the divide belong to the west river, on its left bank (offset `+`), those east
+/// of it to the east river, on its right bank (offset `−`). Between the last texel of one and the
+/// first of the other the interpolated offset passes through 0, where `hw − |o|` alone would
+/// rebuild an 11 m ribbon over dry ground. No ribbon may appear between the channels, and each
+/// river keeps its true width.
+#[test]
+fn converging_rivers_leave_no_ribbon_between_them() {
+    use crate::worldgen::generate::water::encode_river;
+    let mut grid = test_grid();
+    let (west, east) = (1_234.5, 2_734.5);
+    let divide = (west + east) / 2.0;
+    let half_width = 11.0f32;
+    let f = &mut grid.inner;
+    f.water_level_m = texels_of(f, |_, _| 5_000.0);
+    let offsets = texels_of(f, |x, _| {
+        if x < divide {
+            (x - west) as f32
+        } else {
+            (x - east) as f32
+        }
+    });
+    f.river = offsets
+        .iter()
+        .map(|&o| encode_river(half_width - o.abs(), 1.0, 0.0, o))
+        .collect();
+    let mut between = 0;
+    for k in 0..=6_000 {
+        let x = west - 40.0 + f64::from(k) * (east - west + 80.0) / 6_000.0;
+        let z = -20_000.0 + 3.7 * f64::from(k);
+        let r = blended_water(&grid, x, z).ribbon_m;
+        let d = (x - west).abs().min((x - east).abs()) as f32;
+        let exact = half_width - d;
+        if d > half_width + 1.0 {
+            between += 1;
+            assert!(
+                r < 0.0,
+                "({x}, {z}): a ribbon of {r} m {d} m from both rivers"
+            );
+        } else {
+            assert!(
+                (r - exact).abs() < 0.3,
+                "({x}, {z}): ribbon {r}, exact {exact}"
+            );
+        }
+    }
+    assert!(between > 5_000);
+    // The fixture creates the hazard: an unguarded blend of the two texels astride the divide
+    // passes through a zero offset with an 11 m half-width.
+    let texel = grid.inner.spacing_m();
+    let col = ((divide + REGION_SIZE_M / 2.0) / texel).floor() as usize;
+    let (a, b) = (offsets[512 * 1025 + col], offsets[512 * 1025 + col + 1]);
+    assert!(a > 400.0 && b < -400.0, "{a}, {b}");
+}
+
 /// Once a grid's river texels are on the GPU the shell frees them (`Field::free_rivers`): the
 /// levels, and so the fly's floor, are unchanged, and `blended_water` reads no river.
 #[test]

@@ -23,6 +23,11 @@ pub const MORPH_START: f32 = 0.70;
 pub const MORPH_END: f32 = 0.98;
 /// Apron texels inside the inner field's edge over which the inner field fades into the apron.
 pub const BLEND_APRON_TEXELS: f64 = 4.0;
+/// The most one river's signed centreline offset changes across a bilinear cell, in texels: the
+/// cell's diagonal (√2, since a distance changes no faster than the point moves) plus slack for
+/// the offsets' f16 rounding. Taps whose offsets differ in sign by more belong to different
+/// rivers ([`blended_water`]'s crossing guard). Mirrored in `terrain_cdlod.wesl`.
+pub const CROSSING_REACH_TEXELS: f32 = 1.5;
 
 /// Terrain height (m above sea level) at local `(x, z)` metres: the inner field near the centre,
 /// the apron outside it, and a smoothstep between the two.
@@ -76,6 +81,13 @@ pub struct WaterSample {
 /// after the blend, `ribbon = hw − |o|`. A sub-texel river therefore keeps its true width
 /// between texels on either side of it, where interpolating the ribbon itself would lose it
 /// (`ribbon` is `w/2 − |o|`, not linear across the centreline).
+///
+/// The crossing guard: where a field's four taps hold offsets of both signs that differ by
+/// more than [`CROSSING_REACH_TEXELS`] texels, they are not one river seen from both banks (its
+/// offset changes no faster than the distance between the taps) but two (side by side, or at a
+/// confluence or a sharp bend). The interpolated offset would pass through 0 between them and
+/// rebuild a ribbon of `hw` where no river is, so that field contributes its interpolated
+/// ribbons instead, as `hw` with `o = 0`.
 pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
     let s = blend_weight(grid, x_m, z_m);
     let read = |f: &Field| {
@@ -88,6 +100,16 @@ pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
         let offset = sample_field(f, x_m, z_m, |i| decoded(i)[3]);
         let east = sample_field(f, x_m, z_m, |i| decoded(i)[1]);
         let north = sample_field(f, x_m, z_m, |i| decoded(i)[2]);
+        let (lo, hi) = taps(f, x_m, z_m)
+            .0
+            .iter()
+            .map(|&i| decoded(i)[3])
+            .fold((f32::MAX, f32::MIN), |(lo, hi), o| (lo.min(o), hi.max(o)));
+        let reach = CROSSING_REACH_TEXELS * f.spacing_m() as f32;
+        if lo < 0.0 && hi > 0.0 && hi - lo > reach {
+            let ribbon = sample_field(f, x_m, z_m, |i| decoded(i)[0]);
+            return [level, ribbon, 0.0, east, north];
+        }
         [level, hw, offset, east, north]
     };
     let (i, a) = (read(&grid.inner), read(&grid.apron));
@@ -168,6 +190,15 @@ fn sample_clamped(field: &Field, x_m: f64, z_m: f64) -> f32 {
 
 /// [`sample_clamped`] of any per-texel value `at(row × res + col)`.
 fn sample_field(field: &Field, x_m: f64, z_m: f64, at: impl Fn(usize) -> f32) -> f32 {
+    let ([i00, i10, i01, i11], fu, fv) = taps(field, x_m, z_m);
+    let top = at(i00) + (at(i10) - at(i00)) * fu;
+    let bottom = at(i01) + (at(i11) - at(i01)) * fu;
+    top + (bottom - top) * fv
+}
+
+/// [`sample_clamped`]'s four texel indices, `(r0, c0)`, `(r0, c0 + 1)`, `(r0 + 1, c0)` and
+/// `(r0 + 1, c0 + 1)`, and its weights `fu`, `fv`.
+fn taps(field: &Field, x_m: f64, z_m: f64) -> ([usize; 4], f32, f32) {
     let last = f64::from(field.res - 1);
     let spacing = field.spacing_m();
     let u = ((x_m + field.size_m / 2.0) / spacing).clamp(0.0, last);
@@ -176,10 +207,8 @@ fn sample_field(field: &Field, x_m: f64, z_m: f64, at: impl Fn(usize) -> f32) ->
     let (fu, fv) = ((u - c0) as f32, (v - r0) as f32);
     let (c0, r0) = (c0 as usize, r0 as usize);
     let n = field.res as usize;
-    let h = |r: usize, c: usize| at(r * n + c);
-    let top = h(r0, c0) + (h(r0, c0 + 1) - h(r0, c0)) * fu;
-    let bottom = h(r0 + 1, c0) + (h(r0 + 1, c0 + 1) - h(r0 + 1, c0)) * fu;
-    top + (bottom - top) * fv
+    let i = r0 * n + c0;
+    ([i, i + 1, i + n, i + n + 1], fu, fv)
 }
 
 #[cfg(test)]
