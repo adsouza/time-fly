@@ -28,8 +28,9 @@ struct TerrainParams {
     // Reserved for M4's voxel-window clip (centre xz, inner clip radius, outer blend radius).
     // Unused: the draft's clipping is removed for now.
     voxel_window: vec4<f32>,
-    // x > 0.5: wireframe view. yzw reserved.
-    debug: vec4<f32>,
+    // x > 0.5: wireframe view; y: fog start (m); z: fog scale (`ViewRanges` in
+    // terrain/view.rs, see `fog_position`); w reserved.
+    shading: vec4<f32>,
 }
 
 // One selected patch (`PatchInstance` in terrain/material.rs), indexed by the entity's MeshTag.
@@ -166,4 +167,23 @@ fn cdlod_vertex(
     let d = m.xz - params.camera.xz;
     let drop = dot(d, d) / (2.0 * params.lattice.z);
     return CdlodVertex(vec3<f32>(m.xz.x, h - drop, m.xz.y), h, m.k);
+}
+
+// Where Bevy's distance fog should read a fragment at `world`: pulled toward the main camera so
+// the fog sees its distance `d` as max(d − start, 1 m) × scale (shading.yz). Above M2's 60 km
+// ceiling the region's fog starts beyond the empty air under the camera and still completes
+// before the apron's edge; at M2's heights (start 0, scale 1) the position is returned as is.
+// Only the fog reads the result: call it after the lighting.
+fn fog_position(params: TerrainParams, world: vec3<f32>) -> vec3<f32> {
+    let start = params.shading.y;
+    let scale = params.shading.z;
+    if (start <= 0.0 && scale == 1.0) || scale <= 0.0 {
+        return world;
+    }
+    let rel = world - params.camera.xyz;
+    let d = length(rel);
+    // At least a metre out: Bevy's fog divides by the distance it reads (its sun scattering
+    // normalises the view ray), so ground nearer than the start must not land on the camera.
+    let k = max(d - start, 1.0) * scale / max(d, 1.0);
+    return params.camera.xyz + rel * k;
 }

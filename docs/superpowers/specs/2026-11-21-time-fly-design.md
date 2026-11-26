@@ -145,7 +145,7 @@ All levels share: **painterly shading** (§9), the **world generator** (§8), Be
   - Integrate with Bevy's lighting, shadows and fog rather than hand-lit colour. The shader uses its own per-patch storage buffer and `instance_index`, so it needs a custom render pipeline or another Bevy-0.20-compatible route. The builder chooses, but lighting must match the other levels.
   - Fix the clip-radius inconsistency (the draft doc says `voxel_window.w`, the shader reads `.z`).
 - The height source is the world generator, sampled into a height texture per world on load (GPU compute or task pool), then streamed in as detail is needed.
-- Beyond the world's edge, the outer CDLOD rings continue **to the horizon at the parent's resolution, from the same generator**, so the parent world stays visible (§11.2).
+- Beyond the world's edge, the outer CDLOD rings continue **to the horizon at a coarser resolution, from the same generator** (the region's apron), so the land never ends at the edge. The parent world itself is not drawn past the edge: under the M3 design's approach A, only the region is drawn below the cloud *(owner, 2026-11-24; `docs/superpowers/specs/2026-11-24-milestone-3-zoom-and-swap-design.md` §1.1 item 6, §4; see §11.2)*.
 
 ### 7.3 Local: CDLOD + close-up 3D detail
 
@@ -210,7 +210,7 @@ The draft paired `fastnoise-lite` on the CPU with a different hash noise on the 
 - Real landforms and biome colours from data. Era-aware palettes (§6.3).
 - Soft ramped diffuse with hue-shifted shadows, brush-like triplanar noise breaking up surfaces, soft silhouettes on vegetation.
 - Gradient skies with painted clouds. Atmospheric perspective tinted per era and biome.
-- Light tilt-shift during zoom-and-swap transitions only *(call)*.
+- Light tilt-shift during zoom-and-swap transitions only *(call)*. *(Dropped in M3 Task 11 when the cloud pass was over budget, then restored at the owner's request on 2026-11-25; see the M3 plan's rulings.)*
 - Optional painterly post-process (e.g. a cheap Kuwahara-style filter) only if it fits the web frame budget *(builder)*.
 
 ## 10. Cultural data (owner's CSV)
@@ -242,12 +242,12 @@ The source is `Chronology of global human civilizations - Sheet1.csv`. Columns a
 ### 11.2 Zoom-and-swap
 
 Moving between levels uses altitude, with no menu *(call)*:
-- **Down:** descending below a level's dive altitude centres a child world under the creature. When entering a child from the continuously timed globe, snap to the child's target snapshot before resolving its location (§5.2). The camera zooms in until the view roughly matches the child's starting view, crossfades (under a second), and the child takes over.
+- **Down:** descending below a level's dive altitude centres a child world under the creature. When entering a child from the continuously timed globe, snap to the child's target snapshot before resolving its location (§5.2). The creature passes through a cloud: it gathers as the creature descends, the swap happens on a frame where the cloud is fully opaque, and the child emerges below it. *(Owner, 2026-11-24, M3: replaces the zoom and crossfade.)* The globe's relief flattens as the creature descends, so the land just above the cloud matches the child below it.
+- **One world at a time:** below the cloud only the child is drawn. The parent is not visible past the child's edge *(owner, 2026-11-24, M3: this drops the earlier rule that the parent stays visible beyond the child)*.
 - **Street worlds:** chosen sites are softly marked in local worlds (a gentle glow or landmark silhouette, no UI icon *(call)*). Descending into one enters the street world.
-- **Up:** climbing through a world's ceiling or flying out past its edge reverses the zoom and returns to the parent at the matching geographic spot.
-- **Edges:** a soft boundary nudges the creature upward and out rather than stopping it.
-- **Sideways:** moving to a different region goes up through the parent and back down, as the tree requires.
-- **Loading:** the child world generates during the zoom. If it isn't ready, the zoom holds on the parent view with a gentle slowdown, never a loading screen *(call)*.
+- **Up:** climbing through a world's ceiling (a region's cloud base), or pressing `Backspace`, reverses the dive through the cloud and returns to the parent at the matching geographic spot and heading.
+- **Sideways and edges:** as the creature nears a region's border heading outward, the neighbouring region is preloaded. At the border the creature is lifted gently to about 60 km into cloud cover, the swap to the neighbour happens inside it, and the creature eases back down to its height above the ground. *(Owner, 2026-11-24, M3: replaces going up through the parent and back down, and the soft boundary that nudged the creature upward and out.)*
+- **Loading:** the child or neighbour generates during the transition. If it isn't ready, the creature holds inside the opaque cloud, still moving gently, never a loading screen or a frozen view *(call)*.
 
 ## 12. Chosen city sites
 
@@ -288,8 +288,9 @@ Watercraft appear on rivers, lakes, coasts and seas **only where and when the hi
 
 1. **Globe + slider:** plate-piece sphere, continuous drift, ice and sea level, painterly sky. Proves the data pipeline end to end.
 2. **Region worlds:** world generator, CDLOD fixes, painterly terrain, water, era vegetation palette.
-3. **Zoom-and-swap:** globe ↔ region, then region ↔ local.
-4. **Local worlds:** CDLOD at fine scale with vegetation. Then the voxel close-up tier and underwater.
+3. **Zoom-and-swap:** globe ↔ region and region ↔ region (M3). Region ↔ local moves to the local-worlds milestone, since local worlds don't exist before it *(builder's call, proposed in the M3 design §1.1 item 8; the owner did not object)*.
+   - Then **lakes and rivers** at region scale, from the generator's hydrology (§7.5): a milestone of their own between M3 and M4 *(owner, 2026-11-24)*.
+4. **Local worlds:** CDLOD at fine scale with vegetation, entered from regions (region ↔ local), likely through the same cloud *(builder's call, not yet decided)*. Then the voxel close-up tier and underwater.
 5. **Captions, settlements and ships:** CSV import, captions, extra snapshots. Then generated settlements in local worlds, starting with one vernacular kit. Then ships, starting with one vessel type on one stretch of water.
 6. **First street site:** one kit, distant blocks, interiors. Then more sites.
 7. **Sound and polish.**

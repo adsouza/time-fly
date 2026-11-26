@@ -181,6 +181,16 @@ pub struct RegionGrid {
     pub apron: Field,
 }
 
+impl RegionGrid {
+    /// The bytes its two fields hold, by capacity.
+    pub fn bytes(&self) -> usize {
+        [&self.inner, &self.apron]
+            .iter()
+            .map(|f| f.elevation_m.capacity() * 4 + f.surface.capacity() * 4)
+            .sum()
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FieldKind {
     Inner,
@@ -437,6 +447,22 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
     /// Rows in a field.
     pub fn rows_in(&self, kind: FieldKind) -> u32 {
         self.layers[kind.index()].res
+    }
+
+    /// The size in bytes of each allocation holding lattice nodes.
+    pub fn node_allocation_bytes(&self) -> Vec<usize> {
+        self.lattices
+            .iter()
+            .flat_map(|l| l.blocks.iter().flatten())
+            .flat_map(|b| b.nodes.allocation_bytes())
+            .collect()
+    }
+
+    /// The bytes the precomputation holds while the generator lives: the lattices' stored nodes
+    /// and the coast-distance field, by capacity. For memory diagnostics.
+    pub fn working_bytes(&self) -> usize {
+        let nodes: usize = self.node_allocation_bytes().iter().sum();
+        nodes + self.coast_km.capacity() * std::mem::size_of::<f32>()
     }
 
     /// The inner field's height and surface at an era-frame direction. Grid texels equal this at

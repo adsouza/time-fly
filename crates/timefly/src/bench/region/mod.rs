@@ -7,7 +7,7 @@
 //! and a settle has passed at the start pose, the bench drives [`FlyState`] along the region's
 //! scripted path ([`BenchPath`], [`SCRIPT_SECS`] of flight), then writes [`RegionLeft`] and
 //! waits on the globe. A region marked `pan_from_previous` is reached by an 8 s globe pan
-//! from the one before ([`pan_orbit`]). It then re-enters [`CYCLE_REGION`] [`MEMORY_CYCLES`]
+//! from the one before ([`pan_globe`]). It then re-enters [`CYCLE_REGION`] [`MEMORY_CYCLES`]
 //! times, sampling memory on the globe after each leave.
 //!
 //! **Blocks.** One per region, in the scrub bench's format: frame statistics under the R14 rule
@@ -29,6 +29,13 @@
 //!   [`CYCLE_MEMORY_TOLERANCE`] of the first cycle's. Natively the process footprint; on the web
 //!   the wasm linear memory (it only grows, so the check is that it stops growing).
 //!
+//! **Stopping early.** A stop is a region, or the globe pan before a panned one. A region that
+//! fails a gate decided within it (its gated R14 flight, its pan, its first-entry generation and
+//! R11 on the web, or a region that fails to load or is left early) ends the run after its block:
+//! the summary names the stops run, the failed gate and the stops skipped (the memory cycles
+//! with them). Warm generation and the memory cycles are judged at the end. `--keep-going` flies
+//! every stop.
+//!
 //! On native the run exits after the summary: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL
 //! (a result, not a crash). The web logs each block to the console as one message.
 //!
@@ -46,16 +53,16 @@ use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, 
 use timefly_core::terrain::blended_height_m;
 
 use super::{
-    MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
-    frame_budget_ms, frame_time_stats, header_lines_titled, memory, mib, missed_frames, pacing,
-    passes, stall_count,
+    EarlyStop, MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS,
+    bench_exit, frame_budget_ms, frame_time_stats, header_lines_titled, memory, mib, missed_frames,
+    on_failure_line, pacing, passes, stall_count, stopped_early_lines,
 };
 use crate::args::RegionArg;
-use crate::camera::{MAX_LATITUDE_DEG, OrbitState};
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
 use crate::fly_camera::{FlyState, FlySystems};
 use crate::globe::GlobeRenderStatus;
+use crate::globe_flight::{GlobeFlightState, GlobeFlightSystems};
 use crate::region::launch::launch_request;
 use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
 use crate::region::{
@@ -64,23 +71,31 @@ use crate::region::{
 use crate::terrain::TerrainOptions;
 use crate::time::GlobeTime;
 pub use path::{BenchPath, Coast, SCRIPT_SECS, Segment};
+use timefly_core::flight::altitudes::GLOBE_MAX_ALTITUDE_KM;
+use timefly_core::flight::globe::GlobeFlight;
 
 /// A bench region: a name and the launch argument that enters it. With `pan_from_previous`,
-/// the bench reaches it from the previous region by a globe pan ([`pan_orbit`]) instead of
+/// the bench reaches it from the previous region by a globe pan ([`pan_globe`]) instead of
 /// entering it from where the globe was left.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BenchRegion {
     pub name: &'static str,
     pub arg: RegionArg,
     pub pan_from_previous: bool,
+    /// Whether the region's flight frames gate the run. An ungated region's flight verdict is
+    /// still computed and printed, marked reported only.
+    pub flight_gated: bool,
 }
 
 /// Seconds the globe pan between two bench regions takes (eased at both ends).
 pub const PAN_SECS: f64 = 8.0;
+/// The fly's altitude during the globe pan: the top of globe flight, whose view (the whole disc
+/// under the fly) is the nearest to M1's orbit pan (Task 4 fix round 1).
+pub const PAN_ALTITUDE_KM: f64 = GLOBE_MAX_ALTITUDE_KM;
 
-/// The orbit camera `t_s` seconds into a pan from `from` to `to` (lat, lon in degrees) at
-/// `distance_km`: along the great circle, eased in and out over [`PAN_SECS`].
-pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -> OrbitState {
+/// The globe's fly `t_s` seconds into a pan from `from` to `to` (lat, lon in degrees) at
+/// `altitude_km`: along the great circle, eased in and out over [`PAN_SECS`], heading along it.
+pub fn pan_globe(from: (f64, f64), to: (f64, f64), altitude_km: f64, t_s: f64) -> GlobeFlight {
     let dir = |(lat, lon): (f64, f64)| geo_to_render(latlon_to_geo(lat, lon)).0.normalize();
     let (a, b) = (dir(from), dir(to));
     let u = (t_s / PAN_SECS).clamp(0.0, 1.0);
@@ -91,11 +106,18 @@ pub fn pan_orbit(from: (f64, f64), to: (f64, f64), distance_km: f64, t_s: f64) -
     } else {
         (a * ((1.0 - s) * angle).sin() + b * (s * angle).sin()) / angle.sin()
     };
-    let (lat, lon) = geo_to_latlon(render_to_geo(RenderDir(p.normalize())));
-    OrbitState {
-        lat_deg: lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG),
-        lon_deg: lon,
-        distance_km,
+    let p = p.normalize();
+    let (lat, lon) = geo_to_latlon(render_to_geo(RenderDir(p)));
+    let start = GlobeFlight::start(lat, lon);
+    // Along the arc: the great circle's normal crossed with the position.
+    let heading = a
+        .cross(b)
+        .try_normalize()
+        .map_or(start.heading, |n| n.cross(p).normalize());
+    GlobeFlight {
+        dir: p,
+        heading,
+        altitude_km,
     }
 }
 
@@ -120,6 +142,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 250.0e6,
         },
         pan_from_previous: false,
+        flight_gated: false,
     },
     BenchRegion {
         name: "Red Sea",
@@ -129,6 +152,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 0.0,
         },
         pan_from_previous: false,
+        flight_gated: false,
     },
     BenchRegion {
         name: "Himalayas",
@@ -138,6 +162,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 0.0,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Sundaland",
@@ -147,6 +172,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 21_000.0,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Japan",
@@ -156,6 +182,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 1.0e6,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Beringia",
@@ -165,6 +192,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 21_000.0,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Rockies ice margin",
@@ -174,6 +202,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 21_000.0,
         },
         pan_from_previous: true,
+        flight_gated: true,
     },
     BenchRegion {
         name: "Panama",
@@ -183,6 +212,7 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
             years: 3.0e6,
         },
         pan_from_previous: false,
+        flight_gated: true,
     },
 ];
 
@@ -198,6 +228,20 @@ pub fn cycle_region(regions: &[BenchRegion]) -> Option<usize> {
 /// Bench stops: the regions plus the globe pans before panned regions.
 pub fn stop_count(regions: &[BenchRegion]) -> usize {
     regions.len() + regions.iter().filter(|r| r.pan_from_previous).count()
+}
+
+/// The stops' names, in order ([`stop_count`] of them): each region, after the globe pan into
+/// it if it has one (`globe pan Beringia -> Rockies ice margin`).
+pub fn stop_names(regions: &[BenchRegion]) -> Vec<String> {
+    let mut names = Vec::with_capacity(stop_count(regions));
+    for (i, r) in regions.iter().enumerate() {
+        if r.pan_from_previous {
+            let from = regions[i.saturating_sub(1)].name;
+            names.push(format!("globe pan {from} -> {}", r.name));
+        }
+        names.push(r.name.to_string());
+    }
+    names
 }
 
 /// The name a single-region run gives the region it was asked to bench.
@@ -231,6 +275,8 @@ pub struct RegionBenchConfig {
     /// The regions to fly, in order: [`BENCH_REGIONS`] for the full bench, or one
     /// [`CHOSEN_REGION`] for `--region-bench --region=…`.
     pub regions: Vec<BenchRegion>,
+    /// `--keep-going`: run every stop even after a gate has failed.
+    pub keep_going: bool,
 }
 
 impl RegionBenchConfig {
@@ -242,6 +288,7 @@ impl RegionBenchConfig {
             cycles: MEMORY_CYCLES,
             timeout_secs: REGION_TIMEOUT_SECS,
             regions: BENCH_REGIONS.to_vec(),
+            keep_going: false,
         }
     }
 
@@ -254,6 +301,7 @@ impl RegionBenchConfig {
                 name: CHOSEN_REGION,
                 arg,
                 pan_from_previous: false,
+                flight_gated: true,
             }],
             ..RegionBenchConfig::new(target_fps, exit_when_done)
         }
@@ -312,7 +360,9 @@ impl Plugin for RegionBenchPlugin {
                         .after(RegionSystems)
                         .after(NavigationSystems)
                         .after(FlySystems::Step)
-                        .before(FlySystems::Apply),
+                        .before(FlySystems::Apply)
+                        .after(GlobeFlightSystems::Step)
+                        .before(GlobeFlightSystems::Apply),
                     banner::update_banner.after(drive_region_bench),
                 ),
             );
@@ -349,13 +399,12 @@ enum Stage {
         region: usize,
         since: f64,
     },
-    /// Panning the globe from the previous region toward `region` ([`pan_orbit`]), then
+    /// Panning the globe from the previous region toward `region` ([`pan_globe`]), then
     /// entering it.
     Panning {
         region: usize,
         since: f64,
         from: (f64, f64),
-        distance_km: f64,
     },
     /// [`RegionLeft`] was written; waiting for the globe. `cycle` is the cycle that left.
     Leaving {
@@ -390,13 +439,18 @@ struct RegionRun {
     generated: Option<RegionGenerated>,
     path: Option<BenchPath>,
     flight_ms: Vec<f32>,
-    segment_ms: [Vec<f32>; 4],
+    segment_ms: [Vec<f32>; 5],
     /// The globe pan that led here, if any.
     pan_ms: Vec<f32>,
     memory_before: Option<u64>,
     memory_peak: Option<u64>,
     failure: Option<String>,
+    /// The flight's own verdict (whether or not it gates the region).
+    flight_pass: Option<bool>,
     pass: bool,
+    /// The gates the region failed, as the summary's `stopped early` line names them (R11 on the
+    /// web included for the first region): any ends the run unless `--keep-going`.
+    failed_gates: Vec<String>,
 }
 
 /// One enter/leave cycle.
@@ -423,6 +477,8 @@ pub struct RegionBench {
     passed: Option<bool>,
     /// The path segment being flown (for the banner).
     segment: Segment,
+    /// Where the run stopped at its first failed gate, if it did.
+    stopped: Option<EarlyStop>,
 }
 
 impl RegionBench {
@@ -437,6 +493,7 @@ impl RegionBench {
             summary: None,
             passed: None,
             segment: Segment::LowPass,
+            stopped: None,
         }
     }
 
@@ -468,7 +525,7 @@ impl RegionBench {
 
 /// The memory the cycles compare: the process footprint natively, the wasm linear memory on the
 /// web.
-fn cycle_memory() -> Option<u64> {
+pub(crate) fn cycle_memory() -> Option<u64> {
     #[cfg(target_arch = "wasm32")]
     return memory::web_memory().1;
     #[cfg(not(target_arch = "wasm32"))]
@@ -476,7 +533,7 @@ fn cycle_memory() -> Option<u64> {
 }
 
 /// What [`cycle_memory`] measures.
-fn cycle_memory_kind() -> &'static str {
+pub(crate) fn cycle_memory_kind() -> &'static str {
     if cfg!(target_arch = "wasm32") {
         "wasm linear memory, which grows but never shrinks"
     } else {
@@ -485,7 +542,7 @@ fn cycle_memory_kind() -> &'static str {
 }
 
 /// Logs a block as one message (the browser console shows it whole) and prints it on native.
-fn emit(report: &str) {
+pub(crate) fn emit(report: &str) {
     info!("{report}");
     #[cfg(not(target_arch = "wasm32"))]
     println!("{report}");
@@ -503,14 +560,14 @@ pub fn memory_cycles_pass(on_globe: &[Option<u64>]) -> Option<(bool, f64)> {
 
 /// The display the run is measured on.
 #[derive(SystemParam)]
-struct Screen<'w, 's> {
-    adapter: Option<Res<'w, RenderAdapterInfo>>,
+pub(crate) struct Screen<'w, 's> {
+    pub(crate) adapter: Option<Res<'w, RenderAdapterInfo>>,
     windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     monitors: Query<'w, 's, &'static Monitor, With<PrimaryMonitor>>,
 }
 
 impl Screen<'_, '_> {
-    fn info(&self) -> DisplayInfo {
+    pub(crate) fn info(&self) -> DisplayInfo {
         let window = self.windows.single().ok();
         DisplayInfo {
             size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
@@ -525,10 +582,10 @@ impl Screen<'_, '_> {
     }
 }
 
-struct DisplayInfo {
-    size: Option<UVec2>,
-    present_mode: Option<PresentMode>,
-    refresh_hz: Option<f32>,
+pub(crate) struct DisplayInfo {
+    pub(crate) size: Option<UVec2>,
+    pub(crate) present_mode: Option<PresentMode>,
+    pub(crate) refresh_hz: Option<f32>,
 }
 
 /// What the bench reads about the game.
@@ -552,13 +609,12 @@ impl Game<'_, '_> {
             .map_or(RegionState::Globe, |s| *s.get())
     }
 
-    /// In a region and flying (or, without navigation, in a region).
+    /// In a region and flying (or, without navigation, in a region). A hop still preloading
+    /// counts ([`NavPhase::is_flying`]): the path never comes within the preload reach at its
+    /// own speed (ruling P5), but a test that plays it faster may.
     fn flying(&self) -> bool {
         self.state() == RegionState::InRegion
-            && self
-                .nav
-                .as_ref()
-                .is_none_or(|n| n.phase == NavPhase::Flying)
+            && self.nav.as_ref().is_none_or(|n| n.phase.is_flying())
     }
 
     /// Back on the globe, navigation included.
@@ -573,7 +629,7 @@ impl Game<'_, '_> {
 struct Controls<'w> {
     time: Option<ResMut<'w, GlobeTime>>,
     fly: Option<ResMut<'w, FlyState>>,
-    orbit: Option<ResMut<'w, OrbitState>>,
+    flight: Option<ResMut<'w, GlobeFlightState>>,
     requests: MessageWriter<'w, RegionRequested>,
     leave: MessageWriter<'w, RegionLeft>,
     exit: MessageWriter<'w, AppExit>,
@@ -728,11 +784,7 @@ fn drive_region_bench(
                 emit(&block);
                 bench.reports.push(block);
                 controls.leave.write(RegionLeft);
-                bench.stage = Stage::Leaving {
-                    next: after_region(region, bench.config.regions.len(), bench.config.cycles),
-                    cycle: None,
-                    since: now,
-                };
+                after_stop(bench, region, now, &game, &display, &mut controls);
             } else {
                 fly(bench, region, script, &game, &mut controls);
             }
@@ -762,10 +814,6 @@ fn drive_region_bench(
             match next {
                 Next::Region(region) if bench.config.regions[region].pan_from_previous => {
                     let prev = bench.config.regions[region - 1].arg;
-                    let distance_km = controls
-                        .orbit
-                        .as_ref()
-                        .map_or(crate::region::navigate::NEAR_ORBIT_KM, |o| o.distance_km);
                     info!(
                         from = bench.config.regions[region - 1].name,
                         to = bench.config.regions[region].name,
@@ -775,7 +823,6 @@ fn drive_region_bench(
                         region,
                         since: now,
                         from: (prev.lat_deg, prev.lon_deg),
-                        distance_km,
                     };
                 }
                 Next::Region(region) => start_region(bench, region, now, &mut controls),
@@ -796,7 +843,6 @@ fn drive_region_bench(
             region,
             since,
             from,
-            distance_km,
         } => {
             bench.runs[region].pan_ms.push(frame_ms);
             let to = (
@@ -804,10 +850,10 @@ fn drive_region_bench(
                 bench.config.regions[region].arg.lon_deg,
             );
             let t = now - since;
-            if let Some(orbit) = controls.orbit.as_mut() {
-                let next = pan_orbit(from, to, distance_km, t);
-                if **orbit != next {
-                    **orbit = next;
+            if let Some(flight) = controls.flight.as_mut() {
+                let next = pan_globe(from, to, PAN_ALTITUDE_KM, t);
+                if flight.0 != next {
+                    flight.0 = next;
                 }
             }
             if t >= PAN_SECS {
@@ -924,18 +970,45 @@ fn fail_region(
     if game.state() != RegionState::Globe {
         controls.leave.write(RegionLeft);
     }
-    bench.stage = Stage::Leaving {
-        next: after_region(region, bench.config.regions.len(), bench.config.cycles),
-        cycle: None,
-        since: now,
-    };
+    after_stop(bench, region, now, game, display, controls);
+}
+
+/// After region `region`'s block (its leave already written): the summary if it failed a gate
+/// (unless `--keep-going`), else on to what follows it.
+fn after_stop(
+    bench: &mut RegionBench,
+    region: usize,
+    now: f64,
+    game: &Game,
+    display: &Screen,
+    controls: &mut Controls,
+) {
+    let failed = &bench.runs[region].failed_gates;
+    if !bench.config.keep_going && !failed.is_empty() {
+        let gate = failed.join(", ");
+        warn!(
+            region = bench.config.regions[region].name,
+            gate, "region bench: a gate failed, stopping early"
+        );
+        bench.stopped = Some(EarlyStop {
+            stops_run: banner::stop_number(region, &bench.config.regions),
+            gate,
+        });
+        finish(bench, game, display, controls, None);
+    } else {
+        bench.stage = Stage::Leaving {
+            next: after_region(region, bench.config.regions.len(), bench.config.cycles),
+            cycle: None,
+            since: now,
+        };
+    }
 }
 
 fn secs(v: Option<f64>) -> String {
     v.map_or("unknown".to_string(), |s| format!("{s:.2} s"))
 }
 
-fn show_mib(v: Option<u64>) -> String {
+pub(crate) fn show_mib(v: Option<u64>) -> String {
     v.map_or("n/a".to_string(), mib)
 }
 
@@ -948,7 +1021,7 @@ fn stat_line(name: &str, frames: &[f32]) -> String {
 }
 
 /// The pacing in effect for a series of frames on this display.
-fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
+pub(crate) fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
     let uncapped_requested = matches!(
         display.present_mode,
         Some(PresentMode::AutoNoVsync | PresentMode::Immediate | PresentMode::Mailbox)
@@ -961,7 +1034,7 @@ fn pacing_for(display: &DisplayInfo, frames: &[f32]) -> Pacing {
     )
 }
 
-fn pacing_name(pacing: Pacing) -> &'static str {
+pub(crate) fn pacing_name(pacing: Pacing) -> &'static str {
     match pacing {
         Pacing::DisplayPaced => "display-paced",
         Pacing::Uncapped => "uncapped",
@@ -981,7 +1054,7 @@ pub fn host_stalls(frames: &[f32]) -> (usize, f32) {
         .fold((0, 0.0), |(n, longest), &ms| (n + 1, f32::max(longest, ms)))
 }
 
-fn host_stall_line(window: &str, frames: &[f32]) -> String {
+pub(crate) fn host_stall_line(window: &str, frames: &[f32]) -> String {
     let (count, longest) = host_stalls(frames);
     format!(
         "  host stalls in the {window} (frames > {HOST_STALL_MS:.0} ms; page paused or throttled?): {count}{}",
@@ -999,8 +1072,53 @@ pub fn first_entry_gate(millis: Option<u32>, web: bool) -> Option<bool> {
     web.then(|| millis.is_some_and(|m| m <= WEB_GEN_TARGET_MS))
 }
 
-fn gate_word(pass: bool) -> &'static str {
+pub(crate) fn gate_word(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
+}
+
+/// A flight's verdict word: an ungated region's is marked reported only.
+fn flight_verdict_word(pass: bool, gated: bool) -> String {
+    if gated {
+        gate_word(pass).to_string()
+    } else {
+        format!("{} (reported only)", gate_word(pass))
+    }
+}
+
+/// Whether a region passes: no failure, its flight (unless ungated), its pan and the first-entry
+/// gate.
+fn region_passes(
+    failed: bool,
+    flight_pass: bool,
+    flight_gated: bool,
+    pan_pass: bool,
+    gen_gate: Option<bool>,
+) -> bool {
+    !failed && (flight_pass || !flight_gated) && pan_pass && gen_gate.unwrap_or(true)
+}
+
+/// A region's entry in the summary's `regions (R14 frame rate)` line.
+fn region_summary_entry(
+    name: &str,
+    measured: bool,
+    pass: bool,
+    flight_gated: bool,
+    flight_pass: Option<bool>,
+) -> String {
+    let word = match (measured, pass) {
+        (false, _) => return format!("{name} not run"),
+        (true, true) => "PASS",
+        (true, false) => "FAIL",
+    };
+    match (flight_gated, flight_pass) {
+        (false, Some(flight)) => {
+            format!(
+                "{name} {word} (flight {}, reported only)",
+                gate_word(flight)
+            )
+        }
+        _ => format!("{name} {word}"),
+    }
 }
 
 /// The first-region worst frame against the R11 limit.
@@ -1192,7 +1310,7 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         s.worst_ms,
         STALL_BUDGETS * interval,
         stall_count(&r.flight_ms, fps),
-        if flight_pass { "PASS" } else { "FAIL" }
+        flight_verdict_word(flight_pass, spec.flight_gated)
     ));
     out.push(format!(
         "  missed frames (>{:.1} ms = {MISSED_INTERVALS}x interval): {missed} ({share:.2}%)",
@@ -1202,15 +1320,24 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
         out.push(format!("  {}", stat_line(segment.label(), frames)));
     }
-    let pass = r.failure.is_none() && flight_pass && pan_pass && gen_gate.unwrap_or(true);
+    let pass = region_passes(
+        r.failure.is_some(),
+        flight_pass,
+        spec.flight_gated,
+        pan_pass,
+        gen_gate,
+    );
     out.push(match &r.failure {
         Some(reason) => format!("result: FAIL ({reason})"),
         None => format!(
-            "result: {} (decided by the {} rule{})",
+            "result: {} ({}{})",
             if pass { "PASS" } else { "FAIL" },
-            match pacing {
-                Pacing::DisplayPaced => "display-paced missed-frame",
-                Pacing::Uncapped => "uncapped p95",
+            match (spec.flight_gated, pacing) {
+                (false, _) => "decided without the flight, which is reported only".to_string(),
+                (true, Pacing::DisplayPaced) => {
+                    "decided by the display-paced missed-frame rule".to_string()
+                }
+                (true, Pacing::Uncapped) => "decided by the uncapped p95 rule".to_string(),
             },
             if gen_gate.is_some() {
                 " and the first-entry generation gate"
@@ -1220,7 +1347,36 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         ),
     });
     out.push("===== end region bench =====".to_string());
-    bench.runs[region].pass = pass;
+    let mut failed_gates = Vec::new();
+    match &r.failure {
+        Some(reason) => failed_gates.push(reason.clone()),
+        None => {
+            if spec.flight_gated && !flight_pass {
+                failed_gates.push(format!(
+                    "R14 flight frame rate ({} rule) FAIL",
+                    pacing_name(pacing)
+                ));
+            }
+            if !pan_pass {
+                failed_gates.push("globe pan frame rate FAIL".to_string());
+            }
+            if gen_gate == Some(false) {
+                failed_gates.push(format!(
+                    "first-entry generation (web gate <= {WEB_GEN_TARGET_MS} ms) FAIL"
+                ));
+            }
+        }
+    }
+    // R11 decides the result on the web only.
+    if web && region == 0 && first_region_gate(bench).is_some_and(|(_, ok)| !ok) {
+        failed_gates.push(format!(
+            "R11 first-region worst frame (<= {FIRST_REGION_FRAME_LIMIT_MS:.0} ms) FAIL"
+        ));
+    }
+    let run = &mut bench.runs[region];
+    run.pass = pass;
+    run.flight_pass = Some(flight_pass);
+    run.failed_gates = failed_gates;
     out.join("\n")
 }
 
@@ -1241,7 +1397,8 @@ fn finish(
     );
     push_dunes_line(&mut out, game);
     out.push(regions_line(&bench.config));
-    let mut pass = failure.is_none();
+    out.push(on_failure_line(bench.config.keep_going));
+    let mut pass = failure.is_none() && bench.stopped.is_none();
     let regions: Vec<String> = bench
         .config
         .regions
@@ -1249,14 +1406,12 @@ fn finish(
         .zip(&bench.runs)
         .map(|(spec, run)| {
             let measured = run.failure.is_some() || !run.flight_ms.is_empty();
-            format!(
-                "{} {}",
+            region_summary_entry(
                 spec.name,
-                match (measured, run.pass) {
-                    (false, _) => "not run",
-                    (true, true) => "PASS",
-                    (true, false) => "FAIL",
-                }
+                measured,
+                run.pass,
+                spec.flight_gated,
+                run.flight_pass,
             )
         })
         .collect();
@@ -1376,6 +1531,20 @@ fn finish(
     }
     if bench.cycles.iter().any(|c| c.failed) {
         pass = false;
+    }
+    if let Some(stop) = &bench.stopped {
+        let cycles = bench.config.cycles;
+        let then = (cycles > 0).then(|| {
+            format!(
+                "the {cycles} memory cycle{}",
+                if cycles == 1 { "" } else { "s" }
+            )
+        });
+        out.extend(stopped_early_lines(
+            stop,
+            &stop_names(&bench.config.regions),
+            then.as_deref(),
+        ));
     }
     out.push(match failure {
         Some(reason) => format!("result: FAIL ({reason})"),
@@ -1534,6 +1703,112 @@ mod tests {
     }
 
     #[test]
+    fn only_the_red_sea_and_pangaea_have_an_ungated_flight() {
+        // Owner, 2026-11-25: their uncapped p95 is the terrain's cost (Red Sea 18.15 ms,
+        // Pangaea 20.06 ms at 2560 x 1440); every other region's flight gates.
+        let gated: Vec<(&str, bool)> = BENCH_REGIONS
+            .iter()
+            .map(|r| (r.name, r.flight_gated))
+            .collect();
+        assert_eq!(
+            gated,
+            [
+                ("Pangaea interior", false),
+                ("Red Sea", false),
+                ("Himalayas", true),
+                ("Sundaland", true),
+                ("Japan", true),
+                ("Beringia", true),
+                ("Rockies ice margin", true),
+                ("Panama", true),
+            ]
+        );
+        // A region picked with --region keeps its flight gated, even at the Red Sea's place.
+        let red_sea = BENCH_REGIONS[1].arg;
+        let single = RegionBenchConfig::single(60, true, red_sea);
+        assert_eq!(single.regions.len(), 1);
+        assert!(single.regions[0].flight_gated);
+    }
+
+    #[test]
+    fn an_ungated_regions_flight_failure_does_not_fail_it() {
+        // Ungated: a failing flight passes the region; the other gates still count.
+        assert!(region_passes(false, false, false, true, None));
+        assert!(!region_passes(false, false, false, false, None), "pan");
+        assert!(
+            !region_passes(false, false, false, true, Some(false)),
+            "first entry on the web"
+        );
+        assert!(!region_passes(true, true, false, true, None), "failure");
+        // Gated: a failing flight fails the region.
+        assert!(!region_passes(false, false, true, true, None));
+        assert!(region_passes(false, true, true, true, Some(true)));
+        // The flight line says so.
+        assert_eq!(flight_verdict_word(false, false), "FAIL (reported only)");
+        assert_eq!(flight_verdict_word(true, false), "PASS (reported only)");
+        assert_eq!(flight_verdict_word(false, true), "FAIL");
+        assert_eq!(flight_verdict_word(true, true), "PASS");
+    }
+
+    #[test]
+    fn the_summary_marks_an_ungated_flight_reported_only() {
+        let entry = |measured, pass, gated, flight| {
+            region_summary_entry("Red Sea", measured, pass, gated, flight)
+        };
+        // The region passes, its flight failed: the summary shows both.
+        assert_eq!(
+            entry(true, true, false, Some(false)),
+            "Red Sea PASS (flight FAIL, reported only)"
+        );
+        assert_eq!(
+            entry(true, true, false, Some(true)),
+            "Red Sea PASS (flight PASS, reported only)"
+        );
+        // A gated region reads as before.
+        assert_eq!(entry(true, true, true, Some(true)), "Red Sea PASS");
+        assert_eq!(entry(true, false, true, Some(false)), "Red Sea FAIL");
+        // Not run: nothing to mark.
+        assert_eq!(entry(false, false, false, None), "Red Sea not run");
+    }
+
+    #[test]
+    fn a_stopped_run_names_its_stops_the_pan_included() {
+        let names = stop_names(&BENCH_REGIONS);
+        assert_eq!(names.len(), stop_count(&BENCH_REGIONS));
+        assert_eq!(names[5], "Beringia");
+        assert_eq!(names[6], "globe pan Beringia -> Rockies ice margin");
+        assert_eq!(names[7], "Rockies ice margin");
+        // Stopped by the pan's region: the pan counts as a run stop.
+        let stop = EarlyStop {
+            stops_run: banner::stop_number(6, &BENCH_REGIONS),
+            gate: "globe pan frame rate FAIL".to_string(),
+        };
+        let [at, run, skipped] = stopped_early_lines(&stop, &names, Some("the 10 memory cycles"));
+        assert_eq!(
+            at,
+            "stopped early at stop 8 of 9, Rockies ice margin: globe pan frame rate FAIL; --keep-going runs every stop"
+        );
+        assert!(
+            run.starts_with("stops run: 8 of 9: Pangaea interior, ")
+                && run.ends_with(", Rockies ice margin"),
+            "{run}"
+        );
+        assert_eq!(
+            skipped,
+            "stops skipped: 1: Panama; and the 10 memory cycles"
+        );
+        // The last stop: nothing skipped.
+        let last = EarlyStop {
+            stops_run: 9,
+            gate: "x".to_string(),
+        };
+        assert_eq!(
+            stopped_early_lines(&last, &names, None)[2],
+            "stops skipped: 0: none"
+        );
+    }
+
+    #[test]
     fn reports_say_whether_dunes_were_drawn() {
         assert_eq!(dunes_line(true), "dunes: on");
         assert_eq!(dunes_line(false), "dunes: off");
@@ -1578,28 +1853,39 @@ mod tests {
 
     #[test]
     fn the_pan_follows_the_great_circle_eased() {
+        // The bench pans at the top of globe flight, the view nearest M1's orbit pan.
+        assert_eq!(PAN_ALTITUDE_KM, GLOBE_MAX_ALTITUDE_KM);
         let from = (62.0, -175.0);
         let to = (48.5, -113.5);
-        let dir = |o: OrbitState| geo_to_render(latlon_to_geo(o.lat_deg, o.lon_deg)).0;
+        let dir = |f: GlobeFlight| f.dir;
         let (a, b) = (
             geo_to_render(latlon_to_geo(from.0, from.1)).0,
             geo_to_render(latlon_to_geo(to.0, to.1)).0,
         );
-        let start = pan_orbit(from, to, 955.0, 0.0);
+        let start = pan_globe(from, to, 955.0, 0.0);
         assert!((dir(start) - a).length() < 1e-9);
-        assert_eq!(start.distance_km, 955.0);
-        let end = pan_orbit(from, to, 955.0, PAN_SECS);
+        assert_eq!(start.altitude_km, 955.0);
+        let end = pan_globe(from, to, 955.0, PAN_SECS);
         assert!((dir(end) - b).length() < 1e-9);
-        assert_eq!(pan_orbit(from, to, 955.0, PAN_SECS + 3.0), end);
+        assert_eq!(pan_globe(from, to, 955.0, PAN_SECS + 3.0), end);
+        // Heading along the arc, a unit tangent, all the way.
+        for k in 0..=8 {
+            let f = pan_globe(from, to, 955.0, PAN_SECS * f64::from(k) / 8.0);
+            assert!((f.heading.length() - 1.0).abs() < 1e-9 && f.heading.dot(f.dir).abs() < 1e-9);
+            let later = pan_globe(from, to, 955.0, PAN_SECS * (f64::from(k) + 0.5) / 8.0);
+            if k < 8 {
+                assert!((later.dir - f.dir).dot(f.heading) > 0.0, "{k}");
+            }
+        }
         // Halfway in time is halfway along the arc (the ease is symmetric).
-        let mid = dir(pan_orbit(from, to, 955.0, PAN_SECS / 2.0));
+        let mid = dir(pan_globe(from, to, 955.0, PAN_SECS / 2.0));
         assert!((mid.dot(a) - mid.dot(b)).abs() < 1e-9);
         assert!(
             (mid.normalize().dot(a.cross(b).normalize())).abs() < 1e-9,
             "on the great circle"
         );
         // Eased: the first tenth of the time covers under a tenth of the arc.
-        let early = dir(pan_orbit(from, to, 955.0, PAN_SECS / 10.0));
+        let early = dir(pan_globe(from, to, 955.0, PAN_SECS / 10.0));
         let total = a.dot(b).acos();
         assert!(early.dot(a).clamp(-1.0, 1.0).acos() < 0.1 * total);
     }

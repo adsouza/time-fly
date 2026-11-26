@@ -9,7 +9,9 @@
 //! - **Dome.** A unit sphere drawn at infinite depth around the camera (`sky.wesl`): the horizon
 //!   colour at the geometric horizon (which dips below level as the camera climbs), the zenith
 //!   overhead, and a warm glow and disc toward the region's sun. It tonemaps like the terrain,
-//!   so the horizon meets the fogged far terrain.
+//!   so the horizon meets the fogged far terrain. Below the horizon it is the fully fogged
+//!   ground's colour (the fog's, with its sun scattering): from high up (M3) the apron ends
+//!   inside the horizon, and the ground beyond its edge reads as more fogged ground.
 //! - **Fog.** `DistanceFog` on the region camera: the [`sky_tint`] fog colour, an
 //!   exponential-squared falloff from [`fog_visibility_m`], and the sun's colour scattered toward
 //!   the sun.
@@ -39,7 +41,9 @@ use timefly_core::worldgen::generate::RegionGrid;
 use tracing::instrument;
 
 use crate::terrain::material::ALL_BIOMES;
-use crate::terrain::view::{REGION_AMBIENT, REGION_SUN_COLOR, REGION_SUN_DIRECTION};
+use crate::terrain::view::{
+    REGION_AMBIENT, REGION_SUN_COLOR, REGION_SUN_DIRECTION, REGION_SUN_LUX,
+};
 use crate::terrain::{TERRAIN_LAYER, TerrainScene, TerrainSceneSystems};
 
 /// `sky.wesl`: the gradient dome.
@@ -169,17 +173,24 @@ pub struct SkyParams {
     pub sun: Vec4,
     /// The sun's linear colour.
     pub sun_color: Vec4,
+    /// Below the horizon: `rgb` the fog's linear colour, `w` its sun glow ([`FOG_SUN_GLOW`]).
+    pub fog: Vec4,
+    /// Below the horizon: `rgb` the sun's linear colour times its illuminance (as Bevy's light
+    /// uniform carries it), `w` the fog's sun exponent ([`FOG_SUN_EXPONENT`]).
+    pub fog_sun: Vec4,
 }
 
 /// The dome's uniform for an era and biome.
 pub fn sky_params(era: VegetationEra, biome: BiomeClass) -> SkyParams {
-    let (zenith, horizon, _) = sky_tint(era, biome);
+    let (zenith, horizon, fog) = sky_tint(era, biome);
     let v = |c: Color| Vec4::from_array(c.to_linear().to_f32_array());
     SkyParams {
         zenith: v(zenith),
         horizon: v(horizon),
         sun: REGION_SUN_DIRECTION.normalize().extend(SKY_SUN_GLOW),
         sun_color: v(REGION_SUN_COLOR),
+        fog: v(fog).truncate().extend(FOG_SUN_GLOW),
+        fog_sun: (v(REGION_SUN_COLOR).truncate() * REGION_SUN_LUX).extend(FOG_SUN_EXPONENT),
     }
 }
 

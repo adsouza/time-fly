@@ -131,7 +131,7 @@ pub(super) fn spawn_banner(mut commands: Commands) {
         .spawn((
             Name::new("Region bench banner"),
             BenchBanner,
-            // Above the fade overlay (-1) and the captions; the "Descending..." caption sits at
+            // Above the captions; the "Descending..." caption sits at
             // 40% of the height and the fallback notice at 8%, below this.
             GlobalZIndex(10),
             Pickable::IGNORE,

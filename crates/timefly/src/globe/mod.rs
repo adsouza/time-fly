@@ -32,6 +32,8 @@ use timefly_core::surface::{FrameSelection, Timeline};
 use tracing::instrument;
 
 use crate::clock::{LoadClock, add_load_clock};
+use crate::cloud::CLOUD_LAYER;
+use crate::creature::FLY_LAYER;
 use crate::data::{GlobeData, GlobeLoadError, GlobeLoadState};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use crate::diagnostics::{DiagnosticsContext, FirstInteractiveFrame};
@@ -278,9 +280,27 @@ pub fn next_render_status(
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GlobeDebugView(pub bool);
 
-/// Marks the camera that shows the globe. The orbit controller (`crate::camera`) drives it.
+/// Marks the camera that shows the globe. Globe flight (`crate::globe_flight`) drives it.
 #[derive(Component)]
 pub struct GlobeCamera;
+
+/// The relief exaggeration the globe draws with (`GlobeParams.shape.y`): written each frame
+/// by globe flight from the fly's altitude (`globe_exaggeration`), applied to the surfaces in
+/// [`GlobeExaggerationSync`]. The CPU's own uses of `ELEVATION_EXAGGERATION` (ranking, the
+/// recent displacement) are unaffected.
+#[derive(Resource, Copy, Clone, Debug, PartialEq)]
+pub struct GlobeExaggeration(pub f32);
+
+impl Default for GlobeExaggeration {
+    fn default() -> Self {
+        GlobeExaggeration(ELEVATION_EXAGGERATION as f32)
+    }
+}
+
+/// The system that copies [`GlobeExaggeration`] into the globe surfaces' uniforms, after the
+/// view for the age is applied (which rebuilds them). Whatever writes it runs before.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GlobeExaggerationSync;
 
 /// Marks the globe's sun. The region has its own (`crate::terrain::view::TerrainSun`), which
 /// must not steer the globe materials' sun direction.
@@ -344,6 +364,7 @@ impl Plugin for GlobePlugin {
         .add_domain_event::<FrameSelectionChanged>()
         .init_resource::<GlobeRenderStatus>()
         .init_resource::<GlobeDebugView>()
+        .init_resource::<GlobeExaggeration>()
         .insert_resource(probe.clone())
         .add_systems(Startup, spawn_globe_camera)
         .add_systems(OnEnter(GlobeLoadState::Ready), spawn_globe)
@@ -354,6 +375,7 @@ impl Plugin for GlobePlugin {
                 // A region view switches the globe camera off: the globe neither draws nor
                 // follows the time until it is back, then catches up at once.
                 update_globe_view.run_if(globe_camera_active),
+                sync_exaggeration.in_set(GlobeExaggerationSync),
                 sync_sun,
                 sync_bridge_cameras.in_set(GlobeCameraSync),
                 track_render_status,
@@ -368,6 +390,12 @@ impl Plugin for GlobePlugin {
                 .add_systems(Render, probe_pipelines.in_set(RenderSystems::Cleanup));
         }
     }
+}
+
+/// The globe camera's layers when it draws the globe on `layer`: that globe, the atmosphere,
+/// the dragonfly and the transition cloud.
+pub fn globe_view_layers(layer: usize) -> RenderLayers {
+    RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer, FLY_LAYER, CLOUD_LAYER])
 }
 
 /// Whether the globe is on screen: its camera is active (or there is none, in headless runs).
@@ -393,7 +421,7 @@ fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamer
         Tonemapping::None,
         DebandDither::Disabled,
         Transform::from_xyz(0.0, 0.0, CAMERA_DISTANCE_KM).looking_at(Vec3::ZERO, Vec3::Y),
-        RenderLayers::from_layers(&[ATMOSPHERE_LAYER, RECENT_LAYER]),
+        globe_view_layers(RECENT_LAYER),
         // The game UI draws over the globe (the bridge cameras render offscreen).
         IsDefaultUiCamera,
     ));
@@ -679,6 +707,106 @@ fn update_globe_view(
     scene.view = Some(view);
 }
 
+/// Copies [`GlobeExaggeration`] into the surfaces' `shape.y`, writing only a material whose
+/// value differs (a write re-uploads it).
+fn sync_exaggeration(
+    exaggeration: Res<GlobeExaggeration>,
+    scene: Res<GlobeScene>,
+    mut plates_m: ResMut<Assets<PlateMaterial>>,
+    mut oceans_m: ResMut<Assets<OceanMaterial>>,
+    mut recents_m: ResMut<Assets<RecentGlobeMaterial>>,
+) {
+    let e = exaggeration.0;
+    if plates_m
+        .get(&scene.plate)
+        .is_some_and(|m| m.params.shape.y != e)
+        && let Some(mut m) = plates_m.get_mut(&scene.plate)
+    {
+        m.params.shape.y = e;
+    }
+    if oceans_m
+        .get(&scene.ocean)
+        .is_some_and(|m| m.params.shape.y != e)
+        && let Some(mut m) = oceans_m.get_mut(&scene.ocean)
+    {
+        m.params.shape.y = e;
+    }
+    if recents_m
+        .get(&scene.recent)
+        .is_some_and(|m| m.params.shape.y != e)
+        && let Some(mut m) = recents_m.get_mut(&scene.recent)
+    {
+        m.params.shape.y = e;
+    }
+}
+
+/// Test support: a [`GlobeScene`] with real surface materials (and placeholders for the rest)
+/// and [`sync_exaggeration`], without the render plugins or globe data. Returns the plate,
+/// ocean and recent material handles.
+#[cfg(test)]
+pub(crate) fn add_exaggeration_test_scene(
+    app: &mut App,
+) -> (
+    Handle<PlateMaterial>,
+    Handle<OceanMaterial>,
+    Handle<RecentGlobeMaterial>,
+) {
+    app.init_asset::<PlateMaterial>()
+        .init_asset::<OceanMaterial>()
+        .init_asset::<RecentGlobeMaterial>()
+        .init_resource::<GlobeExaggeration>()
+        .add_systems(
+            Update,
+            sync_exaggeration
+                .in_set(GlobeExaggerationSync)
+                .run_if(resource_exists::<GlobeScene>),
+        );
+    let sun = SUN_DIRECTION;
+    let params = GlobeParams::recent(0.0, 64, sun);
+    let world = app.world_mut();
+    let plate = world
+        .resource_mut::<Assets<PlateMaterial>>()
+        .add(PlateMaterial {
+            params,
+            younger: default(),
+            older: default(),
+            plates: default(),
+            list_flags: default(),
+        });
+    let ocean = world
+        .resource_mut::<Assets<OceanMaterial>>()
+        .add(OceanMaterial {
+            params,
+            younger: default(),
+            older: default(),
+        });
+    let recent = world
+        .resource_mut::<Assets<RecentGlobeMaterial>>()
+        .add(RecentGlobeMaterial {
+            params,
+            younger: default(),
+            older: default(),
+        });
+    world.insert_resource(GlobeScene {
+        plate: plate.clone(),
+        ocean: ocean.clone(),
+        recent: recent.clone(),
+        composite: default(),
+        atmosphere: default(),
+        plates_buffer: default(),
+        list_buffer: default(),
+        lists: Vec::new(),
+        recent_target: default(),
+        deep_target: default(),
+        target_size: UVec2::ONE,
+        sun,
+        applied_age_myr: None,
+        applied_debug: false,
+        view: None,
+    });
+    (plate, ocean, recent)
+}
+
 /// Copies the sun light's direction into the materials when the light moves.
 fn sync_sun(
     lights: Query<&GlobalTransform, (With<GlobeSun>, Changed<GlobalTransform>)>,
@@ -749,7 +877,7 @@ fn sync_bridge_cameras(
     };
     // The offscreen cameras prepare both inputs. Draw the composite on the actual
     // presentation camera during loading so its target-specific pipeline warms up too.
-    let mut wanted = RenderLayers::from_layers(&[ATMOSPHERE_LAYER, layer]);
+    let mut wanted = globe_view_layers(layer);
     if warming_up {
         wanted = wanted.with(COMPOSITE_LAYER);
     }

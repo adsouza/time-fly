@@ -73,6 +73,23 @@ pub const WATER_F0: f32 = 0.02;
 pub const WATER_RADIUS_M: f32 = 1_750_000.0;
 /// Segments around the water mesh.
 pub const WATER_SEGMENTS: u32 = 256;
+/// The Earth's radius (m) the water's drop and horizon use, as the terrain's `lattice.z`.
+const EARTH_RADIUS_M: f32 = (crate::globe::EARTH_RADIUS_KM * 1000.0) as f32;
+/// The water reaches this fraction past the horizon (`water_radius_m`), so the mesh's rim and
+/// its chord sag stay behind the curve.
+pub const WATER_HORIZON_MARGIN: f32 = 0.05;
+
+/// The water mesh's radius (m) seen from `camera_height_m` above the sea: [`WATER_RADIUS_M`],
+/// or past the horizon where that is farther (M3 Task 7: above about 215 km the 1,750 km disc's
+/// rim stood 0.35° over the true horizon as a 256-sided outline). The horizon is the tangent
+/// distance `√(h (2R + h))` over the drop `d² / 2R`; the margin is [`WATER_HORIZON_MARGIN`].
+/// Mirrored in `water.wesl`'s vertex stage, which stretches the mesh by this over
+/// [`WATER_RADIUS_M`].
+pub fn water_radius_m(camera_height_m: f32) -> f32 {
+    let h = camera_height_m.max(0.0);
+    let horizon = (h * (2.0 * EARTH_RADIUS_M + h)).sqrt();
+    WATER_RADIUS_M.max(horizon * (1.0 + WATER_HORIZON_MARGIN))
+}
 /// The water mesh's ring spacing: this many metres near the camera, growing to
 /// [`WATER_RING_GROWTH`] of the radius farther out.
 pub const WATER_RING_M: f32 = 25.0;
@@ -227,7 +244,8 @@ pub struct WaterLook {
     /// `xy`: the region-local wind direction (`wind_axis`), the way it blows; `zw`: unused.
     pub wind: Vec4,
     /// The water mesh's vertex spacing ([`water_vertex_spacing_m`]): `x`: [`WATER_RING_M`];
-    /// `y`: [`WATER_RING_GROWTH`]; `z`: [`WATER_SEGMENTS`]; `w`: reserved.
+    /// `y`: [`WATER_RING_GROWTH`]; `z`: [`WATER_SEGMENTS`]; `w`: [`WATER_RADIUS_M`], which the
+    /// vertex stage stretches to [`water_radius_m`] from high up.
     pub mesh: Vec4,
     /// `x`: [`BAND_SLOPE`]; `y`: [`BAND_PATCH_M`]; `z`, `w`: [`SWELL_FADE_DEPTH_M`], the depths
     /// over which every wave (displaced or normal-only) comes in from the shore.
@@ -263,7 +281,12 @@ pub fn water_look(grid: &RegionGrid) -> WaterLook {
             FOAM_WIDTH_M,
         ),
         wind: wind.extend(0.0).extend(0.0),
-        mesh: Vec4::new(WATER_RING_M, WATER_RING_GROWTH, WATER_SEGMENTS as f32, 0.0),
+        mesh: Vec4::new(
+            WATER_RING_M,
+            WATER_RING_GROWTH,
+            WATER_SEGMENTS as f32,
+            WATER_RADIUS_M,
+        ),
         bands: Vec4::new(
             BAND_SLOPE,
             BAND_PATCH_M,
@@ -784,7 +807,7 @@ mod tests {
         assert_eq!(look.waves, water_waves(wind));
         assert_eq!(look.swell, Vec4::new(0.5, 500.0, 1000.0, 4.0));
         assert_eq!(look.swash, Vec4::new(8.0, 800.0, 3.0, 60.0));
-        assert_eq!(look.mesh, Vec4::new(25.0, 0.04, 256.0, 0.0));
+        assert_eq!(look.mesh, Vec4::new(25.0, 0.04, 256.0, 1_750_000.0));
         assert_eq!(look.bands, Vec4::new(0.02, 6000.0, 2.0, 10.0));
         // Task 4's calm-from-altitude ramp.
         assert!(look.pull.y < look.pull.z);
@@ -809,6 +832,54 @@ mod tests {
                 "waves"
             ]
         );
+    }
+
+    #[test]
+    fn the_water_reaches_past_the_horizon_from_any_height() {
+        use crate::fly_camera::CAMERA_CEILING_M;
+        use crate::terrain::view::view_ranges;
+        use timefly_core::flight::altitudes::{CHASE_DISTANCE_PER_AGL, CHASE_ELEVATION_DEG};
+        let r = 6_371_000.0f32;
+        let mut last = water_radius_m(0.0);
+        assert_eq!(last, WATER_RADIUS_M);
+        // From the ground to the chase eye over a fly at the cloud base (351 km), and beyond.
+        for i in 0..=500 {
+            let h = i as f32 * 1_000.0;
+            let radius = water_radius_m(h);
+            let horizon = (h * (2.0 * r + h)).sqrt();
+            assert!(radius >= WATER_RADIUS_M, "{h} m: {radius}");
+            assert!(
+                radius >= horizon * (1.0 + WATER_HORIZON_MARGIN) * (1.0 - 1e-6),
+                "{h} m: the rim at {radius} m is inside the horizon at {horizon} m"
+            );
+            // Grows with height, without a jump.
+            assert!(radius >= last && radius - last < 0.01 * radius, "{h} m");
+            last = radius;
+        }
+        // Below about 200 km the mesh keeps its radius (and its vertex spacing).
+        assert_eq!(water_radius_m(200_000.0), WATER_RADIUS_M);
+        // The horizon itself is never past the far plane, from any fly height up to the cloud
+        // base (the chase eye sits up to CHASE_DISTANCE_PER_AGL × AGL behind and above).
+        let rise = (CHASE_DISTANCE_PER_AGL * CHASE_ELEVATION_DEG.to_radians().sin()) as f32;
+        for i in 0..=300 {
+            let fly = (i as f32 * 1_000.0).min(CAMERA_CEILING_M);
+            let eye = fly * (1.0 + rise);
+            let tangent = (eye * (2.0 * r + eye)).sqrt();
+            let far = view_ranges(fly).far_m;
+            assert!(
+                tangent < far,
+                "fly {fly} m: horizon {tangent} m, far {far} m"
+            );
+        }
+        // The shader mirrors it.
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "WATER_HORIZON_MARGIN"),
+            WATER_HORIZON_MARGIN
+        );
+        assert!(WATER_WESL.contains(
+            "let reach = max(look.mesh.w, sqrt(h * (2.0 * params.lattice.z + h)) * (1.0 + WATER_HORIZON_MARGIN));"
+        ));
+        assert!(WATER_WESL.contains("let rel = in.position.xz * (reach / look.mesh.w);"));
     }
 
     #[test]

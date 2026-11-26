@@ -1,12 +1,14 @@
-//! The game's UI: the time slider, the loading/failure status, the credits overlay, and the
-//! altitude and frame-rate readouts.
+//! The game's UI: the time slider, the loading/failure status, the credits overlay, the
+//! altitude and frame-rate readouts, the position readout and compass rose, and bug shots.
 //!
 //! Each plugin keeps its decisions in pure functions (unit-tested directly); the systems only
 //! gather input, call them and apply the result.
 
-mod altitude;
+pub mod altitude;
+pub mod bug_shot;
 pub mod credits;
 pub mod fps;
+pub mod position;
 pub mod slider;
 pub mod status;
 
@@ -25,8 +27,8 @@ pub const TEXT_COLOR: Color = Color::srgb(0.93, 0.93, 0.95);
 /// Panels behind text.
 pub const PANEL_COLOR: Color = Color::srgba(0.07, 0.08, 0.11, 0.82);
 
-/// Whether the pointer is over the UI (or a UI overlay is open), so the orbit camera leaves
-/// drags and the scroll wheel alone.
+/// Whether the pointer is over the UI (or a UI overlay is open), so a drag that starts there
+/// steers neither the globe's fly nor the region's.
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PointerOverUi(pub bool);
 
@@ -35,8 +37,9 @@ pub struct PointerOverUi(pub bool);
 #[require(Hovered)]
 pub struct BlocksCamera;
 
-/// Plugins: slider, status, credits and the readouts, plus the pointer-over-UI
-/// tracking they share.
+/// Plugins: slider, status, credits, the readouts and bug shots, plus the pointer-over-UI
+/// tracking they share. (The `--from-shot` repro, [`bug_shot::ShotRestorePlugin`], is added by
+/// `crate::app`.)
 pub struct GameUiPlugins;
 
 impl Plugin for GameUiPlugins {
@@ -47,6 +50,8 @@ impl Plugin for GameUiPlugins {
             CreditsPlugin,
             FpsOverlayPlugin,
             altitude::AltitudeOverlayPlugin,
+            position::PositionOverlayPlugin,
+            bug_shot::BugShotPlugin,
         ))
         .init_resource::<PointerOverUi>()
         .add_systems(PreUpdate, track_pointer_over_ui);

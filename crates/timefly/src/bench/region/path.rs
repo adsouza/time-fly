@@ -1,7 +1,10 @@
 //! The region bench's scripted flight: a pure function of the region's ground, so the same
 //! region always gives the same camera path.
 //!
-//! [`SCRIPT_SECS`] of flight in four quarters ([`Segment`]):
+//! [`SCRIPT_SECS`] of flight in five segments of [`SEGMENT_SECS`] ([`Segment`]). Each pitch is
+//! set by the chase look it gives ([`pitch_for_look_deg`]): the chase camera looks that far below
+//! the horizontal, as M2's free camera looked at the same pitch, so flight views frame the
+//! terrain as M2's did.
 //!
 //! 1. **Low pass** (0–15 s): from the region's start pose ([`FlyState::start`]) down to
 //!    [`LOW_PASS_AGL_M`] over the first 3 s, then on toward the coast at 600 m/s, following the
@@ -14,11 +17,16 @@
 //!    looking at it; with no coast at all, it runs across the heading.
 //! 4. **Apron sweep** (45–60 s): out to the field's edge in the coast's direction (or the
 //!    heading's), climbing to [`SWEEP_AGL_M`] and panning ±50° across the apron's horizon.
+//! 5. **High pass** (60–75 s, M3): up to [`HIGH_PASS_TOP_M`], near the region's cloud base,
+//!    drifting back over the centre and looking further down, then turning half round, so the
+//!    view crosses both the apron's fogged edge and the whole inner field.
 //!
-//! The path never leaves [`FIELD_LIMIT_M`] on either axis (inside the inner field, so the fly
-//! camera's soft edge never pushes it; ruling from the Task 9 review: `edge_nudge` is
-//! unbounded) and never comes within [`MIN_AGL_M`] of the ground under it, well above the fly
-//! camera's clearance.
+//! The path never leaves [`FIELD_LIMIT_M`] on either axis and never comes within [`MIN_AGL_M`]
+//! of the ground under it, well above the fly camera's clearance. The limit keeps it out of the
+//! hop's preload reach (M3 Task 9, ruling P5: the path is a test driver, so it was pulled in
+//! from 0.92 of the half field to 0.5, and the edge segments are not strictly comparable with
+//! M2's numbers): it never flies out within `PRELOAD_MIN_M` of the edge, nor within a
+//! generation's flight at its speed on either platform, so the bench never hops.
 
 use std::f32::consts::{PI, TAU};
 
@@ -26,11 +34,13 @@ use bevy::prelude::*;
 use timefly_core::terrain::blended_height_m;
 use timefly_core::worldgen::generate::RegionGrid;
 
-use crate::fly_camera::{EDGE_M, FlyState, START_PITCH_DEG};
+use crate::fly_camera::{EDGE_M, FlyState, START_PITCH_DEG, pitch_for_look_deg};
 use crate::region::CAMERA_START_ALTITUDE_M;
 
+/// Seconds of each [`Segment`].
+pub const SEGMENT_SECS: f32 = 15.0;
 /// Seconds of scripted flight; the bench may play it faster (its tests do).
-pub const SCRIPT_SECS: f32 = 60.0;
+pub const SCRIPT_SECS: f32 = 5.0 * SEGMENT_SECS;
 /// The low pass's height above the ground.
 pub const LOW_PASS_AGL_M: f32 = 300.0;
 /// The top of the climb, above sea level.
@@ -41,13 +51,20 @@ pub const COAST_AGL_M: f32 = 1_000.0;
 pub const COAST_VIEW_M: f32 = 3_000.0;
 /// The apron sweep's height above the ground.
 pub const SWEEP_AGL_M: f32 = 6_000.0;
+/// The top of the high pass, above sea level: in the cloud base's band (within
+/// `REGION_CLOUD_BAND_M` of `REGION_CLOUD_BASE_M`) and below the climb out (ruling P3:
+/// `REGION_CLOUD_BASE_M − 1 km`), so the bench stays in the region.
+pub const HIGH_PASS_TOP_M: f32 = 280_000.0;
 /// The path's floor above the ground (the fly camera's own clearance is 150 m).
 pub const MIN_AGL_M: f32 = 300.0;
-/// The path stays within this of the centre on either axis.
-pub const FIELD_LIMIT_M: f32 = 0.92 * EDGE_M;
+/// The path stays within this of the centre on either axis: 75 km inside the edge. A fly within
+/// `PRELOAD_MIN_M` of the edge, or a generation's flight at its speed, preloads a neighbour, and
+/// on the web a generation is expected to take `EXPECTED_GEN_S_WEB` (8 s): at 0.6 of the half
+/// field the coast run's transit (about 13 km/s) came within that reach (fix round 1).
+pub const FIELD_LIMIT_M: f32 = 0.5 * EDGE_M;
 /// A coast within this of the centre on both axes is run along; farther out it is viewed from
 /// the field's edge.
-pub const COAST_IN_FIELD_M: f32 = 0.85 * EDGE_M;
+pub const COAST_IN_FIELD_M: f32 = 0.45 * EDGE_M;
 /// The low pass's speed.
 const LOW_SPEED_MPS: f32 = 600.0;
 /// The climb ends at this speed.
@@ -63,31 +80,34 @@ const COAST_REACH_M: f32 = 1_150_000.0;
 /// The ground-following window: the highest ground on a 3 × 3 grid this far apart.
 const FOLLOW_SPAN_M: f32 = 600.0;
 
-/// The four quarters of the path.
+/// The path's five segments, [`SEGMENT_SECS`] each.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Segment {
     LowPass,
     Climb,
     CoastRun,
     ApronSweep,
+    HighPass,
 }
 
 impl Segment {
-    pub const ALL: [Segment; 4] = [
+    pub const ALL: [Segment; 5] = [
         Segment::LowPass,
         Segment::Climb,
         Segment::CoastRun,
         Segment::ApronSweep,
+        Segment::HighPass,
     ];
 
     /// The segment at `script_s` seconds into the path.
     pub fn at(script_s: f32) -> Segment {
-        let quarter = SCRIPT_SECS / 4.0;
+        let q = SEGMENT_SECS;
         match script_s {
-            t if t < quarter => Segment::LowPass,
-            t if t < 2.0 * quarter => Segment::Climb,
-            t if t < 3.0 * quarter => Segment::CoastRun,
-            _ => Segment::ApronSweep,
+            t if t < q => Segment::LowPass,
+            t if t < 2.0 * q => Segment::Climb,
+            t if t < 3.0 * q => Segment::CoastRun,
+            t if t < 4.0 * q => Segment::ApronSweep,
+            _ => Segment::HighPass,
         }
     }
 
@@ -97,6 +117,7 @@ impl Segment {
             Segment::Climb => "climb",
             Segment::CoastRun => "coast run",
             Segment::ApronSweep => "apron sweep",
+            Segment::HighPass => "high pass",
         }
     }
 }
@@ -285,7 +306,7 @@ pub fn coast_run_distance(path: &BenchPath, ground: impl Fn(f32, f32) -> f32) ->
 
 /// Distance along the heading at `t` (0–30 s): 600 m/s, then speeding up to 4,000 m/s.
 fn along(t: f32) -> f32 {
-    let quarter = SCRIPT_SECS / 4.0;
+    let quarter = SEGMENT_SECS;
     if t <= quarter {
         LOW_SPEED_MPS * t
     } else {
@@ -300,7 +321,7 @@ impl BenchPath {
     pub fn plan(ground: impl Fn(f32, f32) -> f32) -> BenchPath {
         let start_y = ground(0.0, 0.0).max(0.0) + CAMERA_START_ALTITUDE_M;
         let coast = find_coast(&ground);
-        let climb_end_d = along(SCRIPT_SECS / 2.0);
+        let climb_end_d = along(2.0 * SEGMENT_SECS);
         let (run_start, run_end, run_yaw, run_high, toward) = match coast {
             Coast::InField { point, tangent } => {
                 let half = tangent * (COAST_RUN_M / 2.0);
@@ -366,14 +387,18 @@ impl BenchPath {
     /// the path was planned on.
     pub fn at(&self, script_s: f32, ground: impl Fn(f32, f32) -> f32) -> FlyState {
         let t = script_s.clamp(0.0, SCRIPT_SECS);
-        let q = SCRIPT_SECS / 4.0;
+        let q = SEGMENT_SECS;
         let follow = |p: Vec2, agl: f32| surface_around(&ground, p) + agl;
         let heading_yaw = yaw_of(self.heading);
         let start_pitch = -START_PITCH_DEG.to_radians();
-        let low_pitch = -6f32.to_radians();
-        let climb_pitch = -30f32.to_radians();
-        let run_pitch = -10f32.to_radians();
-        let sweep_pitch = -3f32.to_radians();
+        // M2's pitches (6°, 30°, 10° and 3° down) as chase looks (Task 3 changed what a pitch
+        // means: M2's −3° now looks 2° up).
+        let look = |deg: f64| pitch_for_look_deg(deg).to_radians();
+        let low_pitch = look(6.0);
+        let climb_pitch = look(30.0);
+        let run_pitch = look(10.0);
+        let sweep_pitch = look(3.0);
+        let high_pitch = look(25.0);
         let run_y = |p: Vec2| {
             let y = follow(p, COAST_AGL_M);
             if self.run_high {
@@ -407,7 +432,7 @@ impl BenchPath {
                 )
             }
             Segment::CoastRun => {
-                let transit = 6.0 * SCRIPT_SECS / 60.0;
+                let transit = 0.4 * SEGMENT_SECS;
                 let u = t - 2.0 * q;
                 if u < transit {
                     let s = smoothstep(u / transit);
@@ -424,6 +449,19 @@ impl BenchPath {
                     let p = self.run_start.lerp(self.run_end, s);
                     (p, run_y(p), self.run_yaw, run_pitch)
                 }
+            }
+            Segment::HighPass => {
+                let u = (t - 4.0 * q) / q;
+                // Where the sweep ends: its yaw by the same expression, so nothing jumps.
+                let y0 = follow(self.sweep_end, SWEEP_AGL_M);
+                let yaw0 = lerp_angle(self.run_yaw, self.sweep_yaw, 1.0);
+                let climb = smoothstep(u / 0.7);
+                (
+                    self.sweep_end.lerp(Vec2::ZERO, smoothstep(u)),
+                    y0 + (HIGH_PASS_TOP_M - y0) * climb,
+                    yaw0 + PI * smoothstep((u - 0.5) / 0.5),
+                    sweep_pitch + (high_pitch - sweep_pitch) * climb,
+                )
             }
             Segment::ApronSweep => {
                 let u = (t - 3.0 * q) / q;
@@ -451,7 +489,7 @@ impl BenchPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, MAX_PITCH_DEG};
+    use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, MAX_PITCH_DEG, MIN_PITCH_DEG};
 
     /// Hills over a plane that falls to the east: the coast runs north-south near x = 20 km.
     fn coastal(x: f32, z: f32) -> f32 {
@@ -542,7 +580,7 @@ mod tests {
                 assert!(p.y >= floor + MIN_AGL_M - 1e-3, "{i}: {p} over {floor}");
                 assert!(p.y >= floor + CAMERA_CLEARANCE_M);
                 assert!(p.y <= CAMERA_CEILING_M);
-                assert!(f.pitch.abs() <= MAX_PITCH_DEG.to_radians());
+                assert!((MIN_PITCH_DEG..=MAX_PITCH_DEG).contains(&f.pitch.to_degrees()));
             }
             for (i, w) in frames.windows(2).enumerate() {
                 let (a, b) = (w[0].pos_m, w[1].pos_m);
@@ -580,12 +618,14 @@ mod tests {
             assert!(coastal(p.x, p.z).abs() < 400.0, "{t}: {p}");
         }
         // The sweep ends at the field's edge in the coast's direction (east).
-        let end = path.at(SCRIPT_SECS, coastal).pos_m;
+        let end = path.at(4.0 * SEGMENT_SECS - 1e-3, coastal).pos_m;
         assert!((end.x - FIELD_LIMIT_M).abs() < 1.0, "{end}");
         assert_eq!(Segment::at(0.0), Segment::LowPass);
         assert_eq!(Segment::at(15.0), Segment::Climb);
         assert_eq!(Segment::at(44.99), Segment::CoastRun);
-        assert_eq!(Segment::at(60.0), Segment::ApronSweep);
+        assert_eq!(Segment::at(59.99), Segment::ApronSweep);
+        assert_eq!(Segment::at(60.0), Segment::HighPass);
+        assert_eq!(Segment::at(SCRIPT_SECS), Segment::HighPass);
     }
 
     /// Islands and inlets everywhere, like the Aegean: the coast run stays near a real coast.
@@ -619,6 +659,30 @@ mod tests {
             (d - (280_000f32.hypot(300_000.0) - 120_000.0)).abs() < 4_000.0,
             "{d}"
         );
+    }
+
+    /// The high pass climbs into the cloud base's band (at least 250 km) and stays below the
+    /// climb-out trigger (`REGION_CLOUD_BASE_M − 1 km`, ruling P3), so the bench never leaves
+    /// the region through the cloud.
+    #[test]
+    fn the_bench_path_reaches_the_cloud_base_band() {
+        use timefly_core::flight::altitudes::REGION_CLOUD_BASE_M;
+        let trigger = (REGION_CLOUD_BASE_M - 1_000.0) as f32;
+        for ground in [coastal as fn(f32, f32) -> f32, inland, far_coast, himalaya] {
+            let path = BenchPath::plan(ground);
+            let high: Vec<FlyState> = samples(&path, ground)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| Segment::at(*i as f32 / 60.0) == Segment::HighPass)
+                .map(|(_, f)| f)
+                .collect();
+            let top = high.iter().map(|f| f.pos_m.y).fold(f32::MIN, f32::max);
+            assert!(top >= 250_000.0, "the high pass tops out at {top} m");
+            assert!(
+                high.iter().all(|f| f.pos_m.y < trigger),
+                "{top} m reaches the climb-out trigger"
+            );
+        }
     }
 
     #[test]

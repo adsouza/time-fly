@@ -2,7 +2,8 @@
 //! [`ActiveRegion`].
 //!
 //! A request runs through three stages, one job at a time (a new request replaces the job in
-//! flight, which cancels it):
+//! flight, which cancels it; a [`RequestPurpose::Neighbour`] request is the exception, see
+//! [`RegionRequested`]):
 //!
 //! 1. **Frames.** The globe frames the snapshot's coarse field reads (`frames_needed`), from the
 //!    bounded [`FrameCache`] or loaded again as [`CpuGrid`]s; the tile manifest on the first
@@ -17,7 +18,7 @@
 //!    [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool) task, then the rows
 //!    across the pool. Web: time-boxed slices of [`WEB_GEN_BUDGET_MS`] per frame, or
 //!    [`WEB_GEN_LARGE_BUDGET_MS`] while no region is on screen to keep smooth: a first entry
-//!    from the globe, or a snapshot change held under the fade overlay ([`LargeGenBudget`],
+//!    from the globe, or a snapshot change held under the opaque cloud ([`LargeGenBudget`],
 //!    [`gen_budget`]).
 //!
 //! Then [`ActiveRegion`] is inserted, [`RegionGenerated`] and [`RegionEntered`] (or
@@ -25,6 +26,11 @@
 //! state enters [`RegionState::InRegion`]. A [`RegionLeft`] removes the region (or cancels the
 //! job) and returns to [`RegionState::Globe`]. A failure (a frame that will not load, an
 //! invalid field) logs a `warn` and also returns to the globe.
+//!
+//! A [`RequestPurpose::Neighbour`] request generates a region beside the current one without
+//! leaving it: the result waits in [`PendingRegion`], the state stays `InRegion`, and a failure
+//! is a [`RegionPreloadFailed`] (never a return to the globe). [`RegionSwapRequested`] promotes
+//! it; whoever sends that gates it on an opaque cloud.
 
 pub mod frames;
 pub mod generate;
@@ -47,21 +53,26 @@ pub use crate::clock::{LOAD_CLOCK_MAX_DELTA_S, LoadClock, advance_load_clock};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use frames::{CpuGrid, CpuGridLoader, FrameCache};
 pub use job::LOAD_TIMEOUT_S;
+pub(crate) use job::RegionJob;
 use job::{
-    TileIndex, advance_frames, advance_tiles, leave_region, poll_generation, poll_overview,
-    poll_tile_manifest, start_region_request,
+    TileIndex, advance_frames, advance_tiles, cancel_preload, leave_region, poll_generation,
+    poll_overview, poll_tile_manifest, start_region_request, swap_region,
 };
 use tiles::{TileCache, TileManifest, TileManifestLoader};
 
 /// The web's generation budget per frame (design spec §6.1).
 pub const WEB_GEN_BUDGET_MS: f64 = 6.0;
 /// The web's generation budget per frame while no region is on screen to keep smooth (a first
-/// entry, generated while the globe stays in view, or a snapshot change held under the fade
-/// overlay): the run takes most of a 60 Hz frame. At 6 ms a slice gets about a third of each
+/// entry, generated while the globe stays in view, or a snapshot change held under the opaque
+/// cloud): the run takes most of a 60 Hz frame. At 6 ms a slice gets about a third of each
 /// 16.7 ms frame (wall time ≈ 2.8 × CPU time); at 12 ms about two thirds (≈ 1.4 ×). The
 /// Aegean's first entry took 628 slices of 6 ms in Chrome (≈ 10.5 s); at 12 ms about half as
 /// many.
 pub const WEB_GEN_LARGE_BUDGET_MS: f64 = 12.0;
+/// The web's generation budget per frame while a neighbour preloads during flight
+/// ([`RequestPurpose::Neighbour`]): the region on screen is being flown, so the slice is half the
+/// usual one. The large budget still wins under an opaque cloud.
+pub const WEB_FLIGHT_GEN_BUDGET_MS: f64 = 3.0;
 /// The region camera's starting height above the ground at the region centre (design §6.1).
 pub const CAMERA_START_ALTITUDE_M: f32 = 8_000.0;
 /// The detail seed of every region: a region is a function of its centre and snapshot.
@@ -79,14 +90,70 @@ pub enum RegionState {
     InRegion,
 }
 
+/// Why a region is requested: what happens to the result.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum RequestPurpose {
+    /// Enter a region from the globe (also the launch region and the bench's): the result becomes
+    /// [`ActiveRegion`] and sends [`RegionEntered`].
+    #[default]
+    Enter,
+    /// A snapshot change inside a region: the result replaces [`ActiveRegion`] in place and sends
+    /// [`RegionSnapshotChanged`] (or [`RegionEntered`] when it is back at the shown snapshot).
+    Snapshot,
+    /// Generate a neighbouring region in the background, without leaving the current one: the
+    /// result waits in [`PendingRegion`] until a [`RegionSwapRequested`]. The state stays
+    /// [`RegionState::InRegion`].
+    Neighbour,
+}
+
 /// Request: generate the region centred on `era_dir` (an era-frame direction) at `snapshot`.
-/// Accepted in any state; it replaces any request in flight.
+/// Accepted in any state. An [`Enter`](RequestPurpose::Enter) or
+/// [`Snapshot`](RequestPurpose::Snapshot) request replaces any job in flight (a
+/// [`Neighbour`](RequestPurpose::Neighbour) one included) and drops a ready [`PendingRegion`].
+/// A `Neighbour` request replaces an older `Neighbour` job, and is ignored while an enter or
+/// snapshot job runs, or when no region is active. Several requests in one frame: the last
+/// enter or snapshot one wins over any neighbour one.
 #[derive(Message, Copy, Clone, Debug, PartialEq)]
 pub struct RegionRequested {
     pub era_dir: RenderDir,
     pub snapshot: YearsBp,
+    pub purpose: RequestPurpose,
 }
 
+/// The neighbour generated by a [`RequestPurpose::Neighbour`] request, ready to be promoted by a
+/// [`RegionSwapRequested`]. Cleared by a swap, a [`RegionPreloadCancelled`], a [`RegionLeft`], a
+/// newer neighbour request and any enter or snapshot request, so a stale neighbour is never
+/// promoted and no grid outlives its use.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct PendingRegion {
+    pub region: Option<ActiveRegion>,
+    /// Whether the ready neighbour fell back (its [`RegionGenerated::fallback`]): the swap's
+    /// [`RegionEntered`] carries it, so the notice starts at the swap, not at the preload.
+    pub fallback: bool,
+}
+
+/// Drops the neighbour: the [`RequestPurpose::Neighbour`] job in flight and a ready
+/// [`PendingRegion`]. [`ActiveRegion`] and [`RegionState`] are untouched; an enter or snapshot
+/// job is not a preload and keeps running.
+#[derive(Message, Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct RegionPreloadCancelled;
+
+/// Promotes [`PendingRegion`] to [`ActiveRegion`] in the frame this message is read, and sends
+/// [`RegionEntered`] for it; the old grid is dropped. With no pending region it is a `warn` and
+/// nothing else.
+///
+/// The caller is responsible for the opacity gate: the global rule is that a world swap happens
+/// only on a frame where the cloud's density is exactly 1.0, and this plugin does not check it.
+#[derive(Message, Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct RegionSwapRequested;
+
+/// Domain event: a [`RequestPurpose::Neighbour`] job failed or timed out (a frame that will not
+/// load, an invalid field, a tile load that timed out, an unusable request). Logged at `warn`.
+/// The active region and the state are untouched.
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+pub struct RegionPreloadFailed {
+    pub reason: String,
+}
 /// Domain event: a region's grid is ready. `millis` runs from the request to the grid being
 /// ready; `tiles_fetched` counts tiles loaded for it (cache hits excluded) and `bytes_fetched`
 /// their file bytes (the session's one-time manifest and overview not included); `fallback`
@@ -103,10 +170,14 @@ pub struct RegionGenerated {
 }
 
 /// Domain event: the player entered a region from the globe (or from a region at the same
-/// snapshot). Sent with [`RegionGenerated`], when [`ActiveRegion`] is inserted.
+/// snapshot), sent with [`RegionGenerated`] when [`ActiveRegion`] is inserted; or a hop's
+/// neighbour was promoted ([`RegionSwapRequested`]). `fallback` is the region's
+/// [`RegionGenerated::fallback`] (for a neighbour, sent at its preload and carried in
+/// [`PendingRegion`]).
 #[derive(Message, Copy, Clone, Debug, PartialEq)]
 pub struct RegionEntered {
     pub spec: RegionSpec,
+    pub fallback: bool,
 }
 
 /// Leaving the region, written by whoever leaves (Task 9's `Backspace`, once the view is back on
@@ -146,10 +217,14 @@ pub fn web_budget() -> Duration {
 }
 
 /// The slice budget for a time-boxed run started with `base`: at least
-/// [`WEB_GEN_LARGE_BUDGET_MS`] when it may take the large budget, `base` otherwise.
-pub fn gen_budget(base: Duration, large: bool) -> Duration {
+/// [`WEB_GEN_LARGE_BUDGET_MS`] when it may take the large budget; else at most
+/// [`WEB_FLIGHT_GEN_BUDGET_MS`] for a neighbour preloading during flight (`flight_preload`);
+/// `base` otherwise. Native runs are not time-boxed, so none of this applies to them.
+pub fn gen_budget(base: Duration, large: bool, flight_preload: bool) -> Duration {
     if large {
         base.max(Duration::from_secs_f64(WEB_GEN_LARGE_BUDGET_MS / 1000.0))
+    } else if flight_preload {
+        base.min(Duration::from_secs_f64(WEB_FLIGHT_GEN_BUDGET_MS / 1000.0))
     } else {
         base
     }
@@ -204,6 +279,13 @@ impl Default for RegionSettings {
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RegionSystems;
 
+/// The region swap: [`RegionSwapRequested`] promotes [`PendingRegion`]. After
+/// [`RegionSystems`]; region navigation, which sends it, orders it after itself and before the
+/// terrain scene and the fly camera, so a swap is one frame: the message, the fly carried into
+/// the new region, the new region active and the terrain scene on its grid.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionSwapSystems;
+
 pub struct RegionPlugin;
 
 impl Plugin for RegionPlugin {
@@ -217,16 +299,21 @@ impl Plugin for RegionPlugin {
             .init_resource::<TileIndex>()
             .init_resource::<RegionSettings>()
             .init_resource::<LargeGenBudget>()
+            .init_resource::<PendingRegion>()
             .add_logged_state::<RegionState>()
             .add_domain_event::<RegionRequested>()
             .add_domain_event::<RegionGenerated>()
             .add_domain_event::<RegionEntered>()
             .add_domain_event::<RegionLeft>()
             .add_domain_event::<RegionSnapshotChanged>()
+            .add_domain_event::<RegionPreloadCancelled>()
+            .add_domain_event::<RegionSwapRequested>()
+            .add_domain_event::<RegionPreloadFailed>()
             .add_systems(
                 Update,
                 (
                     leave_region,
+                    cancel_preload,
                     start_region_request,
                     poll_tile_manifest,
                     poll_overview,
@@ -236,7 +323,9 @@ impl Plugin for RegionPlugin {
                 )
                     .chain()
                     .in_set(RegionSystems),
-            );
+            )
+            .configure_sets(Update, RegionSwapSystems.after(RegionSystems))
+            .add_systems(Update, swap_region.in_set(RegionSwapSystems));
         crate::clock::add_load_clock(app);
         launch::add_launch_systems(app);
     }
@@ -249,11 +338,37 @@ mod tests {
     #[test]
     fn the_large_budget_doubles_the_web_budget() {
         let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
-        assert_eq!(gen_budget(web_budget(), false), ms(WEB_GEN_BUDGET_MS));
-        assert_eq!(gen_budget(web_budget(), true), ms(WEB_GEN_LARGE_BUDGET_MS));
+        assert_eq!(
+            gen_budget(web_budget(), false, false),
+            ms(WEB_GEN_BUDGET_MS)
+        );
+        assert_eq!(
+            gen_budget(web_budget(), true, false),
+            ms(WEB_GEN_LARGE_BUDGET_MS)
+        );
         assert_eq!(WEB_GEN_LARGE_BUDGET_MS, 2.0 * WEB_GEN_BUDGET_MS);
         // A larger base (a test's) is never shrunk.
-        assert_eq!(gen_budget(ms(20.0), true), ms(20.0));
-        assert_eq!(gen_budget(ms(0.5), false), ms(0.5));
+        assert_eq!(gen_budget(ms(20.0), true, false), ms(20.0));
+        assert_eq!(gen_budget(ms(0.5), false, false), ms(0.5));
+    }
+
+    #[test]
+    fn the_flight_budget_is_smaller_on_the_web() {
+        let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+        assert_eq!(WEB_FLIGHT_GEN_BUDGET_MS, 3.0);
+        // A preload during flight takes half the usual web slice.
+        assert_eq!(
+            gen_budget(web_budget(), false, true),
+            ms(WEB_FLIGHT_GEN_BUDGET_MS)
+        );
+        // Under an opaque cloud (no region to keep smooth) the large budget wins.
+        assert_eq!(
+            gen_budget(web_budget(), true, true),
+            ms(WEB_GEN_LARGE_BUDGET_MS)
+        );
+        // Native generation is unaffected: a flight preload never changes the other cases.
+        assert_eq!(gen_budget(web_budget(), false, false), web_budget());
+        // A base already below it (a test's) is never grown.
+        assert_eq!(gen_budget(ms(0.5), false, true), ms(0.5));
     }
 }

@@ -1009,3 +1009,41 @@ fn assert_same_surface_but_dryness(a: [u8; 4], b: [u8; 4]) {
         assert_eq!(a[2], b[2], "ice with the same raise");
     }
 }
+
+/// Lattice nodes live in allocations of one size whatever the region, so the allocator reuses a
+/// freed lattice's memory for the next region's: macOS keeps freed blocks resident and hands them
+/// back only for a request of the same size, so lattices of varying sizes each added their own
+/// 17-31 MiB to the footprint (M3 hop memory, `docs/testing/m3/performance.md`).
+#[test]
+fn lattice_nodes_live_in_allocations_of_one_size() {
+    let chunk = lattice::NODE_CHUNK * std::mem::size_of::<lattice::PackedNode>();
+    assert_eq!(chunk, 512 << 10);
+    // Coarser and finer sources: lattices of different sizes.
+    for spacing_m in [111_000.0, 9_000.0] {
+        let field = FnField {
+            f: |d: RenderDir| 800.0 * (d.0.x * 40.0).sin() + 200.0,
+            spacing_m,
+            koppen: None,
+        };
+        let g = RegionGenerator::new(spec_at(dir(10.0, 30.0), 0.0, 33, 17), &field);
+        let sizes = g.node_allocation_bytes();
+        assert!(!sizes.is_empty());
+        assert!(
+            sizes.iter().all(|&s| s == chunk),
+            "{spacing_m} m: node allocations {sizes:?}, want all {chunk}"
+        );
+    }
+    // A store over several chunks reads back every node in order.
+    let mut store = lattice::NodeStore::default();
+    let n = 2 * lattice::NODE_CHUNK + 5;
+    for i in 0..n {
+        store.push(lattice::PackedNode::test_node(i as f32));
+    }
+    assert_eq!(store.len(), n);
+    assert_eq!(store.allocation_bytes().collect::<Vec<_>>(), vec![chunk; 3]);
+    for i in [0, 1, lattice::NODE_CHUNK - 1, lattice::NODE_CHUNK, n - 1] {
+        assert_eq!(store.get(i).map(|p| p.elevation_m), Some(i as f32));
+        assert_eq!(store[i].elevation_m, i as f32);
+    }
+    assert!(store.get(n).is_none());
+}

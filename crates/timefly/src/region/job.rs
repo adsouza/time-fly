@@ -28,8 +28,10 @@ use super::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, TileManifest, t
 #[cfg(target_arch = "wasm32")]
 use super::web_budget;
 use super::{
-    ActiveRegion, GenMode, LargeGenBudget, REGION_SEED, RegionEntered, RegionGenerated, RegionLeft,
-    RegionRequested, RegionSettings, RegionSnapshotChanged, RegionState, gen_budget,
+    ActiveRegion, GenMode, LargeGenBudget, PendingRegion, REGION_SEED, RegionEntered,
+    RegionGenerated, RegionLeft, RegionPreloadCancelled, RegionPreloadFailed, RegionRequested,
+    RegionSettings, RegionSnapshotChanged, RegionState, RegionSwapRequested, RequestPurpose,
+    gen_budget,
 };
 use crate::clock::LoadClock;
 #[cfg(test)]
@@ -168,14 +170,33 @@ enum Stage {
 /// The request in flight. Replacing or removing it drops its handles and task, which cancels
 /// its loads and its run.
 #[derive(Resource)]
-pub(super) struct RegionJob {
+pub(crate) struct RegionJob {
     spec: RegionSpec,
+    purpose: RequestPurpose,
     started: Instant,
     /// The snapshot of the active region this job replaces.
     replaces: Option<YearsBp>,
     /// Frame files it loads (not in the frame cache).
     frames_fetched: u32,
     stage: Stage,
+}
+
+impl RegionJob {
+    /// Its purpose and stage, for diagnostics: `neighbour/frames`, `enter/running` and so on.
+    pub(crate) fn describe(&self) -> &'static str {
+        use RequestPurpose::{Enter, Neighbour, Snapshot};
+        match (self.purpose, &self.stage) {
+            (Enter, Stage::Frames { .. }) => "enter/frames",
+            (Enter, Stage::Tiles { .. }) => "enter/tiles",
+            (Enter, Stage::Running { .. }) => "enter/running",
+            (Snapshot, Stage::Frames { .. }) => "snapshot/frames",
+            (Snapshot, Stage::Tiles { .. }) => "snapshot/tiles",
+            (Snapshot, Stage::Running { .. }) => "snapshot/running",
+            (Neighbour, Stage::Frames { .. }) => "neighbour/frames",
+            (Neighbour, Stage::Tiles { .. }) => "neighbour/tiles",
+            (Neighbour, Stage::Running { .. }) => "neighbour/running",
+        }
+    }
 }
 
 /// The spec a request asks for, or `None` for a direction that is not one. Its sea-level
@@ -214,14 +235,58 @@ fn frame_files(timeline: &Timeline, age_myr: f64) -> Vec<(u32, Vec<usize>)> {
 pub(super) fn leave_region(
     mut left: MessageReader<RegionLeft>,
     mut commands: Commands,
+    mut pending: ResMut<PendingRegion>,
     mut next: ResMut<NextState<RegionState>>,
 ) {
     if left.read().count() == 0 {
         return;
     }
     commands.remove_resource::<ActiveRegion>();
+    // Any job: an enter or snapshot one, or a neighbour's. A ready neighbour goes too.
     commands.remove_resource::<RegionJob>();
+    pending.region = None;
     next.set_if_different(RegionState::Globe);
+}
+
+/// [`RegionPreloadCancelled`]: drops the neighbour job in flight (never an enter or snapshot
+/// job) and a ready [`PendingRegion`]. The active region and the state are untouched.
+pub(super) fn cancel_preload(
+    mut cancelled: MessageReader<RegionPreloadCancelled>,
+    job: Option<Res<RegionJob>>,
+    mut pending: ResMut<PendingRegion>,
+    mut commands: Commands,
+) {
+    if cancelled.read().count() == 0 {
+        return;
+    }
+    if job.is_some_and(|j| j.purpose == RequestPurpose::Neighbour) {
+        commands.remove_resource::<RegionJob>();
+    }
+    pending.region = None;
+}
+
+/// [`RegionSwapRequested`]: promotes the pending neighbour to the active region in this frame
+/// and sends [`RegionEntered`]. The caller gates it on an opaque cloud.
+pub(super) fn swap_region(
+    mut swaps: MessageReader<RegionSwapRequested>,
+    mut pending: ResMut<PendingRegion>,
+    mut commands: Commands,
+    mut entered: MessageWriter<RegionEntered>,
+    mut next: ResMut<NextState<RegionState>>,
+) {
+    if swaps.read().count() == 0 {
+        return;
+    }
+    let Some(region) = pending.region.take() else {
+        warn!("a region swap was requested with no neighbour ready; ignored");
+        return;
+    };
+    entered.write(RegionEntered {
+        spec: region.grid.spec,
+        fallback: pending.fallback,
+    });
+    commands.insert_resource(region);
+    next.set_if_different(RegionState::InRegion);
 }
 
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
@@ -234,18 +299,67 @@ pub(super) fn start_region_request(
     mut index: ResMut<TileIndex>,
     mut frame_cache: ResMut<FrameCache>,
     active: Option<Res<ActiveRegion>>,
+    job: Option<Res<RegionJob>>,
+    mut pending: ResMut<PendingRegion>,
+    mut failed: MessageWriter<RegionPreloadFailed>,
     mut next: ResMut<NextState<RegionState>>,
     clock: Res<LoadClock>,
 ) {
     let now_s = clock.elapsed_s;
-    let Some(request) = requests.read().last().copied() else {
+    // The last enter or snapshot request wins over any neighbour one in the same frame; else the
+    // last neighbour request.
+    let (mut main, mut neighbour) = (None, None);
+    for request in requests.read().copied() {
+        match request.purpose {
+            RequestPurpose::Neighbour => neighbour = Some(request),
+            _ => main = Some(request),
+        }
+    }
+    // Every neighbour request is answered, ready or failed: one the job will not take fails
+    // at once, so whoever asked (a hop) never waits on it.
+    if main.is_some()
+        && let Some(dropped) = neighbour
+    {
+        debug!(request = ?dropped, "neighbour requested with an enter or snapshot request; dropped");
+        failed.write(RegionPreloadFailed {
+            reason: "an enter or snapshot request came with it".to_string(),
+        });
+    }
+    let Some(request) = main.or(neighbour) else {
         return;
     };
+    let purpose = request.purpose;
+    let preload = purpose == RequestPurpose::Neighbour;
+    if preload {
+        // The concurrency rule: a neighbour never competes with an enter or snapshot job, and
+        // needs a region to be a neighbour of. A neighbour job in flight is replaced below.
+        let busy = job.is_some_and(|j| j.purpose != RequestPurpose::Neighbour);
+        if busy || active.is_none() {
+            debug!(
+                ?request,
+                "neighbour requested while a region job runs or no region is active; ignored"
+            );
+            failed.write(RegionPreloadFailed {
+                reason: if busy {
+                    "an enter or snapshot job is running"
+                } else {
+                    "no region is active"
+                }
+                .to_string(),
+            });
+            return;
+        }
+    }
     let Some(globe) = globe else {
         warn!(
             ?request,
             "region requested before the globe data loaded; ignored"
         );
+        if preload {
+            failed.write(RegionPreloadFailed {
+                reason: "the globe data is not loaded".to_string(),
+            });
+        }
         return;
     };
     let Some(spec) = spec_for(&request, &settings, &globe.timeline) else {
@@ -253,8 +367,15 @@ pub(super) fn start_region_request(
             ?request,
             "region requested at an invalid direction; ignored"
         );
+        if preload {
+            failed.write(RegionPreloadFailed {
+                reason: "the neighbour's direction is invalid".to_string(),
+            });
+        }
         return;
     };
+    // A new job supersedes any ready neighbour, which may be at another snapshot.
+    pending.region = None;
     if matches!(index.manifest, ManifestState::Idle) {
         index.manifest = ManifestState::Loading(Loading {
             handle: server.load(TILE_MANIFEST_PATH),
@@ -282,10 +403,12 @@ pub(super) fn start_region_request(
         }
     }
     let replaces = active
+        .filter(|_| !preload)
         .map(|a| a.grid.spec.snapshot)
         .filter(|&s| s != spec.snapshot);
     commands.insert_resource(RegionJob {
         spec,
+        purpose,
         started: Instant::now(),
         replaces,
         frames_fetched: u32::try_from(pending.len()).unwrap_or(u32::MAX),
@@ -295,7 +418,9 @@ pub(super) fn start_region_request(
             frames,
         },
     });
-    next.set_if_different(RegionState::Generating);
+    if !preload {
+        next.set_if_different(RegionState::Generating);
+    }
 }
 
 pub(super) fn poll_tile_manifest(
@@ -416,10 +541,24 @@ pub(super) fn poll_overview(
 }
 
 /// Abandons the job: a `warn`, and back to the globe (never a stale region or a stuck
-/// "descending…").
-fn fail(commands: &mut Commands, next: &mut NextState<RegionState>, why: &str) {
-    warn!(error = why, "region generation failed; back to the globe");
+/// "descending…"). A neighbour job only reports [`RegionPreloadFailed`]: the region the player
+/// is in stays.
+fn fail(
+    commands: &mut Commands,
+    next: &mut NextState<RegionState>,
+    preload_failed: &mut MessageWriter<RegionPreloadFailed>,
+    purpose: RequestPurpose,
+    why: &str,
+) {
     commands.remove_resource::<RegionJob>();
+    if purpose == RequestPurpose::Neighbour {
+        warn!(error = why, "neighbour preload failed; the region stays");
+        preload_failed.write(RegionPreloadFailed {
+            reason: why.to_string(),
+        });
+        return;
+    }
+    warn!(error = why, "region generation failed; back to the globe");
     commands.remove_resource::<ActiveRegion>();
     next.set_if_different(RegionState::Globe);
 }
@@ -448,11 +587,13 @@ pub(super) fn advance_frames(
     index: Res<TileIndex>,
     cache: Res<TileCache>,
     mut next: ResMut<NextState<RegionState>>,
+    mut preload_failed: MessageWriter<RegionPreloadFailed>,
     clock: Res<LoadClock>,
 ) {
     let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
     let spec = job.spec;
+    let purpose = job.purpose;
     let Stage::Frames {
         slots,
         pending,
@@ -492,19 +633,39 @@ pub(super) fn advance_frames(
         _ => true,
     });
     if let Some(why) = failure {
-        return fail(&mut commands, &mut next, why.trim_end());
+        return fail(
+            &mut commands,
+            &mut next,
+            &mut preload_failed,
+            purpose,
+            why.trim_end(),
+        );
     }
     if !pending.is_empty() || !index.manifest_settled() {
         return;
     }
     let Some(globe) = globe else {
-        return fail(&mut commands, &mut next, "the globe data is gone");
+        return fail(
+            &mut commands,
+            &mut next,
+            &mut preload_failed,
+            purpose,
+            "the globe data is gone",
+        );
     };
     let frames = std::mem::take(frames);
     let probe_started = Instant::now();
     let needed = match generate::tiles_needed(&spec, &globe.timeline, &globe.crust, &frames) {
         Ok(needed) => needed,
-        Err(e) => return fail(&mut commands, &mut next, &e.to_string()),
+        Err(e) => {
+            return fail(
+                &mut commands,
+                &mut next,
+                &mut preload_failed,
+                purpose,
+                &e.to_string(),
+            );
+        }
     };
     let probe = probe_started.elapsed();
     let mut pending = Vec::new();
@@ -584,11 +745,13 @@ pub(super) fn advance_tiles(
     settings: Res<RegionSettings>,
     mut commands: Commands,
     mut next: ResMut<NextState<RegionState>>,
+    mut preload_failed: MessageWriter<RegionPreloadFailed>,
     clock: Res<LoadClock>,
 ) {
     let now_s = clock.elapsed_s;
     let Some(mut job) = job else { return };
     let spec = job.spec;
+    let purpose = job.purpose;
     let Stage::Tiles {
         frames,
         needed,
@@ -600,6 +763,7 @@ pub(super) fn advance_tiles(
     else {
         return;
     };
+    let mut failure = None;
     pending.retain(|tile| {
         let state = server.load_state(&tile.handle);
         let finished = matches!(state, LoadState::Loaded | LoadState::Failed(_));
@@ -607,17 +771,36 @@ pub(super) fn advance_tiles(
         if !finished && !timed_out {
             return true;
         }
+        if timed_out && purpose == RequestPurpose::Neighbour {
+            // A region that falls back would pop in at the swap with coarse terrain: a slow
+            // preload is a failed one, not a degraded one.
+            failure = Some(format!(
+                "{}: the load timed out after {:.0} s",
+                tile.path,
+                load_timeout_s(Some(tile.bytes))
+            ));
+            return false;
+        }
         if receive_tile(tile, state, timed_out, &mut grids, &mut cache, needed) {
             *fetched += 1;
             *bytes += tile.bytes;
         }
         false
     });
+    if let Some(why) = failure {
+        return fail(&mut commands, &mut next, &mut preload_failed, purpose, &why);
+    }
     if !pending.is_empty() || !index.overview_settled() {
         return;
     }
     let Some(globe) = globe else {
-        return fail(&mut commands, &mut next, "the globe data is gone");
+        return fail(
+            &mut commands,
+            &mut next,
+            &mut preload_failed,
+            purpose,
+            "the globe data is gone",
+        );
     };
     let tiles = cache.tile_set(needed);
     let missing = tiles.missing(needed);
@@ -658,17 +841,21 @@ pub(super) fn advance_tiles(
     };
 }
 
+#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 pub(super) fn poll_generation(
     job: Option<ResMut<RegionJob>>,
     mut commands: Commands,
     mut generated: MessageWriter<RegionGenerated>,
     mut entered: MessageWriter<RegionEntered>,
     mut changed: MessageWriter<RegionSnapshotChanged>,
+    mut preload_failed: MessageWriter<RegionPreloadFailed>,
+    mut pending: ResMut<PendingRegion>,
     mut next: ResMut<NextState<RegionState>>,
     large_budget: Option<Res<LargeGenBudget>>,
 ) {
     let Some(mut job) = job else { return };
     let job = &mut *job;
+    let purpose = job.purpose;
     let Stage::Running {
         run,
         tiles_fetched,
@@ -683,11 +870,12 @@ pub(super) fn poll_generation(
         Running::Task(task) => bevy::tasks::futures::check_ready(task),
         Running::Budgeted(run) => {
             let large = large_budget.is_some_and(|c| c.0);
-            let budget = gen_budget(run.base_budget(), large);
+            let flight_preload = purpose == RequestPurpose::Neighbour;
+            let budget = gen_budget(run.base_budget(), large, flight_preload);
             if run.budget() != budget {
                 debug!(
                     budget_ms = budget.as_secs_f64() * 1e3,
-                    large, "region generation budget"
+                    large, flight_preload, "region generation budget"
                 );
                 run.set_budget(budget);
             }
@@ -697,14 +885,29 @@ pub(super) fn poll_generation(
     let Some(result) = result else { return };
     let grid = match result {
         Ok(grid) => grid,
-        Err(e) => return fail(&mut commands, &mut next, &e.to_string()),
+        Err(e) => {
+            return fail(
+                &mut commands,
+                &mut next,
+                &mut preload_failed,
+                purpose,
+                &e.to_string(),
+            );
+        }
     };
     let spec = job.spec;
     let millis = u32::try_from(job.started.elapsed().as_millis()).unwrap_or(u32::MAX);
-    commands.insert_resource(ActiveRegion {
+    let region = ActiveRegion {
         frame: spec.frame(),
         grid: Arc::new(grid),
-    });
+    };
+    if purpose == RequestPurpose::Neighbour {
+        // The neighbour waits for a `RegionSwapRequested`; the region and state stay.
+        pending.region = Some(region);
+        pending.fallback = *fallback;
+    } else {
+        commands.insert_resource(region);
+    }
     generated.write(RegionGenerated {
         spec,
         millis,
@@ -713,6 +916,10 @@ pub(super) fn poll_generation(
         frames_fetched: job.frames_fetched,
         fallback: *fallback,
     });
+    if purpose == RequestPurpose::Neighbour {
+        commands.remove_resource::<RegionJob>();
+        return;
+    }
     match job.replaces {
         Some(from) => {
             changed.write(RegionSnapshotChanged {
@@ -722,7 +929,10 @@ pub(super) fn poll_generation(
             });
         }
         None => {
-            entered.write(RegionEntered { spec });
+            entered.write(RegionEntered {
+                spec,
+                fallback: *fallback,
+            });
         }
     }
     commands.remove_resource::<RegionJob>();
@@ -798,6 +1008,7 @@ mod tests {
         let at = |v: DVec3| RegionRequested {
             era_dir: RenderDir(v),
             snapshot: YearsBp(21.0e3),
+            purpose: RequestPurpose::Enter,
         };
         let spec = spec_for(&at(DVec3::new(0.0, 0.0, 2.0)), &settings, &timeline).unwrap();
         assert_eq!(spec.center, RenderDir(DVec3::Z));

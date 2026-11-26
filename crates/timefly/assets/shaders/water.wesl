@@ -19,7 +19,9 @@
 //   shallows toward the camera by the swash's height too, so water laid over the beach still
 //   wins depth ties with the terrain there.
 
-import package::terrain_cdlod::{TerrainBuffer, TerrainParams, blended_height, texel_step};
+import package::terrain_cdlod::{
+    TerrainBuffer, TerrainParams, blended_height, fog_position, texel_step,
+};
 import package::noise::gradient_noise3;
 import package::waves::{
     TAU, SWASH_MAX_AMPLITUDE_M, SWASH_PROBE_M, swash_amplitude_m, swash_level_m, swash_reach_factor,
@@ -96,10 +98,17 @@ fn floor_gradient(params: TerrainParams, xz: vec2<f32>) -> vec2<f32> {
 // triangles that straddle the shore interpolate it.
 const SWASH_LIFT_LAND_M: f32 = 25.0;
 
+// `WATER_HORIZON_MARGIN` in water.rs: the mesh reaches this fraction past the horizon.
+const WATER_HORIZON_MARGIN: f32 = 0.05;
+
 @vertex
 fn vertex(in: Vertex) -> WaterVertexOutput {
     let params = terrain.params;
-    let rel = in.position.xz;
+    // `water_radius_m`: from high up the horizon is farther than the mesh's radius
+    // (`look.mesh.w`), and the mesh stretches past it, so its rim never shows.
+    let h = max(params.camera.y, 0.0);
+    let reach = max(look.mesh.w, sqrt(h * (2.0 * params.lattice.z + h)) * (1.0 + WATER_HORIZON_MARGIN));
+    let rel = in.position.xz * (reach / look.mesh.w);
     let xz = params.camera.xz + rel;
     let drop = dot(rel, rel) / (2.0 * params.lattice.z);
     // Low down: the swell's height, and the swash's amplitude for the depth lift below. Higher
@@ -287,6 +296,7 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     color = vec4<f32>(mix(color.rgb, sky, fresnel * (1.0 - foam)), 1.0);
 
     var out: FragmentOutput;
+    pbr_input.world_position = vec4<f32>(fog_position(params, pbr_input.world_position.xyz), 1.0);
     out.color = main_pass_post_lighting_processing(pbr_input, color);
     return out;
 }

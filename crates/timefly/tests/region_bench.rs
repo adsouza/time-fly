@@ -15,7 +15,9 @@ use bevy::time::TimeUpdateStrategy;
 use timefly::args::RegionArg;
 use timefly::bench::bench_exit;
 use timefly::bench::region::banner::BenchBannerText;
-use timefly::bench::region::{BENCH_REGIONS, RegionBench, RegionBenchConfig, RegionBenchPlugin};
+use timefly::bench::region::{
+    BENCH_REGIONS, BenchRegion, RegionBench, RegionBenchConfig, RegionBenchPlugin,
+};
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::globe::GlobeRenderStatus;
 use timefly::region::navigate::RegionNavigationPlugin;
@@ -125,16 +127,17 @@ fn region_bench_reports_all_regions() {
             "coast: ",
             "memory (",
             "target: 60 fps",
-            "flight (60 s path): frames ",
+            "flight (75 s path): frames ",
             "  low pass: frames ",
             "  apron sweep: frames ",
+            "  high pass: frames ",
             "result: ",
         ] {
             assert!(report.contains(line), "missing {line:?} in\n{report}");
         }
         assert!(!report.contains("result: FAIL ("), "{report}");
         // 6 s of path at 60 updates a second.
-        assert!(report.contains("flight (60 s path): frames 36"), "{report}");
+        assert!(report.contains("flight (75 s path): frames 36"), "{report}");
     }
     assert!(
         reports[0].contains("first-region worst frame (R11"),
@@ -182,7 +185,7 @@ fn region_bench_reports_all_regions() {
         "{summary}"
     );
     for line in [
-        "regions (R14 frame rate): Pangaea interior PASS, Red Sea PASS, Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
+        "regions (R14 frame rate): Pangaea interior PASS (flight PASS, reported only), Red Sea PASS (flight PASS, reported only), Himalayas PASS, Sundaland PASS, Japan PASS, Beringia PASS, Rockies ice margin PASS, Panama PASS",
         "first-region worst frame (R11",
         "warm generation (2 re-entries of Himalayas",
         "first entries (cold tiles; reported only natively): Pangaea interior ",
@@ -313,6 +316,109 @@ fn a_no_dunes_run_says_so() {
         assert!(text.contains("\ndunes: off\n"), "{text}");
         assert!(!text.contains("dunes: on"), "{text}");
     }
+}
+
+/// Eight stops with no pan: Pangaea first (its flight reported only), then the gated regions,
+/// the Red Sea last. Against a 120 fps target the fixed 16.67 ms step fails every gated flight
+/// (R14, display-paced: the median over the interval), so the first failed gate is stop 2's.
+fn failing_from_stop_2(keep_going: bool) -> RegionBenchConfig {
+    let at = |name: &str| *BENCH_REGIONS.iter().find(|r| r.name == name).unwrap();
+    let mut config = RegionBenchConfig::new(120, true);
+    config.regions = [
+        "Pangaea interior",
+        "Himalayas",
+        "Sundaland",
+        "Japan",
+        "Beringia",
+        "Rockies ice margin",
+        "Panama",
+        "Red Sea",
+    ]
+    .map(|name| BenchRegion {
+        pan_from_previous: false,
+        ..at(name)
+    })
+    .to_vec();
+    config.path_secs = 2.0;
+    config.cycles = 2;
+    config.timeout_secs = 1.0e6;
+    config.keep_going = keep_going;
+    config
+}
+
+/// Runs a bench to its summary: `(the summary, the exits written)`.
+fn run_to_summary(app: &mut App) -> (String, Vec<AppExit>) {
+    let deadline = Instant::now() + WALL_LIMIT;
+    let mut exit = Vec::new();
+    while app.world().resource::<RegionBench>().summary().is_none() {
+        app.update();
+        if *app.world().resource::<State<GlobeLoadState>>().get() == GlobeLoadState::Ready {
+            app.insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 });
+        }
+        exit.extend(exits(app));
+        assert!(Instant::now() < deadline, "the bench did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let summary = app.world().resource::<RegionBench>().summary().unwrap();
+    (summary.to_string(), exit)
+}
+
+#[test]
+fn a_failed_gate_stops_the_region_bench() {
+    let mut app = bench_app(failing_from_stop_2(false));
+    let (summary, exit) = run_to_summary(&mut app);
+    println!("{summary}");
+    let bench = app.world().resource::<RegionBench>();
+    // Stop 1 passed (its failing flight is reported only); stop 2's block is out, then the run
+    // ended: no third region, no memory cycles.
+    let reports = bench.reports();
+    assert_eq!(reports.len(), 2, "{reports:#?}");
+    assert!(reports[0].contains("\nresult: PASS ("), "{}", reports[0]);
+    assert!(reports[1].contains(": Himalayas ("), "{}", reports[1]);
+    assert!(reports[1].contains("\nresult: FAIL ("), "{}", reports[1]);
+    for line in [
+        "\non a failed gate: stop (--keep-going runs every stop)\n",
+        "\nregions (R14 frame rate): Pangaea interior PASS (flight FAIL, reported only), Himalayas FAIL, Sundaland not run, Japan not run, Beringia not run, Rockies ice margin not run, Panama not run, Red Sea not run\n",
+        "\nstopped early at stop 2 of 8, Himalayas: R14 flight frame rate (display-paced rule) FAIL; --keep-going runs every stop\n",
+        "\nstops run: 2 of 8: Pangaea interior, Himalayas\n",
+        "\nstops skipped: 6: Sundaland, Japan, Beringia, Rockies ice margin, Panama, Red Sea; and the 2 memory cycles\n",
+        "\nwarm generation (target <= 3000 ms): not measured",
+        "\nresult: FAIL\n",
+    ] {
+        assert!(summary.contains(line), "missing {line:?} in\n{summary}");
+    }
+    assert!(summary.ends_with("===== end region bench summary ====="));
+    assert_eq!(exit, vec![bench_exit(false)], "{summary}");
+    // Reported once.
+    app.update();
+    assert!(exits(&mut app).is_empty());
+    let shown = &app.world().resource::<BannerTexts>().0;
+    assert!(
+        !shown.iter().any(|s| s.starts_with("Sundaland")),
+        "{shown:#?}"
+    );
+    assert_eq!(shown.last().unwrap(), "Region bench finished: FAIL");
+}
+
+#[test]
+fn keep_going_runs_every_stop() {
+    let mut app = bench_app(failing_from_stop_2(true));
+    let (summary, exit) = run_to_summary(&mut app);
+    println!("{summary}");
+    let bench = app.world().resource::<RegionBench>();
+    assert_eq!(bench.reports().len(), 8);
+    for line in [
+        "\non a failed gate: keep going (--keep-going)\n",
+        "\nregions (R14 frame rate): Pangaea interior PASS (flight FAIL, reported only), Himalayas FAIL, Sundaland FAIL, Japan FAIL, Beringia FAIL, Rockies ice margin FAIL, Panama FAIL, Red Sea PASS (flight FAIL, reported only)\n",
+        "\nwarm generation (2 re-entries of Himalayas",
+        "\nmemory cycles",
+        "\nresult: FAIL\n",
+    ] {
+        assert!(summary.contains(line), "missing {line:?} in\n{summary}");
+    }
+    assert!(!summary.contains("stopped early"), "{summary}");
+    assert!(!summary.contains("stops skipped"), "{summary}");
+    assert_eq!(exit, vec![bench_exit(false)], "{summary}");
 }
 
 #[test]

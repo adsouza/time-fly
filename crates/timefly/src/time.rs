@@ -30,6 +30,9 @@ pub enum TimeChangeCause {
     Bench,
     /// Snapped to the nearest snapshot on entering a region (M2 design §6.1).
     Snap,
+    /// Held during a transition (the slider's change put back), or the held change applied
+    /// once the transition ends (M3 design §9).
+    Held,
 }
 
 /// Domain event: the globe time changed.
@@ -47,7 +50,7 @@ impl DomainEventLevel for TimeChanged {
     fn log_level(&self) -> bevy::log::Level {
         match self.cause {
             TimeChangeCause::Key | TimeChangeCause::Snap => bevy::log::Level::INFO,
-            TimeChangeCause::Slider => bevy::log::Level::DEBUG,
+            TimeChangeCause::Slider | TimeChangeCause::Held => bevy::log::Level::DEBUG,
             TimeChangeCause::Bench => bevy::log::Level::TRACE,
         }
     }

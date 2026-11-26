@@ -41,7 +41,7 @@ use material::{
     add_terrain_shaders, height_image, palette_image, patch_instances, surface_image,
     terrain_buffer_bytes, terrain_look,
 };
-use view::{RegionCamera, spawn_region_view, sync_region_view};
+use view::{RegionCamera, apply_view_ranges, fly_view_ranges, spawn_region_view, sync_region_view};
 
 /// The render layer of the terrain, the region camera and the region's sun (the globe uses
 /// layers 0–3).
@@ -61,6 +61,13 @@ const EARTH_RADIUS_M: f32 = (EARTH_RADIUS_KM * 1000.0) as f32;
 /// themselves after it.
 #[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TerrainSceneSystems;
+
+/// The system that switches between the globe and region cameras (`TerrainSettings::visible`).
+/// Whatever writes the fly's pose for the active camera (`crate::fly_camera::FlySystems::Apply`,
+/// `crate::globe_flight::GlobeFlightSystems::Apply`) runs after it, so on a swap frame the pose
+/// is the newly active world's.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionViewSystems;
 
 /// Terrain options set at launch.
 #[derive(Resource, Copy, Clone, Debug, PartialEq, Eq)]
@@ -279,13 +286,16 @@ pub(crate) fn add_terrain_systems(app: &mut App) {
             (
                 sync_terrain_scene.in_set(TerrainSceneSystems),
                 toggle_wireframe,
-                sync_region_view,
+                sync_region_view.in_set(RegionViewSystems),
             )
                 .chain(),
         )
         .add_systems(
             PostUpdate,
-            update_patches.before(VisibilitySystems::VisibilityPropagate),
+            (
+                update_patches.before(VisibilitySystems::VisibilityPropagate),
+                apply_view_ranges.before(bevy::camera::CameraUpdateSystems),
+            ),
         );
 }
 
@@ -510,6 +520,7 @@ fn update_patches(
     mut commands: Commands,
     scene: Option<ResMut<TerrainScene>>,
     settings: Res<TerrainSettings>,
+    fly: Option<Res<crate::fly_camera::FlyState>>,
     cameras: Query<&Transform, With<RegionCamera>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut patches: Query<(&TerrainPatch, &mut Visibility, &mut Aabb)>,
@@ -539,7 +550,8 @@ fn update_patches(
     let params = scene
         .params
         .with_camera(camera)
-        .with_wireframe(settings.wireframe);
+        .with_wireframe(settings.wireframe)
+        .with_fog(&fly_view_ranges(fly.as_deref()));
     if let Some(mut buffer) = buffers.get_mut(&scene.buffer)
         && let Some(data) = buffer.cast_slice_mut::<u8>()
     {

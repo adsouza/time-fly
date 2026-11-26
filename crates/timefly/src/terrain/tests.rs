@@ -517,3 +517,250 @@ fn sky_and_water_follow_the_scene() {
     assert_eq!(world.resource::<Assets<Mesh>>().len(), 0);
     assert_eq!(world.resource::<Assets<Image>>().len(), 0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Seen from higher up (M3 Task 6)
+
+use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, region_chase_pose};
+use timefly_core::flight::altitudes::REGION_CLOUD_BASE_M;
+use view::{FOG_END_M, M2_CEILING_M, REGION_FAR_M, SHADOW_DISTANCE_M, ViewRanges, view_ranges};
+
+const R_M: f64 = timefly_core::worldgen::frame::EARTH_RADIUS_M;
+
+/// The chase camera's eye for a fly at `(x, h, z)` heading `yaw` over sea-level ground.
+fn chase_eye(x: f32, h: f32, z: f32, yaw: f32) -> DVec3 {
+    let fly = FlyState {
+        pos_m: Vec3::new(x, h, z),
+        yaw,
+        pitch: -crate::fly_camera::START_PITCH_DEG.to_radians(),
+    };
+    region_chase_pose(&fly, |_, _| 0.0).eye
+}
+
+/// Distance (m) from `eye` to the sea-level ground at horizontal `(x, z)`, dropped by the
+/// curvature measured from the eye (as the terrain and the water draw it).
+fn to_ground(eye: DVec3, x: f64, z: f64) -> f64 {
+    let s = (x - eye.x).hypot(z - eye.z);
+    DVec3::new(x - eye.x, -curvature_drop_m(s) - eye.y, z - eye.z).length()
+}
+
+/// The distance the fog reads for a fragment `d` metres away.
+fn fog_distance(r: &ViewRanges, d: f64) -> f64 {
+    (d - f64::from(r.fog_start_m)).max(0.0) * f64::from(r.fog_scale())
+}
+
+#[test]
+fn view_ranges_match_m2_below_sixty_km() {
+    for h in [
+        -500.0,
+        0.0,
+        150.0,
+        8_000.0,
+        30_000.0,
+        59_999.0,
+        M2_CEILING_M,
+    ] {
+        let r = view_ranges(h);
+        assert_eq!(
+            r,
+            ViewRanges {
+                far_m: REGION_FAR_M,
+                shadow_m: SHADOW_DISTANCE_M,
+                fog_start_m: 0.0,
+                fog_end_m: FOG_END_M,
+            },
+            "{h}"
+        );
+        assert_eq!(r.fog_scale(), 1.0);
+        assert_eq!(r.first_cascade_m(), view::FIRST_CASCADE_M);
+    }
+    // The fog end is M2's: every era and biome is fully fogged there.
+    use crate::terrain::material::{ALL_BIOMES, ALL_ERAS};
+    for era in ALL_ERAS {
+        for biome in ALL_BIOMES {
+            let bevy::pbr::FogFalloff::ExponentialSquared { density } =
+                crate::sky::distance_fog(era, biome).falloff
+            else {
+                panic!("M2's fog is exponential-squared");
+            };
+            let fog = 1.0 - (-(FOG_END_M * density).powi(2)).exp();
+            assert!(fog >= view::FOG_COMPLETE, "{era:?} {biome:?}: {fog}");
+        }
+    }
+}
+
+/// From every reachable chase camera at 60–300 km, looking anywhere from 89° down to 10° up,
+/// the view's top edge (the farthest it sees along each azimuth) reaches the apron's edge only
+/// where that edge is already past the fog's end.
+#[test]
+fn the_apron_edge_is_never_visible() {
+    let half = APRON_SIZE_M / 2.0;
+    let tan_half_v = f64::from((view::REGION_FOV_DEG.to_radians() / 2.0).tan());
+    // Wider than any window the game opens.
+    let aspect = 2.4;
+    let mut edge_in_view = 0;
+    for h_km in [60.0f32, 120.0, 240.0, 300.0] {
+        let h = h_km * 1000.0;
+        let r = view_ranges(h);
+        // The fly anywhere in the inner field, and past its soft edge (the spring lets a boosted
+        // fly overshoot by tens of kilometres).
+        let reach = crate::fly_camera::EDGE_M + 40_000.0;
+        for (fx, fz) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (-1.0, 0.5), (0.0, -1.0)] {
+            for k in 0..16 {
+                let yaw = k as f32 * std::f32::consts::TAU / 16.0;
+                let eye = chase_eye(fx * reach, h, fz * reach, yaw);
+                let horizon = (2.0 * R_M * eye.y).sqrt();
+                for pitch_deg in -89..=10 {
+                    let rot = Quat::from_rotation_y(yaw)
+                        * Quat::from_rotation_x((pitch_deg as f32).to_radians());
+                    let (fwd, up, right) = (
+                        (rot * Vec3::NEG_Z).as_dvec3(),
+                        (rot * Vec3::Y).as_dvec3(),
+                        (rot * Vec3::X).as_dvec3(),
+                    );
+                    for i in -8..=8 {
+                        let x = f64::from(i) / 8.0 * tan_half_v * aspect;
+                        let ray = fwd + up * tan_half_v + right * x;
+                        let along = ray.xz().length();
+                        if along < 1e-9 {
+                            continue;
+                        }
+                        // The ray against the dropped ground y = −s²/2R: a hit, or the horizon.
+                        let a = along * along / (2.0 * R_M);
+                        let disc = ray.y * ray.y - 4.0 * a * eye.y;
+                        let far = if ray.y < 0.0 && disc >= 0.0 {
+                            let t = (-ray.y - disc.sqrt()) / (2.0 * a);
+                            t * along
+                        } else {
+                            horizon
+                        };
+                        // Where the ray's ground track leaves the apron.
+                        let u = ray.xz() / along;
+                        let exit = |c: f64, d: f64| {
+                            if d.abs() < 1e-12 {
+                                f64::INFINITY
+                            } else {
+                                (half * d.signum() - c) / d
+                            }
+                        };
+                        let s_edge = exit(eye.x, u.x).min(exit(eye.z, u.y));
+                        if far <= s_edge {
+                            continue;
+                        }
+                        edge_in_view += 1;
+                        let at = eye.xz() + u * s_edge;
+                        let d = to_ground(eye, at.x, at.y);
+                        // A 1% margin for the apron's own relief at its edge.
+                        assert!(
+                            fog_distance(&r, 0.99 * d) >= f64::from(FOG_END_M),
+                            "fly {h_km} km, eye {eye}, yaw {yaw}, pitch {pitch_deg}: the edge \
+                             {d:.0} m away, fog {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // The hazard is real: from up high, the apron's edge is in view.
+    assert!(edge_in_view > 1_000, "{edge_in_view}");
+}
+
+/// Higher up, the ground under the fly is seen through no more haze than at M2's ceiling.
+#[test]
+fn the_ground_under_the_fly_stays_as_clear_as_at_sixty_km() {
+    let under = |h: f32| {
+        let eye = chase_eye(0.0, h, 0.0, 0.0);
+        fog_distance(&view_ranges(h), to_ground(eye, 0.0, 0.0))
+    };
+    let m2 = under(M2_CEILING_M);
+    for h in (60..=300).step_by(10) {
+        let h = h as f32 * 1000.0;
+        assert!(under(h) <= 1.01 * m2, "{h}: {} vs {m2}", under(h));
+    }
+}
+
+/// Above M2's ceiling the ranges grow with the height, without jumps; the shadow cascades end
+/// in full fog from 120 km, and the far plane holds the apron's far corner from every camera.
+#[test]
+fn view_ranges_grow_smoothly_and_hide_the_shadow_seam() {
+    let mut last = view_ranges(M2_CEILING_M);
+    for m in (61..=300).map(|km| km as f32 * 1000.0) {
+        let r = view_ranges(m);
+        for (now, before, name) in [
+            (r.far_m, last.far_m, "far"),
+            (r.shadow_m, last.shadow_m, "shadow"),
+            (r.fog_start_m, last.fog_start_m, "fog start"),
+            (r.fog_end_m, last.fog_end_m, "fog end"),
+        ] {
+            assert!(now >= before, "{name} shrinks at {m}");
+            assert!(
+                now - before <= 30_000.0,
+                "{name} jumps at {m}: {before} -> {now}"
+            );
+        }
+        if m >= 120_000.0 {
+            assert!(r.shadow_m >= r.fog_end_m, "{m}: {r:?}");
+        }
+        // The far corner from a fly at the opposite corner of the inner field.
+        let edge = crate::fly_camera::EDGE_M;
+        let dir = Vec2::splat(-1.0).normalize();
+        let yaw = crate::bench::region::path::yaw_of(-dir);
+        let eye = chase_eye(edge, m, edge, yaw);
+        let corner = to_ground(eye, -APRON_SIZE_M / 2.0, -APRON_SIZE_M / 2.0);
+        assert!(
+            f64::from(r.far_m) >= corner,
+            "{m}: far {} < {corner}",
+            r.far_m
+        );
+        last = r;
+    }
+}
+
+/// The fly's clearance reads `blended_height_m` (no drop: the drop at zero distance is zero), but
+/// the terrain and the water draw the ground dropped by the curvature measured from the chase
+/// camera, which sits behind the fly. The two agree to within a centimetre at the clearance and a
+/// fraction of a percent of the height above the ground anywhere up to the ceiling.
+#[test]
+fn clearance_matches_the_drawn_ground_under_the_fly() {
+    assert_eq!(curvature_drop_m(0.0), 0.0);
+    assert_eq!(CAMERA_CEILING_M, REGION_CLOUD_BASE_M as f32);
+    let grid = grid();
+    let ground = |x: f64, z: f64| f64::from(timefly_core::terrain::blended_height_m(&grid, x, z));
+    for (x, z) in [(0.0, 0.0), (90_000.0, -40_000.0), (-149_000.0, 149_000.0)] {
+        let surface = ground(f64::from(x), f64::from(z)).max(0.0) as f32;
+        for agl in [CAMERA_CLEARANCE_M, 1_000.0, 8_000.0, 60_000.0, 150_000.0] {
+            let y = (surface + agl).min(CAMERA_CEILING_M);
+            for yaw in [0.0f32, 1.0, 2.5, 4.0] {
+                let fly = FlyState {
+                    pos_m: Vec3::new(x, y, z),
+                    yaw,
+                    pitch: -0.3,
+                };
+                let eye = region_chase_pose(&fly, |x, z| ground(x, z).max(0.0)).eye;
+                let offset = (eye.x - f64::from(x)).hypot(eye.z - f64::from(z));
+                let clearance = ground(f64::from(x), f64::from(z)) - curvature_drop_m(0.0);
+                let drawn = ground(f64::from(x), f64::from(z)) - curvature_drop_m(offset);
+                let gap = clearance - drawn;
+                let height = f64::from(y) - clearance.max(0.0);
+                assert!(gap >= 0.0, "the drawn ground is above the clearance's");
+                let allowed = if agl <= CAMERA_CLEARANCE_M {
+                    0.01
+                } else {
+                    0.006 * height
+                };
+                assert!(
+                    gap <= allowed,
+                    "fly {} {agl} m up: the camera {offset:.0} m behind drops the ground \
+                     {gap:.3} m",
+                    fly.pos_m
+                );
+            }
+        }
+    }
+    // The water drops its sea by the same d² / 2R from the same camera as the terrain.
+    let water = include_str!("../../assets/shaders/water.wesl");
+    assert!(water.contains("let xz = params.camera.xz + rel;"));
+    assert!(water.contains("let drop = dot(rel, rel) / (2.0 * params.lattice.z);"));
+    let params = TerrainParams::new(&grid, &LodSettings::region());
+    assert_eq!(f64::from(params.lattice[2]), R_M);
+}

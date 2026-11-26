@@ -63,7 +63,7 @@ fn spawn_fps_overlay(mut commands: Commands) {
             ..default()
         },
         BackgroundColor(FPS_PANEL_COLOR),
-        // Above the fade overlay, like the bench banner; never takes the pointer.
+        // Above the captions, like the bench banner; never takes the pointer.
         GlobalZIndex(10),
         Pickable::IGNORE,
     ));

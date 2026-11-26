@@ -6,6 +6,8 @@
 //! (the one global subscriber) and logs what `start` found.
 
 pub mod aspects;
+pub mod hop_memory;
+pub mod memory;
 pub mod notice;
 pub mod probe;
 pub mod recorder;
@@ -296,7 +298,7 @@ impl Session {
     }
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         std::time::SystemTime::now()

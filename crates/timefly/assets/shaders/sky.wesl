@@ -16,6 +16,10 @@ struct SkyParams {
     // xyz: direction toward the sun; w: glow strength.
     sun: vec4<f32>,
     sun_color: vec4<f32>,
+    // Below the horizon: rgb the fog's colour, w its sun glow.
+    fog: vec4<f32>,
+    // Below the horizon: rgb the sun's colour times its illuminance, w the fog's sun exponent.
+    fog_sun: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> sky: SkyParams;
@@ -52,13 +56,17 @@ fn fragment(in: SkyOut) -> @location(0) vec4<f32> {
     // Ease out of the horizon quickly, so the haze is a band, not half the sky.
     let t = 1.0 - pow(1.0 - up, 3.0);
     var color = mix(sky.horizon.rgb, sky.zenith.rgb, t);
-    // Below the horizon (beyond the region's apron): the horizon haze, slightly darker.
-    color = select(color, sky.horizon.rgb * 0.92, dir.y < dip);
     // The sun: a broad warm glow and a soft disc.
     let s = max(dot(dir, normalize(sky.sun.xyz)), 0.0);
     let glow = sky.sun.w * (0.6 * pow(s, 12.0) + 0.4 * pow(s, 3.0) * (1.0 - t));
     let disc = smoothstep(0.9995, 0.99985, s) * 6.0;
     color = color + sky.sun_color.rgb * (glow + disc);
+    // Below the horizon (beyond the region's apron): fully fogged ground, as Bevy's fog colours
+    // the terrain there (its colour plus the sun's scattering), so the apron's edge, seen from
+    // high up, melts into it.
+    let scattering = pow(s, sky.fog_sun.w) * sky.fog_sun.rgb * view.exposure;
+    let fogged = sky.fog.rgb + scattering * sky.sun_color.rgb * sky.fog.w;
+    color = select(color, fogged, dir.y < dip);
     var out = vec4<f32>(color, 1.0);
     @if(TONEMAP_IN_SHADER)
     out = tone_mapping(out, view.color_grading);

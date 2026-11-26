@@ -7,15 +7,17 @@ pub mod args;
 pub mod art;
 pub mod bench;
 pub mod build_features;
-pub mod camera;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
 pub mod clock;
+pub mod cloud;
 pub mod clusters;
+pub mod creature;
 pub mod data;
 pub mod diagnostics;
 pub mod fly_camera;
 pub mod globe;
+pub mod globe_flight;
 pub mod gpu;
 pub mod region;
 pub mod sky;
@@ -28,23 +30,27 @@ pub mod window_memory;
 
 use args::LaunchArgs;
 use bench::ScrubBenchPlugin;
+use bench::journey::{JourneyBenchConfig, JourneyBenchPlugin};
 use bench::region::{RegionBenchConfig, RegionBenchPlugin};
-use camera::OrbitCameraPlugin;
+use creature::CreaturePlugin;
 use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
 use fly_camera::FlyCameraPlugin;
 use globe::GlobePlugin;
+use globe_flight::GlobeFlightPlugin;
 use region::RegionPlugin;
 use region::launch::LaunchRegion;
 use region::navigate::RegionNavigationPlugin;
 use terrain::TerrainCdlodPlugin;
 use ui::GameUiPlugins;
+use ui::bug_shot::{ShotPose, ShotRestore, ShotRestorePlugin};
 
 /// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
 pub const APP_ID: &str = "io.github.adsouza.TimeFly";
 
-/// The primary window for the launch arguments: `--window WxH` sets its size in physical
-/// pixels, and the benchmarks turn vsync off on native so frame times show the real cost.
+/// The primary window for the launch arguments: `--window WxH` sets its size in logical pixels
+/// (bevy_winit creates a `LogicalSize`; the OS multiplies it by the display's scale factor),
+/// and the benchmarks turn vsync off on native so frame times show the real cost.
 pub fn primary_window(args: &LaunchArgs) -> Window {
     #[cfg_attr(
         target_arch = "wasm32",
@@ -66,7 +72,7 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
         if let Some((w, h)) = args.window {
             window.resolution = WindowResolution::new(w, h);
         }
-        if args.scrub_bench || args.region_bench {
+        if args.scrub_bench || args.region_bench || args.journey_bench {
             window.present_mode = PresentMode::AutoNoVsync;
         }
     }
@@ -75,9 +81,68 @@ pub fn primary_window(args: &LaunchArgs) -> Window {
     window
 }
 
+/// The benchmark a launch runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChosenBench {
+    Scrub,
+    Region(RegionBenchConfig),
+    Journey(JourneyBenchConfig),
+}
+
+/// The benchmark the launch arguments ask for: the region bench over the journey bench over the
+/// scrub bench. With `--region`, the region and journey benches fly that region (the region
+/// bench only that one, with no pan or memory cycles); the scrub bench leaves it to the launch.
+/// `--keep-going` reaches every bench (the scrub bench's through its plugin).
+pub fn chosen_bench(
+    args: &LaunchArgs,
+    target_fps: u32,
+    exit_when_done: bool,
+) -> Option<ChosenBench> {
+    if args.region_bench {
+        Some(ChosenBench::Region(RegionBenchConfig {
+            keep_going: args.keep_going,
+            ..match args.region {
+                Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
+                None => RegionBenchConfig::new(target_fps, exit_when_done),
+            }
+        }))
+    } else if args.journey_bench {
+        Some(ChosenBench::Journey(JourneyBenchConfig {
+            keep_going: args.keep_going,
+            ..match args.region {
+                Some(region) => JourneyBenchConfig::chosen(target_fps, exit_when_done, region),
+                None => JourneyBenchConfig::new(target_fps, exit_when_done),
+            }
+        }))
+    } else if args.scrub_bench {
+        Some(ChosenBench::Scrub)
+    } else {
+        None
+    }
+}
+
+/// Reads `--from-shot`'s sidecar, if given (native only: the web cannot read a file).
+fn shot_to_restore(args: &LaunchArgs) -> Option<Result<ShotPose, String>> {
+    let path = args.from_shot.as_deref()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(ui::bug_shot::load_shot(std::path::Path::new(path)))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        Some(Err("the web cannot read a shot's file".to_string()))
+    }
+}
+
 /// Builds the Time Fly app. Plugins are added here as milestones land.
 pub fn app(session: &Session) -> App {
-    let args = session.args().clone();
+    let mut args = session.args().clone();
+    // A repro opens a window of its shot's (logical) size unless `--window` chooses another.
+    let shot = shot_to_restore(&args);
+    if let Some(Ok(pose)) = &shot {
+        ui::bug_shot::repro_window(&mut args, pose);
+    }
     let mut app = App::new();
     // Before `DefaultPlugins`: `LogPlugin` takes its layers from the diagnostics resources.
     app.add_plugins(DiagnosticsPlugin::new(session));
@@ -113,21 +178,25 @@ pub fn app(session: &Session) -> App {
     // Bevy's web panic handler replaces the panic hook; ours chains console_error_panic_hook.
     #[cfg(target_arch = "wasm32")]
     let plugins = plugins.disable::<bevy::app::PanicHandlerPlugin>();
-    app.add_plugins(plugins).add_plugins((
-        clusters::NoClusteringPlugin,
-        time::TimePlugin,
-        GlobeDataPlugin::default(),
-        GlobePlugin,
-        RegionPlugin,
-        TerrainCdlodPlugin,
-        sky::SkyPlugin,
-        water::WaterPlugin,
-        terrain::warmup::RegionWarmupPlugin,
-        OrbitCameraPlugin,
-        RegionNavigationPlugin,
-        FlyCameraPlugin,
-        GameUiPlugins,
-    ));
+    app.add_plugins(plugins)
+        .add_plugins((
+            clusters::NoClusteringPlugin,
+            time::TimePlugin,
+            GlobeDataPlugin::default(),
+            GlobePlugin,
+            RegionPlugin,
+            TerrainCdlodPlugin,
+            sky::SkyPlugin,
+            water::WaterPlugin,
+            terrain::warmup::RegionWarmupPlugin,
+            GlobeFlightPlugin,
+            RegionNavigationPlugin,
+            FlyCameraPlugin,
+            CreaturePlugin,
+            cloud::CloudPlugin,
+            GameUiPlugins,
+        ))
+        .add_plugins(ShotRestorePlugin);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = remembered {
         app.add_plugins(window_memory::WindowMemoryPlugin { path });
@@ -143,23 +212,39 @@ pub fn app(session: &Session) -> App {
     app.insert_resource(terrain::TerrainOptions {
         dunes: !args.no_dunes,
     });
-    if args.region_bench {
-        // The region bench enters its own regions and takes precedence over the scrub bench.
-        // With `--region` it benches only that region (one flight, no pan or memory cycles).
-        let config = match args.region {
-            Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
-            None => RegionBenchConfig::new(target_fps, exit_when_done),
-        };
-        app.add_plugins(RegionBenchPlugin(config));
-    } else {
-        if let Some(region) = args.region {
-            app.insert_resource(LaunchRegion(region));
+    // The benches enter their own regions; a `--region` launch region is play or the scrub
+    // bench's start.
+    match chosen_bench(&args, target_fps, exit_when_done) {
+        Some(ChosenBench::Region(config)) => {
+            app.add_plugins(RegionBenchPlugin(config));
         }
-        if args.scrub_bench {
-            app.add_plugins(ScrubBenchPlugin {
-                target_fps,
-                exit_when_done,
-            });
+        Some(ChosenBench::Journey(config)) => {
+            app.add_plugins(JourneyBenchPlugin(config));
+        }
+        chosen => {
+            // `--from-shot` over `--region`.
+            match shot {
+                Some(Ok(pose)) => {
+                    app.insert_resource(ShotRestore::new(pose));
+                }
+                Some(Err(e)) => {
+                    app.add_systems(Startup, move || {
+                        error!(error = %e, "--from-shot: starting at the usual place instead");
+                    });
+                }
+                None => {
+                    if let Some(region) = args.region {
+                        app.insert_resource(LaunchRegion(region));
+                    }
+                }
+            }
+            if chosen == Some(ChosenBench::Scrub) {
+                app.add_plugins(ScrubBenchPlugin {
+                    target_fps,
+                    exit_when_done,
+                    keep_going: args.keep_going,
+                });
+            }
         }
     }
     app
@@ -168,6 +253,96 @@ pub fn app(session: &Session) -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_benches_take_precedence_in_order() {
+        use bench::region::CHOSEN_REGION;
+        let arg = args::parse_region("20,37.5,0").unwrap();
+        let chosen = |args: LaunchArgs| chosen_bench(&args, 60, true);
+        // The region bench over the journey bench over the scrub bench.
+        let all = LaunchArgs {
+            scrub_bench: true,
+            region_bench: true,
+            journey_bench: true,
+            ..default()
+        };
+        assert_eq!(
+            chosen(all.clone()),
+            Some(ChosenBench::Region(RegionBenchConfig::new(60, true)))
+        );
+        let journey = LaunchArgs {
+            region_bench: false,
+            ..all.clone()
+        };
+        assert_eq!(
+            chosen(journey.clone()),
+            Some(ChosenBench::Journey(JourneyBenchConfig::new(60, true)))
+        );
+        assert_eq!(
+            chosen(LaunchArgs {
+                journey_bench: false,
+                ..journey.clone()
+            }),
+            Some(ChosenBench::Scrub)
+        );
+        assert_eq!(chosen(LaunchArgs::default()), None);
+        // `--region` names the region either bench flies.
+        let Some(ChosenBench::Journey(c)) = chosen(LaunchArgs {
+            region: Some(arg),
+            ..journey
+        }) else {
+            panic!("not the journey bench");
+        };
+        assert_eq!(c.routes.len(), 1);
+        assert_eq!(
+            (c.routes[0].region.name, c.routes[0].region.arg),
+            (CHOSEN_REGION, arg)
+        );
+        assert_eq!(c.journeys.len(), bench::journey::JOURNEY_CYCLES as usize);
+        assert_eq!(
+            chosen(LaunchArgs {
+                region: Some(arg),
+                ..all
+            }),
+            Some(ChosenBench::Region(RegionBenchConfig::single(
+                60, true, arg
+            )))
+        );
+        // A bare `--region` is play, not a bench.
+        assert_eq!(
+            chosen(LaunchArgs {
+                region: Some(arg),
+                ..default()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn keep_going_reaches_the_benches() {
+        let arg = args::parse_region("20,37.5,0").unwrap();
+        for keep_going in [false, true] {
+            for region in [None, Some(arg)] {
+                let args = |region_bench, journey_bench| LaunchArgs {
+                    region_bench,
+                    journey_bench,
+                    keep_going,
+                    region,
+                    ..default()
+                };
+                let Some(ChosenBench::Region(r)) = chosen_bench(&args(true, false), 60, true)
+                else {
+                    panic!("not the region bench");
+                };
+                assert_eq!(r.keep_going, keep_going);
+                let Some(ChosenBench::Journey(j)) = chosen_bench(&args(false, true), 60, true)
+                else {
+                    panic!("not the journey bench");
+                };
+                assert_eq!(j.keep_going, keep_going);
+            }
+        }
+    }
 
     #[test]
     fn the_canvas_fills_its_page() {

@@ -1,8 +1,8 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--region-bench`, `--no-dunes`, `--target-fps N`, `--window WxH` and
-//! `--region LAT,LON,AGE_YEARS`. A value
+//! `--region-bench`, `--journey-bench`, `--keep-going`, `--no-dunes`, `--target-fps N`,
+//! `--window WxH`, `--region LAT,LON,AGE_YEARS` and `--from-shot <json>`. A value
 //! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
 //! with `--` is the next flag, never a value.
 //! `--check-data` takes its optional value only as `--check-data=DIR`.
@@ -22,18 +22,29 @@ pub struct LaunchArgs {
     /// then the enter/leave memory cycles, and report. It takes precedence over `--scrub-bench`.
     /// With `--region` it benches only that region: one flight, no globe pan or memory cycles.
     pub region_bench: bool,
+    /// `--journey-bench` (web: `?journey-bench`): from the globe, dive into a region, hop twice
+    /// to its neighbours and climb back out, several times, and report. A bare flag. It takes
+    /// precedence over the scrub bench, and the region bench over it.
+    pub journey_bench: bool,
+    /// `--keep-going` (web: `?keep-going`): the benches run every stop even after a gate has
+    /// failed, instead of stopping at the first failed gate. A bare flag.
+    pub keep_going: bool,
     /// `--no-dunes` (web: `?no-dunes`): skip the terrain's dune shading, for slower machines.
     /// A bare flag: `--no-dunes=VALUE` is not it and goes to `unknown`.
     pub no_dunes: bool,
     /// `--target-fps N`: the frame rate the benchmarks check their frames against.
     pub target_fps: Option<u32>,
-    /// `--window WxH`: the window's size in physical pixels (native only).
+    /// `--window WxH`: the window's size in logical pixels (native only): on a 2× display a
+    /// 1280x720 window is 2560 × 1440 physical pixels.
     pub window: Option<(u32, u32)>,
     /// Hidden `--check-data[=DIR]` (native only): load the globe data headlessly and exit.
     pub check_data: Option<DataCheck>,
     /// `--region=LAT,LON,AGE_YEARS` (web: `?region=LAT,LON,AGE_YEARS`): enter the region centred
     /// there once the globe data is ready.
     pub region: Option<RegionArg>,
+    /// `--from-shot <json>` (native only): start at a bug shot's pose, read from its sidecar
+    /// (`crate::ui::bug_shot`); it takes precedence over `--region`, the benches over it.
+    pub from_shot: Option<String>,
     /// Unrecognized arguments. Diagnostics log only their count because URL query
     /// values and command-line arguments can contain private data.
     pub unknown: Vec<String>,
@@ -51,10 +62,13 @@ const CHECK_DATA_FLAG: &str = "--check-data";
 const PROBE_FLAG: &str = "--diagnostics-probe";
 const BENCH_FLAG: &str = "--scrub-bench";
 const REGION_BENCH_FLAG: &str = "--region-bench";
+const JOURNEY_BENCH_FLAG: &str = "--journey-bench";
+const KEEP_GOING_FLAG: &str = "--keep-going";
 const NO_DUNES_FLAG: &str = "--no-dunes";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
 const REGION_FLAG: &str = "--region";
+const FROM_SHOT_FLAG: &str = "--from-shot";
 
 /// Where `--region` asks to go: an era-frame latitude and longitude (degrees, as the globe shows
 /// them at that age) and an age in years before present.
@@ -116,6 +130,14 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
             parsed.region_bench = true;
             continue;
         }
+        if arg == JOURNEY_BENCH_FLAG {
+            parsed.journey_bench = true;
+            continue;
+        }
+        if arg == KEEP_GOING_FLAG {
+            parsed.keep_going = true;
+            continue;
+        }
         if arg == NO_DUNES_FLAG {
             parsed.no_dunes = true;
             continue;
@@ -137,10 +159,15 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
             }
             continue;
         }
-        let Some(flag) = [PROBE_FLAG, TARGET_FPS_FLAG, WINDOW_FLAG, REGION_FLAG]
-            .into_iter()
-            .find(|f| arg == *f || arg.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
-        else {
+        let Some(flag) = [
+            PROBE_FLAG,
+            TARGET_FPS_FLAG,
+            WINDOW_FLAG,
+            REGION_FLAG,
+            FROM_SHOT_FLAG,
+        ]
+        .into_iter()
+        .find(|f| arg == *f || arg.strip_prefix(f).is_some_and(|r| r.starts_with('='))) else {
             parsed.unknown.push(arg);
             continue;
         };
@@ -153,6 +180,7 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
                 PROBE_FLAG => ProbeMode::parse(v).map(|m| parsed.diagnostics_probe = Some(m)),
                 TARGET_FPS_FLAG => parse_fps(v).map(|f| parsed.target_fps = Some(f)),
                 REGION_FLAG => parse_region(v).map(|r| parsed.region = Some(r)),
+                FROM_SHOT_FLAG => (!v.is_empty()).then(|| parsed.from_shot = Some(v.to_string())),
                 _ => parse_window_size(v).map(|s| parsed.window = Some(s)),
             }
             .is_some()
@@ -232,6 +260,58 @@ mod tests {
             assert!(parsed.no_dunes && parsed.region_bench, "{q}");
         }
         assert!(!parse_query_args("?no-dunes=true").no_dunes);
+    }
+
+    #[test]
+    fn keep_going_is_a_bare_flag_on_both_platforms() {
+        let parsed = parse_launch_args(args(&["--region-bench", "--keep-going"]));
+        assert!(parsed.keep_going && parsed.region_bench);
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        assert!(!parse_launch_args(args(&["--region-bench"])).keep_going);
+        let valued = parse_launch_args(args(&["--keep-going=1"]));
+        assert!(!valued.keep_going);
+        assert_eq!(valued.unknown, args(&["--keep-going=1"]));
+        for q in ["?journey-bench&keep-going", "?keep-going&journey-bench"] {
+            let parsed = parse_query_args(q);
+            assert!(parsed.keep_going && parsed.journey_bench, "{q}");
+        }
+        assert!(!parse_query_args("?journey-bench").keep_going);
+    }
+
+    #[test]
+    fn journey_bench_is_a_bare_flag() {
+        let parsed = parse_launch_args(args(&["--journey-bench"]));
+        assert!(parsed.journey_bench);
+        assert!(!parsed.region_bench && !parsed.scrub_bench);
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        assert!(!parse_launch_args(args(&[])).journey_bench);
+        let valued = parse_launch_args(args(&["--journey-bench=1"]));
+        assert!(!valued.journey_bench);
+        assert_eq!(valued.unknown, args(&["--journey-bench=1"]));
+        // Not a prefix match.
+        let longer = parse_launch_args(args(&["--journey-benchmark"]));
+        assert!(!longer.journey_bench);
+        assert_eq!(longer.unknown, args(&["--journey-benchmark"]));
+        // Vsync off on native, as the other benches, so frame times show the real cost.
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(
+            crate::primary_window(&parsed).present_mode,
+            bevy::window::PresentMode::AutoNoVsync
+        );
+    }
+
+    #[test]
+    fn journey_bench_on_the_web_in_any_order() {
+        for q in [
+            "?journey-bench&target-fps=30",
+            "?target-fps=30&journey-bench",
+        ] {
+            let parsed = parse_query_args(q);
+            assert!(parsed.journey_bench, "{q}");
+            assert_eq!(parsed.target_fps, Some(30), "{q}");
+            assert!(parsed.unknown.is_empty(), "{q}: {:?}", parsed.unknown);
+        }
+        assert!(!parse_query_args("?journey-bench=true").journey_bench);
     }
 
     #[test]
@@ -455,6 +535,25 @@ mod tests {
         // The edges of each range are accepted.
         assert!(parse_region("90,180,540000000").is_some());
         assert!(parse_region("-90,-180,0").is_some());
+    }
+
+    #[test]
+    fn from_shot_flag() {
+        let path = "/Users/me/Pictures/Time Fly/timefly_20261126-143005_22.870N_71.420E.json";
+        for argv in [
+            vec![format!("--from-shot={path}")],
+            vec!["--from-shot".into(), path.into()],
+        ] {
+            let parsed = parse_launch_args(argv);
+            assert_eq!(parsed.from_shot.as_deref(), Some(path));
+            assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        }
+        // With no value it is unknown and does nothing; the next flag is never its value.
+        let parsed = parse_launch_args(args(&["--from-shot", "--no-dunes"]));
+        assert_eq!(parsed.from_shot, None);
+        assert!(parsed.no_dunes);
+        assert_eq!(parsed.unknown, args(&["--from-shot"]));
+        assert_eq!(parse_launch_args(args(&["--from-shot="])).from_shot, None);
     }
 
     #[test]
