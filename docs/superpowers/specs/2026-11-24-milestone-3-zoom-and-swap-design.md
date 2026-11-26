@@ -104,7 +104,8 @@ journey is the creature's.
   overlay (`FadeOverlay`, `ENTER_FADE_S` 0.8 s) to the region camera 8 km above the centre.
   Only one camera is ever active.
 - **Region flight** (M2 §6.6, `fly_camera.rs`): a free camera. `W` `A` `S` `D` and the arrow keys
-  move, drag looks, `Space`/`E` climb, `Ctrl`/`Q` descend, `Shift`+forward boosts. Speed is
+  move, drag looks, `Space`/`E` climb, `Ctrl`/`Q` descend (M3 moves it to `Option` on a Mac,
+  below), `Shift`+forward boosts. Speed is
   0.8 × height above ground per second (60 m/s to 10 km/s). Clearance 150 m. Soft ceiling at
   60 km. A soft edge nudges the camera back inside the 300 km inner field.
 - **Leaving:** `Backspace` fades back to the globe centred on the region.
@@ -175,7 +176,9 @@ The same keys as M2's free camera, now steering the fly, everywhere *(call)*:
 - `W` `A` `S` `D` and the arrow keys fly (forward, back, turn or strafe as in M2, including the
   arrow-key rules from PR #10).
 - Drag turns the fly and tilts the view.
-- `Space`/`E` climb, `Ctrl`/`Q` descend, `Shift` with forward boosts.
+- `Space`/`E` climb, `Ctrl`/`Q` descend, `Shift` with forward boosts. *As built (Task 14,
+  2026-11-26):* on a Mac, browsers included, descend is `Option`/`Q`, since `Ctrl+↑` opens
+  Mission Control; `Ctrl`/`Q` elsewhere.
 - `Backspace` starts an automatic climb back to the globe (the reverse zoom), a shortcut kept from
   M2 *(call)*.
 - The slider, `[` and `]` behave as now, with the transition rules in §9.

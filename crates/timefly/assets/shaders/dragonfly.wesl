@@ -3,9 +3,11 @@
 // material turns fog off) and adds a subtle rim light, so the fly's outline reads over dark
 // forest: the rim colour × strength × (1 − N·V)^power, on the body and the wings alike.
 //
-// The wings flap about the body axis (the model's z) by sin(time × 2π × hz) × amplitude, mirrored
-// between the right (x > 0) and left wings. At 25 Hz the beats alias at any frame rate, which
-// reads as a blur rather than as individual strokes. `globals.time` is Bevy's virtual time.
+// The wings flap about the body axis (the model's z) by sin(2π × phase) × amplitude, mirrored
+// between the right (x > 0) and left wings. The phase steps a fixed part of a cycle every frame
+// (`look.flap.x`, 0.4: creature's `FLAP_CYCLES_PER_FRAME` and `flap_phase`), so the stroke sweeps
+// from one side to the other each frame at any frame rate. A beat in time aliased instead: 25 Hz
+// sampled at the frame rate read as about 1 Hz at 26 fps, 5 Hz at 30, and held still at 50.
 
 import bevy_pbr::render::mesh_functions;
 import bevy_pbr::render::view_transformations::position_world_to_clip;
@@ -17,7 +19,7 @@ import bevy_pbr::render::pbr_functions::{apply_pbr_lighting, main_pass_post_ligh
 const TAU: f32 = 6.283185307179586;
 
 struct DragonflyLook {
-    // x: flap frequency (Hz); y: flap amplitude (radians).
+    // x: the flap's step (cycles per frame); y: flap amplitude (radians).
     flap: vec4<f32>,
     // rgb: rim colour (linear); w: rim strength.
     rim: vec4<f32>,
@@ -36,6 +38,12 @@ struct DragonflyVertex {
     @location(8) wing: f32,
 }
 
+// The flap's phase (cycles) on this frame. The frame count wraps every 1000 frames, a whole number
+// of cycles at 0.4 a frame (creature's `FLAP_WRAP_FRAMES`), so `f32` keeps the phase exact.
+fn flap_phase() -> f32 {
+    return fract(f32(globals.frame_count % 1000u) * look.flap.x);
+}
+
 // Rotates `v` about the z axis by `angle`.
 fn about_z(v: vec3<f32>, angle: f32) -> vec3<f32> {
     let c = cos(angle);
@@ -47,7 +55,7 @@ fn about_z(v: vec3<f32>, angle: f32) -> vec3<f32> {
 fn vertex(v: DragonflyVertex) -> VertexOutput {
     // Positive angles raise the right wing; the left wing mirrors it, so both rise together.
     let side = select(-1.0, 1.0, v.position.x >= 0.0);
-    let angle = sin(globals.time * TAU * look.flap.x) * look.flap.y * v.wing * side;
+    let angle = sin(TAU * flap_phase()) * look.flap.y * v.wing * side;
     let position = about_z(v.position, angle);
     let normal = about_z(v.normal, angle);
 

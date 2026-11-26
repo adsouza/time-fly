@@ -51,12 +51,14 @@ use region::launch::LaunchRegion;
 use region::navigate::RegionNavigationPlugin;
 use terrain::TerrainCdlodPlugin;
 use ui::GameUiPlugins;
+use ui::bug_shot::{ShotPose, ShotRestore, ShotRestorePlugin};
 
 /// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
 pub const APP_ID: &str = "io.github.adsouza.TimeFly";
 
-/// The primary window for the launch arguments: `--window WxH` sets its size in physical
-/// pixels, and the benchmarks turn vsync off on native so frame times show the real cost.
+/// The primary window for the launch arguments: `--window WxH` sets its size in logical pixels
+/// (bevy_winit creates a `LogicalSize`; the OS multiplies it by the display's scale factor),
+/// and the benchmarks turn vsync off on native so frame times show the real cost.
 pub fn primary_window(args: &LaunchArgs) -> Window {
     #[cfg_attr(
         target_arch = "wasm32",
@@ -98,20 +100,27 @@ pub enum ChosenBench {
 /// The benchmark the launch arguments ask for: the region bench over the journey bench over the
 /// scrub bench. With `--region`, the region and journey benches fly that region (the region
 /// bench only that one, with no pan or memory cycles); the scrub bench leaves it to the launch.
+/// `--keep-going` reaches every bench (the scrub bench's through its plugin).
 pub fn chosen_bench(
     args: &LaunchArgs,
     target_fps: u32,
     exit_when_done: bool,
 ) -> Option<ChosenBench> {
     if args.region_bench {
-        Some(ChosenBench::Region(match args.region {
-            Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
-            None => RegionBenchConfig::new(target_fps, exit_when_done),
+        Some(ChosenBench::Region(RegionBenchConfig {
+            keep_going: args.keep_going,
+            ..match args.region {
+                Some(region) => RegionBenchConfig::single(target_fps, exit_when_done, region),
+                None => RegionBenchConfig::new(target_fps, exit_when_done),
+            }
         }))
     } else if args.journey_bench {
-        Some(ChosenBench::Journey(match args.region {
-            Some(region) => JourneyBenchConfig::chosen(target_fps, exit_when_done, region),
-            None => JourneyBenchConfig::new(target_fps, exit_when_done),
+        Some(ChosenBench::Journey(JourneyBenchConfig {
+            keep_going: args.keep_going,
+            ..match args.region {
+                Some(region) => JourneyBenchConfig::chosen(target_fps, exit_when_done, region),
+                None => JourneyBenchConfig::new(target_fps, exit_when_done),
+            }
         }))
     } else if args.scrub_bench {
         Some(ChosenBench::Scrub)
@@ -120,9 +129,28 @@ pub fn chosen_bench(
     }
 }
 
+/// Reads `--from-shot`'s sidecar, if given (native only: the web cannot read a file).
+fn shot_to_restore(args: &LaunchArgs) -> Option<Result<ShotPose, String>> {
+    let path = args.from_shot.as_deref()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(ui::bug_shot::load_shot(std::path::Path::new(path)))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        Some(Err("the web cannot read a shot's file".to_string()))
+    }
+}
+
 /// Builds the Time Fly app. Plugins are added here as milestones land.
 pub fn app(session: &Session) -> App {
-    let args = session.args().clone();
+    let mut args = session.args().clone();
+    // A repro opens a window of its shot's (logical) size unless `--window` chooses another.
+    let shot = shot_to_restore(&args);
+    if let Some(Ok(pose)) = &shot {
+        ui::bug_shot::repro_window(&mut args, pose);
+    }
     let mut app = App::new();
     // Before `DefaultPlugins`: `LogPlugin` takes its layers from the diagnostics resources.
     app.add_plugins(DiagnosticsPlugin::new(session));
@@ -185,6 +213,7 @@ pub fn app(session: &Session) -> App {
         cloud::CloudPlugin,
         GameUiPlugins,
     ));
+    app.add_plugins(ShotRestorePlugin);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = remembered {
         app.add_plugins(window_memory::WindowMemoryPlugin { path });
@@ -210,13 +239,27 @@ pub fn app(session: &Session) -> App {
             app.add_plugins(JourneyBenchPlugin(config));
         }
         chosen => {
-            if let Some(region) = args.region {
-                app.insert_resource(LaunchRegion(region));
+            // `--from-shot` over `--region`.
+            match shot {
+                Some(Ok(pose)) => {
+                    app.insert_resource(ShotRestore::new(pose));
+                }
+                Some(Err(e)) => {
+                    app.add_systems(Startup, move || {
+                        error!(error = %e, "--from-shot: starting at the usual place instead");
+                    });
+                }
+                None => {
+                    if let Some(region) = args.region {
+                        app.insert_resource(LaunchRegion(region));
+                    }
+                }
             }
             if chosen == Some(ChosenBench::Scrub) {
                 app.add_plugins(ScrubBenchPlugin {
                     target_fps,
                     exit_when_done,
+                    keep_going: args.keep_going,
                 });
             }
         }
@@ -290,6 +333,32 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn keep_going_reaches_the_benches() {
+        let arg = args::parse_region("20,37.5,0").unwrap();
+        for keep_going in [false, true] {
+            for region in [None, Some(arg)] {
+                let args = |region_bench, journey_bench| LaunchArgs {
+                    region_bench,
+                    journey_bench,
+                    keep_going,
+                    region,
+                    ..default()
+                };
+                let Some(ChosenBench::Region(r)) = chosen_bench(&args(true, false), 60, true)
+                else {
+                    panic!("not the region bench");
+                };
+                assert_eq!(r.keep_going, keep_going);
+                let Some(ChosenBench::Journey(j)) = chosen_bench(&args(false, true), 60, true)
+                else {
+                    panic!("not the journey bench");
+                };
+                assert_eq!(j.keep_going, keep_going);
+            }
+        }
     }
 
     #[test]

@@ -18,9 +18,18 @@ TIMEFLY_LOG_DIR=/tmp/timefly-m3-checks target/release/timefly
 to start in a region instead of on the globe (the fly at M2's start pose).
 
 **Controls:** `W` `A` `S` `D` or the arrows fly; drag turns the fly and tilts the view;
-`Space`/`E` climb, `Ctrl`/`Q` descend; `Shift` with forward boosts; on the globe the scroll
-wheel climbs and descends; `Backspace` climbs back out to the globe; `[` and `]` step to the
-older and younger snapshot.
+`Space`/`E` climb, `Option`/`Q` descend (`Ctrl`/`Q` on Windows and Linux, and in a browser
+away from a Mac: on a Mac `Ctrl+↑` is Mission Control); `Shift` with forward boosts; on the
+globe the scroll wheel climbs and descends; `Backspace` climbs back out to the globe; `[` and
+`]` step to the older and younger snapshot; `F12` (or the small camera button under the
+compass) saves a bug shot, a PNG named by the place and view with a JSON sidecar beside it, in
+`Pictures/Time Fly` (see check 16); `--from-shot <sidecar.json>` starts the game at a shot's pose.
+
+**The HUD** (top left): the altitude, under it the latitude and longitude (`22.87° N  71.42° E`,
+in the era's frame, the frame `--region` takes; marked `(then)` past 26 ka, where that frame is
+no longer today's), and under that a heading-up compass rose: its top tick is where the fly
+faces, the N (red), E, S and W marks turn to show true directions, and the label gives the
+heading (`NE 47°`).
 
 Tick a box when it passes. If one fails, note what you saw next to it (a screenshot helps).
 
@@ -33,13 +42,20 @@ tree):
   mode).
 - `himalayas-region-below.png`: the region below the cloud base after that dive, at 230 km (for
   check 9).
+- `globe-framing-top.jpg`, `globe-framing-top-portrait.jpg`, `globe-framing-mid.jpg` and
+  `globe-framing-above-cloud.jpg`: the globe chase over 30° N 15° E at the start altitude
+  (8,282 km, 16:9 and 9:16), mid-way (3,150 km) and just above the cloud (2,600 km), Task 14's
+  tree (`globebug` mode, 1280 × 720 scaled down). At the dive altitude the cloud is a
+  white-out.
+- `wings-after-globe-descent.jpg`: the wings in a full-speed descent over the globe with the
+  view dragged fully up (the eye at its 20° floor; `globedescent` mode, a 4K crop).
 
 ## Design §10 checks
 
 ### 1. The dive and the climb, recent era
 
 1. Launch on the globe at the present. Steer toward the Alps (about 46.5° N, 10° E) and descend
-   (`Ctrl`) until the cloud gathers and you pass through it.
+   (`Option` or `Q`) until the cloud gathers and you pass through it.
 2. Below the cloud, fly a little. Then climb (`Space`) up through the cloud base until you come
    out over the globe.
 3. Repeat once with `Backspace` instead of climbing by hand.
@@ -88,7 +104,9 @@ tree):
 
 Look for the fly, without hunting for it, at each of these:
 
-- [ ] the globe's top altitude (just after launch);
+- [ ] the globe's top altitude (just after launch). The camera is behind the fly, not over it,
+      and the whole globe is in view, nearly centred, with the fly over its upper part (your
+      "A: globe centred", Task 14; `globe-framing-top.jpg`, `globe-framing-top-portrait.jpg`);
 - [ ] just above the cloud top (2,500 km) and at the dive altitude (1,200 km);
 - [ ] in a region just below the cloud base (about 290 km) and at 230 km where you emerge;
 - [ ] in a region near the ground (300 m to a few km), over dark forest and over snow.
@@ -108,6 +126,32 @@ Fly a full journey: dive, two hops, climb out.
 
 - [ ] No abrupt camera swings, no roll you didn't ask for, no sudden speed change at a swap.
 - [ ] Nothing in it made you queasy. If something did, note where: ______
+
+### 16. Bug shots and the compass (Task 12, the owner's request of 2026-11-26)
+
+Reference frames (this folder, `examples/region_tour.rs` `bugshot` and `globebug`, offscreen at
+1280 × 720): `hud-region.jpg` (the Alps at the present, 8 km up, facing NE 47°) and
+`hud-globe.jpg` (over the Himalayas at 5,000 km, facing NE 47°). `hud-globe.jpg` was rendered
+before Task 14, so it shows the old globe framing (the camera over the fly); judge the HUD in
+it, not the camera.
+
+1. Launch on the globe. Fly a little, turning: watch the rose. Then dive into a region and fly
+   there too.
+2. Press `F12` (`fn`+`F12` on Apple keyboards, or the camera button) once on the globe and
+   once in a region, and click the camera button once. On the web in Windows and Linux
+   browsers `F12` opens DevTools, so use the camera button there.
+3. Quit with `Cmd+Q`. Relaunch with `--from-shot` and the region shot's `.json` file:
+   `target/release/timefly --from-shot "$HOME/Pictures/Time Fly/timefly_…_region.json"`.
+4. Quit again and relaunch with the globe shot's `.json` file:
+   `target/release/timefly --from-shot "$HOME/Pictures/Time Fly/timefly_…_globe.json"`.
+
+- [ ] The readout sits right under the altitude and the rose under it, small and out of the way.
+- [ ] The rose's top is always where the fly faces; turning right swings N to the left.
+- [ ] Each shot shows a toast naming its full path, and the PNG and the `.json` are both there.
+      The PNG is the frame you saw (HUD included), not a blank one.
+- [ ] Each relaunch (the region shot and the globe shot) opens a window of the shot's size at
+      the same place, era and view: the frame matches the PNG (the wings, water and clouds move
+      with time). The camera stays put until you press a key or click.
 
 ## Questions the build raised
 

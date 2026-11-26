@@ -17,11 +17,14 @@
 //!   (`crate::terrain::RegionViewSystems`) and before the bridge cameras copy the globe camera,
 //!   [`GlobeCameraSync`]): `globe_chase_pose` in kilometres, the look pitch rising with altitude
 //!   (`globe_look_pitch_deg`: 50° at the dive, so the ground fills the lower two-thirds of the
-//!   frame, to 85° at the top, with the eye straight over the fly and the globe centred) and
-//!   the eye 5° above it, so the fly sits 5° below the view's centre at every altitude. The glide is the region's ([`ChaseGlide`]); the held offsets are carried
+//!   frame, to 83.8° at the top, where the whole globe is centred) and the eye behind the fly,
+//!   rising from 55° at the dive (the fly 5° below the view's centre, as in a region) to 70° at
+//!   the top (`globe_chase_elevation_deg`: never overhead, the fly over the globe's upper part;
+//!   owner's "A: globe centred", M3 Task 14). The glide is the region's ([`ChaseGlide`]); the held offsets are carried
 //!   by the turn of the local up as the fly travels, so travel is followed rigidly and only
 //!   turns and view changes glide. The eye never leaves `GLOBE_MAX_CAMERA_DISTANCE_KM`.
-//! - **The fly** ([`FlyPose`], scaled by `fly_scale` at the globe camera's field of view) and
+//! - **The fly** ([`FlyPose`], scaled by `fly_scale` at the globe camera's field of view, by its
+//!   depth along the view, so it holds its share of the view off the centre too) and
 //!   the overlay's [`FlyAltitude`] (`Kilometres`, true altitude above sea level) are written only
 //!   while the globe camera is active. The relief exaggeration follows the altitude
 //!   ([`GlobeExaggeration`], `globe_exaggeration`).
@@ -311,7 +314,7 @@ fn heading_rotation(heading: DVec3, up: DVec3) -> Quat {
 /// Places the globe camera behind and above the fly (smoothed), and writes the fly's pose, the
 /// overlay's altitude, the exaggeration and the diagnostics' camera.
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
-fn apply_globe_flight(
+pub(crate) fn apply_globe_flight(
     flight: Res<GlobeFlightState>,
     look: Res<GlobeLook>,
     time: Res<Time>,
@@ -391,7 +394,10 @@ fn apply_globe_flight(
         Projection::Perspective(p) => p.fov,
         _ => PerspectiveProjection::default().fov,
     };
-    let scale = fly_scale((eye - fly).length(), f64::from(vfov)) as f32;
+    // By the fly's depth along the view, not its distance: off the view's centre (above it at
+    // the top, `globe_fly_below_centre_deg`) perspective draws it 1 / cos larger.
+    let depth = (fly - eye).dot((target - eye).normalize());
+    let scale = fly_scale(depth, f64::from(vfov)) as f32;
     let (bank_rad, pitch_rad, bob) = chase.flourish.step(turn, dt_s, time.elapsed_secs(), scale);
     let next = FlyPose {
         translation: (fly + up * f64::from(bob)).as_vec3(),
@@ -451,7 +457,8 @@ mod tests {
         CHASE_GLOBE_TOP_PITCH_DEG, DIVE_ALTITUDE_KM, FLY_SCREEN_FRACTION, GLOBE_MAX_ALTITUDE_KM,
     };
     use timefly_core::flight::chase::{
-        CHASE_FLY_BELOW_CENTRE_DEG, globe_chase_elevation_deg, globe_look_pitch_deg,
+        GLOBE_CHASE_MAX_ELEVATION_DEG, globe_chase_elevation_deg, globe_fly_below_centre_deg,
+        globe_look_pitch_deg,
     };
 
     use super::*;
@@ -535,8 +542,8 @@ mod tests {
             run(&mut app, 180);
             let t = camera(&app, cam);
             let eye = t.translation.as_dvec3();
-            // Outside the fly's altitude, behind it along the heading (straight over it at the
-            // top; f32 camera translations, so within a kilometre).
+            // Outside the fly's altitude, behind it along the heading (f32 camera translations,
+            // so within a kilometre).
             assert!(
                 eye.length() > EARTH_RADIUS_KM + alt,
                 "{alt}: {} km",
@@ -548,10 +555,11 @@ mod tests {
             );
             // No roll about the view axis: the camera's right is level in the fly's frame.
             assert!(t.right().as_vec3().as_dvec3().dot(f.up()).abs() < 1e-3);
-            // The fly 5° below the centre, on the vertical centre line.
+            // The fly where the altitude puts it (5° below the centre at the dive, above it at
+            // the top), on the vertical centre line.
             let (below, side) = seen(&t, f.position_km());
             assert!(
-                (below - CHASE_FLY_BELOW_CENTRE_DEG).abs() < 0.05,
+                (below - globe_fly_below_centre_deg(alt)).abs() < 0.05,
                 "{alt}: {below}"
             );
             assert!(side.abs() < 1e-3, "{alt}: {side}");
@@ -567,9 +575,10 @@ mod tests {
                 (down - globe_look_pitch_deg(alt)).abs() < 0.05,
                 "{alt}: {down}"
             );
-            // The fly is drawn there at the size that holds its share of the view.
+            // The fly is drawn there at the size that holds its share of the view: by its depth
+            // along the view.
             let pose = *app.world().resource::<FlyPose>();
-            let d = (f.position_km() - eye).length();
+            let d = (f.position_km() - eye).dot(t.forward().as_vec3().as_dvec3());
             let scale = fly_scale(d, f64::from(vfov(&app, cam))) as f32;
             assert!(
                 (pose.scale - scale).abs() < 1e-3 * scale,
@@ -718,28 +727,62 @@ mod tests {
         }
     }
 
+    /// Where `p` projects in normalized device coordinates, and whether it is in front.
+    fn ndc(t: &Transform, p: &PerspectiveProjection, w: DVec3) -> (Vec3, bool) {
+        let view = t.to_matrix().inverse().transform_point3(w.as_vec3());
+        (p.get_clip_from_view().project_point3(view), view.z < 0.0)
+    }
+
     #[test]
-    fn at_the_top_the_globe_is_centred_under_the_fly() {
-        // Framing target (fix round 1): at the top altitude the globe's centre projects within
-        // about a tenth of the view's height of the view's centre, and the fly is over the
-        // disc. With the fly 5° below the centre the best possible is the eye straight over the
-        // fly: tan 5° / tan 22.5° / 2 = 10.6 % of the height in landscape (6.4 % in portrait).
-        for aspect in [16.0 / 9.0, 600.0 / 1000.0] {
+    fn the_whole_globe_is_in_frame_at_the_top() {
+        // Owner, M3 Task 14 ("A: globe centred"): at the start altitude (the top) the whole
+        // globe's outline is inside the view, 16:9 and 9:16, nearly centred, and the fly is in
+        // view over the globe's upper part, the eye behind it.
+        for aspect in [16.0 / 9.0, 9.0 / 16.0] {
             let (mut app, cam) = app(aspect);
             set_flight(&mut app, at(GLOBE_MAX_ALTITUDE_KM));
             run(&mut app, 180);
             let t = camera(&app, cam);
             let p = perspective(&app, cam);
-            let clip_from_world = p.get_clip_from_view() * t.to_matrix().inverse();
-            let c = clip_from_world.project_point3(Vec3::ZERO);
-            let share = f64::from(c.y.abs()) / 2.0;
-            assert!(share <= 0.107, "aspect {aspect}: {share} of the height");
-            assert!(c.x.abs() < 1e-3, "aspect {aspect}: {c}");
             let eye = t.translation.as_dvec3();
-            let fly = flight(&app).position_km();
+            // The outline: the circle of points where the eye's rays graze the sphere.
+            let e = eye.length();
+            let axis = eye / e;
+            let centre = axis * (EARTH_RADIUS_KM * EARTH_RADIUS_KM / e);
+            let radius = EARTH_RADIUS_KM * (1.0 - (EARTH_RADIUS_KM / e).powi(2)).sqrt();
+            let u = axis.any_orthonormal_vector();
+            let v = axis.cross(u);
+            for k in 0..128 {
+                let a = std::f64::consts::TAU * f64::from(k) / 128.0;
+                let limb = centre + (u * a.cos() + v * a.sin()) * radius;
+                let (c, ahead) = ndc(&t, &p, limb);
+                assert!(
+                    ahead && c.x.abs() <= 1.0 && c.y.abs() <= 1.0,
+                    "aspect {aspect}: the outline leaves the view at {c}"
+                );
+            }
+            // Nearly centred: the centre within a tenth of the height of the view's centre.
+            let (c, _) = ndc(&t, &p, DVec3::ZERO);
             assert!(
-                meets_globe(eye, (fly - eye).normalize()),
+                c.y.abs() / 2.0 <= 0.1 && c.x.abs() < 1e-3,
+                "aspect {aspect}: {c}"
+            );
+            // The fly in view, in the upper half, over the disc; the eye behind it.
+            let f = flight(&app);
+            let (c, ahead) = ndc(&t, &p, f.position_km());
+            assert!(
+                ahead && c.y > 0.0 && c.y < 0.9 && c.x.abs() < 1e-3,
+                "aspect {aspect}: {c}"
+            );
+            assert!(
+                meets_globe(eye, (f.position_km() - eye).normalize()),
                 "the fly is off the disc"
+            );
+            let back = eye - f.position_km();
+            let rise = back.dot(f.up()).atan2(-back.dot(f.heading)).to_degrees();
+            assert!(
+                rise < GLOBE_CHASE_MAX_ELEVATION_DEG && rise > 60.0,
+                "aspect {aspect}: eye {rise}° up"
             );
         }
     }
@@ -923,22 +966,23 @@ mod tests {
         assert!((offset - hi).abs() < 1e-9, "{offset} vs {hi}");
         drag(&mut app, -1.0, 1);
         assert!(app.world().resource::<GlobeLook>().offset_deg < hi);
-        // The eye's elevation follows: the fly stays 5° below the centre.
+        // The eye's elevation follows: the fly stays where the altitude puts it in the view.
         run(&mut app, 120);
         let (below, _) = seen(&camera(&app, cam), flight(&app).position_km());
-        assert!((below - CHASE_FLY_BELOW_CENTRE_DEG).abs() < 0.05, "{below}");
+        let want = globe_fly_below_centre_deg(3_000.0);
+        assert!((below - want).abs() < 0.05, "{below} vs {want}");
         // Climbing re-clamps the stored offset to the new altitude's range.
         let elevation = globe_chase_elevation_deg(3_000.0) + offset;
         assert!(
-            elevation <= timefly_core::flight::chase::GLOBE_CHASE_MAX_ELEVATION_DEG + 1e-9,
+            elevation <= GLOBE_CHASE_MAX_ELEVATION_DEG + 1e-9,
             "{elevation}"
         );
     }
 
     #[test]
     fn the_chase_follows_travel_rigidly_over_the_globe() {
-        // Steady forward flight at the speed cap: the fly holds its place 5° below the centre
-        // on every frame (a world-space follower would lag behind the turning frame).
+        // Steady forward flight at the speed cap: the fly holds its place in the view on every
+        // frame (a world-space follower would lag behind the turning frame).
         let (mut app, cam) = app(16.0 / 9.0);
         for alt in [GLOBE_MAX_ALTITUDE_KM, DIVE_ALTITUDE_KM] {
             set_flight(&mut app, at(alt));
@@ -949,8 +993,9 @@ mod tests {
             for frame in 0..120 {
                 app.update();
                 let (below, side) = seen(&camera(&app, cam), flight(&app).position_km());
+                let want = globe_fly_below_centre_deg(flight(&app).altitude_km);
                 assert!(
-                    (below - CHASE_FLY_BELOW_CENTRE_DEG).abs() < 0.1 && side.abs() < 1e-3,
+                    (below - want).abs() < 0.1 && side.abs() < 1e-3,
                     "{alt} km, frame {frame}: {below} {side}"
                 );
             }
@@ -987,7 +1032,7 @@ mod tests {
         set_flight(&mut app, at(3_000.0));
         run(&mut app, 3);
         let limit = crate::creature::MAX_PITCH_DEG.to_radians();
-        for (key, sign) in [(KeyCode::Space, 1.0), (KeyCode::ControlLeft, -1.0)] {
+        for (key, sign) in [(KeyCode::Space, 1.0), (KeyCode::KeyQ, -1.0)] {
             app.world_mut()
                 .resource_mut::<ButtonInput<KeyCode>>()
                 .press(key);
@@ -1089,7 +1134,7 @@ mod tests {
         set_flight(&mut app, at(DIVE_ALTITUDE_KM - 1.0));
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::ControlLeft);
+            .press(KeyCode::KeyQ);
         app.update();
         let mut last = flight(&app).altitude_km;
         let mut step = f64::INFINITY;

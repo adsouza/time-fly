@@ -5,6 +5,10 @@ The cloud cost re-measure and the web build used `e3bd6e9`, Task 11's code commi
 tilt-shift (see "Cloud pass cost"). On 2026-11-25 the owner asked for the tilt-shift back, and it
 is back in the game (about 1.8 ms, inside the owner's accepted 2 ms).
 
+**2026-11-26:** the native numbers (`4b79f08`) and the Chrome numbers (`73696b4`) predate Tasks
+12–15: the globe framing, the HUD readout and rose, and the frame-locked flap. The region and
+journey benches will re-run on the merged rivers branch (ruled: not re-run here).
+
 | | |
 |---|---|
 | Machine | Apple M4, 16 GB, macOS 27.2.1 (26B131) |
@@ -21,6 +25,25 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<a root whose assets/ has data, s
 TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=<same> \
   target/release/timefly --journey-bench --target-fps 60 --window 2560x1440
 ```
+
+Since Task 15 (owner, 2026-11-26) the region, journey and scrub benches stop at the first failed
+gate instead of running to the end. The summary still prints: the stops run, the failed gate on a
+`stopped early at stop k of n, <stop>: <gate>` line, and the stops skipped. The run exits 3, as
+for any FAIL. A stop is a region (or a globe pan) in the region bench, a journey in the journey
+bench and a scrub direction in the scrub bench. Gates decided within a stop end the run:
+
+- **Region bench:** a region's R14 flight (gated regions only), its globe pan, its first-entry
+  generation and R11 on the web, or a region that fails to load or is left early. The run stops
+  after that region's block.
+- **Journey bench:** a hold over its native gate, a swap frame over its native gate, a hop's
+  memory over its gate, or a route check. The run stops as soon as the gate fails.
+- **Scrub bench:** the older direction, when its frames fail both pass rules. Then the run has
+  failed whatever pacing the pooled frames show.
+
+Gates that need the whole run are judged at the end, as before: the memory cycles, warm
+generation, and the journey bench's flight (one pacing for the run, from every flight frame
+pooled). Add `--keep-going` (web `?keep-going`) to run every stop and get every verdict. Each
+summary says which mode ran: `on a failed gate: stop` or `on a failed gate: keep going`.
 
 ## Summary
 
@@ -64,7 +87,7 @@ journey memory cycles.
   1.8 ms again.
   - The benches ran on `4b79f08`, which has the tilt-shift, so they match the restored cloud.
 - **Near geometry under the cloud** (Task 7's rule), observed on Metal: PASS (a new GPU test).
-- **Chrome WebGPU:** pending; the controller runs it.
+- **Chrome WebGPU:** both benches PASS in the owner's Chrome, 2026-11-26, at 3840 × 1941 (see "Chrome WebGPU" below).
 - The owner's checks are in `manual-checks.md` and the deferred minors in `deferred.md`, both in
   this folder.
 
@@ -556,49 +579,93 @@ rule). Swap worst 35.17 ms (run 1: 34.35). Hop memory worst +22.0 MiB (run 1: +3
 cube corner (run 1: 98 km). Sites: the canyon 1,097 m deep, Fuji 3,025 m. Journey memory cycles:
 Andes +0.6% (run 1: +5.3%).
 
-## Chrome WebGPU — pending (controller runs this)
+## Chrome WebGPU, 2026-11-26 (the owner's run)
 
-**Not yet run.** The controller runs both benches in the owner's Chrome (an Incognito window, in
-front, hands off; not the Claude app's browser pane, which throttles `requestAnimationFrame`, R23)
-and fills this section in.
+**Both benches PASS.** The owner ran them in Chrome 158 (macOS, `BrowserWebGpu`) against the
+`web-release` build of `73696b4`, served on `127.0.0.1:1334`:
+- The file is `timefly-final2.wasm`: 70,914,334 bytes, sha256 `36f8ca62c887b99f…`.
+- `grep -a -c 'decided without the flight'` finds 1, which proves the build. The in-binary label
+  reads the stale `4b79f08`, as worktree builds do.
 
-**The build.** `web-release` of `ed78ff8` (the final review's fix wave, HEAD), built
-2026-11-25, `timefly-final.wasm` in the SDD scratch folder.
-- `timefly.wasm`: 70,913,241 bytes, sha256
-  `5c9946d65023068e5f1fd43cca22ef96beddb150abdbd08da8b4e9351c68ce62`.
-- `grep -a -c 'Warm-up dragonfly body'` finds 1 (new in the fix wave; the `e3bd6e9` build finds
-  0), and so does the web hop-memory gate's new text ("no growth in any hop of a route's repeat
-  visit"). So the build is HEAD's. (The label in a binary built in this worktree reads a stale
-  SHA, so the string is the proof.)
-- The shaders are served from the tree, which has the tilt-shift (restored in `7c15064`).
-- The web journey bench judges hop memory per route (a route's first visit may grow the linear
-  memory, repeat visits may not), and its memory cycles by what a repeat visit added (spec §10).
+**Render size.** The window was full screen: 3840 × 1941, about 1.29 times the pixels of the
+earlier gated runs' 3200 × 1800 (a 1600 × 900 window at 2×). The numbers below are therefore
+heavier than like-for-like, not lighter.
 
-**To serve it** (from a folder whose `assets/` holds `data` from the main checkout and this
-branch's `shaders` and `credits.txt`; `wasm-server-runner` serves `./assets`):
+### Region bench (session `0852d41b`)
 
-```sh
-cargo build --profile web-release -p timefly --target wasm32-unknown-unknown
-cd <root with assets/{data,shaders,credits.txt}>
-wasm-server-runner <target dir>/wasm32-unknown-unknown/web-release/timefly.wasm
-```
+`result: PASS`.
 
-From the main checkout after the merge, `cd crates/timefly && cargo run --profile web-release
--p timefly --target wasm32-unknown-unknown` does both, as in M2. Checked with curl: `/`,
-`/?region-bench`, `/?journey-bench`, `assets/data/tiles/manifest.json` (353,054 B),
-`assets/data/tiles/overview.tfgrid` (12,430,497 B), `assets/data/globe/manifest.json` and
-`assets/shaders/cloud.wesl` all return 200.
+| Region | First entry (gate ≤ 8,000 ms) | Load worst | Flight median / p95 / worst | Missed (> 50 ms) | Verdict |
+|---|---|---|---|---|---|
+| Pangaea interior (250 Ma) | 1,336 ms | **235.41 ms (R11 ≤ 250: PASS)** | 29.72 / 38.88 / 41.38 ms | 0 | PASS (flight reported only) |
+| Red Sea | 1,426 ms | 29.22 ms | 19.54 / 30.91 / 33.87 ms | 0 | PASS (flight reported only) |
+| Himalayas | 1,126 ms | 31.56 ms | 21.42 / 27.26 / 29.26 ms | 0 | PASS |
+| Sundaland (21 ka) | 1,140 ms | 32.43 ms | 21.93 / 26.92 / 29.12 ms | 0 | PASS |
+| Japan (1 Ma) | 4,411 ms | 31.19 ms | 19.32 / 22.31 / 36.99 ms | 0 | PASS |
+| Beringia (21 ka) | 1,220 ms | 32.56 ms | 20.10 / 24.50 / 27.40 ms | 0 | PASS |
+| Rockies ice margin (21 ka) | 1,806 ms | 32.95 ms | 20.94 / 27.28 / 29.65 ms | 0 | PASS |
+| Panama (3 Ma) | 1,139 ms | 31.02 ms | 18.18 / 20.91 / 24.92 ms | 0 | PASS |
 
-**What to open:**
-- `http://127.0.0.1:1334/?region-bench` (about 13 minutes). Gates: R14 at 30 fps, R11
-  ≤ 250 ms, generation ≤ 8,000 ms, linear memory flat across cycles.
-- `http://127.0.0.1:1334/?journey-bench` (about 5 minutes). Holds are reported against 8 s,
-  flight frames are gated, swap frames are reported, and linear memory must stay flat across the
-  hops of a route's repeat visit (the second Andes journey; a route's first visit may grow it).
-- Watch the cloud during the dives and hops: `cloud.wesl` has no GPU or naga test on WebGPU (the
-  ledger's Task 7 note). Check that near ground under a gathering cloud is veiled, not sharp in
-  front of it (the Chrome side of the near-geometry check above).
+- **The globe pan** from Beringia to the Rockies: 16.63 / 18.26 / 19.75 ms, PASS.
+- **Warm generation** (10 re-entries of the Himalayas): median 1,111 ms, max 1,127 ms, PASS.
+- **Memory cycles:** wasm linear memory stays at 309.5 MiB in every cycle (+0.0%), PASS. It was
+  213.4 MiB before the first entry. The JS heap peaked at 34.8 MiB.
+- **Pangaea's segment medians:** low pass 25.55 ms, climb 34.67 ms, coast run 30.41 ms, apron
+  sweep 30.43 ms, high pass 26.85 ms. The dunes make it the expensive stop, as in M2.
+- **R11 headroom is 15 ms, about 6%,** at this render size. The art pass's like-for-like run read
+  256.08 ms (FAIL) at 3200 × 1800, before M3.
 
-Copy each log from DevTools with M2's one-liner (`performance.md` of `region-m2`, "Chrome WebGPU,
-real Chrome (gated)"), with `'journey bench summary'` in place of `'region bench summary'` for
-the journey bench.
+### Journey bench (session `e7315a0a`)
+
+`result: PASS`. Five journeys, each a dive, two hops and a climb: the Andes, Pangaea interior, the
+Grand Canyon, Mt Fuji, then the Andes again.
+
+- **Holds** (web, reported against 8 s):
+  - dives 1,217–1,882 ms;
+  - hops 1,153–1,916 ms;
+  - climbs 54–75 ms.
+- **Flight outside the cloud,** per route:
+
+  | Route | Median / p95 / worst | Missed (> 50 ms) | Verdict |
+  |---|---|---|---|
+  | Andes | 23.56 / 29.31 / **149.38** ms | 1 | PASS |
+  | Pangaea interior | 30.80 / 33.67 / 40.30 ms | 0 | PASS (reported only) |
+  | Grand Canyon | 22.89 / 26.92 / 29.96 ms | 0 | PASS |
+  | Mt Fuji | 18.24 / 23.14 / 25.27 ms | 0 | PASS |
+
+  The Andes' one 149 ms frame is the run's only stall: 1 of 14,938 frames, 0.01%.
+- **Swap worst frame** (the swap frame and the two after it; reported only, native gate 100 ms):
+  39.11 ms (the Pangaea climb), with every swap at 16–39 ms.
+- **Hop generation, under the flight budget:**
+  - 9.6–11.9 s of wall time.
+  - It takes 3 ms slices while the fly flies the lift, then 12 ms slices under the opaque cloud.
+  - Hop holds stay under 2 s because most of the work is done before the cloud closes.
+- **Hop memory:** +0.0 MiB in every hop, PASS (no growth on a route's repeat visit).
+- **Journey memory cycles:** 288.3 MiB on the globe after every climb, PASS.
+- **Route checks,** PASS:
+  - Fuji's hop 1 lands on a coast, with land at 65% of the neighbour's inner field.
+  - Its hop 2 reaches the cube corner, 95 km from the neighbour's centre.
+- **Sites:**
+  - Grand Canyon: floor 1,041 m and rims 2,509 / 2,145 m, so 1,104 m deep.
+  - Fuji: 3,024 m at the site.
+
+### Seen during the run (the owner's observations)
+
+- **About 40 fps in Pangaea at full screen.** That matches the 29.7 ms median above.
+- **The wings sometimes flutter slowly.**
+  - `dragonfly.wesl` flaps at a fixed 25 Hz of virtual time.
+  - Sampled at the frame rate, that aliases: about 1 Hz at 26 fps, 5 Hz at 30, and a slow
+    shimmer near 50 fps.
+  - Fixed in Task 13: the flap now steps 0.4 of a cycle every frame (`globals.frame_count`),
+    so it reads fast at any frame rate.
+- **Sometimes no wings at all during descents.**
+  - Reproduced in Task 13 (`region_tour … descent 20000`). A full-speed descent pitches the fly
+    20° nose down, and the chase eye sits 20° above its horizon, so the camera looks straight
+    along the body axis. The flap turns the wings about that axis, so the flat wings stayed
+    edge-on: 0.05° to the view, and only the body's end showed, clear or in the cloud
+    (`wings-before-descent.jpg`, `wings-before-descent-cloud.jpg`). The cloud was not the cause.
+  - Fixed: each wing is pitched 20° leading edge up, so it shows at least 20° to that view
+    (`wings-after-descent.jpg`, `wings-after-descent-cloud.jpg`) and 40° in level flight
+    (`wings-after-level.jpg`).
+- **The cloud over near geometry** (the Chrome side of the check above): not reported. Still to
+  check in Chrome.

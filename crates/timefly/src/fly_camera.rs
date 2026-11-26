@@ -4,7 +4,8 @@
 //!
 //! The controls: `W` `A` `S` `D` move the fly level along its heading, a drag turns it and
 //! tilts the view (dragging down looks further down, as in M2; the pitch never tilts the
-//! flight path), `Space` / `E` climb and `Ctrl` / `Q` descend. The arrow keys also fly: `↑` / `↓` forward and back,
+//! flight path), `Space` / `E` climb and `Q` or `Ctrl` (`Option` on a Mac,
+//! [`descend_modifiers`]) descend. The arrow keys also fly: `↑` / `↓` forward and back,
 //! `←` / `→` turn, and with `Shift` held `←` / `→` fly sideways instead. `Shift` with forward
 //! (`↑` or `W`) boosts; `Shift` alone, or with any other direction, does not.
 //!
@@ -348,9 +349,46 @@ pub struct KeyInput {
     pub boost: bool,
 }
 
+/// Whether `navigator.platform` names a Mac (`"MacIntel"` in every current Mac browser).
+pub fn is_mac_platform(platform: &str) -> bool {
+    platform.starts_with("Mac")
+}
+
+/// Whether the game runs on a Mac: natively by the target, on the web by `navigator.platform`
+/// (read once). A Mac browser has the native app's clash (Mission Control is the system's, so a
+/// page cannot take the keys back), and elsewhere a browser's `Alt` with the arrows is Back and
+/// Forward, so the web follows the machine, not the build.
+pub fn platform_is_mac() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MAC.get_or_init(|| {
+            web_sys::window()
+                .and_then(|w| w.navigator().platform().ok())
+                .is_some_and(|p| is_mac_platform(&p))
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        cfg!(target_os = "macos")
+    }
+}
+
+/// The modifier keys that descend (with `Q`, everywhere): `Option` on a Mac, where `Ctrl+↑`
+/// opens Mission Control and `Ctrl+←` / `→` switch Spaces; `Ctrl` elsewhere. Not `Cmd`: `⌘Q`
+/// quits, and `Q` is the other descend key.
+pub fn descend_modifiers(mac: bool) -> [KeyCode; 2] {
+    if mac {
+        [KeyCode::AltLeft, KeyCode::AltRight]
+    } else {
+        [KeyCode::ControlLeft, KeyCode::ControlRight]
+    }
+}
+
 /// The held keys as flight input:
 /// - `W` / `↑` forward, `S` / `↓` back, `A` / `D` sideways;
-/// - `Space` / `E` up, `Ctrl` / `Q` down;
+/// - `Space` / `E` up, `Q` or the descend modifier ([`descend_modifiers`]: `Option` on a Mac,
+///   `Ctrl` elsewhere) down;
 /// - `←` / `→` turn, or fly sideways while `Shift` is held;
 /// - `Shift` with forward boosts. It boosts nothing else, since with the arrows it means
 ///   "sideways".
@@ -368,7 +406,7 @@ pub fn keys_to_input(keys: &ButtonInput<KeyCode>) -> KeyInput {
         ),
         axis(
             held(&[KeyCode::Space, KeyCode::KeyE]),
-            held(&[KeyCode::ControlLeft, KeyCode::ControlRight, KeyCode::KeyQ]),
+            held(&descend_modifiers(platform_is_mac())) || held(&[KeyCode::KeyQ]),
         ),
         axis(
             held(&[KeyCode::KeyS, KeyCode::ArrowDown]),
@@ -552,7 +590,7 @@ impl FlyChase {
 
 /// Places the region camera behind and above [`FlyState`] (smoothed, and always clear of the
 /// ground) and writes the dragonfly's [`FlyPose`] and the overlay's [`FlyAltitude`].
-fn apply_fly(
+pub(crate) fn apply_fly(
     fly: Res<FlyState>,
     scene: Option<Res<TerrainScene>>,
     time: Res<Time>,
@@ -1073,6 +1111,47 @@ mod tests {
     }
 
     #[test]
+    fn descend_is_option_on_macos_and_ctrl_elsewhere() {
+        // On a Mac `Ctrl+↑` opens Mission Control (and `Ctrl+←/→` switch Spaces), so descend is
+        // `Option` there; `Ctrl` elsewhere. Not `Cmd`: `⌘Q` quits, and `Q` descends too.
+        let option = [KeyCode::AltLeft, KeyCode::AltRight];
+        let ctrl = [KeyCode::ControlLeft, KeyCode::ControlRight];
+        assert_eq!(descend_modifiers(true), option);
+        assert_eq!(descend_modifiers(false), ctrl);
+        // The web asks `navigator.platform`.
+        for (platform, mac) in [
+            ("MacIntel", true),
+            ("MacPPC", true),
+            ("Win32", false),
+            ("Linux x86_64", false),
+            ("iPhone", false),
+            ("", false),
+        ] {
+            assert_eq!(is_mac_platform(platform), mac, "{platform:?}");
+        }
+        // Natively, the target decides.
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(platform_is_mac(), mac);
+        let (descends, inert) = if mac { (option, ctrl) } else { (ctrl, option) };
+        for key in descends.into_iter().chain([KeyCode::KeyQ]) {
+            assert_eq!(
+                held(&[key]).move_local,
+                Vec3::new(0.0, -1.0, 0.0),
+                "{key:?}"
+            );
+        }
+        for key in inert {
+            assert_eq!(held(&[key]).move_local, Vec3::ZERO, "{key:?}");
+        }
+        // Descending while flying forward with the arrow: the case Mission Control took.
+        let modifier = descends[0];
+        assert_eq!(
+            held(&[modifier, KeyCode::ArrowUp]).move_local,
+            Vec3::new(0.0, -1.0, -1.0)
+        );
+    }
+
+    #[test]
     fn arrows_move_forward_and_back_and_turn() {
         let forward = held(&[KeyCode::ArrowUp]);
         assert_eq!(forward.move_local, Vec3::new(0.0, 0.0, -1.0));
@@ -1558,12 +1637,10 @@ mod tests {
         }
 
         /// Descends with the keys held (boosted forward, so it also crosses the water) until the
-        /// height stops changing; returns every frame's fly and camera positions.
+        /// height stops changing; returns every frame's fly and camera positions. `Q` descends on
+        /// every platform (the descend modifier is `Option` on a Mac, `Ctrl` elsewhere).
         fn descend(app: &mut App) -> Vec<(Vec3, Vec3)> {
-            flying(
-                app,
-                &[KeyCode::ControlLeft, KeyCode::KeyW, KeyCode::ShiftLeft],
-            );
+            flying(app, &[KeyCode::KeyQ, KeyCode::KeyW, KeyCode::ShiftLeft]);
             let mut frames = Vec::new();
             for _ in 0..3_000 {
                 app.update();

@@ -446,7 +446,11 @@ fn track_idle(
     mut idle: ResMut<UiIdle>,
     mut opacity: ResMut<UiOpacity>,
 ) {
-    let key = keys.is_some_and(|k| k.get_just_pressed().next().is_some());
+    // The bug-shot key does not wake the UI: the shot shows the screen as the player had it.
+    let key = keys.is_some_and(|k| {
+        k.get_just_pressed()
+            .any(|&c| c != super::bug_shot::SHOT_KEY)
+    });
     let button = mouse.is_some_and(|m| m.get_pressed().next().is_some());
     let scrolled = scroll.is_some_and(|s| s.delta != Vec2::ZERO);
     // The root's `Hovered` covers the label, track and captions (it includes descendants).
@@ -798,6 +802,13 @@ mod tests {
         }
         let idle = app.world().resource::<UiIdle>().idle_secs;
         assert!((idle - 3.1).abs() < 1e-3, "{idle}");
+        assert_eq!(app.world().resource::<UiOpacity>().0, IDLE_OPACITY);
+
+        // A bug shot (F12) pictures the screen as it was: the faded UI stays faded.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(super::super::bug_shot::SHOT_KEY);
+        app.update();
         assert_eq!(app.world().resource::<UiOpacity>().0, IDLE_OPACITY);
 
         app.world_mut()

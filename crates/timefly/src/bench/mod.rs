@@ -19,6 +19,14 @@
 //! On native it exits after logging: 0 on PASS, [`FAILED_RESULT_EXIT_CODE`] on FAIL (a result,
 //! not a crash, so the next launch shows no crash notice).
 //!
+//! **Stopping early (Task 15).** Every bench stops at its first failed gate, still printing its
+//! report with the stops run, the failed gate and the stops skipped ([`stopped_early_lines`]),
+//! and exits [`FAILED_RESULT_EXIT_CODE`]. A gate is judged early only when its failure is
+//! final; gates that need the whole run are judged at the end, as before. Here the older
+//! direction stops the run when it fails both pass rules ([`fails_every_rule`]), so the run has
+//! failed whatever pacing the pooled frames show. `--keep-going` (web `?keep-going`) runs to the
+//! end.
+//!
 //! The region bench (`--region-bench`, web `?region-bench`) lives in [`region`] and shares the
 //! statistics, the pass rule, the block's header and the exit codes; so does the journey bench
 //! (`--journey-bench`, web `?journey-bench`), in [`journey`].
@@ -43,6 +51,8 @@ use crate::time::{GlobeTime, TimeChangeCause, TimeChanged};
 
 /// Seconds per scrub direction.
 pub const SCRUB_SECS: f64 = 20.0;
+/// The scrub's stops, for a report that stopped early: its two directions.
+const SCRUB_STOPS: [&str; 2] = ["older (present -> 540 Ma)", "younger (540 Ma -> present)"];
 /// Seconds between the first interactive frame and the start of the scrub.
 pub const SETTLE_SECS: f64 = 1.0;
 /// Default frame-rate targets (spec): 60 fps on desktop, 30 fps in the browser.
@@ -143,6 +153,57 @@ pub fn passes(frame_ms: &[f32], target_fps: u32, pacing: Pacing) -> bool {
                 && stats.median_ms <= (1.0 + MEDIAN_TOLERANCE) * frame_budget_ms(target_fps)
         }
     }
+}
+
+/// Whether `frame_ms` fails under both pass rules, so that a run judged by either has failed
+/// (empty frames fail both).
+pub fn fails_every_rule(frame_ms: &[f32], target_fps: u32) -> bool {
+    !passes(frame_ms, target_fps, Pacing::DisplayPaced)
+        && !passes(frame_ms, target_fps, Pacing::Uncapped)
+}
+
+/// Where a run stopped at its first failed gate: how many of its stops ran (the last is the one
+/// that failed) and what failed, as the report names it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EarlyStop {
+    pub stops_run: usize,
+    pub gate: String,
+}
+
+/// The report's line on what a failed gate does to the run (`--keep-going`).
+pub fn on_failure_line(keep_going: bool) -> String {
+    if keep_going {
+        "on a failed gate: keep going (--keep-going)".to_string()
+    } else {
+        "on a failed gate: stop (--keep-going runs every stop)".to_string()
+    }
+}
+
+/// The report's lines for a run that stopped early, over its `stops` in order: where it stopped
+/// and on what gate, the stops run, and the stops skipped (`then` names what would have followed
+/// them, if anything).
+pub fn stopped_early_lines(stop: &EarlyStop, stops: &[String], then: Option<&str>) -> [String; 3] {
+    let n = stops.len();
+    let k = stop.stops_run.clamp(1, n.max(1)).min(n);
+    let (run, skipped) = stops.split_at(k);
+    [
+        format!(
+            "stopped early at stop {k} of {n}, {}: {}; --keep-going runs every stop",
+            run.last().map_or("before the first stop", String::as_str),
+            stop.gate
+        ),
+        format!("stops run: {k} of {n}: {}", run.join(", ")),
+        format!(
+            "stops skipped: {}: {}{}",
+            skipped.len(),
+            if skipped.is_empty() {
+                "none".to_string()
+            } else {
+                skipped.join(", ")
+            },
+            then.map_or(String::new(), |t| format!("; and {t}"))
+        ),
+    ]
 }
 
 /// Milliseconds per frame at `fps`.
@@ -325,6 +386,8 @@ enum Phase {
 pub struct ScrubBench {
     pub target_fps: u32,
     pub exit_when_done: bool,
+    /// `--keep-going`: scrub back even after the first direction has failed.
+    pub keep_going: bool,
     phase: Phase,
     phase_started: Option<Instant>,
     /// From diagnostics start (just after the app starts) to the first interactive frame.
@@ -335,15 +398,20 @@ pub struct ScrubBench {
     younger_ms: Vec<f32>,
     bridge_ms: Vec<f32>,
     memory: MemoryTrack,
+    /// Whether the older direction has been judged for an early stop (once, at its end).
+    older_judged: bool,
+    /// Where the run stopped at its first failed gate, if it did.
+    stopped: Option<EarlyStop>,
     /// The block, once logged.
     report: Option<String>,
 }
 
 impl ScrubBench {
-    pub fn new(target_fps: u32, exit_when_done: bool) -> Self {
+    pub fn new(target_fps: u32, exit_when_done: bool, keep_going: bool) -> Self {
         ScrubBench {
             target_fps,
             exit_when_done,
+            keep_going,
             phase: Phase::WaitingForGlobe,
             phase_started: None,
             cold_load_secs: None,
@@ -352,6 +420,8 @@ impl ScrubBench {
             younger_ms: Vec::new(),
             bridge_ms: Vec::new(),
             memory: MemoryTrack::default(),
+            older_judged: false,
+            stopped: None,
             report: None,
         }
     }
@@ -402,12 +472,17 @@ pub(crate) fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 pub struct ScrubBenchPlugin {
     pub target_fps: u32,
     pub exit_when_done: bool,
+    pub keep_going: bool,
 }
 
 impl Plugin for ScrubBenchPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ScrubBench::new(self.target_fps, self.exit_when_done))
-            .add_systems(PreUpdate, drive_scrub_bench);
+        app.insert_resource(ScrubBench::new(
+            self.target_fps,
+            self.exit_when_done,
+            self.keep_going,
+        ))
+        .add_systems(PreUpdate, drive_scrub_bench);
     }
 }
 
@@ -464,6 +539,39 @@ fn drive_scrub_bench(
             let elapsed = now
                 .duration_since(bench.phase_started.unwrap_or(now))
                 .as_secs_f64();
+            let display = || {
+                let window = windows.single().ok();
+                DisplayInfo {
+                    size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
+                    present_mode: window.map(|w| w.present_mode),
+                    refresh_hz: monitors
+                        .iter()
+                        .next()
+                        .and_then(|m| m.refresh_rate_millihertz)
+                        .map(|mhz| mhz as f32 / 1000.0),
+                }
+            };
+            // The older direction is over: judged once, before this frame (the younger
+            // direction's first) is recorded.
+            if elapsed > SCRUB_SECS && !bench.older_judged {
+                bench.older_judged = true;
+                if !bench.keep_going && fails_every_rule(&bench.older_ms, bench.target_fps) {
+                    warn!("scrub bench: the older direction failed, stopping early");
+                    bench.stopped = Some(EarlyStop {
+                        stops_run: 1,
+                        gate: "its frames fail both pass rules".to_string(),
+                    });
+                    let (report, pass) = report_block(
+                        &bench,
+                        session.as_deref(),
+                        data.as_deref(),
+                        adapter.as_deref(),
+                        &display(),
+                    );
+                    bench.finish(report, pass, &mut exit);
+                    return;
+                }
+            }
             // This frame's time belongs to the age shown since the last frame.
             let frame_ms = real.delta_secs() * 1000.0;
             let shown = time.years.0;
@@ -482,22 +590,12 @@ fn drive_scrub_bench(
                 bench.younger_ms.push(frame_ms);
             }
             if elapsed > 2.0 * SCRUB_SECS {
-                let window = windows.single().ok();
-                let display = DisplayInfo {
-                    size: window.map(|w| UVec2::new(w.physical_width(), w.physical_height())),
-                    present_mode: window.map(|w| w.present_mode),
-                    refresh_hz: monitors
-                        .iter()
-                        .next()
-                        .and_then(|m| m.refresh_rate_millihertz)
-                        .map(|mhz| mhz as f32 / 1000.0),
-                };
                 let (report, pass) = report_block(
                     &bench,
                     session.as_deref(),
                     data.as_deref(),
                     adapter.as_deref(),
-                    &display,
+                    &display(),
                 );
                 bench.finish(report, pass, &mut exit);
                 return;
@@ -644,7 +742,9 @@ fn report_block(
     );
     let pacing = pacing(web, uncapped_requested, display.refresh_hz, median_all);
     let bridge = frame_time_stats(&bench.bridge_ms);
-    let pass = passes(&bench.older_ms, fps, pacing) && passes(&bench.younger_ms, fps, pacing);
+    let pass = bench.stopped.is_none()
+        && passes(&bench.older_ms, fps, pacing)
+        && passes(&bench.younger_ms, fps, pacing);
     let size = display.size;
     let mut out = header_lines(session, adapter);
     if let Some(size) = size {
@@ -715,6 +815,7 @@ fn report_block(
         }
     ));
     out.push(format!("target: {fps} fps (interval {interval:.2} ms)"));
+    out.push(on_failure_line(bench.keep_going));
     out.push(match pacing {
         Pacing::DisplayPaced => format!(
             "pass rule (display-paced): missed frames (>{:.1} ms) <= {:.0}% and median <= {:.2} ms (interval +{:.0}%)",
@@ -731,12 +832,16 @@ fn report_block(
         fps,
         pacing,
     ));
-    out.extend(direction_lines(
-        "younger (540 Ma -> present)",
-        &bench.younger_ms,
-        fps,
-        pacing,
-    ));
+    if bench.stopped.is_some() {
+        out.push("younger (540 Ma -> present): not run".to_string());
+    } else {
+        out.extend(direction_lines(
+            "younger (540 Ma -> present)",
+            &bench.younger_ms,
+            fps,
+            pacing,
+        ));
+    }
     out.push(format!(
         "bridge (26-30 ka, both directions): frames {}, median {:.2} ms, worst {:.2} ms, stalls {}",
         bridge.frames,
@@ -744,14 +849,25 @@ fn report_block(
         bridge.worst_ms,
         stall_count(&bench.bridge_ms, fps)
     ));
-    out.push(format!(
-        "result: {} (decided by the {} rule)",
-        if pass { "PASS" } else { "FAIL" },
-        match pacing {
-            Pacing::DisplayPaced => "display-paced missed-frame",
-            Pacing::Uncapped => "uncapped p95",
-        }
-    ));
+    if let Some(stop) = &bench.stopped {
+        out.extend(stopped_early_lines(
+            stop,
+            &SCRUB_STOPS.map(String::from),
+            None,
+        ));
+    }
+    out.push(if bench.stopped.is_some() {
+        "result: FAIL (stopped early: the older direction fails under either rule)".to_string()
+    } else {
+        format!(
+            "result: {} (decided by the {} rule)",
+            if pass { "PASS" } else { "FAIL" },
+            match pacing {
+                Pacing::DisplayPaced => "display-paced missed-frame",
+                Pacing::Uncapped => "uncapped p95",
+            }
+        )
+    });
     out.push("===== end scrub bench =====".to_string());
     (out.join("\n"), pass)
 }
@@ -916,6 +1032,10 @@ mod tests {
     }
 
     fn bench_app(status: GlobeRenderStatus, exit_when_done: bool) -> App {
+        scrub_app(status, exit_when_done, false)
+    }
+
+    fn scrub_app(status: GlobeRenderStatus, exit_when_done: bool, keep_going: bool) -> App {
         let mut app = App::new();
         app.init_resource::<Time<Real>>()
             .init_resource::<GlobeTime>()
@@ -925,8 +1045,95 @@ mod tests {
             .add_plugins(ScrubBenchPlugin {
                 target_fps: 60,
                 exit_when_done,
+                keep_going,
             });
         app
+    }
+
+    /// A scrub bench `secs` into its scrub, its older direction's frames already `older_ms`.
+    fn scrubbed_for(app: &mut App, secs: f64, older_ms: Vec<f32>) {
+        let mut bench = app.world_mut().resource_mut::<ScrubBench>();
+        bench.phase = Phase::Scrubbing;
+        bench.phase_started = Some(Instant::now() - std::time::Duration::from_secs_f64(secs));
+        bench.older_ms = older_ms;
+    }
+
+    #[test]
+    fn a_failed_direction_stops_the_scrub_bench() {
+        // 40 ms frames at a 60 fps target fail under either pass rule, so the run has failed
+        // whatever pacing the pooled frames would show: it stops instead of scrubbing back.
+        let mut app = scrub_app(
+            GlobeRenderStatus::Interactive { first_frame: 1 },
+            true,
+            false,
+        );
+        scrubbed_for(&mut app, SCRUB_SECS + 0.5, vec![40.0; 100]);
+        app.update();
+        assert_eq!(exits(&app), vec![bench_exit(false)]);
+        let bench = app.world().resource::<ScrubBench>();
+        assert!(bench.younger_ms.is_empty(), "{:?}", bench.younger_ms);
+        let report = bench.report().expect("a report");
+        for line in [
+            "\non a failed gate: stop (--keep-going runs every stop)\n",
+            "\nolder   (present -> 540 Ma): frames 100, ",
+            "\nyounger (540 Ma -> present): not run\n",
+            "\nstopped early at stop 1 of 2, older (present -> 540 Ma): its frames fail both pass rules; --keep-going runs every stop\n",
+            "\nstops run: 1 of 2: older (present -> 540 Ma)\n",
+            "\nstops skipped: 1: younger (540 Ma -> present)\n",
+            "\nresult: FAIL (stopped early: the older direction fails under either rule)\n",
+        ] {
+            assert!(report.contains(line), "missing {line:?} in\n{report}");
+        }
+        assert!(report.ends_with("===== end scrub bench ====="), "{report}");
+
+        // A direction that passes either rule scrubs on: it may still pass under the pooled
+        // frames' pacing.
+        for older in [vec![16.0; 100], vec![16.67 + 0.5; 100], {
+            // Jitter over the interval fails the uncapped rule, not the display-paced one.
+            (0..100)
+                .map(|i| if i % 2 == 0 { 15.0 } else { 18.0 })
+                .collect()
+        }] {
+            let mut app = scrub_app(
+                GlobeRenderStatus::Interactive { first_frame: 1 },
+                true,
+                false,
+            );
+            scrubbed_for(&mut app, SCRUB_SECS + 0.5, older.clone());
+            app.update();
+            let bench = app.world().resource::<ScrubBench>();
+            assert!(bench.report().is_none(), "{older:?}");
+            assert_eq!(bench.younger_ms.len(), 1);
+        }
+    }
+
+    #[test]
+    fn keep_going_scrubs_both_directions() {
+        let mut app = scrub_app(
+            GlobeRenderStatus::Interactive { first_frame: 1 },
+            true,
+            true,
+        );
+        scrubbed_for(&mut app, SCRUB_SECS + 0.5, vec![40.0; 100]);
+        app.update();
+        assert!(exits(&app).is_empty());
+        assert!(app.world().resource::<ScrubBench>().report().is_none());
+        // Past the end of the scrub back: the report, with both directions.
+        let started = Instant::now() - std::time::Duration::from_secs_f64(2.0 * SCRUB_SECS + 0.5);
+        app.world_mut().resource_mut::<ScrubBench>().phase_started = Some(started);
+        app.update();
+        assert_eq!(exits(&app), vec![bench_exit(false)]);
+        let report = app.world().resource::<ScrubBench>().report().unwrap();
+        assert!(
+            report.contains("\non a failed gate: keep going (--keep-going)\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\nyounger (540 Ma -> present): frames 2, "),
+            "{report}"
+        );
+        assert!(!report.contains("stopped early"), "{report}");
+        assert!(report.contains("\nresult: FAIL"), "{report}");
     }
 
     fn exits(app: &App) -> Vec<AppExit> {

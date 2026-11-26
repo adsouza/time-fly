@@ -1,12 +1,14 @@
-//! The game's UI: the time slider, the loading/failure status, the credits overlay, and the
-//! altitude and frame-rate readouts.
+//! The game's UI: the time slider, the loading/failure status, the credits overlay, the
+//! altitude and frame-rate readouts, the position readout and compass rose, and bug shots.
 //!
 //! Each plugin keeps its decisions in pure functions (unit-tested directly); the systems only
 //! gather input, call them and apply the result.
 
 pub mod altitude;
+pub mod bug_shot;
 pub mod credits;
 pub mod fps;
+pub mod position;
 pub mod slider;
 pub mod status;
 
@@ -35,8 +37,9 @@ pub struct PointerOverUi(pub bool);
 #[require(Hovered)]
 pub struct BlocksCamera;
 
-/// Plugins: slider, status, credits and the readouts, plus the pointer-over-UI
-/// tracking they share.
+/// Plugins: slider, status, credits, the readouts and bug shots, plus the pointer-over-UI
+/// tracking they share. (The `--from-shot` repro, [`bug_shot::ShotRestorePlugin`], is added by
+/// `crate::app`.)
 pub struct GameUiPlugins;
 
 impl Plugin for GameUiPlugins {
@@ -47,6 +50,8 @@ impl Plugin for GameUiPlugins {
             CreditsPlugin,
             FpsOverlayPlugin,
             altitude::AltitudeOverlayPlugin,
+            position::PositionOverlayPlugin,
+            bug_shot::BugShotPlugin,
         ))
         .init_resource::<PointerOverUi>()
         .add_systems(PreUpdate, track_pointer_over_ui);

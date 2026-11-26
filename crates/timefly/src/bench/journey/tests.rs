@@ -216,7 +216,7 @@ fn the_globe_keys_fly_to_the_region_and_descend_to_the_dive() {
     }
     // Over the region, the keys only descend.
     let over = GlobeFlight::start(46.5, 10.0);
-    assert_eq!(globe_keys(&over, target), [KeyCode::ControlLeft]);
+    assert_eq!(globe_keys(&over, target), [KeyCode::KeyQ]);
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn the_region_keys_descend_in_place_then_turn_east_and_fly_out_steadily() {
     // puts it higher above the ground does not stop it.
     assert_eq!(
         region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, false, EAST_YAW),
-        [KeyCode::ControlLeft]
+        [KeyCode::KeyQ]
     );
     assert_eq!(
         region_keys(&NavPhase::Flying, EAST_YAW, 25_000.0, true, EAST_YAW),
@@ -827,4 +827,110 @@ fn an_ungated_routes_flight_never_fails_the_run() {
     let verdicts = judge_flight_by_route(&config, &ms, &cycles, 60, native_60hz);
     assert!(!verdicts[1].pass && !verdicts[1].gated);
     assert!(flight_by_route_passes(&verdicts));
+}
+
+#[test]
+fn the_gates_a_journey_decides_stop_the_run_once_failed() {
+    let mib = |m: u64| Some(m << 20);
+    let config = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    let fresh = || JourneyBench::new(config.clone());
+    let none = |b: &JourneyBench, web| failed_journey_gate(b, web).is_none();
+
+    // A hold over 3 s natively, once it has ended; the web only reports holds.
+    let mut b = fresh();
+    b.start_hold(Transition::Hop(1), 0);
+    b.holds[0].clock.observe(10.0, 1.0);
+    assert!(none(&b, false), "still in the hold");
+    b.holds[0].clock.observe(13.5, 0.5);
+    assert_eq!(
+        failed_journey_gate(&b, false).as_deref(),
+        Some("hold: hop 1 3500 ms (cycle 1) -> FAIL")
+    );
+    assert!(none(&b, true));
+    let mut b = fresh();
+    b.start_hold(Transition::Dive, 0);
+    b.holds[0].clock.observe(10.0, 1.0);
+    b.holds[0].clock.observe(12.0, 0.5);
+    assert!(none(&b, false), "a hold within its gate");
+
+    // A swap over 100 ms natively, once its window has closed.
+    let swap = |worst_ms, frames_left| SwapRecord {
+        transition: Transition::Climb,
+        cycle: 0,
+        worst_ms,
+        frames_left,
+    };
+    let mut b = fresh();
+    b.swaps.push(swap(150.0, 1));
+    assert!(none(&b, false), "the window is still open");
+    b.swaps[0].frames_left = 0;
+    assert_eq!(
+        failed_journey_gate(&b, false).as_deref(),
+        Some("swap worst frame: climb 150.00 ms (cycle 1) -> FAIL")
+    );
+    assert!(none(&b, true), "reported only on the web");
+    b.swaps[0].worst_ms = 99.0;
+    assert!(none(&b, false));
+
+    // A hop's memory, once the hop is over: natively its peak over the baseline.
+    let hop = |baseline, peak, end, open| HopRecord {
+        cycle: 0,
+        hop: 1,
+        baseline,
+        peak,
+        end,
+        open,
+        ..default()
+    };
+    let mut b = fresh();
+    b.hops.push(hop(mib(100), mib(170), mib(110), true));
+    assert!(none(&b, false), "the hop is still open");
+    b.hops[0].open = false;
+    assert_eq!(
+        failed_journey_gate(&b, false).as_deref(),
+        Some("hop memory peak: hop 1 +70.0 MiB (cycle 1) -> FAIL")
+    );
+    b.hops[0].peak = mib(160);
+    assert!(none(&b, false), "+60 MiB is within +64");
+    b.hops[0].peak = None;
+    assert!(none(&b, false), "no sample, no verdict");
+    // On the web only a repeat visit's hop is judged, by its growth.
+    let repeat = JourneyBenchConfig {
+        journeys: vec![0, 0],
+        ..config.clone()
+    };
+    let mut b = JourneyBench::new(repeat);
+    b.hops.push(HopRecord {
+        cycle: 1,
+        ..hop(mib(100), mib(170), mib(101), false)
+    });
+    assert_eq!(
+        failed_journey_gate(&b, true).as_deref(),
+        Some("hop memory peak: hop 1 +1.0 MiB (cycle 2) -> FAIL")
+    );
+    b.hops[0].cycle = 0;
+    assert!(none(&b, true), "a first visit may grow the memory");
+
+    // A route check, once its hop is over and the region it left read.
+    let corner = JourneyRoute {
+        crosses: &[(1, Crossing::Corner)],
+        ..ALPS_ROUTE
+    };
+    let mut b = JourneyBench::new(JourneyBenchConfig::single(60, true, corner));
+    b.hops.push(HopRecord {
+        centre: Some(RenderDir(dir(46.5, 12.0))),
+        ..hop(None, None, None, false)
+    });
+    assert!(none(&b, false), "the region is not read yet");
+    b.hops[0].land_share = Some(1.0);
+    let gate = failed_journey_gate(&b, false).unwrap();
+    assert!(
+        gate.starts_with("route check: hop 1 (cycle 1): cube corner ") && gate.ends_with(" FAIL"),
+        "{gate}"
+    );
+    assert_eq!(
+        failed_journey_gate(&b, true),
+        Some(gate),
+        "gated on the web too"
+    );
 }

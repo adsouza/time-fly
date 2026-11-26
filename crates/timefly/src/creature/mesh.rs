@@ -5,6 +5,10 @@
 //! along `±x` and `+y` is up. The body is 1 unit long, so the drawn scale is the body length
 //! (`timefly_core::flight::chase::fly_scale`). Every vertex carries [`ATTRIBUTE_WING`] (`0` on
 //! the body, `1` on a wing) for the shader's flap, and a vertex colour: iridescent blue-green.
+//!
+//! Each wing is a flat quad pitched leading edge up by [`WING_INCIDENCE_DEG`], so its plane never
+//! holds the body axis. The flap turns the wings about that axis, so a wing plane that held it
+//! would stay edge-on to a view along it, whatever the flap.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, MeshVertexAttribute, PrimitiveTopology};
@@ -29,8 +33,14 @@ const BODY_RINGS: [(f32, f32); 8] = [
 ];
 /// Sides of each body ring.
 const BODY_SIDES: u32 = 6;
-/// The wings' height above the body axis.
+/// The wings' height above the body axis, at each wing's mid-chord.
 const WING_Y: f32 = 0.03;
+/// Each wing's pitch about its own span, leading edge up (degrees) *(call)*. The chase eye sits
+/// `CHASE_ELEVATION_DEG` (20°) above the fly's horizon and a full-speed descent pitches the fly
+/// `MAX_PITCH_DEG` (20°) nose down, so the camera then looks straight along the body axis: flat
+/// wings in the body plane were edge-on there whatever the flap (it turns them about that axis).
+/// Pitched, they show at least this angle to that view, and about twice it in level flight.
+pub const WING_INCIDENCE_DEG: f32 = 20.0;
 /// Each right wing as `[root front, root back, tip back, tip front]` in `(x, z)`; the left ones
 /// mirror them. Fore and hind wings meet at the thorax, each about half the body long.
 const WINGS: [[[f32; 2]; 4]; 2] = [
@@ -106,17 +116,24 @@ fn body() -> Part {
 }
 
 /// The four wings: flat quads with their own vertices (so each is its own piece), pale and
-/// iridescent, blue-green at the root shading to blue at the tip.
+/// iridescent, blue-green at the root shading to blue at the tip, each pitched
+/// [`WING_INCIDENCE_DEG`] leading edge up about the line across its mid-chord.
 fn wings() -> Part {
     let mut part = Part::default();
     let root = [0.30, 0.62, 0.55, 1.0];
     let tip = [0.35, 0.55, 0.85, 1.0];
+    let (sin, cos) = WING_INCIDENCE_DEG.to_radians().sin_cos();
+    let rise = sin / cos;
     for side in [1.0f32, -1.0] {
         for wing in WINGS {
             let base = part.positions.len() as u32;
+            let mid_z = wing.iter().map(|[_, z]| z).sum::<f32>() / wing.len() as f32;
             for (i, [x, z]) in wing.into_iter().enumerate() {
-                part.positions.push([side * x, WING_Y, z]);
-                part.normals.push([0.0, 1.0, 0.0]);
+                // Ahead of the mid-chord (toward −z) is higher: the plane y + rise·z = const,
+                // whose normal (0, cos, sin) leans back toward the chase eye.
+                part.positions
+                    .push([side * x, WING_Y + (mid_z - z) * rise, z]);
+                part.normals.push([0.0, cos, sin]);
                 part.colors.push(if i < 2 { root } else { tip });
                 part.wing.push(1.0);
             }
@@ -228,6 +245,29 @@ mod tests {
         for tri in indices(&mesh).chunks(3) {
             let parts: Vec<f32> = tri.iter().map(|&i| wing[i]).collect();
             assert!(parts.iter().all(|&w| w == parts[0]), "{tri:?} mixes parts");
+        }
+        // Each wing is flat, pitched leading edge up by WING_INCIDENCE_DEG, and lit by its own
+        // plane's normal.
+        let normals = mesh
+            .attribute(Mesh::ATTRIBUTE_NORMAL)
+            .and_then(|a| a.as_float3())
+            .expect("normals");
+        let incidence = WING_INCIDENCE_DEG.to_radians();
+        let want = Vec3::new(0.0, incidence.cos(), incidence.sin());
+        for tri in indices(&mesh).chunks(3).filter(|t| wing[t[0]] == 1.0) {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| Vec3::from(p[i]));
+            let face = (b - a).cross(c - a).normalize();
+            assert!(
+                face.abs_diff_eq(want, 1e-5),
+                "{tri:?}: face {face}, want {want}"
+            );
+            for &i in tri {
+                assert!(
+                    Vec3::from(normals[i]).abs_diff_eq(want, 1e-5),
+                    "{i}: {:?}",
+                    normals[i]
+                );
+            }
         }
         // Lit and coloured: normals and vertex colours on every vertex.
         assert_eq!(

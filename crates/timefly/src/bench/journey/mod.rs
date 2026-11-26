@@ -8,14 +8,14 @@
 //! and:
 //!
 //! 1. **Flies the globe** to above the route's region (within [`ARRIVE_DEG`]) with the turn keys
-//!    and `W` ([`globe_keys`]), then descends with `Ctrl`, still steering in to within
+//!    and `W` ([`globe_keys`]), then descends with `Q`, still steering in to within
 //!    [`SETTLE_DEG`], until the dive commits below `DIVE_ALTITUDE_KM`. It lets go while the dive
 //!    waits in the cloud and the fly emerges.
 //! 2. **Descends, then flies out** along the route's heading in the region ([`region_keys`]:
 //!    north for the Andes, Pangaea and the Grand Canyon, west for Mt Fuji, east for the headless
 //!    tests' Alps). The fly emerges at 230 km,
 //!    above `HOP_ALTITUDE_M`, where a hop's lift would do nothing; so before the first hop it
-//!    holds `Ctrl` alone, straight down in place (about 21 s at the 10 km/s cap), to
+//!    holds `Q` alone, straight down in place (about 21 s at the 10 km/s cap), to
 //!    [`CRUISE_AGL_M`] above the ground, turning to face the heading meanwhile. Then it holds `W` to the
 //!    edge, still at the speed cap, so the preload's lead is the worst case. The neighbour
 //!    preloads, the lift raises the fly to the cloud bank and the cloud gathers, the fly holds in
@@ -60,6 +60,12 @@
 //!   the run ([`pass_lines`]), and the GPU frame times read on flight frames, per route
 //!   ([`gpu_frame_line`]; a reading arrives a few frames after the frame it times).
 //!
+//! **Stopping early.** A stop is a journey. A gate decided within one ends the run as soon as it
+//! fails ([`failed_journey_gate`]): a hold or a swap frame over its native gate, a hop's memory
+//! over its gate, or a route check. The summary names the stops run, the failed gate and the
+//! stops skipped. The flight (one pacing for the run, from every flight frame pooled) and the
+//! journey memory cycles are judged at the end. `--keep-going` flies every journey.
+//!
 //! A stage that does not finish within [`STAGE_TIMEOUT_SECS`] (the longest, the region's, is
 //! about 21 s of descent, 15 s and 25 s of flight and two holds: about 65 s natively), a dive that comes back out over
 //! the globe, or a hop that turns back fails the run with the reason. On native the run exits
@@ -82,9 +88,10 @@ use super::region::{
     pacing_for, pacing_name, show_mib,
 };
 use super::{
-    MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS, bench_exit,
-    frame_budget_ms, frame_time_stats, gpu_available, gpu_frame_line, gpu_status_line,
-    header_lines_titled, missed_frames, pass_lines, passes, stall_count,
+    EarlyStop, MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS,
+    bench_exit, frame_budget_ms, frame_time_stats, gpu_available, gpu_frame_line, gpu_status_line,
+    header_lines_titled, missed_frames, on_failure_line, pass_lines, passes, stall_count,
+    stopped_early_lines,
 };
 use crate::args::RegionArg;
 use crate::data::GlobeData;
@@ -465,13 +472,13 @@ fn region_dir(arg: &RegionArg) -> DVec3 {
 }
 
 /// The keys flying the globe's fly toward `target` (a direction): turn toward its bearing,
-/// fly forward while facing it, and once within [`ARRIVE_DEG`] only descend (`Ctrl`) to the dive.
+/// fly forward while facing it, and once within [`ARRIVE_DEG`] only descend (`Q`, a descend key on every platform) to the dive.
 pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
     let up = flight.dir.normalize();
     let target = target.normalize();
     let arc = up.dot(target).clamp(-1.0, 1.0).acos();
     if arc <= SETTLE_DEG.to_radians() {
-        return vec![KeyCode::ControlLeft];
+        return vec![KeyCode::KeyQ];
     }
     let toward = (target - up * up.dot(target)).normalize_or_zero();
     if toward == DVec3::ZERO {
@@ -495,14 +502,14 @@ pub fn globe_keys(flight: &GlobeFlight, target: DVec3) -> Vec<KeyCode> {
         keys.push(KeyCode::KeyW);
     }
     if arrived {
-        keys.push(KeyCode::ControlLeft);
+        keys.push(KeyCode::KeyQ);
     }
     keys
 }
 
 /// The keys flying the region's fly, heading `yaw`, `agl_m` above the ground, in `phase`, on a
 /// route heading `want` (a yaw):
-/// - flying, not yet `cruising` and above [`CRUISE_AGL_M`]: descend (`Ctrl`) in place, turning
+/// - flying, not yet `cruising` and above [`CRUISE_AGL_M`]: descend (`Q`) in place, turning
 ///   toward `want` meanwhile;
 /// - flying otherwise: turn to face `want` and fly forward within [`YAW_TOLERANCE_DEG`] of it
 ///   (once cruising, a valley that puts the fly higher above the ground does not stop it);
@@ -533,7 +540,7 @@ pub fn region_keys(
                 });
             }
             if !cruising && agl_m > CRUISE_AGL_M {
-                keys.push(KeyCode::ControlLeft);
+                keys.push(KeyCode::KeyQ);
             } else if err.abs() <= YAW_TOLERANCE_DEG.to_radians() {
                 keys.push(KeyCode::KeyW);
             }
@@ -551,6 +558,8 @@ pub struct JourneyBenchConfig {
     pub journeys: Vec<usize>,
     pub target_fps: u32,
     pub exit_when_done: bool,
+    /// `--keep-going`: fly every journey even after a gate has failed.
+    pub keep_going: bool,
 }
 
 impl JourneyBenchConfig {
@@ -561,6 +570,7 @@ impl JourneyBenchConfig {
             journeys: JOURNEY_ORDER.to_vec(),
             target_fps,
             exit_when_done,
+            keep_going: false,
         }
     }
 
@@ -571,6 +581,7 @@ impl JourneyBenchConfig {
             journeys: vec![0; JOURNEY_CYCLES as usize],
             target_fps,
             exit_when_done,
+            keep_going: false,
         }
     }
 
@@ -608,6 +619,20 @@ impl JourneyBenchConfig {
         } else {
             format!("cycle {}, {}", cycle + 1, self.route(cycle).region.name)
         }
+    }
+
+    /// The stops' names, one per journey: `journey 2`, or with several routes
+    /// `journey 2 (Mt Fuji)`.
+    pub fn stop_names(&self) -> Vec<String> {
+        (0..self.journeys.len())
+            .map(|j| {
+                if self.routes.len() == 1 {
+                    format!("journey {}", j + 1)
+                } else {
+                    format!("journey {} ({})", j + 1, self.route(j as u32).region.name)
+                }
+            })
+            .collect()
     }
 
     /// Whether journey `cycle` visits a route flown earlier in the run.
@@ -942,6 +967,8 @@ pub struct JourneyBench {
     keys_held: Vec<KeyCode>,
     summary: Option<String>,
     passed: Option<bool>,
+    /// Where the run stopped at its first failed gate, if it did.
+    stopped: Option<EarlyStop>,
 }
 
 impl JourneyBench {
@@ -964,6 +991,7 @@ impl JourneyBench {
             keys_held: Vec::new(),
             summary: None,
             passed: None,
+            stopped: None,
         }
     }
 
@@ -1177,6 +1205,20 @@ fn measure_journey(
                 .site
                 .filter(|site| site.hop == hop.hop)
                 .and_then(|site| read_site(&site, &region.grid, &region.frame));
+        }
+        if !bench.config.keep_going
+            && let Some(gate) = failed_journey_gate(bench, cfg!(target_arch = "wasm32"))
+        {
+            warn!(
+                cycle = cycle + 1,
+                gate, "journey bench: a gate failed, stopping early"
+            );
+            bench.stopped = Some(EarlyStop {
+                stops_run: cycle as usize + 1,
+                gate,
+            });
+            finish(bench, &game, &display, &mut controls, None);
+            return;
         }
     }
     let timed_out = |since: f64| now - since > STAGE_TIMEOUT_SECS;
@@ -1444,6 +1486,67 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
     }
 }
 
+/// The first gate decided within a journey that has failed, as the summary's lines name it
+/// (`hold: hop 1 3500 ms (cycle 1) -> FAIL`): a hold over its native gate once it has ended, a
+/// swap frame over its native gate once its window has closed, a hop's memory over its gate
+/// ([`hop_memory_gate`] on that hop alone) once the hop is over, or a route check once its hop
+/// is over and the region it left was read. Each is final when it fails, so the run has failed.
+/// Holds and swaps are reported only on the web (`web`), so never stop a run there.
+fn failed_journey_gate(bench: &JourneyBench, web: bool) -> Option<String> {
+    let config = &bench.config;
+    if !web {
+        for hold in &bench.holds {
+            if let Some(ms) = hold.clock.hold_ms()
+                && ms > HOLD_LIMIT_NATIVE_MS
+            {
+                return Some(hold_line(hold.transition, ms, &config.tag(hold.cycle), web).0);
+            }
+        }
+        for s in &bench.swaps {
+            if s.frames_left == 0 && s.worst_ms > SWAP_FRAME_LIMIT_MS {
+                return Some(format!(
+                    "swap worst frame: {} {:.2} ms ({}) -> FAIL",
+                    s.transition.label(),
+                    s.worst_ms,
+                    config.tag(s.cycle)
+                ));
+            }
+        }
+    }
+    for h in bench.hops.iter().filter(|h| !h.open) {
+        let sample = HopMemory {
+            baseline: h.baseline,
+            peak: h.peak,
+            end: h.end,
+            repeat: config.is_repeat(h.cycle),
+        };
+        if let Some((false, worst)) = hop_memory_gate(&[sample], web) {
+            return Some(format!(
+                "hop memory peak: hop {} {} ({}) -> FAIL",
+                h.hop,
+                signed_mib(worst),
+                config.tag(h.cycle)
+            ));
+        }
+        if h.land_share.is_none() {
+            continue;
+        }
+        for &(hop, c) in config.route(h.cycle).crosses {
+            if hop != h.hop {
+                continue;
+            }
+            let (ok, text) = crossing_check(c, h);
+            if !ok {
+                return Some(format!(
+                    "route check: hop {hop} ({}): {text} FAIL",
+                    config.tag(h.cycle)
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// `+1.5 MiB` or `-0.3 MiB`.
 fn signed_mib(bytes: i64) -> String {
     let mib = bytes as f64 / (1024.0 * 1024.0);
@@ -1510,7 +1613,8 @@ fn finish(
             order.join(", ")
         ));
     }
-    let mut pass = failure.is_none();
+    out.push(on_failure_line(config.keep_going));
+    let mut pass = failure.is_none() && bench.stopped.is_none();
 
     // Holds.
     out.push(format!(
@@ -1928,6 +2032,9 @@ fn finish(
     out.extend(pass_lines(&bench.passes));
     if gpu_on {
         out.push(gpu_status_line(bench.gpu.as_ref()));
+    }
+    if let Some(stop) = &bench.stopped {
+        out.extend(stopped_early_lines(stop, &config.stop_names(), None));
     }
     out.push(match failure {
         Some(reason) => format!("result: FAIL ({reason})"),

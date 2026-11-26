@@ -42,7 +42,7 @@
   - `CHASE_DISTANCE_PER_AGL = 0.5`
   - `CHASE_MIN_DISTANCE_M = 60.0`
   - `CHASE_ELEVATION_DEG = 20.0`
-  - `CHASE_GLOBE_TOP_PITCH_DEG = 70.0` (the look-down pitch at `GLOBE_MAX_ALTITUDE_KM`)
+  - `CHASE_GLOBE_TOP_PITCH_DEG = 83.8` (the look-down pitch at `GLOBE_MAX_ALTITUDE_KM`; 70.0 until Task 14's framing A, see its rulings)
   - `FLY_SCREEN_FRACTION = 0.05` (5% of the view's height)
 - **Cloud timings** *(call)*:
   - `CLOUD_GATHER_S = 0.6`
@@ -507,6 +507,65 @@ git commit -m "feat(core): flight altitudes, cloud density and chase camera"
 - [ ] **Step 5: Update the parent spec §11.2 and §14** with the owner's decisions (design §1.1, items 6–9).
 - [ ] **Step 6: Run the gate and commit:** `docs: M3 verification and spec updates`.
 
+### Task 12: Bug shots, the position readout and the compass
+
+Owner, 2026-11-26, after playing: a hotkey that saves a screenshot named by the current position and orientation, so it "can serve as a visual bug report"; "the current lat/long right below the altitude"; and "a tiny compass rose below that that swivels to always point in the direction the fly is facing".
+
+**Files:** create `crates/timefly/src/ui/bug_shot.rs`, `crates/timefly/src/ui/position.rs` (readout and rose) and their core helpers (a formatter and the rose angle in `timefly_core`, pure); modify `ui/mod.rs`, `ui/altitude.rs` (layout), `args.rs` (`--from-shot`), `examples/region_tour.rs` (`--from-shot`), `docs/testing/m3/manual-checks.md` (controls).
+
+**Interfaces and decisions:**
+- **Bug shot.** `F12` and a small camera button on the HUD save the window as PNG. Name: `timefly_<UTC yyyymmdd-hhmmss>_<lat>_<lon>_<alt m ASL>_h<heading°>_p<look pitch°>_<era years>_<globe|region>.png`, lat/lon to 3 decimals with `N`/`S`/`E`/`W`. A JSON sidecar beside it holds the full pose: the fly's position (f64), heading, the camera's eye/target/up, the look offset, the era, the active region's centre and spec, the build SHA, the session id and the window size. A toast names the full path.
+  - Folder: `directories::UserDirs::picture_dir()` + `Time Fly`; with none, the `ProjectDirs` data dir's `shots` folder. Web: the same name as a browser download (the PNG, and the sidecar as a second download).
+  - The screenshot resolves a few frames later (Bevy): the name and sidecar are fixed at the key press.
+- **Repro.** `--from-shot <json>` (the app and `region_tour`) starts at exactly that pose: same era, same region spec, same fly pose and camera.
+- **Readout.** Under the altitude: `22.87° N  71.42° E`, 2 decimals. In a past era, decide and document whether it shows the era frame's coordinates or today's coordinates of the ground below, and label it if they differ.
+- **Compass rose.** Below the readout: small, heading-up (its top is where the fly faces; N/E/S/W turn to show true directions), with the heading as `NE 47°`. On the globe and in regions; no per-frame allocation.
+
+- [ ] **Step 1: Write the failing tests:** `shot_names_parse_back_to_the_pose` (property test: lat, lon, altitude, heading and era survive within their precision), `the_sidecar_round_trips`, `from_shot_restores_the_pose` (camera within 1e-6 of the saved eye/target), `the_shot_folder_falls_back_without_a_pictures_dir`, `positions_format_with_hemispheres` (parse back), `the_rose_turns_with_the_heading` (incl. over a pole on the globe).
+- [ ] **Step 2: Run them to check they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run them to check they pass.**
+- [ ] **Step 5: Render** the HUD with `region_tour` (globe and region) and take one real F12 shot of a launched app session (fresh `TIMEFLY_LOG_DIR`, closed with `Cmd+Q`), then `--from-shot` it and compare the two frames.
+- [ ] **Step 6: Run the gate and commit** `feat: bug shots, the position readout and the compass`.
+
+### Task 13: Wings that always read as wings
+
+Owner, 2026-11-26: "sometimes the wings flutter slowly" and "sometimes during descents I see no wings at all!". The flutter is aliasing: `dragonfly.wesl` flaps `sin(globals.time · 2π · 25 Hz)`, sampled at the frame rate (about 1 Hz apparent at 26 fps, 5 Hz at 30, a slow shimmer near 50). The missing wings are not yet reproduced: either edge-on flat wings (the body plane matching the chase camera's look in a descent, with the flap held near 0 by aliasing) or the blended cloud painting over the blended wings.
+
+**Files:** `assets/shaders/dragonfly.wesl`, `crates/timefly/src/creature/{mod.rs,mesh.rs}`, maybe `cloud.rs`.
+
+- **Flutter:** frame-rate independent. Either advance the flap phase by a fixed fraction of a stroke per frame (about 0.4 cycle), or draw a translucent motion-blur fan when the beat exceeds half the frame rate. Fix the shader's comment.
+- **Missing wings:** first reproduce with `region_tour` renders at a descent pose (the fly pitched down as far as the chase camera looks down) with and without the cloud at density > 0; name the cause from the frames. Fix the cause: for edge-on, a small wing dihedral or a rest angle so the wings never lie in the view plane, and/or the stroke always sweeping out of it; for the cloud, the draw order or the wings' depth so the cloud veils but never erases them.
+- [ ] **Step 1: Write the failing tests:** `the_flap_reads_fast_at_every_frame_rate` (the apparent stroke rate stays ≥ some fraction of the true rate for frame rates 20–144 Hz) and a test for the named cause (e.g. `the_wings_never_lie_edge_on_to_the_chase_view` over the descent poses).
+- [ ] **Steps 2–4:** RED, implement, GREEN.
+- [ ] **Step 5: Render** the descent pose before and after; the wings visible in both the clear and cloudy frames.
+- [ ] **Step 6: Run the gate and commit** `fix: wings that read as wings at any frame rate and pose`.
+
+### Task 14: The globe camera behind the fly, and descend on Option
+
+Owner, 2026-11-26: on the globe the camera sat straight over the fly (its eye elevation reaches `GLOBE_CHASE_MAX_ELEVATION_DEG` = 90° at the start altitude, `GLOBE_START_ALTITUDE_KM` = `GLOBE_MAX_ALTITUDE_KM`), so the globe sat low with the bottom cut off; the owner chose "Behind, globe framed". And `Ctrl+↑` opens Mission Control on macOS; the owner suggested Option or Cmd.
+
+**Files:** `crates/timefly_core/src/flight/{chase.rs,altitudes.rs}`, `crates/timefly/src/globe_flight.rs`, the key mapping (`fly_camera.rs` or wherever `KeyInput` is built), `docs/testing/m3/manual-checks.md`.
+
+- **Globe camera:** behind and above the fly at every altitude: cap the eye's elevation at about 45–50° (decide and justify from renders). At the top altitude, aim the view past the fly so the whole globe fits in the frame with the fly in its lower part. The dive framing is unchanged (ground fills at least the lower two-thirds, landscape or portrait). The drag range stays sensible.
+  - *As built:* the owner's framing A ("globe centred", 2026-11-26) replaced the 45–50° cap: the eye rises to 70° at the top with the globe centred and the fly over its upper part (Task 14's rulings below).
+- **Descend key:** on macOS, descend is `Option` (`Alt`) in place of `Ctrl`; `Q` unchanged. Not `Cmd` (`⌘Q` quits and `Q` is the descend key). Other platforms keep `Ctrl`. Update the controls text.
+- [ ] **Step 1: Write the failing tests:** `the_globe_chase_stays_behind_the_fly` (elevation ≤ the cap at every altitude), `the_whole_globe_is_in_frame_at_the_top` (the globe's limb inside the view for a 16:9 and a 9:16 window), the existing dive-framing test kept, `descend_is_option_on_macos_and_ctrl_elsewhere`.
+- [ ] **Steps 2–4:** RED, implement, GREEN.
+- [ ] **Step 5: Render** the globe at the start altitude, mid-way and at the dive altitude, before and after.
+- [ ] **Step 6: Run the gate and commit** `fix: the globe camera chases from behind; descend on Option on macOS`.
+
+### Task 15: Benches stop at the first failure
+
+Owner, 2026-11-26: "update the bench code so it ends early if it encounters a failure instead of wasting time going all the way to the end."
+
+**Files:** `crates/timefly/src/bench/{mod.rs,region/,journey/}` and the scrub bench; `args.rs` (`--keep-going`, web `?keep-going`).
+
+- The region, journey and scrub benches stop at the first gate that has failed (a region's R14, R11, a first entry over its gate, a hold over its gate, a stall), still print the summary block (the stops run, the failed gate, `stopped early`, the stops skipped) and exit `FAILED_RESULT_EXIT_CODE`. Gates decided only at the end (memory cycles, the warm-generation median) are judged as now. `--keep-going` / `?keep-going` runs to the end.
+- [ ] **Step 1: Write the failing tests:** `a_failed_gate_stops_the_region_bench` (a stubbed gate failing at stop 2 of 8 ends there with the summary), `keep_going_runs_every_stop`, the same for the journey bench.
+- [ ] **Steps 2–4:** RED, implement, GREEN.
+- [ ] **Step 5: Run the gate and commit** `feat: benches stop at the first failed gate`.
+
 ## Appendix: rulings
 
 - **Globe clearance is structural.** The fly cannot be below `DIVE_ALTITUDE_KM` (1,200 km) on the globe outside a dive. Exaggerated relief is at most about 177 km (Everest at 20×). So design §5.4's clearance query, and §5.4's "the clearance query uses the same exaggeration", are satisfied without a CPU globe height query. Cost if wrong: a globe height query (`rendered_surface`) has to be added if a later milestone lets the fly lower over the globe.
@@ -582,3 +641,21 @@ left out on purpose: they belong to that branch, not to this plan.
 - The fly pitches with climbs: `MAX_PITCH_DEG` = 20° at the climb keys' full speed (a climb fraction of 1, clamped), smoothed over `PITCH_SMOOTHING_S` = 0.25 s like the bank. Why: design §5.1. Cost if wrong: two constants.
 - A wish under `WISH_DEADBAND_MPS` (1 m/s) on an axis is no push out of an edge. Why: flying along an edge the fly sits exactly on, float noise (about 1e-8) started a hop; the slowest real push (60 m/s, 1° out) is 1.05 m/s. Cost if wrong: one constant.
 - Owner (2026-11-25): the region bench's Red Sea flight failing the uncapped rule at 2560 × 1440 (p95 18.15 ms, median 10.07) is accepted as the terrain's cost, as Pangaea's was. The region bench now reports the Red Sea's and Pangaea's flight only (`BenchRegion::flight_gated` is false for both; the verdict is still printed, marked "(reported only)"), as the journey bench does for Pangaea; every other region's flight still gates, and a `--region`-picked single-region run keeps gating its own. Cost: a known red line in uncapped native runs until the terrain gets cheaper.
+
+**Task 12 (bug shots, the readout and the compass)**
+- The readout shows the **era frame's** latitude and longitude, labelled ` (then)` past `GEOGRAPHIC_FRAME_MAX_YEARS` (26,076 years), where that frame stops being today's. Why: it is where the globe draws the place at that era and what `--region` and `--from-shot` take, so a reading can be typed back in; today's coordinates of the ground below need the plate model and do not exist for much of a deep era's crust. Cost if wrong: a second line from `CrustModel::resolve` at the readout's 2 Hz.
+- Degree signs are drawn as small rings between text pieces (`DegreeText`). Why: Bevy's built-in UI font is a 95-glyph ASCII subset, so `°` drew as a missing-glyph box. Cost if wrong: ship a fuller font (licence and credits) and drop the rings.
+- A `--from-shot` repro holds the camera at the saved transform (to the bit) until the first input other than `F12`; `F12` does not wake the faded slider either. Why: the chase's glide at the shot is not re-derivable, and the shot should show the screen as the player had it. Cost if wrong: a held camera that feels stuck until a key is pressed.
+- The sidecar's JSON needs serde_json's `float_roundtrip`: without it, f64s read back 1 ulp off (caught by `the_sidecar_round_trips`). Cost: slightly slower JSON parsing everywhere in the crate.
+
+**Task 13 (wings that read as wings)**
+- Each wing is pitched `WING_INCIDENCE_DEG` = 20° about its own span, leading edge up. Why: in a descent the fly's 20° nose-down pitch (`MAX_PITCH_DEG`) met the chase's 20° elevation, so the camera looked straight along the body axis and the flat wings were edge-on whatever the flap, which turns them about that axis. Pitched, they show at least 20° to that view and about twice it in level flight. Cost if wrong: one constant.
+- The flap advances `FLAP_CYCLES_PER_FRAME` = 0.4 cycle per frame, not by time. Why: a 25 Hz beat sampled at the frame rate aliased into a slow flutter; a fixed fraction per frame always reads as a fast beat. So the beat follows the frame rate, and it keeps going while virtual time pauses. Cost if wrong: a beat that slows with a slow frame rate; a time-based flap with a motion-blur fan instead.
+
+**Task 14 (the globe camera, descend on Option)**
+- `GLOBE_CHASE_MIN_ELEVATION_DEG` goes from 5° to 20° (the region's `CHASE_ELEVATION_DEG`). Why: at 5° a fly descending nose down showed the eye its wings edge-on on the globe (2° of wing). Cost if wrong: a drag up stops higher (15° down at and below the dive, 33.8° at the top).
+- Framing A (owner, 2026-11-26, "A: globe centred") replaces the plan's 45–50° cap: the eye's elevation rises from 55° at the dive to 70° at the top (a drag may raise it to 75°); the look from 50° to 83.8° (`CHASE_GLOBE_TOP_PITCH_DEG`), capped at 85°; and the globe fly is sized by its depth along the view, not its distance. Why: from an eye at elevation `E` behind a fly at radius `r` the fly is seen over the globe only when `r·cos E < R` (64° at the top), so a 45–50° cap put the fly against space; at 70° and 83.8° the whole globe is in a 16:9 or 9:16 view with the fly over its upper part; off the view's centre perspective draws the fly 1 / cos larger. Cost if wrong: retune three constants.
+- Descend is `Option` (`Alt`) on a Mac, including Mac browsers (the web build reads `navigator.platform`), `Ctrl` elsewhere, and `Q` everywhere. Why: `Ctrl+↑` opens Mission Control on macOS and `⌘Q` quits. Cost if wrong: one key mapping.
+
+**Task 15 (benches stop at the first failure)**
+- The journey bench also stops on a failed hop memory or route check, besides the plan's holds and swap frames: each is final once its hop ends. In the region bench a web R11 failure still flies that region: the run ends after the failing region's block, as for its other gates. Why: a gate decided within a stop cannot change later, so the rest of the run is wasted time (the owner's ask); a stop is the whole region, so its block reports every gate it decided. Cost if wrong: a stopped run hides later stops' results (`--keep-going` flies them).
