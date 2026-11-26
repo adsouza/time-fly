@@ -31,7 +31,8 @@ pub struct LaunchArgs {
     pub no_dunes: bool,
     /// `--target-fps N`: the frame rate the benchmarks check their frames against.
     pub target_fps: Option<u32>,
-    /// `--window WxH`: the window's size in physical pixels (native only).
+    /// `--window WxH`: the window's size in logical pixels (native only): on a 2× display a
+    /// 1280x720 window is 2560 × 1440 physical pixels.
     pub window: Option<(u32, u32)>,
     /// Hidden `--check-data[=DIR]` (native only): load the globe data headlessly and exit.
     pub check_data: Option<DataCheck>,

@@ -1337,10 +1337,9 @@ fn main() -> AppExit {
     let size = args
         .get(1)
         .and_then(|s| parse_window_size(s))
-        .or(shot_pose
-            .as_ref()
-            .map(|p| (p.window.width, p.window.height))
-            .filter(|&(w, h)| w > 0 && h > 0))
+        // The shot's logical size: the tour's `WxH` is the window's logical size and the
+        // offscreen image's pixels, as when its own bug shots were taken.
+        .or(shot_pose.as_ref().and_then(|p| p.window.logical_size()))
         .unwrap_or((1280, 720));
     // A repro takes its place from the shot: the region argument is not read.
     let region_text = match (&shot_pose, args.get(2)) {

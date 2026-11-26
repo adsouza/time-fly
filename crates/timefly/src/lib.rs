@@ -48,8 +48,9 @@ use ui::bug_shot::{ShotPose, ShotRestore, ShotRestorePlugin};
 /// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
 pub const APP_ID: &str = "io.github.adsouza.TimeFly";
 
-/// The primary window for the launch arguments: `--window WxH` sets its size in physical
-/// pixels, and the benchmarks turn vsync off on native so frame times show the real cost.
+/// The primary window for the launch arguments: `--window WxH` sets its size in logical pixels
+/// (bevy_winit creates a `LogicalSize`; the OS multiplies it by the display's scale factor),
+/// and the benchmarks turn vsync off on native so frame times show the real cost.
 pub fn primary_window(args: &LaunchArgs) -> Window {
     #[cfg_attr(
         target_arch = "wasm32",
@@ -130,14 +131,10 @@ fn shot_to_restore(args: &LaunchArgs) -> Option<Result<ShotPose, String>> {
 /// Builds the Time Fly app. Plugins are added here as milestones land.
 pub fn app(session: &Session) -> App {
     let mut args = session.args().clone();
-    // A repro opens a window of its shot's size unless `--window` chooses another.
+    // A repro opens a window of its shot's (logical) size unless `--window` chooses another.
     let shot = shot_to_restore(&args);
-    if let Some(Ok(pose)) = &shot
-        && args.window.is_none()
-        && pose.window.width > 0
-        && pose.window.height > 0
-    {
-        args.window = Some((pose.window.width, pose.window.height));
+    if let Some(Ok(pose)) = &shot {
+        ui::bug_shot::repro_window(&mut args, pose);
     }
     let mut app = App::new();
     // Before `DefaultPlugins`: `LogPlugin` takes its layers from the diagnostics resources.

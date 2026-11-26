@@ -274,6 +274,28 @@ pub struct WindowShot {
     pub scale_factor: f32,
 }
 
+impl WindowShot {
+    /// The window's logical size (what `--window WxH` asks for: the OS scales it by the
+    /// display's factor), or `None` for an unknown size. A 2560 × 1440 shot at 2× is 1280 × 720.
+    pub fn logical_size(&self) -> Option<(u32, u32)> {
+        let scale = f64::from(self.scale_factor);
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let logical = |px: u32| ((f64::from(px) / scale).round() as u32).max(1);
+        (self.width > 0 && self.height > 0).then(|| (logical(self.width), logical(self.height)))
+    }
+}
+
+/// A repro's window: the shot's logical size, unless `--window` already chose one.
+pub fn repro_window(args: &mut crate::args::LaunchArgs, pose: &ShotPose) {
+    if args.window.is_none() {
+        args.window = pose.window.logical_size();
+    }
+}
+
 /// The sidecar: everything needed to stand where the shot was taken.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShotPose {
@@ -1135,6 +1157,42 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         assert!(load_shot(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_repro_window_is_the_shots_logical_size() {
+        // A Retina shot: 2560 × 1440 physical at 2×. `--window` is logical (bevy_winit makes a
+        // `LogicalSize`), so the repro asks for 1280 × 720, not 2560 × 1440.
+        let pose = region_pose();
+        assert_eq!(
+            (
+                pose.window.width,
+                pose.window.height,
+                pose.window.scale_factor
+            ),
+            (2560, 1440, 2.0)
+        );
+        let mut args = crate::args::LaunchArgs::default();
+        repro_window(&mut args, &pose);
+        assert_eq!(args.window, Some((1280, 720)));
+        // `--window` wins.
+        let mut args = crate::args::LaunchArgs {
+            window: Some((800, 600)),
+            ..Default::default()
+        };
+        repro_window(&mut args, &pose);
+        assert_eq!(args.window, Some((800, 600)));
+        // Odd sizes and fractional factors round; an unknown size or factor is safe.
+        let shot = |width, height, scale_factor| WindowShot {
+            width,
+            height,
+            scale_factor,
+        };
+        assert_eq!(shot(1281, 721, 1.0).logical_size(), Some((1281, 721)));
+        assert_eq!(shot(3000, 2000, 1.5).logical_size(), Some((2000, 1333)));
+        assert_eq!(shot(0, 0, 1.0).logical_size(), None);
+        assert_eq!(shot(1280, 720, 0.0).logical_size(), Some((1280, 720)));
+        assert_eq!(shot(1280, 720, f32::NAN).logical_size(), Some((1280, 720)));
     }
 
     #[test]
