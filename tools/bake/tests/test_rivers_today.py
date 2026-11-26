@@ -34,6 +34,26 @@ def test_select_keeps_ranked_rivers_only():
     assert rivers_today.TODAY_RIVER_MAX_SCALERANK == 7
 
 
+def test_select_drops_canals():
+    # Natural Earth files canals as River: the Suez Canal (rank 6), the Ismailiya and Gharraf
+    # canals, and the Ferenc Csatorna (Hungarian for the Franz Canal, the Danube-Tisa-Danube
+    # Canal). The Hindiyah Channel is a natural branch of the Euphrates and stays.
+    features = [
+        _feature("River", 6, [[(32.3, 31.2), (32.5, 30.0)]], "Suez Canal"),
+        _feature("River", 6, [[(31.2, 30.1), (32.2, 30.6)]], "Ismailiya Canal"),
+        _feature("River", 4, [[(45.8, 32.5), (46.2, 31.0)]], "Gharraf Canal"),
+        _feature("River", 7, [[(19.0, 45.8), (20.0, 45.6)]], "Ferenc Csatorna"),
+        _feature("River", 7, [[(44.3, 32.7), (44.6, 32.0)]], "Hindiyah Channel"),
+        _feature("River", 1, [[(19.0, 47.5), (22.5, 44.7)]], "Danube"),
+    ]
+    got = rivers_today.select(features)
+    assert [p.name for p in got] == ["Hindiyah Channel", "Danube"]
+    # The committed table holds none of them.
+    if SHIPPED.exists():
+        names = {r["name"] for r in json.loads(SHIPPED.read_bytes())["rivers"]}
+        assert not {n for n in names if "canal" in n.lower() or "csatorna" in n.lower()}
+
+
 def test_orient_puts_the_higher_end_first():
     # A 1' grid over 10..12 N, 20..22 E (rows from the south), rising to the north and east.
     rows, cols = 120, 120

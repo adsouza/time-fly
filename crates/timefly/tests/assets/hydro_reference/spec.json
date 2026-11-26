@@ -1,4 +1,4 @@
 {"recent_n": 64,
  "boxes": [{"name": "tiny", "file": "tiny.json", "tolerance_km": 50, "min_share": 0.8, "every_link": true}],
  "lakes": [{"name": "Lake Victoria", "lat": -1.0, "lon": 33.0}],
- "outlets": [{"name": "tiny river", "from": [1.0, 1.0], "via": ["the equator", [0.0, 0.0]], "sea": [-0.9, -0.9]}]}
+ "outlets": [{"name": "tiny river", "from": [1.0, 1.0], "vias": [["the equator", [0.0, 0.0]]], "sea": [-0.9, -0.9]}]}

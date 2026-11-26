@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn the_shipped_straits_parse_and_run_node_to_node() {
         let straits = shipped_straits();
-        assert_eq!(straits.len(), 4);
+        assert_eq!(straits.len(), 6);
         let bosporus = &straits[0];
         assert_eq!(
             (bosporus.name.as_str(), bosporus.sill_m),
@@ -223,6 +223,81 @@ mod tests {
         // West of the Bend at Esztergom, south of it at Budapest.
         assert!(start.1 < 18.75 && end.0 < 47.55, "{start:?} to {end:?}");
         assert!((101.0..=105.0).contains(&nodes[nodes.len() - 1].1));
+    }
+
+    /// A gorge's `(node, level)` list and each node's `(lat, lon)`.
+    type GorgeCourse = (Vec<(u32, f32)>, Vec<(f64, f64)>);
+
+    /// The named gorge's course on the n = 900 lattice, checked to be cited, chained neighbour
+    /// to neighbour and never rising downstream.
+    fn gorge_course(name: &str) -> GorgeCourse {
+        let gorge = shipped_straits()
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("the {name} entry"));
+        let table: serde_json::Value = serde_json::from_str(STRAITS_JSON).unwrap();
+        let entry = table["straits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap();
+        assert!(
+            entry["source"]
+                .as_str()
+                .unwrap()
+                .contains("read 2026-11-26"),
+            "{name}: a cited source"
+        );
+        let lattice = CubeLattice { n: 900 };
+        let nodes = strait_levels(&lattice, gorge);
+        for w in nodes.windows(2) {
+            assert!(lattice.neighbours(w[0].0).contains(&Some(w[1].0)), "{w:?}");
+            assert!(w[1].1 <= w[0].1, "{w:?}");
+        }
+        let at = nodes
+            .iter()
+            .map(|&(v, _)| crate::geo::geo_to_latlon(crate::geo::render_to_geo(lattice.dir(v))))
+            .collect();
+        (nodes, at)
+    }
+
+    /// Task 11d: without it Lake Victoria drains east of Jinja over a 1,152 m rim.
+    #[test]
+    fn the_victoria_nile_runs_from_jinja_to_lake_kyoga() {
+        let (nodes, at) = gorge_course("Victoria Nile");
+        assert!(nodes.len() >= 8, "{nodes:?}");
+        let (start, end) = (at[0], at[at.len() - 1]);
+        // From the outlet at Jinja (0.44 N, 33.19 E) north-west to Lake Kyoga.
+        assert!(
+            start.0 < 0.55 && start.1 > 33.1 && end.0 > 1.2 && end.1 < 33.0,
+            "{start:?} to {end:?}"
+        );
+        // Below the rim the lake spills over without it (and Lake Victoria's 1,133 m), falling
+        // to Kyoga's 1,030 m.
+        assert!(nodes[0].1 < 1133.0 && nodes[0].1 > 1100.0, "{nodes:?}");
+        assert!(nodes[nodes.len() - 1].1 <= 1031.0, "{nodes:?}");
+    }
+
+    /// Task 11d: without it the Minusinsk basin spills west at 235 m and the Yenisei reaches
+    /// the sea by the Ob.
+    #[test]
+    fn the_krasnoyarsk_reservoir_runs_from_the_minusinsk_basin_north() {
+        let (nodes, at) = gorge_course("Krasnoyarsk Reservoir");
+        assert!(nodes.len() >= 20, "{}", nodes.len());
+        let (start, end) = (at[0], at[at.len() - 1]);
+        // From Abakan's end of the reservoir (53.7 N) to where Natural Earth's river resumes
+        // (55.5 N), north-east.
+        assert!(
+            start.0 < 53.8 && end.0 > 55.4 && end.1 > start.1,
+            "{start:?} to {end:?}"
+        );
+        // The reservoir's surface: below the basin's 235 m western spill at its lower end.
+        assert!(
+            nodes.iter().all(|&(_, l)| (231.0..=242.0).contains(&l)),
+            "{nodes:?}"
+        );
+        assert!(nodes[nodes.len() - 1].1 < 235.0);
     }
 
     #[test]

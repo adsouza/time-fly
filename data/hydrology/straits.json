@@ -113,6 +113,53 @@
       ],
       "source": "The Indus from the south-west edge of Tibet through the Ladakh and Zanskar ranges to its Zanskar confluence near Nimo, a reach of gorges (about 7 m/km from Mahe to Upshi): Kumar, A. & Srivastava, P. (2017), The role of climate and tectonics in aggradation and incision of the Indus River in the Ladakh Himalaya during the late Quaternary, Quaternary Research 87(3), 363-385, doi:10.1017/qua.2017.19. Course and levels: the river traced by the 1' reference pass over ETOPO 2022 60 arc-second (NOAA NCEI 2022, doi:10.25921/fd45-gt74; tools/bake/timefly_bake/hydro_ref.py, the indus box), simplified to 1 km, levels its running minimum downstream.",
       "note": "Without it the 10 km lattice closes the valley in Ladakh, and the Indus's headwaters spill east through Tibet's lake basins to the Bay of Bengal (rivers Task 11 reality check)."
+    },
+    {
+      "name": "Victoria Nile",
+      "kind": "gorge",
+      "points": [
+        [0.428, 33.187, 1134.6],
+        [0.465, 33.181, 1122.0],
+        [0.562, 33.085, 1078.1],
+        [0.642, 33.051, 1065.9],
+        [0.798, 33.034, 1045.7],
+        [0.95, 32.954, 1036.8],
+        [1.083, 32.936, 1033.5],
+        [1.122, 32.961, 1033.5],
+        [1.182, 32.961, 1033.0],
+        [1.311, 32.893, 1030.1]
+      ],
+      "source": "The Victoria Nile from its outlet of Lake Victoria at Jinja (the Nalubaale and Kiira dams, above Bujagali Falls) to Lake Kyoga: Wikipedia, 'Victoria Nile' (en.wikipedia.org/wiki/Victoria_Nile, read 2026-11-26): it 'starts at the outlet of Lake Victoria, at Jinja, Uganda' and flows north-west to Lake Kyoga. Course: Natural Earth 1:10m Rivers + lake centerlines v5.1.2, the Victoria Nile (the table's own course, data/hydrology/rivers_today.json). Levels: the lowest ETOPO 2022 60 arc-second cell within 2' of each point (NOAA NCEI 2022, doi:10.25921/fd45-gt74), their running minimum downstream: 1134.6 m at the outlet to 1030.1 m at Lake Kyoga.",
+      "note": "The 10 km lattice's node at the outlet stands at 1170 m (ETOPO's mean within 5' is 1187 m, the river 1135 m), so a 10 m burn of the course leaves it above Lake Victoria's eastern rim at 1152 m: without the gorge the lake drains east of Jinja, at (0.16, 33.91), and no river passes Jinja (rivers Task 11d reality check)."
+    },
+    {
+      "name": "Krasnoyarsk Reservoir",
+      "kind": "gorge",
+      "points": [
+        [53.735, 91.511, 241.0],
+        [53.799, 91.443, 238.6],
+        [53.862, 91.436, 237.5],
+        [53.932, 91.459, 237.0],
+        [53.958, 91.513, 237.0],
+        [54.029, 91.559, 234.3],
+        [54.095, 91.548, 232.0],
+        [54.311, 91.38, 232.0],
+        [54.382, 91.294, 232.0],
+        [54.511, 91.26, 232.0],
+        [54.64, 90.959, 232.0],
+        [54.667, 90.934, 232.0],
+        [54.887, 90.951, 232.0],
+        [55.002, 91.035, 232.0],
+        [55.042, 91.099, 232.0],
+        [55.058, 91.166, 232.0],
+        [55.064, 91.347, 232.0],
+        [55.149, 91.818, 232.0],
+        [55.221, 92.107, 232.0],
+        [55.307, 92.236, 232.0],
+        [55.503, 92.408, 232.0]
+      ],
+      "source": "The Yenisei's Krasnoyarsk Reservoir from the Minusinsk basin (Abakan) towards the Krasnoyarsk Dam, 388 km long and at most 15 km wide, its surface at 243 m: Wikipedia, 'Krasnoyarsk Reservoir' (en.wikipedia.org/wiki/Krasnoyarsk_Reservoir, read 2026-11-26). Course: Natural Earth 1:10m Rivers + lake centerlines v5.1.2, the Verkhniy Yenisey's lake centreline (left out of the table with the other lake centrelines), simplified to 1 km. Levels: the lowest ETOPO 2022 60 arc-second cell within 2' of each point (NOAA NCEI 2022, doi:10.25921/fd45-gt74), their running minimum downstream: 241.0 m to 232.0 m.",
+      "note": "ETOPO's mean within 5' of the reservoir stands 26-168 m above its surface, so the 10 km lattice closes the valley: without the gorge the Minusinsk basin fills to 235 m and spills west to the Chulym, and the Yenisei reaches the sea by the Ob (rivers Task 11d reality check). Natural Earth's river course resumes at its end."
     }
   ]
 }

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use bevy_math::DVec3;
 use serde_json::Value;
 
-use super::{Down, EraHydrology};
+use super::{Down, EraHydrology, HydroGraph};
 use crate::geo::{RenderDir, geo_to_render, latlon_to_geo};
 use crate::worldgen::frame::EARTH_RADIUS_M;
 
@@ -347,8 +347,10 @@ pub struct OutletTrace {
 }
 
 /// The river node leaving lake `l`: of the river nodes within one and a half lattice spacings of
-/// its exit that do not drain into it and carry at least its outflow (to f32 rounding), the one
-/// of the largest discharge (ties: the lowest index). `None` for a lake with no outflow.
+/// its exit or at one of the exit's lattice neighbours (its outflow's receiver is one, and a
+/// diagonal near a face centre stands nearly two mean spacings away) that do not drain into it
+/// and carry at least its outflow (to f32 rounding), the one of the largest discharge (ties: the
+/// lowest index). `None` for a lake with no outflow.
 fn lake_outlet(hydro: &EraHydrology, l: u16) -> Option<u32> {
     let lake = &hydro.lakes[usize::from(l)];
     if lake.outflow_m3s <= 0.0 {
@@ -362,6 +364,13 @@ fn lake_outlet(hydro: &EraHydrology, l: u16) -> Option<u32> {
         lattice.dir(lake.exit),
         1.5 * lattice.mean_spacing_m(),
         &mut near,
+    );
+    near.extend(
+        lattice
+            .neighbours(lake.exit)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| hydro.rivers.index_of(v)),
     );
     near.into_iter()
         .filter(|&k| {
@@ -690,6 +699,56 @@ mod tests {
         assert_eq!(
             (t.nodes, t.lakes, t.end),
             (6, 0, Down::Lake(0, lake[0])),
+            "{t:?}"
+        );
+    }
+
+    /// A lake's outflow leaves its exit for one of the exit's lattice neighbours, which near a
+    /// face centre can stand nearly two mean spacings away (Task 11d: the Niger's Lake Debo
+    /// drains to a diagonal 19 km from its exit, past the 1.5-spacing search).
+    #[test]
+    fn an_outlet_trace_leaves_a_lake_by_a_far_diagonal_neighbour() {
+        let lattice = CubeLattice { n: 64 };
+        let start = lattice.nearest(RenderDir(DVec3::Z));
+        let walk = lattice_walk(&lattice, start, 0, 8);
+        let (inflow, lake, exit) = (&walk[..6], &walk[6..8], walk[7]);
+        // North-east (step 1) from the exit.
+        let out = lattice_walk(&lattice, lattice.neighbours(exit)[1].unwrap(), 1, 5);
+        let (outflow, sea) = (&out[..5], out[5]);
+        // The hazard: the river leaving the lake starts beyond 1.5 mean spacings of the exit.
+        assert!(
+            lattice.distance_m(exit, outflow[0]) > 1.5 * lattice.mean_spacing_m(),
+            "{} vs {}",
+            lattice.distance_m(exit, outflow[0]),
+            lattice.mean_spacing_m()
+        );
+        let chain = |nodes: &[u32], q: f32, end| RiverChain {
+            q: vec![q; nodes.len()],
+            bed: vec![0.0; nodes.len()],
+            nodes: nodes.to_vec(),
+            end,
+        };
+        let hydro = river_hydro(
+            lattice,
+            &[
+                chain(inflow, 120.0, Down::Lake(0, lake[0])),
+                chain(outflow, 100.0, Down::Ocean(sea)),
+            ],
+            vec![Lake {
+                level_m: 100.0,
+                spill_m: 100.0,
+                kind: LakeKind::Data,
+                inflow_m3s: 120.0,
+                evaporation_m3s: 20.0,
+                outflow_m3s: 100.0,
+                area_km2: 2000.0,
+                exit,
+            }],
+        );
+        let t = trace_outlet(&hydro, lattice.dir(start).0, 1.0, None).unwrap();
+        assert_eq!(
+            (t.nodes, t.lakes, t.end),
+            (11, 1, Down::Ocean(sea)),
             "{t:?}"
         );
     }

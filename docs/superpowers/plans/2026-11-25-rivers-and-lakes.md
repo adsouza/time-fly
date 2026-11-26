@@ -911,6 +911,57 @@ Owner, 2026-11-26: "Burn real courses". The reality check's Indus box fails (76.
 - [ ] **Step 6: Re-run the reality check** as Task 11, Step 6 (the `dev` profile is acceptable, as Task 11 recorded). Expected: the lower Indus follows Sehwan, and the Indus box's share passes 80%; the Shyok and the Arghandab still unmatched. Record every bar before and after in `reality-check.md`, the pass time at 0 ka and the longest step (≤ 2 ms native), with the burn disclosed under "Choices made". If the lower Indus still leaves its line, try `TODAY_RIVER_BURN_M` = 20 and record both. Any bar that gets worse goes to the owner, unchanged.
 - [ ] **Step 7: Run the gate and commit** `feat: today's major river courses burnt into today's terrain`. If a region golden hash changes, the commit message says which region and why (a burnt course crosses it).
 
+### Task 11d: The world's major river systems
+
+Owner, 2026-11-26: "We should do sanity checks on other major river systems of the world (e.g. Ganges, Yangtze, Yellow, Nile, Mississippi, Congo, Mekong, Hudson, Yenisei, Niger, Orinoco, Brahmaputra, Parana, Ob, Pearl, etc.) too." The Indus and Amazon boxes test centrelines against a 1′ reference; with Task 11b's courses burnt in, a centreline test against Natural Earth would be circular. What can still go wrong is the network: a river leaving its basin by the wrong pass (the Danube through the Moravian Gate), ending in the wrong sea, stopping in a pit, or carrying the wrong water. This task extends the outlet check to the world's major rivers and adds a discharge sanity table.
+
+**Files:**
+- Modify: `crates/timefly/src/hydro_check.rs` (and its tests), `docs/testing/rivers/reality-check.md`, `tools/bake/timefly_bake/rivers_today.py` and `data/hydrology/rivers_today.json` (canals out), and `data/hydrology/straits.json` only for a gorge a misroute needs.
+
+**Interfaces:**
+- Consumes: Task 11's outlet bar (start within `OUTLET_START_KM`, each via within `OUTLET_VIA_KM`, the ocean within `OUTLET_SEA_KM` of the mouth) with Task 11b's cited points, and the pass's per-node discharge.
+- Produces:
+  - Outlet entries, each point with a cited source (English Wikipedia coordinates are acceptable, read date given; a paper or gazetteer better), for at least: the Ganges (via Varanasi, Farakka), the Brahmaputra (from the Yarlung Tsangpo above the Great Bend, via Pasighat and Guwahati), the Yangtze (via the Three Gorges at Yichang, Wuhan), the Yellow River (via Lanzhou, Zhengzhou), the Pearl (via Wuzhou), the Mekong (via Phnom Penh), the Nile (from Jinja, via Khartoum and Aswan), the Congo (via Kisangani, Kinshasa), the Niger (via Timbuktu, through the inner delta, and Lokoja), the Mississippi (via St. Louis, New Orleans), the Hudson (via Albany), the Yenisei (via Krasnoyarsk), the Ob (via Novosibirsk), the Orinoco (via Ciudad Bolívar), the Paraná (via Rosario), plus the Lena, the Volga (to the Caspian: its "sea" is the Caspian lake) and the Mackenzie. A river whose real end is a lake or an inland delta ends there.
+  - A discharge table (informative, not a bar): at one cited gauge per river, the game's discharge against the published long-term mean (cited), with the ratio. Ratios outside [1/3, 3] are flagged in the doc for the owner.
+  - Canals out of the burn: Natural Earth files the Suez Canal (and possibly others) as `River`. The bake drops features that are artificial channels (name containing "Canal", plus any others found, listed in the doc).
+
+- [ ] **Step 1: Write the failing tests:** `the_major_rivers_have_cited_outlets` (every entry has a source string and every point lies on land within its tolerance of the burnt course or the lattice river), `the_discharge_table_flags_ratios_outside_three` (unit), and in Python `test_select_drops_canals`.
+- [ ] **Step 2: Run them to check they fail.**
+- [ ] **Step 3: Implement,** re-bake `rivers_today.json` without canals.
+- [ ] **Step 4: Run the tests to check they pass.**
+- [ ] **Step 5: Run the check** (dev profile acceptable). Record every river's outlet margins and discharge ratio in `reality-check.md`. For each failing outlet, find the cause (a closed gorge, a burnt course's gap, a pit) and fix a narrow pass with a cited gorge entry, as Task 11 did; anything else goes to the owner unchanged with its numbers and an SVG or render of the misroute.
+- [ ] **Step 6: Run the gate and commit** `feat: the reality check follows the world's major rivers to their mouths`.
+
+### Task 11e: Tributaries find their canyons
+
+Owner, 2026-11-26: "Tributaries find canyons". With today's courses burnt in (Task 11b), a burnt canyon is the lowest ground for a lattice spacing around, so plateau tributaries drain into it, which is right in kind. But the region refines the joining link as a node-to-node chord, and where a fine ridge stands between the tributary's node and the canyon, the incision carves a gash through it: in Hells Canyon, 826–1,146 m deep and 375–875 m wide. This task routes such a link down the fine terrain instead.
+
+**Files:**
+- Modify: `crates/timefly_core/src/worldgen/generate/rivers.rs` (and a new focused module beside it if the search grows past about 300 lines), `hydrology/params.rs`, `docs/testing/rivers/reality-check.md` or a new `docs/testing/rivers/canyons.md` with the renders.
+
+**Interfaces:**
+- Consumes: Task 5's refinement (sub-points, `relax_river_node`, the incision bed), Task 11b's anchors (`EraHydrology` anchors, `relax_reach_m`, `river_tile_margin_m`).
+- Produces:
+  - A joining link (a link whose downstream node is burnt and whose upstream node is not) is refined along the least-cost path through the field's source level, from the upstream node's relaxed point to the downstream node's anchored point.
+    - The cost per step is the step's length × (1 + `JOIN_PATH_CLIMB_WEIGHT` × the height the step stands above the straight line between the two ends' levels, clamped at 0).
+    - The search runs over a lattice that is a function of the link alone (its two end directions, in f64), not of the region: points every `SUBPOINT_M` along and across the chord, out to `JOIN_PATH_HALF_WIDTH_FRACTION` × the lattice's mean spacing on each side.
+    - So every region that sees the link finds the same path, bit for bit.
+  - The path replaces the chord's sub-points, and the incision bed follows it (still never rising downstream).
+  - Links that are not joining links are unchanged: the region golden hashes for regions without burnt courses stay the same.
+  - New constants in `params.rs`: `JOIN_PATH_CLIMB_WEIGHT` and `JOIN_PATH_HALF_WIDTH_FRACTION`, values chosen and justified by the tests and the Hells Canyon render. The tile margin grows if the corridor needs it, and is counted.
+  - Generation cost: region generation stays within `EXPECTED_GEN_S_NATIVE` and `EXPECTED_GEN_S_WEB` (measure the Hells Canyon and Indus tributaries regions before and after), and no time-boxed slice grows past the web budget.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `a_tributary_joins_down_its_side_valley`: a synthetic plateau with a burnt canyon, a tributary node behind a 1,500 m ridge, and a side valley around the ridge's end. The refined path stays in the side valley (max height above the water < 50 m) and ends at the canyon.
+  - `a_joining_path_never_climbs_more_than_the_chord`: on any field, the path's cost ≤ the chord's.
+  - `joining_paths_agree_bit_for_bit_across_regions`: two regions whose edges cut the corridor differently, same path where they overlap. Prove the hazard: the path leaves the chord by more than a texel inside both.
+  - `links_that_do_not_join_a_course_are_unchanged`: an unburnt network refines exactly as before.
+- [ ] **Step 2: Run them to check they fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run the tests to check they pass.**
+- [ ] **Step 5: Re-render Hells Canyon** (`region_tour <out> 1920x1080 45.28,-116.59,0 hells high 6000`) and the Indus tributaries region (32.5, 74.5). Pass: no ridge gash; tributaries reach the Snake through side valleys. Record the generation times and commit the renders as JPG.
+- [ ] **Step 6: Run the gate and commit** `feat: tributaries join a burnt course down their own valleys`.
+
 ### Task 11c: White water that sloshes over rocks
 
 Owner, 2026-11-26: "add a white-water look pass". The design's intent (the owner's words): "In places where there are rapids it should look like the water is sloshing over rocks." Today the rapids read as a flat cream stripe: isotropic broken foam scrolled downstream, and at most 6 boulders per 500 m sub-segment, mostly under the surface.

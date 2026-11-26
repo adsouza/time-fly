@@ -16,12 +16,18 @@
 //!   level table's level (a table lake within [`TABLE_LAKE_KM`]), else of the lake map's baked
 //!   surface there.
 //! - **Outlets:** the river of the largest discharge within [`OUTLET_START_KM`] of a point flows
-//!   within [`OUTLET_VIA_KM`] of its real gorge (when one is named) and ends in the ocean within
-//!   [`OUTLET_SEA_KM`] of its real mouth, or its own allowance ([`OutletBar::sea_km`];
-//!   the Amazon's is 160 km) ([`trace_outlet`]).
+//!   within [`OUTLET_VIA_KM`] of each of its named places ([`OutletBar::vias`]) and ends in the
+//!   ocean (or, for [`OutletEnd::Lake`], a lake with no outflow: the Volga's Caspian) within
+//!   [`OUTLET_SEA_KM`] of its real mouth, or its own allowance ([`OutletBar::sea_km`]; the
+//!   Amazon's is 160 km) ([`trace_outlet`], [`judge_trace`]). Task 11d added the world's major
+//!   rivers, every point cited ([`OutletBar::source`]).
 //! - **Arid basins:** no lake of at least `LARGE_LAKE_KM2` touching a box whose basin (the lake
 //!   and the river nodes upstream of it) averages under [`ARID_PRECIP_MM`] of precipitation, in
 //!   the game's network or the reference's.
+//!
+//! It also prints a discharge table (informative, never a bar; Task 11d): at each
+//! [`DischargeGauge`], the game's discharge ([`game_discharge`]) against the published long-term
+//! mean, flagged outside a ratio of [`DISCHARGE_FLAG_RATIO`] ([`discharge_row`]).
 //!
 //! It writes `hydro-check-<box>.svg` per box (reference blue, game red, equirectangular, a
 //! [`SCALE_BAR_KM`] scale bar) to `OUT_DIR` (the working directory without one), prints one line
@@ -45,7 +51,7 @@ use timefly_core::formats::{Grid, read_tfgrid};
 use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
 use timefly_core::hydrology::climate::{BeyerClimate, ClimateSource, ZonalClimate};
 use timefly_core::hydrology::compare::{
-    Agreement, Reference, centreline_agreement, parse_reference, trace_outlet,
+    Agreement, OutletTrace, Reference, centreline_agreement, parse_reference, trace_outlet,
 };
 use timefly_core::hydrology::lakemap::shipped_lake_map;
 use timefly_core::hydrology::levels::shipped_lake_levels;
@@ -122,17 +128,44 @@ pub struct LakePoint {
     pub lon: f64,
 }
 
-/// A river's real course: a point on it, its gorge (if checked) and its mouth, `(lat, lon)`.
+/// What a river's real end is: the ocean, or a lake with no outlet (the Volga's Caspian).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutletEnd {
+    #[default]
+    Ocean,
+    Lake,
+}
+
+/// A river's real course: a point on it, the places it passes (in order, each checked) and its
+/// mouth, `(lat, lon)`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct OutletBar {
     pub name: String,
     pub from: (f64, f64),
     #[serde(default)]
-    pub via: Option<(String, (f64, f64))>,
+    pub vias: Vec<(String, (f64, f64))>,
     pub sea: (f64, f64),
     /// This river's own allowance at its mouth (km), in place of [`OUTLET_SEA_KM`].
     #[serde(default)]
     pub sea_km: Option<f64>,
+    /// What the river must end in.
+    #[serde(default)]
+    pub ends_in: OutletEnd,
+    /// Where its points come from.
+    #[serde(default)]
+    pub source: String,
+}
+
+/// A gauge for the discharge table (informative): the published long-term mean discharge at a
+/// point on a river.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DischargeGauge {
+    pub river: String,
+    pub gauge: String,
+    pub at: (f64, f64),
+    pub mean_m3s: f64,
+    pub source: String,
 }
 
 impl OutletBar {
@@ -151,6 +184,8 @@ pub struct CheckSpec {
     pub boxes: Vec<BoxBar>,
     pub lakes: Vec<LakePoint>,
     pub outlets: Vec<OutletBar>,
+    #[serde(default)]
+    pub gauges: Vec<DischargeGauge>,
 }
 
 impl CheckSpec {
@@ -161,12 +196,21 @@ impl CheckSpec {
             lat,
             lon,
         };
-        let outlet = |name: &str, from, via: Option<(&str, (f64, f64))>, sea| OutletBar {
+        let outlet = |name: &str, from, vias: &[(&str, (f64, f64))], sea, source: &str| OutletBar {
             name: name.into(),
             from,
-            via: via.map(|(n, p)| (n.to_string(), p)),
+            vias: vias.iter().map(|&(n, p)| (n.to_string(), p)).collect(),
             sea,
             sea_km: None,
+            ends_in: OutletEnd::Ocean,
+            source: format!("English Wikipedia, read 2026-11-26: {source}"),
+        };
+        let gauge = |river: &str, gauge: &str, at, mean_m3s, source: &str| DischargeGauge {
+            river: river.into(),
+            gauge: gauge.into(),
+            at,
+            mean_m3s,
+            source: source.into(),
         };
         CheckSpec {
             recent_n: None,
@@ -195,35 +239,371 @@ impl CheckSpec {
                 lake("Great Salt Lake", 41.1, -112.5),
                 lake("Lake Victoria", -1.0, 33.0),
             ],
-            // Every point is an English Wikipedia article's coordinates, read 2026-11-26 (the
-            // owner's ruling: cited outlet points); docs/testing/rivers/reality-check.md lists
-            // them with the values they replaced.
+            // Every point is an English Wikipedia article's coordinates (its own, or its
+            // infobox's mouth), read 2026-11-26 (the owner's ruling: cited outlet points); each
+            // entry's `source` names them, and docs/testing/rivers/reality-check.md lists them.
             outlets: vec![
-                // From Budapest ("Budapest"), through the Iron Gate ("Iron Gates"), to the
-                // delta ("Danube", infobox mouth).
                 outlet(
                     "Danube",
                     (47.49250, 19.05139),
-                    Some(("the Iron Gate", (44.67111, 22.52972))),
+                    &[("the Iron Gate", (44.67111, 22.52972))],
                     (45.21750, 29.76139),
+                    "from \"Budapest\"; via \"Iron Gates\"; mouth \"Danube\" (infobox)",
                 ),
-                // From Srinagar ("Srinagar"), out of the Kashmir valley at Baramulla
-                // ("Baramulla"), to the Indus delta ("Indus River", infobox mouth).
                 outlet(
                     "Jhelum",
                     (34.09000, 74.79000),
-                    Some(("Baramulla", (34.20869, 74.34350))),
+                    &[("Baramulla", (34.20869, 74.34350))],
                     (23.99500, 67.43500),
+                    "from \"Srinagar\"; via \"Baramulla\"; mouth \"Indus River\" (infobox)",
                 ),
-                // From Skardu ("Skardu") to the Arabian Sea ("Indus River", infobox mouth).
-                outlet("Indus", (35.29028, 75.64444), None, (23.99500, 67.43500)),
-                // From Iquitos ("Iquitos") to the Atlantic by the North Channel, north of Marajó
-                // past Macapá ("Amazon River", infobox mouth). Its allowance is 160 km (owner,
-                // 2026-11-26): its estuary is about 300 km across.
+                outlet(
+                    "Indus",
+                    (35.29028, 75.64444),
+                    &[],
+                    (23.99500, 67.43500),
+                    "from \"Skardu\"; mouth \"Indus River\" (infobox)",
+                ),
+                // Its allowance is 160 km (owner, 2026-11-26): its estuary is about 300 km across.
                 OutletBar {
                     sea_km: Some(160.0),
-                    ..outlet("Amazon", (-3.750, -73.250), None, (0.70778, -50.08944))
+                    ..outlet(
+                        "Amazon",
+                        (-3.750, -73.250),
+                        &[],
+                        (0.70778, -50.08944),
+                        "from \"Iquitos\"; mouth \"Amazon River\" (infobox: the North Channel)",
+                    )
                 },
+                // Task 11d: the world's major river systems (owner, 2026-11-26).
+                outlet(
+                    "Ganges",
+                    (26.449923, 80.331874),
+                    &[
+                        ("Varanasi", (25.31888889, 83.01277778)),
+                        ("the Farakka Barrage", (24.80444444, 87.93305556)),
+                    ],
+                    (22.0, 90.9),
+                    "from \"Kanpur\"; via \"Varanasi\", \"Farakka Barrage\"; mouth \"Ganges\" \
+                     (infobox)",
+                ),
+                // The Brahmaputra's own mouth is its confluence with the Ganges; it reaches the
+                // sea by the Ganges's mouth (as the Jhelum takes the Indus's).
+                outlet(
+                    "Brahmaputra",
+                    (29.185, 92.51666667),
+                    &[
+                        ("Pasighat", (28.07, 95.33)),
+                        ("Guwahati", (26.17222222, 91.74583333)),
+                    ],
+                    (22.0, 90.9),
+                    "from \"Zangmu Dam\" (the Yarlung Tsangpo above the Great Bend); via \
+                     \"Pasighat\", \"Guwahati\"; mouth \"Ganges\" (infobox)",
+                ),
+                outlet(
+                    "Yangtze",
+                    (29.5637, 106.5504),
+                    &[
+                        ("the Three Gorges", (31.01777778, 110.22861111)),
+                        ("Yichang", (30.692, 111.287)),
+                        ("Wuhan", (30.595, 114.2975)),
+                    ],
+                    (31.39361111, 121.98305556),
+                    "from \"Chongqing\"; via \"Three Gorges\", \"Yichang\", \"Wuhan\"; mouth \
+                     \"Yangtze\" (infobox)",
+                ),
+                // Zhengzhou's own point stands 15 km from the river: Huayuankou, its riverside
+                // district and gauge, is the via.
+                outlet(
+                    "Yellow River",
+                    (35.989, 101.471),
+                    &[
+                        ("Lanzhou", (36.0606, 103.8268)),
+                        ("Zhengzhou (Huayuankou)", (34.87694444, 113.67277778)),
+                    ],
+                    (37.763, 119.162),
+                    "from \"Guide County\"; via \"Lanzhou\", \"Huayuankou, Henan\"; mouth \
+                     \"Yellow River\" (infobox)",
+                ),
+                outlet(
+                    "Pearl",
+                    (23.4, 110.08333333),
+                    &[("Wuzhou", (23.4767, 111.279))],
+                    (22.76666667, 113.63333333),
+                    "from \"Guiping\"; via \"Wuzhou\"; mouth \"Pearl River\" (the article's \
+                     coordinates: its infobox gives none)",
+                ),
+                outlet(
+                    "Mekong",
+                    (17.98, 102.63),
+                    &[("Phnom Penh", (11.56944444, 104.92111111))],
+                    (10.19, 106.75),
+                    "from \"Vientiane\"; via \"Phnom Penh\"; mouth \"Mekong\" (infobox)",
+                ),
+                outlet(
+                    "Nile",
+                    (0.44361111, 33.185),
+                    &[
+                        ("Khartoum", (15.6, 32.5)),
+                        ("Aswan", (24.08888889, 32.89972222)),
+                    ],
+                    (30.1725, 31.14),
+                    "from \"Nalubaale Hydroelectric Power Station\" (the Owen Falls Dam at Jinja); via \"Khartoum\", \"Aswan\"; mouth \"Nile\" \
+                     (infobox: 30 10 21 N, 31 8 24 E, the delta's head)",
+                ),
+                outlet(
+                    "Congo",
+                    (-2.95, 25.95),
+                    &[
+                        ("Kisangani", (0.51666667, 25.2)),
+                        ("Kinshasa", (-4.32194444, 15.31194444)),
+                    ],
+                    (-6.075, 12.45),
+                    "from \"Kindu\"; via \"Kisangani\", \"Kinshasa\"; mouth \"Congo River\" \
+                     (infobox)",
+                ),
+                // Timbuktu stands 13 km from the river: Kabara, its port, is the via.
+                outlet(
+                    "Niger",
+                    (12.63916667, -8.00277778),
+                    &[
+                        ("the Inner Niger Delta", (15.2, -4.1)),
+                        ("Timbuktu (Kabara)", (16.70695, -2.9853)),
+                        ("Lokoja", (7.80194444, 6.74416667)),
+                    ],
+                    (5.32222222, 6.46916667),
+                    "from \"Bamako\"; via \"Inner Niger Delta\", \"Kabara, Mali\", \"Lokoja\"; \
+                     mouth \"Niger River\" (infobox)",
+                ),
+                outlet(
+                    "Mississippi",
+                    (44.98194444, -93.26916667),
+                    &[
+                        ("St. Louis", (38.62722222, -90.19777778)),
+                        ("New Orleans", (29.9761, -90.0783)),
+                    ],
+                    (29.15111111, -89.25333333),
+                    "from \"Minneapolis\"; via \"St. Louis\", \"New Orleans\"; mouth \
+                     \"Mississippi River\" (infobox)",
+                ),
+                outlet(
+                    "Hudson",
+                    (43.31222222, -73.64833333),
+                    &[("Albany", (42.6525, -73.75722222))],
+                    (40.69666667, -74.02833333),
+                    "from \"Glens Falls, New York\"; via \"Albany, New York\"; mouth \
+                     \"Hudson River\" (infobox)",
+                ),
+                outlet(
+                    "Yenisei",
+                    (51.71666667, 94.45),
+                    &[("Krasnoyarsk", (56.00888889, 92.87194444))],
+                    (71.83333333, 82.66666667),
+                    "from \"Kyzyl\"; via \"Krasnoyarsk\"; mouth \"Yenisei\" (infobox: the \
+                     Yenisey Gulf)",
+                ),
+                outlet(
+                    "Ob",
+                    (53.34861111, 83.77638889),
+                    &[("Novosibirsk", (55.05, 82.95))],
+                    (66.53388889, 71.39472222),
+                    "from \"Barnaul\"; via \"Novosibirsk\"; mouth \"Ob\" (infobox: the Gulf \
+                     of Ob)",
+                ),
+                outlet(
+                    "Orinoco",
+                    (7.65, -66.16666667),
+                    &[("Ciudad Bolívar", (8.13793, -63.548266))],
+                    (8.61666667, -62.25),
+                    "from \"Caicara del Orinoco\"; via \"Ciudad Bolívar\"; mouth \"Orinoco\" \
+                     (infobox)",
+                ),
+                outlet(
+                    "Paraná",
+                    (-27.48333333, -58.81666667),
+                    &[("Rosario", (-32.9575, -60.63944444))],
+                    (-34.00138889, -58.39361111),
+                    "from \"Corrientes\"; via \"Rosario\"; mouth \"Paraná River\" (infobox: \
+                     the Paraná Guazú into the Río de la Plata)",
+                ),
+                outlet(
+                    "Lena",
+                    (57.78333333, 108.08333333),
+                    &[("Yakutsk", (62.03, 129.73))],
+                    (72.4087, 126.6847),
+                    "from \"Kirensk\"; via \"Yakutsk\"; mouth \"Lena River\" (infobox)",
+                ),
+                // Its sea is the Caspian, a lake with no outlet.
+                OutletBar {
+                    ends_in: OutletEnd::Lake,
+                    ..outlet(
+                        "Volga",
+                        (56.32694444, 44.0075),
+                        &[("Volgograd", (48.70861111, 44.51472222))],
+                        (45.695, 47.8975),
+                        "from \"Nizhny Novgorod\"; via \"Volgograd\"; mouth \"Volga\" \
+                         (infobox: the Volga Delta on the Caspian)",
+                    )
+                },
+                outlet(
+                    "Mackenzie",
+                    (61.35472222, -117.66),
+                    &[("Fort Simpson", (61.86083333, -121.35277778))],
+                    (68.93972222, -136.17277778),
+                    "from \"Fort Providence\"; via \"Fort Simpson\"; mouth \"Mackenzie \
+                     River\" (infobox)",
+                ),
+            ],
+            // Task 11d's discharge table (informative): one gauge per river, the published
+            // long-term mean and its citation, as the river's English Wikipedia article gives
+            // it (read 2026-11-26) unless named otherwise. The gauges' points are their
+            // articles' coordinates.
+            gauges: vec![
+                gauge(
+                    "Ganges",
+                    "the Farakka Barrage",
+                    (24.80444444, 87.93305556),
+                    16_648.0,
+                    "\"Ganges\", infobox: Kumar, Singh & Sharma (2005), Water Resources of India, \
+                     Current Science 89(5), 794-811",
+                ),
+                gauge(
+                    "Brahmaputra",
+                    "Guwahati",
+                    (26.17222222, 91.74583333),
+                    18_850.4,
+                    "\"Brahmaputra River\", infobox (1971-2000): Tilman, Rivers Network, Ganga \
+                     (Ganges)-Brahmaputra",
+                ),
+                // 711.1 km3/yr at 365.25 days a year.
+                gauge(
+                    "Yangtze",
+                    "Wuhan (Hankou)",
+                    (30.595, 114.2975),
+                    22_534.0,
+                    "\"Yangtze\", infobox (1980-2020, 711.1 km3/yr): Yang et al. (2023), Frontiers \
+                     in Marine Science 10, 1201533, doi:10.3389/fmars.2023.1201533",
+                ),
+                // The article names no gauge: GRDC station 2180800.
+                gauge(
+                    "Yellow River",
+                    "Huayuankou",
+                    (34.87694444, 113.67277778),
+                    1_438.0,
+                    "UNH/GRDC Composite Runoff Fields, station 2180800 Huayuankou (1946-1988), \
+                     compositerunoff.sr.unh.edu; point \"Huayuankou, Henan\"",
+                ),
+                gauge(
+                    "Pearl",
+                    "Wuzhou",
+                    (23.4767, 111.279),
+                    7_410.0,
+                    "\"Xi River\", infobox: NASA GES DISC (archived 2008-08-28)",
+                ),
+                gauge(
+                    "Mekong",
+                    "Kratié",
+                    (12.48, 106.03),
+                    13_200.0,
+                    "\"Mekong\", Table 2 (1960-2004): Mekong River Commission (2005), Overview of \
+                     the Hydrology of the Mekong Basin; point \"Kratié (town)\"",
+                ),
+                gauge(
+                    "Nile",
+                    "Aswan",
+                    (24.08888889, 32.89972222),
+                    2_757.0,
+                    "\"Nile\", infobox: Senay et al. (2014), Water Resources Research 50(11), \
+                     8625-8650, doi:10.1002/2013WR015231, Table 4",
+                ),
+                gauge(
+                    "Congo",
+                    "Kinshasa-Brazzaville",
+                    (-4.32194444, 15.31194444),
+                    40_500.0,
+                    "\"Congo River\", infobox (1902-2019): Laraque et al. (2020), Water 12(9), 2613, \
+                     doi:10.3390/w12092613",
+                ),
+                gauge(
+                    "Niger",
+                    "Lokoja",
+                    (7.80194444, 6.74416667),
+                    6_743.2,
+                    "\"Niger River\", infobox (2000-2025): Niger-HYCOS, Bilan hydrologique du \
+                     bassin du Niger annee 2023/2024",
+                ),
+                // 200,500 ft3/s.
+                gauge(
+                    "Mississippi",
+                    "St. Louis",
+                    (38.62722222, -90.19777778),
+                    5_677.5,
+                    "\"Mississippi River\", infobox (1933-2024): USGS Water-Year Summary for Site \
+                     07010000",
+                ),
+                // 17,400 ft3/s.
+                gauge(
+                    "Hudson",
+                    "Green Island",
+                    (42.74416667, -73.69138889),
+                    492.7,
+                    "\"Hudson River\", infobox: USGS, Hudson River at Green Island NY (01358000); \
+                     point \"Green Island, New York\"",
+                ),
+                gauge(
+                    "Yenisei",
+                    "Igarka",
+                    (67.46666667, 86.58333333),
+                    19_499.0,
+                    "\"Yenisei\", infobox (1971-2015): Stadnyk et al. (2021), Changing freshwater \
+                     contributions to the Arctic, Elementa 9(1), doi:10.1525/elementa.2020.00098",
+                ),
+                gauge(
+                    "Ob",
+                    "Salekhard",
+                    (66.53333333, 66.6),
+                    12_889.0,
+                    "\"Ob\", infobox (1971-2015): Stadnyk et al. (2021), \
+                     doi:10.1525/elementa.2020.00098",
+                ),
+                gauge(
+                    "Orinoco",
+                    "Ciudad Bolívar",
+                    (8.13793, -63.548266),
+                    32_760.0,
+                    "\"Orinoco\", infobox (1926-2011): Cordova & Sanabria, La geografia del agua",
+                ),
+                gauge(
+                    "Paraná",
+                    "Corrientes",
+                    (-27.48333333, -58.81666667),
+                    18_979.0,
+                    "\"Paraná River\", infobox (1971-2010): Transboundary Diagnostic Analysis for \
+                     the La Plata Basin",
+                ),
+                gauge(
+                    "Lena",
+                    "Kyusyur",
+                    (70.68333333, 127.36666667),
+                    17_773.0,
+                    "\"Lena River\", infobox (1971-2015): Stadnyk et al. (2021), \
+                     doi:10.1525/elementa.2020.00098",
+                ),
+                gauge(
+                    "Volga",
+                    "Volgograd",
+                    (48.70861111, 44.51472222),
+                    8_228.3,
+                    "\"Volga\", infobox: Tilman, Rivers Network, Volga",
+                ),
+                gauge(
+                    "Mackenzie",
+                    "Tsiigehtchic (Arctic Red River)",
+                    (67.44055556, -133.74527778),
+                    9_211.0,
+                    "\"Mackenzie River\", infobox (1971-2015): NOAA Arctic Report Card, River \
+                     Discharge",
+                ),
             ],
         }
     }
@@ -425,22 +805,55 @@ pub fn judge_lake(hydro: &EraHydrology, lake: &LakePoint) -> BarResult {
     }
 }
 
+/// Traces `outlet`'s river ([`trace_outlet`]) once to its end and once per via, and judges it
+/// ([`judge_trace`]).
 pub fn judge_outlet(hydro: &EraHydrology, outlet: &OutletBar) -> BarResult {
-    let via = outlet.via.as_ref().map(|(_, (lat, lon))| dir(*lat, *lon));
     let from = dir(outlet.from.0, outlet.from.1);
-    let (pass, line) = match trace_outlet(hydro, from, OUTLET_START_KM, via) {
+    let trace = trace_outlet(hydro, from, OUTLET_START_KM, None);
+    let via_km: Vec<Option<f64>> = outlet
+        .vias
+        .iter()
+        .map(|(_, (lat, lon))| {
+            trace_outlet(hydro, from, OUTLET_START_KM, Some(dir(*lat, *lon))).and_then(|t| t.via_km)
+        })
+        .collect();
+    judge_trace(outlet, trace.as_ref(), &via_km)
+}
+
+/// The outlet bar on a trace: every via within [`OUTLET_VIA_KM`] (`via_km`, one per via, in
+/// order), and an end of the outlet's kind ([`OutletBar::ends_in`]) within its allowance of its
+/// mouth.
+pub fn judge_trace(
+    outlet: &OutletBar,
+    trace: Option<&OutletTrace>,
+    via_km: &[Option<f64>],
+) -> BarResult {
+    let (pass, line) = match trace {
         None => (false, format!("no river within {OUTLET_START_KM} km")),
         Some(t) => {
             let sea_km = km_between(t.end_dir, dir(outlet.sea.0, outlet.sea.1));
             let (lat, lon) = latlon(t.end_dir);
-            let ocean = matches!(t.end, Down::Ocean(_));
-            let via_ok = t.via_km.is_none_or(|km| km <= OUTLET_VIA_KM);
-            let via_text = match (&outlet.via, t.via_km) {
-                (Some((name, _)), Some(km)) => {
-                    format!("passes {km:.1} km from {name} ({OUTLET_VIA_KM} km allowed), ")
-                }
-                _ => String::new(),
+            let end_ok = match outlet.ends_in {
+                OutletEnd::Ocean => matches!(t.end, Down::Ocean(_)),
+                OutletEnd::Lake => matches!(t.end, Down::Lake(..)),
             };
+            let mut via_ok = true;
+            let mut via_text = String::new();
+            for ((name, _), km) in outlet.vias.iter().zip(via_km) {
+                match km {
+                    Some(km) => {
+                        via_ok &= *km <= OUTLET_VIA_KM;
+                        let _ = write!(
+                            via_text,
+                            "passes {km:.1} km from {name} ({OUTLET_VIA_KM} km allowed), "
+                        );
+                    }
+                    None => {
+                        via_ok = false;
+                        let _ = write!(via_text, "never measured from {name}, ");
+                    }
+                }
+            }
             let end = match t.end {
                 Down::Ocean(_) => "the ocean",
                 Down::Lake(..) => "a lake",
@@ -448,10 +861,15 @@ pub fn judge_outlet(hydro: &EraHydrology, outlet: &OutletBar) -> BarResult {
                 Down::Sink(_) => "a dry sink",
                 Down::River(_) => "a river",
             };
+            let wants = match (outlet.ends_in, end_ok) {
+                (_, true) => "",
+                (OutletEnd::Ocean, false) => " (needs the ocean)",
+                (OutletEnd::Lake, false) => " (needs a lake)",
+            };
             (
-                ocean && via_ok && sea_km <= outlet.sea_allowance_km(),
+                end_ok && via_ok && sea_km <= outlet.sea_allowance_km(),
                 format!(
-                    "{} river nodes through {} lakes, {via_text}ends in {end} at ({lat:.2}, \
+                    "{} river nodes through {} lakes, {via_text}ends in {end}{wants} at ({lat:.2}, \
                      {lon:.2}), {sea_km:.0} km from its mouth ({} km allowed)",
                     t.nodes,
                     t.lakes,
@@ -464,6 +882,56 @@ pub fn judge_outlet(hydro: &EraHydrology, outlet: &OutletBar) -> BarResult {
         pass,
         line: format!("outlet {}: {line} - {}", outlet.name, verdict(pass)),
         details: Vec::new(),
+    }
+}
+
+/// A ratio of game to published discharge outside `[1 / DISCHARGE_FLAG_RATIO,
+/// DISCHARGE_FLAG_RATIO]` is flagged in the discharge table.
+pub const DISCHARGE_FLAG_RATIO: f64 = 3.0;
+
+/// The game's discharge at a gauge: the largest of the river nodes within [`OUTLET_START_KM`]
+/// (m³/s), as an outlet's start.
+pub fn game_discharge(hydro: &EraHydrology, at: (f64, f64)) -> Option<f64> {
+    let nodes = hydro.rivers.nodes();
+    let mut near = Vec::new();
+    hydro.rivers.near(
+        &hydro.lattice,
+        RenderDir(dir(at.0, at.1)),
+        OUTLET_START_KM * 1e3,
+        &mut near,
+    );
+    near.iter()
+        .map(|&k| f64::from(nodes[k as usize].discharge_m3s))
+        .reduce(f64::max)
+}
+
+/// The discharge table's row (informative, never a bar): whether it is flagged (no river at the
+/// gauge, or a ratio outside [`DISCHARGE_FLAG_RATIO`]), and its line.
+pub fn discharge_row(gauge: &DischargeGauge, game_m3s: Option<f64>) -> (bool, String) {
+    let head = format!(
+        "discharge {} at {} ({:.2}, {:.2})",
+        gauge.river, gauge.gauge, gauge.at.0, gauge.at.1
+    );
+    match game_m3s {
+        None => (
+            true,
+            format!(
+                "{head}: no river within {OUTLET_START_KM} km, published {:.0} m3/s - FLAG",
+                gauge.mean_m3s
+            ),
+        ),
+        Some(q) => {
+            let ratio = q / gauge.mean_m3s;
+            let flagged = !(1.0 / DISCHARGE_FLAG_RATIO..=DISCHARGE_FLAG_RATIO).contains(&ratio);
+            (
+                flagged,
+                format!(
+                    "{head}: game {q:.0} m3/s, published {:.0} m3/s, ratio {ratio:.2} - {}",
+                    gauge.mean_m3s,
+                    if flagged { "FLAG" } else { "ok" }
+                ),
+            )
+        }
     }
 }
 
@@ -809,6 +1277,23 @@ pub fn hydro_check(
         pass &= result.pass;
         lines.push(result.line);
     }
+    // Informative (Task 11d): the game's discharge at a gauge per river against its published
+    // long-term mean.
+    let mut flagged = 0;
+    for gauge in &spec.gauges {
+        let (flag, line) = discharge_row(gauge, game_discharge(hydro, gauge.at));
+        flagged += usize::from(flag);
+        lines.push(line);
+    }
+    if !spec.gauges.is_empty() {
+        lines.push(format!(
+            "discharge table (informative): {flagged} of {} gauges flagged (ratio outside 1/{} to \
+             {})",
+            spec.gauges.len(),
+            DISCHARGE_FLAG_RATIO,
+            DISCHARGE_FLAG_RATIO
+        ));
+    }
     let precip_at = |v: u32| {
         let d = hydro.lattice.dir(v);
         let e = field.sample_overview(d).elevation_m as f32;
@@ -960,7 +1445,7 @@ mod tests {
             assert!(level.is_finite());
         }
         let names: Vec<&str> = s.outlets.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, ["Danube", "Jhelum", "Indus", "Amazon"]);
+        assert_eq!(names[..4], ["Danube", "Jhelum", "Indus", "Amazon"]);
     }
 
     #[test]
@@ -969,11 +1454,22 @@ mod tests {
             "boxes": [{"name": "tiny", "file": "tiny.json", "tolerance_km": 50,
                        "min_share": 0.5, "every_link": false}],
             "lakes": [{"name": "x", "lat": 1.0, "lon": 2.0}],
-            "outlets": [{"name": "r", "from": [1, 2], "via": ["g", [1.5, 2.5]], "sea": [0, 0]}]}"#;
+            "outlets": [{"name": "r", "from": [1, 2], "vias": [["g", [1.5, 2.5]]], "sea": [0, 0]},
+                        {"name": "l", "from": [1, 2], "sea": [0, 0], "ends_in": "lake",
+                         "source": "s"}],
+            "gauges": [{"river": "r", "gauge": "g", "at": [1, 2], "mean_m3s": 10,
+                        "source": "s"}]}"#;
         let spec: CheckSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.recent_n, Some(64));
         assert_eq!(spec.boxes[0].below_m, None);
-        assert_eq!(spec.outlets[0].via, Some(("g".to_string(), (1.5, 2.5))));
+        assert_eq!(spec.outlets[0].vias, [("g".to_string(), (1.5, 2.5))]);
+        assert_eq!(
+            (spec.outlets[0].ends_in, spec.outlets[0].source.as_str()),
+            (OutletEnd::Ocean, "")
+        );
+        assert_eq!(spec.outlets[1].ends_in, OutletEnd::Lake);
+        assert!(spec.outlets[1].vias.is_empty());
+        assert_eq!(spec.gauges[0].mean_m3s, 10.0);
     }
 
     #[test]
@@ -1046,5 +1542,221 @@ mod tests {
             assert_eq!(o.sea_allowance_km(), want, "{}", o.name);
         }
         assert_eq!(OUTLET_SEA_KM, 150.0);
+    }
+
+    /// The great-circle distance from `p` to the minor arc `a`-`b` (km).
+    fn km_to_arc(p: DVec3, a: DVec3, b: DVec3) -> f64 {
+        let (p, a, b) = (p.normalize(), a.normalize(), b.normalize());
+        let ends = km_between(p, a).min(km_between(p, b));
+        let n = a.cross(b);
+        if n.length() < 1e-15 {
+            return ends;
+        }
+        let n = n.normalize();
+        let s = p.dot(n);
+        let foot = p - s * n;
+        if a.cross(foot).dot(n) >= 0.0 && foot.cross(b).dot(n) >= 0.0 {
+            s.abs().min(1.0).asin() * EARTH_RADIUS_M * 1e-3
+        } else {
+            ends
+        }
+    }
+
+    /// The nearest burnt course to a point: its name and distance (km).
+    fn nearest_course(lat: f64, lon: f64) -> (f64, String) {
+        let p = dir(lat, lon);
+        let mut best = (f64::INFINITY, String::new());
+        for r in shipped_today_rivers() {
+            for w in r.points.windows(2) {
+                let km = km_to_arc(p, dir(w[0].0, w[0].1), dir(w[1].0, w[1].1));
+                if km < best.0 {
+                    best = (km, r.name.clone());
+                }
+            }
+        }
+        best
+    }
+
+    /// Task 11d: the world's major rivers have outlet bars and gauges with cited sources, and
+    /// every start, via and gauge lies on land (outside the lake map's lakes) within its
+    /// tolerance of a burnt course; a river ending in a lake has a lake within its allowance of
+    /// its mouth.
+    #[test]
+    fn the_major_rivers_have_cited_outlets() {
+        let spec = CheckSpec::standard();
+        let major = [
+            "Ganges",
+            "Brahmaputra",
+            "Yangtze",
+            "Yellow River",
+            "Pearl",
+            "Mekong",
+            "Nile",
+            "Congo",
+            "Niger",
+            "Mississippi",
+            "Hudson",
+            "Yenisei",
+            "Ob",
+            "Orinoco",
+            "Paraná",
+            "Lena",
+            "Volga",
+            "Mackenzie",
+        ];
+        let named = |n: &str| spec.outlets.iter().find(|o| o.name == n);
+        for river in major {
+            let o = named(river).unwrap_or_else(|| panic!("no outlet bar for {river}"));
+            assert!(
+                spec.gauges.iter().filter(|g| g.river == river).count() == 1,
+                "{river}: one gauge"
+            );
+            assert_eq!(o.sea_allowance_km(), OUTLET_SEA_KM, "{river}");
+        }
+        let vias = |o: &str| named(o).unwrap().vias.len();
+        assert_eq!(
+            [
+                vias("Ganges"),
+                vias("Brahmaputra"),
+                vias("Nile"),
+                vias("Niger")
+            ],
+            [2, 2, 2, 3]
+        );
+        let map = shipped_lake_map();
+        let mut problems = Vec::new();
+        let mut check = |what: String, (lat, lon): (f64, f64), tolerance_km: f64| {
+            let (km, course) = nearest_course(lat, lon);
+            if km > tolerance_km {
+                problems.push(format!(
+                    "{what} ({lat}, {lon}): {km:.1} km from {course:?}, over {tolerance_km} km"
+                ));
+            }
+            if map.lake_at(lat, lon).is_some() {
+                problems.push(format!("{what} ({lat}, {lon}): in a lake"));
+            }
+        };
+        for o in &spec.outlets {
+            assert!(!o.source.is_empty(), "{}: no source", o.name);
+            check(format!("{} start", o.name), o.from, OUTLET_START_KM);
+            for (name, at) in &o.vias {
+                check(format!("{} via {name}", o.name), *at, OUTLET_VIA_KM);
+            }
+            if o.ends_in == OutletEnd::Lake {
+                // Its mouth is where its burnt course ends, and its lake is a lake of the level
+                // table (the Caspian), which the pass fills to its table level, named in its
+                // source.
+                let (km, course) = nearest_course(o.sea.0, o.sea.1);
+                assert!(
+                    km <= o.sea_allowance_km(),
+                    "{}: mouth {km:.1} km from {course:?}",
+                    o.name
+                );
+                let lake = shipped_lake_levels().iter().find(|t| {
+                    let first = t.name.split(' ').next().unwrap_or(&t.name);
+                    o.source.contains(first)
+                });
+                assert!(lake.is_some(), "{}: names no level-table lake", o.name);
+            }
+        }
+        for g in &spec.gauges {
+            assert!(!g.source.is_empty() && g.mean_m3s > 0.0, "{g:?}");
+            assert!(named(&g.river).is_some(), "{}: no outlet bar", g.river);
+            check(
+                format!("{} gauge {}", g.river, g.gauge),
+                g.at,
+                OUTLET_START_KM,
+            );
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn the_discharge_table_flags_ratios_outside_three() {
+        let g = DischargeGauge {
+            river: "R".into(),
+            gauge: "G".into(),
+            at: (1.0, 2.0),
+            mean_m3s: 900.0,
+            source: "s".into(),
+        };
+        let flag = |q: Option<f64>| discharge_row(&g, q).0;
+        // 1/3 and 3 themselves are inside; just past them is not.
+        assert!(!flag(Some(300.0)) && !flag(Some(900.0)) && !flag(Some(2700.0)));
+        assert!(flag(Some(299.0)) && flag(Some(2701.0)) && flag(Some(0.0)));
+        assert!(flag(None));
+        let (_, line) = discharge_row(&g, Some(1800.0));
+        assert_eq!(
+            line,
+            "discharge R at G (1.00, 2.00): game 1800 m3/s, published 900 m3/s, ratio 2.00 - ok"
+        );
+        let (_, line) = discharge_row(&g, Some(90.0));
+        assert!(line.ends_with("ratio 0.10 - FLAG"), "{line}");
+        let (_, line) = discharge_row(&g, None);
+        assert!(
+            line.contains("no river within 30 km") && line.ends_with("FLAG"),
+            "{line}"
+        );
+    }
+
+    /// Task 11d: the Volga's sea is the Caspian, a lake. A bar names what its river must end in;
+    /// each of several vias is judged.
+    #[test]
+    fn an_outlet_ends_in_the_water_its_bar_names() {
+        let lattice = CubeLattice { n: 30 };
+        let mouth = (45.7, 47.9);
+        let end = lattice.nearest(RenderDir(dir(mouth.0, mouth.1)));
+        let trace = |down| OutletTrace {
+            start: 0,
+            nodes: 9,
+            lakes: 0,
+            via_km: None,
+            end: down,
+            end_dir: lattice.dir(end).0,
+        };
+        let bar = |ends_in| OutletBar {
+            name: "V".into(),
+            from: (56.0, 44.0),
+            vias: vec![("A".into(), (50.0, 45.0)), ("B".into(), (48.7, 44.5))],
+            sea: mouth,
+            sea_km: None,
+            ends_in,
+            source: "s".into(),
+        };
+        let ok = [Some(1.0), Some(OUTLET_VIA_KM)];
+        let lake = trace(Down::Lake(0, end));
+        let ocean = trace(Down::Ocean(end));
+        assert!(judge_trace(&bar(OutletEnd::Lake), Some(&lake), &ok).pass);
+        assert!(judge_trace(&bar(OutletEnd::Ocean), Some(&ocean), &ok).pass);
+        let r = judge_trace(&bar(OutletEnd::Ocean), Some(&lake), &ok);
+        assert!(
+            !r.pass && r.line.contains("ends in a lake (needs the ocean)"),
+            "{}",
+            r.line
+        );
+        let r = judge_trace(&bar(OutletEnd::Lake), Some(&ocean), &ok);
+        assert!(!r.pass && r.line.contains("(needs a lake)"), "{}", r.line);
+        assert!(!judge_trace(&bar(OutletEnd::Lake), Some(&trace(Down::Sink(end))), &ok).pass);
+        // Every via is judged: the second one off by a metre fails.
+        let r = judge_trace(
+            &bar(OutletEnd::Lake),
+            Some(&lake),
+            &[Some(1.0), Some(15.001)],
+        );
+        assert!(!r.pass, "{}", r.line);
+        assert!(
+            r.line
+                .contains("passes 1.0 km from A (15 km allowed), passes 15.0 km from B"),
+            "{}",
+            r.line
+        );
+        assert!(!judge_trace(&bar(OutletEnd::Lake), Some(&lake), &[Some(1.0), None]).pass);
+        // Far from its mouth.
+        let far = OutletTrace {
+            end_dir: dir(40.0, 50.0),
+            ..lake
+        };
+        assert!(!judge_trace(&bar(OutletEnd::Lake), Some(&far), &ok).pass);
+        assert!(!judge_trace(&bar(OutletEnd::Lake), None, &ok).pass);
     }
 }

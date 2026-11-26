@@ -4,7 +4,11 @@ routing wherever the terrain is today's (``timefly_core::hydrology::today_rivers
 
 - **Select:** features whose ``featurecla`` is ``River`` with ``scalerank`` at most
   :data:`TODAY_RIVER_MAX_SCALERANK`; each part of a MultiLineString is its own polyline. Lake
-  centrelines are left out: today's lakes are the lake map's (Task 8b).
+  centrelines are left out: today's lakes are the lake map's (Task 8b). Artificial channels are
+  left out too (Task 11d): Natural Earth files canals as ``River``, so a feature whose name holds
+  a word of :data:`ARTIFICIAL_NAME_WORDS` is dropped (the Suez, Panama, Ismailiya and Gharraf
+  canals and the Ferenc Csatorna, the Danube-Tisa-Danube Canal; the Hindiyah Channel, a natural
+  branch of the Euphrates, stays).
 - **Orient:** upstream first. Each end's height is the lowest ETOPO 2022 60″ surface cell whose
   centre lies within :data:`ORIENT_CELLS` cells (2′) of the end's cell, in both rows and columns;
   the higher end goes first. Ties keep Natural Earth's order.
@@ -29,6 +33,9 @@ import numpy as np
 from timefly_bake.log import traced
 
 TODAY_RIVER_MAX_SCALERANK = 7
+#: Name words of an artificial channel, matched whole and ignoring case: "canal", and the
+#: Hungarian "csatorna" (canal) of the Ferenc Csatorna.
+ARTIFICIAL_NAME_WORDS = ("canal", "csatorna")
 SIMPLIFY_M = 1000.0
 ORIENT_CELLS = 2
 ROUND_DIGITS = 3
@@ -42,7 +49,7 @@ SOURCE = (
 )
 COMMENT = (
     "Today's major river courses (rivers Task 11b): Natural Earth rivers of scalerank <= 7 (lake "
-    "centrelines left out), one entry per line part, upstream first (the end with the higher "
+    "centrelines and canals left out), one entry per line part, upstream first (the end with the higher "
     "lowest ETOPO 60-second cell within 2 arc-minutes goes first), simplified to 1 km, points "
     "[lat, lon] rounded to 0.001 degrees. Where the terrain is today's, the continental pass burns "
     "each course into its routing: the running minimum of the era's node elevations along it, "
@@ -91,17 +98,26 @@ def _rank(properties) -> int:
 
 
 @traced
+def is_artificial(name: str) -> bool:
+    """Whether a feature's name marks an artificial channel (:data:`ARTIFICIAL_NAME_WORDS`)."""
+    return any(word in ARTIFICIAL_NAME_WORDS for word in name.lower().split())
+
+
+@traced
 def select(features) -> list[Polyline]:
-    """Each part of every ``River`` feature with ``scalerank <= TODAY_RIVER_MAX_SCALERANK``, as
-    a polyline of (lat, lon), in file order."""
+    """Each part of every ``River`` feature with ``scalerank <= TODAY_RIVER_MAX_SCALERANK`` that
+    is not an artificial channel (:func:`is_artificial`), as a polyline of (lat, lon), in file
+    order."""
     out = []
     for f in features:
         p = f["properties"]
         if p.get("featurecla") != "River" or _rank(p) > TODAY_RIVER_MAX_SCALERANK:
             continue
+        name = (p.get("name") or p.get("name_en") or "").strip()
+        if is_artificial(name):
+            continue
         g = f["geometry"]
         parts = g["coordinates"] if g["type"] == "MultiLineString" else [g["coordinates"]]
-        name = (p.get("name") or p.get("name_en") or "").strip()
         for part in parts:
             lonlat = np.asarray(part, dtype=np.float64)[:, :2]
             out.append(Polyline(name, _rank(p), lonlat[:, ::-1].copy()))
@@ -269,9 +285,11 @@ def main(argv=None) -> int:
 
 
 __all__ = [
+    "ARTIFICIAL_NAME_WORDS",
     "CellGrid",
     "Polyline",
     "bake",
+    "is_artificial",
     "main",
     "orient",
     "select",
