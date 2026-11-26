@@ -701,6 +701,13 @@ The test below pins the result.
   - Iguazu Falls: the rapid flag within 5 km upstream of (−25.695, −54.437).
 - [ ] **Step 6: Run the gate and commit** `feat: lakes checked against today's lake map`.
 
+**Amended by controller rulings (2026-11-25, after round 1 on real data):**
+- At the present-day snapshot (age 0) the map decides every lake. Each mapped lake stands at its baked surface (table lakes at the table level), with footprint = its own mapped nodes, so several lakes can share a basin and no lattice node need lie below the level. An unmapped closed basin holds no lake, and its rivers end at its sink. Past eras keep the water balance with the rules above.
+- In past eras, a lake capped at its mapped surface takes its mapped nodes as its footprint (never "basin nodes below S"), choosing the mapped lake that holds the most basin nodes. Its outlet is among those nodes.
+- The Black Sea is sea at 0 m (a strait table, `data/hydrology/straits.json`), not part of a Caspian lake.
+- Both falls are dropped from the Step 4 rapids check (the 10 km lattice can't hold their drops). They stay as Task 12 renders.
+- The wet-taps-only blend applies to standing water (lake and sea taps) only. Rivers keep their blend.
+
 ### Task 9: Boulders, the first instanced scatter
 
 **Files:**
@@ -813,6 +820,10 @@ The test below pins the result.
   - **Amazon flats** (reference elevation < 300 m): within 25 km for ≥ 80%.
   - **Lakes:** at the Caspian (42.0, 50.5), the Dead Sea (31.5, 35.5), Titicaca (−15.8, −69.4), the Great Salt Lake (41.1, −112.5) and Victoria (−1.0, 33.0), `lake_tap(..).level_m` is within 5 m of the overview's elevation there.
     Task 8b amends this: mapped lakes compare against their baked fine-data surface level, not the overview (the overview reads the Dead Sea at about −276 m), and the Python mirror follows Task 8b's map rules (breached unmapped Open lakes, map-gated data flats, the mapped-surface cap).
+    Task 8b's rulings, which the mirror must also follow:
+    - At age 0 the map decides every lake (the present-mode overlay, `hydrology/today.rs`). Each mapped lake stands at its baked surface, or the table level for table lakes, over its own mapped nodes. Several lakes may share a basin. An unmapped closed basin holds no lake, and its rivers end in `Down::Sink`.
+    - In past eras a capped lake's footprint is its mapped nodes only, with its outlet picked among them.
+    - Straits (`data/hydrology/straits.json`, the Bosporus) join the Black Sea to the ocean.
   - **Arid basins:** no lake ≥ `LARGE_LAKE_KM2` where the basin's mean precipitation < 250 mm/yr, in either network inside the boxes.
   - It writes `hydro-check-{indus,amazon}.svg` (reference blue, game red, equirectangular, a 100 km scale bar) and prints the numbers. It exits 0 on PASS and `FAILED_RESULT_EXIT_CODE` on FAIL.
 
