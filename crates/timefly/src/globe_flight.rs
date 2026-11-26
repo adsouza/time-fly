@@ -311,7 +311,7 @@ fn heading_rotation(heading: DVec3, up: DVec3) -> Quat {
 /// Places the globe camera behind and above the fly (smoothed), and writes the fly's pose, the
 /// overlay's altitude, the exaggeration and the diagnostics' camera.
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
-fn apply_globe_flight(
+pub(crate) fn apply_globe_flight(
     flight: Res<GlobeFlightState>,
     look: Res<GlobeLook>,
     time: Res<Time>,

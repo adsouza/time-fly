@@ -548,7 +548,7 @@ impl FlyChase {
 
 /// Places the region camera behind and above [`FlyState`] (smoothed, and always clear of the
 /// ground) and writes the dragonfly's [`FlyPose`] and the overlay's [`FlyAltitude`].
-fn apply_fly(
+pub(crate) fn apply_fly(
     fly: Res<FlyState>,
     scene: Option<Res<TerrainScene>>,
     time: Res<Time>,

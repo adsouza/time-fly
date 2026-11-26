@@ -41,7 +41,7 @@ pub struct WindowGeometry {
 }
 
 /// Whether this launch restores and saves the window: only when nothing on the command line
-/// chooses the window or runs an automated mode.
+/// chooses the window (a `--from-shot` repro takes its shot's size) or runs an automated mode.
 pub fn remembers_window(args: &LaunchArgs) -> bool {
     args.window.is_none()
         && !args.scrub_bench
@@ -49,6 +49,7 @@ pub fn remembers_window(args: &LaunchArgs) -> bool {
         && !args.journey_bench
         && args.diagnostics_probe.is_none()
         && args.check_data.is_none()
+        && args.from_shot.is_none()
 }
 
 /// The game's state folder, beside the log folder's rules (`resolve_log_root`): macOS

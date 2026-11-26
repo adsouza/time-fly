@@ -43,6 +43,7 @@ use region::launch::LaunchRegion;
 use region::navigate::RegionNavigationPlugin;
 use terrain::TerrainCdlodPlugin;
 use ui::GameUiPlugins;
+use ui::bug_shot::{ShotPose, ShotRestore, ShotRestorePlugin};
 
 /// Reverse-DNS application ID, shared with `packaging/linux` and `packaging/flatpak`.
 pub const APP_ID: &str = "io.github.adsouza.TimeFly";
@@ -112,9 +113,32 @@ pub fn chosen_bench(
     }
 }
 
+/// Reads `--from-shot`'s sidecar, if given (native only: the web cannot read a file).
+fn shot_to_restore(args: &LaunchArgs) -> Option<Result<ShotPose, String>> {
+    let path = args.from_shot.as_deref()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(ui::bug_shot::load_shot(std::path::Path::new(path)))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        Some(Err("the web cannot read a shot's file".to_string()))
+    }
+}
+
 /// Builds the Time Fly app. Plugins are added here as milestones land.
 pub fn app(session: &Session) -> App {
-    let args = session.args().clone();
+    let mut args = session.args().clone();
+    // A repro opens a window of its shot's size unless `--window` chooses another.
+    let shot = shot_to_restore(&args);
+    if let Some(Ok(pose)) = &shot
+        && args.window.is_none()
+        && pose.window.width > 0
+        && pose.window.height > 0
+    {
+        args.window = Some((pose.window.width, pose.window.height));
+    }
     let mut app = App::new();
     // Before `DefaultPlugins`: `LogPlugin` takes its layers from the diagnostics resources.
     app.add_plugins(DiagnosticsPlugin::new(session));
@@ -150,23 +174,25 @@ pub fn app(session: &Session) -> App {
     // Bevy's web panic handler replaces the panic hook; ours chains console_error_panic_hook.
     #[cfg(target_arch = "wasm32")]
     let plugins = plugins.disable::<bevy::app::PanicHandlerPlugin>();
-    app.add_plugins(plugins).add_plugins((
-        clusters::NoClusteringPlugin,
-        time::TimePlugin,
-        GlobeDataPlugin::default(),
-        GlobePlugin,
-        RegionPlugin,
-        TerrainCdlodPlugin,
-        sky::SkyPlugin,
-        water::WaterPlugin,
-        terrain::warmup::RegionWarmupPlugin,
-        GlobeFlightPlugin,
-        RegionNavigationPlugin,
-        FlyCameraPlugin,
-        CreaturePlugin,
-        cloud::CloudPlugin,
-        GameUiPlugins,
-    ));
+    app.add_plugins(plugins)
+        .add_plugins((
+            clusters::NoClusteringPlugin,
+            time::TimePlugin,
+            GlobeDataPlugin::default(),
+            GlobePlugin,
+            RegionPlugin,
+            TerrainCdlodPlugin,
+            sky::SkyPlugin,
+            water::WaterPlugin,
+            terrain::warmup::RegionWarmupPlugin,
+            GlobeFlightPlugin,
+            RegionNavigationPlugin,
+            FlyCameraPlugin,
+            CreaturePlugin,
+            cloud::CloudPlugin,
+            GameUiPlugins,
+        ))
+        .add_plugins(ShotRestorePlugin);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = remembered {
         app.add_plugins(window_memory::WindowMemoryPlugin { path });
@@ -192,8 +218,21 @@ pub fn app(session: &Session) -> App {
             app.add_plugins(JourneyBenchPlugin(config));
         }
         chosen => {
-            if let Some(region) = args.region {
-                app.insert_resource(LaunchRegion(region));
+            // `--from-shot` over `--region`.
+            match shot {
+                Some(Ok(pose)) => {
+                    app.insert_resource(ShotRestore::new(pose));
+                }
+                Some(Err(e)) => {
+                    app.add_systems(Startup, move || {
+                        error!(error = %e, "--from-shot: starting at the usual place instead");
+                    });
+                }
+                None => {
+                    if let Some(region) = args.region {
+                        app.insert_resource(LaunchRegion(region));
+                    }
+                }
             }
             if chosen == Some(ChosenBench::Scrub) {
                 app.add_plugins(ScrubBenchPlugin {

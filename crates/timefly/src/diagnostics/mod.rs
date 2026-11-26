@@ -298,7 +298,7 @@ impl Session {
     }
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
         std::time::SystemTime::now()

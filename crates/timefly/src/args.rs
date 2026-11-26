@@ -1,8 +1,8 @@
 //! Launch arguments: one parser for native argv and the web URL query string.
 //!
 //! Flags: `--diagnostics-probe <mode>` (hidden), `--check-data[=DIR]` (hidden), `--scrub-bench`,
-//! `--region-bench`, `--journey-bench`, `--no-dunes`, `--target-fps N`, `--window WxH` and
-//! `--region LAT,LON,AGE_YEARS`. A value
+//! `--region-bench`, `--journey-bench`, `--no-dunes`, `--target-fps N`, `--window WxH`,
+//! `--region LAT,LON,AGE_YEARS` and `--from-shot <json>`. A value
 //! may follow its flag as `--flag=value` or as the next argument; a next argument that starts
 //! with `--` is the next flag, never a value.
 //! `--check-data` takes its optional value only as `--check-data=DIR`.
@@ -38,6 +38,9 @@ pub struct LaunchArgs {
     /// `--region=LAT,LON,AGE_YEARS` (web: `?region=LAT,LON,AGE_YEARS`): enter the region centred
     /// there once the globe data is ready.
     pub region: Option<RegionArg>,
+    /// `--from-shot <json>` (native only): start at a bug shot's pose, read from its sidecar
+    /// (`crate::ui::bug_shot`); it takes precedence over `--region`, the benches over it.
+    pub from_shot: Option<String>,
     /// Unrecognized arguments. Diagnostics log only their count because URL query
     /// values and command-line arguments can contain private data.
     pub unknown: Vec<String>,
@@ -60,6 +63,7 @@ const NO_DUNES_FLAG: &str = "--no-dunes";
 const TARGET_FPS_FLAG: &str = "--target-fps";
 const WINDOW_FLAG: &str = "--window";
 const REGION_FLAG: &str = "--region";
+const FROM_SHOT_FLAG: &str = "--from-shot";
 
 /// Where `--region` asks to go: an era-frame latitude and longitude (degrees, as the globe shows
 /// them at that age) and an age in years before present.
@@ -146,10 +150,15 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
             }
             continue;
         }
-        let Some(flag) = [PROBE_FLAG, TARGET_FPS_FLAG, WINDOW_FLAG, REGION_FLAG]
-            .into_iter()
-            .find(|f| arg == *f || arg.strip_prefix(f).is_some_and(|r| r.starts_with('=')))
-        else {
+        let Some(flag) = [
+            PROBE_FLAG,
+            TARGET_FPS_FLAG,
+            WINDOW_FLAG,
+            REGION_FLAG,
+            FROM_SHOT_FLAG,
+        ]
+        .into_iter()
+        .find(|f| arg == *f || arg.strip_prefix(f).is_some_and(|r| r.starts_with('='))) else {
             parsed.unknown.push(arg);
             continue;
         };
@@ -162,6 +171,7 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchArgs 
                 PROBE_FLAG => ProbeMode::parse(v).map(|m| parsed.diagnostics_probe = Some(m)),
                 TARGET_FPS_FLAG => parse_fps(v).map(|f| parsed.target_fps = Some(f)),
                 REGION_FLAG => parse_region(v).map(|r| parsed.region = Some(r)),
+                FROM_SHOT_FLAG => (!v.is_empty()).then(|| parsed.from_shot = Some(v.to_string())),
                 _ => parse_window_size(v).map(|s| parsed.window = Some(s)),
             }
             .is_some()
@@ -500,6 +510,25 @@ mod tests {
         // The edges of each range are accepted.
         assert!(parse_region("90,180,540000000").is_some());
         assert!(parse_region("-90,-180,0").is_some());
+    }
+
+    #[test]
+    fn from_shot_flag() {
+        let path = "/Users/me/Pictures/Time Fly/timefly_20261126-143005_22.870N_71.420E.json";
+        for argv in [
+            vec![format!("--from-shot={path}")],
+            vec!["--from-shot".into(), path.into()],
+        ] {
+            let parsed = parse_launch_args(argv);
+            assert_eq!(parsed.from_shot.as_deref(), Some(path));
+            assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+        }
+        // With no value it is unknown and does nothing; the next flag is never its value.
+        let parsed = parse_launch_args(args(&["--from-shot", "--no-dunes"]));
+        assert_eq!(parsed.from_shot, None);
+        assert!(parsed.no_dunes);
+        assert_eq!(parsed.unknown, args(&["--from-shot"]));
+        assert_eq!(parse_launch_args(args(&["--from-shot="])).from_shot, None);
     }
 
     #[test]

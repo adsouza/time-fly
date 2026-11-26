@@ -1,4 +1,6 @@
-//! The fly’s altitude above sea level, sampled twice a second (M3 design §5.3).
+//! The fly’s altitude above sea level, sampled twice a second (M3 design §5.3), at the top of
+//! the HUD's column in the top-left corner ([`HudColumn`]); the position readout and the compass
+//! rose (`super::position`) and the bug-shot button (`super::bug_shot`) sit below it.
 //!
 //! Whichever world shows the fly writes [`FlyAltitude`] in its own units: the region in metres
 //! (`crate::fly_camera`), the globe in kilometres of true altitude (`crate::globe_flight`).
@@ -28,6 +30,11 @@ pub struct FlyAltitude(pub Option<Altitude>);
 #[derive(Component)]
 struct AltitudeText;
 
+/// The HUD's column in the top-left corner: the altitude first, then what other plugins add
+/// below it (spawned after [`spawn_altitude`]).
+#[derive(Component)]
+pub struct HudColumn;
+
 pub(super) struct AltitudeOverlayPlugin;
 
 impl Plugin for AltitudeOverlayPlugin {
@@ -38,22 +45,32 @@ impl Plugin for AltitudeOverlayPlugin {
     }
 }
 
-fn spawn_altitude(mut commands: Commands) {
-    commands.spawn((
-        Name::new("Altitude readout"),
-        AltitudeText,
-        Text::default(),
-        TextFont::from_font_size(14.0),
-        TextColor(TEXT_COLOR.with_alpha(0.75)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(GUTTER_PX),
-            left: px(GUTTER_PX),
-            ..default()
-        },
-        Visibility::Hidden,
-        Pickable::IGNORE,
-    ));
+/// Spawns the HUD's column with the altitude readout in it.
+pub(super) fn spawn_altitude(mut commands: Commands) {
+    commands
+        .spawn((
+            Name::new("HUD column"),
+            HudColumn,
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(GUTTER_PX),
+                left: px(GUTTER_PX),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexStart,
+                row_gap: px(4),
+                ..default()
+            },
+            Pickable::IGNORE,
+        ))
+        .with_child((
+            Name::new("Altitude readout"),
+            AltitudeText,
+            Text::default(),
+            TextFont::from_font_size(14.0),
+            TextColor(TEXT_COLOR.with_alpha(0.75)),
+            Visibility::Hidden,
+            Pickable::IGNORE,
+        ));
 }
 
 /// The readout's text for an altitude.

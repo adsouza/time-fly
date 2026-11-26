@@ -20,7 +20,15 @@ to start in a region instead of on the globe (the fly at M2's start pose).
 **Controls:** `W` `A` `S` `D` or the arrows fly; drag turns the fly and tilts the view;
 `Space`/`E` climb, `Ctrl`/`Q` descend; `Shift` with forward boosts; on the globe the scroll
 wheel climbs and descends; `Backspace` climbs back out to the globe; `[` and `]` step to the
-older and younger snapshot.
+older and younger snapshot; `F12` (or the small camera button under the compass) saves a bug
+shot, a PNG named by the place and view with a JSON sidecar beside it, in `Pictures/Time Fly`
+(see check 16); `--from-shot <sidecar.json>` starts the game at a shot's pose.
+
+**The HUD** (top left): the altitude, under it the latitude and longitude (`22.87° N  71.42° E`,
+in the era's frame, the frame `--region` takes; marked `(then)` past 26 ka, where that frame is
+no longer today's), and under that a heading-up compass rose: its top tick is where the fly
+faces, the N (red), E, S and W marks turn to show true directions, and the label gives the
+heading (`NE 47°`).
 
 Tick a box when it passes. If one fails, note what you saw next to it (a screenshot helps).
 
@@ -108,6 +116,26 @@ Fly a full journey: dive, two hops, climb out.
 
 - [ ] No abrupt camera swings, no roll you didn't ask for, no sudden speed change at a swap.
 - [ ] Nothing in it made you queasy. If something did, note where: ______
+
+### 16. Bug shots and the compass (Task 12, the owner's request of 2026-11-26)
+
+Reference frames (this folder, `examples/region_tour.rs` `bugshot` and `globebug`, offscreen at
+1280 × 720): `hud-region.jpg` (the Alps at the present, 8 km up, facing NE 47°) and
+`hud-globe.jpg` (over the Himalayas at 5,000 km, facing NE 47°).
+
+1. Launch on the globe. Fly a little, turning: watch the rose. Then dive into a region and fly
+   there too.
+2. Press `F12` once on the globe and once in a region, and click the camera button once.
+3. Quit with `Cmd+Q`. Relaunch with `--from-shot` and one of the region shot's `.json` files:
+   `target/release/timefly --from-shot "$HOME/Pictures/Time Fly/timefly_….json"`.
+
+- [ ] The readout sits right under the altitude and the rose under it, small and out of the way.
+- [ ] The rose's top is always where the fly faces; turning right swings N to the left.
+- [ ] Each shot shows a toast naming its full path, and the PNG and the `.json` are both there.
+      The PNG is the frame you saw (HUD included), not a blank one.
+- [ ] The relaunch opens a window of the shot's size at the same place, era and view: the frame
+      matches the PNG (the wings, water and clouds move with time). The camera stays put until
+      you press a key or click.
 
 ## Questions the build raised
 
