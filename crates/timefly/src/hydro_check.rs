@@ -54,7 +54,7 @@ use timefly_core::hydrology::compare::{
     Agreement, OutletTrace, Reference, centreline_agreement, parse_reference, trace_outlet,
     trace_outlet_path,
 };
-use timefly_core::hydrology::lakemap::shipped_lake_map;
+use timefly_core::hydrology::lakemap::{LakeMap, LakeRing, shipped_lake_map};
 use timefly_core::hydrology::levels::shipped_lake_levels;
 use timefly_core::hydrology::params::{HYDRO_RECENT_N, LARGE_LAKE_KM2, SUBPOINT_M};
 use timefly_core::hydrology::today_rivers::{
@@ -1464,11 +1464,127 @@ pub fn hydro_check(
     // course successors.
     let steps = course_steps(hydro, rivers, &source);
     lines.extend(course_step_lines(&hydro.lattice, &steps, &names));
+    // Informative (Task 11d fix round 5): the lake map's surfaces against their shores.
+    let map = shipped_lake_map();
+    let shore_height = |lat: f64, lon: f64| field.sample_overview(dir_render(lat, lon)).elevation_m;
+    let game_lakes = |id: u16| -> String {
+        let found: Vec<String> = hydro
+            .lakes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                let (la, lo) = latlon(hydro.lattice.dir(l.exit).0);
+                map.lake_at(la, lo) == Some(id)
+            })
+            .map(|(k, l)| format!("{k} {:?} {:.1} m", l.kind, l.level_m))
+            .collect();
+        found.join(", ")
+    };
+    lines.extend(lake_map_audit_lines(map, &shore_height, &game_lakes));
     // Every lake, one line each (Task 11d fix round 2): for diffing lakes between runs.
     let tsv = out_dir.join("hydro-check-lakes.tsv");
     fs::write(&tsv, lakes_tsv(hydro)).map_err(|e| format!("{}: {e}", tsv.display()))?;
     lines.push(format!("hydro check {}", verdict(pass)));
     Ok(HydroCheckReport { lines, pass, svgs })
+}
+
+/// A lake-map lake whose baked surface stands more than this below the lowest cell of its
+/// shoreline ring is listed by the audit (Task 11d fix round 5).
+pub const LAKE_MAP_GAP_M: f64 = 20.0;
+
+/// Lakes the audit always reports, flagged or not (Task 11d fix round 5, the controller): name
+/// and a point in each.
+pub const AUDITED_LAKES: &[(&str, (f64, f64))] = &[
+    ("Baikal", (53.5, 108.0)),
+    ("Tanganyika", (-6.0, 29.6)),
+    ("Malawi", (-12.0, 34.6)),
+    ("Superior", (47.7, -87.5)),
+    ("Michigan", (44.0, -87.0)),
+    ("Huron", (44.8, -82.4)),
+    ("Erie", (42.2, -81.2)),
+    ("Ontario", (43.7, -77.9)),
+    ("Great Slave", (61.7, -114.0)),
+    ("Great Bear", (66.0, -121.0)),
+    ("Ladoga", (60.8, 31.5)),
+    ("Issyk-Kul", (42.45, 77.25)),
+];
+
+fn dir_render(lat: f64, lon: f64) -> RenderDir {
+    geo_to_render(latlon_to_geo(lat, lon))
+}
+
+/// Informative (Task 11d fix round 5), never a failure: the lake map's lakes whose baked
+/// surface stands more than [`LAKE_MAP_GAP_M`] below their shoreline ring's lowest cell
+/// ([`LakeMap::rings`], the heights from `height_at(lat, lon)`), the largest gap first, each
+/// with `game(id)` (the pass's lakes whose exit lies in it); then [`AUDITED_LAKES`], flagged or
+/// not.
+pub fn lake_map_audit_lines(
+    map: &LakeMap,
+    height_at: &dyn Fn(f64, f64) -> f64,
+    game: &dyn Fn(u16) -> String,
+) -> Vec<String> {
+    let rings = map.rings();
+    // Each lake's (baked, ring min, ring median), where it has a ring.
+    let shore: Vec<Option<(f64, f64, f64)>> = rings
+        .iter()
+        .map(|r| {
+            let mut h: Vec<f64> = r.ring.iter().map(|&(la, lo)| height_at(la, lo)).collect();
+            h.sort_by(f64::total_cmp);
+            let (&min, med) = (h.first()?, h[h.len() / 2]);
+            Some((f64::from(map.level(r.id)), min, med))
+        })
+        .collect();
+    let named = |id: u16| {
+        AUDITED_LAKES
+            .iter()
+            .find(|(_, (la, lo))| map.lake_at(*la, *lo) == Some(id))
+            .map(|(n, _)| (*n).to_string())
+    };
+    let line = |r: &LakeRing, (baked, min, med): (f64, f64, f64)| {
+        let name = named(r.id).unwrap_or_else(|| format!("map lake {}", r.id));
+        format!(
+            "  {name} at ({:.2}, {:.2}), {} cells: baked {baked:.1} m, ring lowest {min:.1} m \
+             (median {med:.1} m), {:.0} m below; the pass's lakes there [{}]",
+            r.centre.0,
+            r.centre.1,
+            r.cells,
+            min - baked,
+            game(r.id)
+        )
+    };
+    let mut flagged: Vec<(&LakeRing, (f64, f64, f64))> = rings
+        .iter()
+        .zip(&shore)
+        .filter_map(|(r, s)| s.map(|s| (r, s)))
+        .filter(|(_, (baked, min, _))| min - baked > LAKE_MAP_GAP_M)
+        .collect();
+    flagged.sort_by(|a, b| (b.1.1 - b.1.0).total_cmp(&(a.1.1 - a.1.0)));
+    let mut lines = vec![format!(
+        "lake map audit (informative): {} of {} lakes stand more than {LAKE_MAP_GAP_M} m below \
+         their shoreline ring's lowest cell",
+        flagged.len(),
+        rings.len()
+    )];
+    lines.extend(flagged.iter().map(|&(r, s)| line(r, s)));
+    lines.push("lake map audit, named lakes:".into());
+    for (name, (la, lo)) in AUDITED_LAKES {
+        match map.lake_at(*la, *lo) {
+            Some(id) => match shore[usize::from(id) - 1] {
+                Some(s) => lines.push(format!(
+                    "{}{}",
+                    line(&rings[usize::from(id) - 1], s),
+                    if s.1 - s.0 > LAKE_MAP_GAP_M {
+                        " - FLAGGED"
+                    } else {
+                        " - ok"
+                    }
+                )),
+                None => lines.push(format!("  {name}: map lake {id} has no ring")),
+            },
+            None => lines.push(format!("  {name} ({la}, {lo}): no lake in the map")),
+        }
+    }
+    lines
 }
 
 /// Informative (Task 11d fix round 2): each endorheic table lake's surplus, the inflow beyond
@@ -1797,6 +1913,49 @@ mod tests {
         assert_eq!(nile.sea, (31.5125, 31.82555556));
         assert!(nile.source.contains("\"Ras El Bar\""), "{}", nile.source);
         assert_eq!(nile.sea_allowance_km(), 150.0);
+    }
+
+    /// Task 11d fix round 5: the lake map audit lists a lake baked far below its shore, the
+    /// largest gap first, and reports the named lakes either way.
+    #[test]
+    fn the_lake_map_audit_lists_lakes_baked_below_their_shores() {
+        let map = shipped_lake_map();
+        // Every shore at 500 m: lakes baked under 480 m are flagged, Victoria (1133 m) is not.
+        let lines = lake_map_audit_lines(map, &|_, _| 500.0, &|id| format!("game {id}"));
+        let count: usize = lines[0]
+            .split_whitespace()
+            .nth(4)
+            .and_then(|n| n.parse().ok())
+            .expect("a count");
+        assert!(count > 100, "{}", lines[0]);
+        let baikal = lines
+            .iter()
+            .find(|l| l.starts_with("  Baikal at") && l.ends_with("FLAGGED"))
+            .expect("Baikal is flagged");
+        assert!(baikal.contains("ring lowest 500.0 m"), "{baikal}");
+        assert!(baikal.contains("[game "), "{baikal}");
+        // The largest gap comes first: the lowest baked surface under a level shore.
+        let gap = |l: &str| -> f64 {
+            let below = l.split(" m below").next().expect("a gap");
+            below
+                .rsplit(", ")
+                .next()
+                .expect("a gap")
+                .parse()
+                .expect("a number")
+        };
+        let gaps: Vec<f64> = lines[1..=count].iter().map(|l| gap(l)).collect();
+        assert!(gaps.windows(2).all(|w| w[0] >= w[1]), "{gaps:?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.ends_with(" - ok") || l.ends_with("FLAGGED"))
+                .count(),
+            AUDITED_LAKES.len()
+        );
+        // With every shore below the sea's floor, nothing is flagged.
+        let none = lake_map_audit_lines(map, &|_, _| -1e4, &|_| String::new());
+        assert!(none[0].contains(" 0 of "), "{}", none[0]);
     }
 
     /// Owner, 2026-11-26: the Amazon alone may end 160 km from its mouth; the rest keep

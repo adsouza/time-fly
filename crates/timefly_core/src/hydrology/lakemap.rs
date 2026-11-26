@@ -137,10 +137,97 @@ impl LakeMap {
             .map(|id| self.levels[usize::from(id) - 1])
     }
 
+    /// The lake id at cell (`row`, `col`), if a lake holds it.
+    fn id_at_cell(&self, row: usize, col: u32) -> Option<u16> {
+        let runs = &self.runs[self.row_start[row] as usize..self.row_start[row + 1] as usize];
+        let col = col as u16;
+        let k = runs.partition_point(|&(s, _, _)| s <= col);
+        let &(_, end, id) = runs.get(k.checked_sub(1)?)?;
+        (col < end).then_some(id)
+    }
+
+    /// Cell (`row`, `col`)'s centre (lat, lon) in degrees.
+    fn cell_centre(&self, row: usize, col: u32) -> (f64, f64) {
+        let step = 360.0 / f64::from(self.width);
+        (
+            90.0 - (row as f64 + 0.5) * step,
+            -180.0 + (f64::from(col) + 0.5) * step,
+        )
+    }
+
+    /// Each lake's footprint and its shoreline ring (Task 11d fix round 5, the map's audit): its
+    /// cell count, the mean of its cells' centres, and the cells outside every lake that touch
+    /// it (8-neighbours, longitudes wrapping), as centres, in row and column order. Lake `id`
+    /// is entry `id − 1`.
+    pub fn rings(&self) -> Vec<LakeRing> {
+        let n = self.levels.len();
+        let mut cells = vec![0u32; n];
+        let mut sum = vec![(0.0f64, 0.0f64); n];
+        let mut ring: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
+        let w = self.width;
+        for r in 0..self.height as usize {
+            let runs = &self.runs[self.row_start[r] as usize..self.row_start[r + 1] as usize];
+            for &(s, e, id) in runs {
+                let k = usize::from(id) - 1;
+                for c in u32::from(s)..u32::from(e) {
+                    let (lat, lon) = self.cell_centre(r, c);
+                    cells[k] += 1;
+                    sum[k].0 += lat;
+                    sum[k].1 += lon;
+                }
+                let (s, e) = (u32::from(s), u32::from(e));
+                let rows = r.saturating_sub(1)..=(r + 1).min(self.height as usize - 1);
+                for rr in rows {
+                    // The run's own row needs only its two ends; the rows beside it, its span
+                    // and a cell either side.
+                    let cols: Vec<u32> = if rr == r {
+                        vec![(s + w - 1) % w, e % w]
+                    } else {
+                        (s + w - 1..=e + w).map(|c| c % w).collect()
+                    };
+                    for c in cols {
+                        if self.id_at_cell(rr, c).is_none() {
+                            ring[k].push((rr as u32, c));
+                        }
+                    }
+                }
+            }
+        }
+        ring.iter_mut()
+            .enumerate()
+            .map(|(k, cs)| {
+                cs.sort_unstable();
+                cs.dedup();
+                let m = f64::from(cells[k].max(1));
+                LakeRing {
+                    id: (k + 1) as u16,
+                    cells: cells[k],
+                    centre: (sum[k].0 / m, sum[k].1 / m),
+                    ring: cs
+                        .iter()
+                        .map(|&(r, c)| self.cell_centre(r as usize, c))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     /// The bytes the map holds, by capacity.
     pub fn bytes(&self) -> usize {
         4 * (self.levels.capacity() + self.row_start.capacity()) + RUN_BYTES * self.runs.capacity()
     }
+}
+
+/// One lake's footprint and shoreline ring ([`LakeMap::rings`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LakeRing {
+    pub id: u16,
+    /// The footprint's cells.
+    pub cells: u32,
+    /// The mean of its cells' centres (lat, lon) in degrees.
+    pub centre: (f64, f64),
+    /// The centres of the cells outside every lake that touch the footprint.
+    pub ring: Vec<(f64, f64)>,
 }
 
 /// The shipped map, decoded once. Its tests guarantee it decodes.
@@ -201,6 +288,23 @@ mod tests {
             }
         }
         b
+    }
+
+    /// Task 11d fix round 5: each lake's ring is the cells outside every lake that touch it,
+    /// across the longitude seam.
+    #[test]
+    fn a_lakes_ring_is_the_land_around_its_footprint() {
+        let map = LakeMap::parse(&tiny()).unwrap();
+        let rings = map.rings();
+        assert_eq!(rings.len(), 2);
+        // Cells are 90 degrees; the only non-lake cells are (0, 1), (1, 0) and (1, 3).
+        let free = vec![(45.0, -45.0), (-45.0, -135.0), (-45.0, 135.0)];
+        assert_eq!((rings[0].id, rings[0].cells), (1, 3));
+        assert_eq!(rings[0].ring, free);
+        // Lake 2 (cols 2 and 3 of row 0) touches (1, 0) across the seam.
+        assert_eq!((rings[1].id, rings[1].cells), (2, 2));
+        assert_eq!(rings[1].ring, free);
+        assert_eq!(rings[1].centre, (45.0, 90.0));
     }
 
     #[test]

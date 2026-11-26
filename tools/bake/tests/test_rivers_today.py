@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from timefly_bake import rivers_today
 from timefly_bake.rivers_today import CellGrid, Polyline
@@ -159,7 +160,7 @@ def test_lake_parts_are_oriented_by_their_connections_first():
     assert ends["between"] == ((2, 0), (3, 0))
     assert ends["both"] == ((7, 0), (0, 0))
     assert ends["alone"] == ((8, 8), (9, 9))
-    assert counts == {"topology": 3, "etopo": 1, "ambiguous": 1}
+    assert counts == {"topology": 3, "etopo": 1, "ambiguous": 1, "cited": 0}
     assert [p.name for p in got] == [p.name for p in lakes]
 
 
@@ -246,7 +247,7 @@ def test_river_parts_are_oriented_by_their_connections():
     # at (1, 0), where every other part is decided and ends: it flows on from there.
     assert ends["upper"] == ((0, 0), (1, 0))
     assert ends["lower"] == ((1, 0), (2, 0))
-    assert counts == {"topology": 2, "etopo": 1, "ambiguous": 0}
+    assert counts == {"topology": 2, "etopo": 1, "ambiguous": 0, "cited": 0}
 
 
 def test_a_clear_fall_is_never_overruled_by_a_weaker_join():
@@ -392,3 +393,82 @@ def test_table_schema_and_size():
             assert isinstance(r["name"], str) and 0 <= r["scalerank"] <= 7
             assert len(r["points"]) >= 2
             assert all(-90 <= la <= 90 and -180 <= lo <= 180 for la, lo in r["points"])
+
+
+def test_select_drops_closed_rings():
+    """Task 11d fix round 5: a closed ring (the Ganges' at Bhedarganj) has no direction."""
+    ring = [[90.213, 23.191], [90.25, 23.2], [90.24, 23.17], [90.213, 23.191]]
+    line = [[90.213, 23.191], [90.394, 22.775]]
+    link = [[90.0, 23.0], [90.001, 23.0]]
+    features = [
+        {
+            "properties": {"featurecla": "River", "scalerank": 3, "name": "Ganges"},
+            "geometry": {"type": "MultiLineString", "coordinates": [ring, line, link]},
+        }
+    ]
+    got = rivers_today.select(features)
+    assert [len(p.points) for p in got] == [2, 2]
+    assert rivers_today.is_ring(np.array(ring)[:, ::-1])
+    # A two-point link whose ends are close is no ring: it joins its neighbours.
+    assert not rivers_today.is_ring(np.array(link)[:, ::-1])
+
+
+def test_a_cited_orientation_decides_a_part_and_its_chain():
+    """Task 11d fix round 5: a cited direction overrules ETOPO's metre-level noise, and the part
+    chained below it follows (the Padma at Bhedarganj)."""
+    upper = Polyline("Ganges", 3, np.array([[23.579, 90.087], [23.191, 90.213]]))
+    lower = Polyline("Ganges", 3, np.array([[23.191, 90.213], [22.775, 90.394]]))
+    # ETOPO: the upper part's north end lower (2.0 vs 3.1 m), the lower part's fall 1.0 m.
+    heights = {id(upper): (2.0, 3.1), id(lower): (3.1, 2.1)}
+    out, _ = rivers_today.orient_by_connections([upper, lower], lambda p: heights[id(p)])
+    assert out[0].points[0].tolist() == [23.191, 90.213], "the hazard: ETOPO runs it north"
+    entries = rivers_today.read_orientations(
+        json.dumps(
+            {
+                "parts": [
+                    {
+                        "name": "Ganges",
+                        "upstream": [23.579, 90.087],
+                        "downstream": [23.191, 90.213],
+                        "source": "a test",
+                    }
+                ]
+            }
+        )
+    )
+    cited = rivers_today.cited_orientations([upper, lower], entries)
+    assert cited == {0: True}
+    rules = []
+    out, counts = rivers_today.orient_by_connections(
+        [upper, lower], lambda p: heights[id(p)], rules=rules, cited=cited
+    )
+    assert out[0].points[0].tolist() == [23.579, 90.087]
+    assert out[1].points[0].tolist() == [23.191, 90.213]
+    assert rules == ["cited", "topology"]
+    assert counts["cited"] == 1
+
+
+def test_read_orientations_refuses_an_uncited_or_unmatched_entry():
+    entry = {"name": "Ganges", "upstream": [1.0, 2.0], "downstream": [3.0, 4.0]}
+    with pytest.raises(ValueError, match="no source"):
+        rivers_today.read_orientations(json.dumps({"parts": [entry]}))
+    entries = rivers_today.read_orientations(
+        json.dumps({"parts": [dict(entry, source="a test")]})
+    )
+    with pytest.raises(ValueError, match="0 parts match"):
+        rivers_today.cited_orientations([], entries)
+
+
+def test_the_shipped_orientations_are_cited_and_match_the_table():
+    path = Path(__file__).resolve().parents[3] / "data" / "hydrology" / "rivers_orient.json"
+    entries = rivers_today.read_orientations(path.read_text(encoding="utf-8"))
+    table = json.loads(
+        (path.parent / "rivers_today.json").read_text(encoding="utf-8")
+    )["rivers"]
+    for e in entries:
+        # The baked table holds the part upstream first, as cited.
+        assert any(
+            r["name"] == e["name"] and r["points"][0] == e["upstream"]
+            and r["points"][-1] == e["downstream"]
+            for r in table
+        ), e

@@ -17,6 +17,12 @@ routing wherever the terrain is today's (``timefly_core::hydrology::today_rivers
   ``data/hydrology/rivers_extra.json`` holds a delta's main channel where Natural Earth's course
   stops above it, each entry cited (:func:`read_extras`). They are appended after Natural
   Earth's courses as given: already upstream first and simplified.
+- **Closed rings are left out** (Task 11d fix round 5): a part of three or more points whose
+  ends lie within :data:`SIMPLIFY_M` of each other (:func:`is_ring`, the Ganges' ring at
+  Bhedarganj) has no direction, and the pass would hold water around it.
+- **Cited orientations** (Task 11d fix round 5): ``data/hydrology/rivers_orient.json`` names
+  parts whose direction ETOPO's metre-level delta noise gets wrong, each with its upstream and
+  downstream ends and a source (:func:`read_orientations`); they are decided first, as certain.
 - **Orient every part, the most certain first** (Task 11d fix rounds 2 and 3;
   :func:`orient_by_connections`): ETOPO's end heights and how the parts join both vote, each as
   sure as its evidence, and the surest decides; a decided part's junctions then vote for the
@@ -57,6 +63,7 @@ LAKE_CENTRELINE_MAX_COVER = 0.5
 LAKE_COVER_STEP_M = 1000.0
 LAKE_MAP_PATH = Path(__file__).resolve().parents[3] / "data" / "hydrology" / "lake_map.bin"
 EXTRA_PATH = Path(__file__).resolve().parents[3] / "data" / "hydrology" / "rivers_extra.json"
+ORIENT_PATH = Path(__file__).resolve().parents[3] / "data" / "hydrology" / "rivers_orient.json"
 SIMPLIFY_M = 1000.0
 ORIENT_CELLS = 2
 ROUND_DIGITS = 3
@@ -71,7 +78,8 @@ SOURCE = (
 COMMENT = (
     "Today's major river courses (rivers Task 11b): Natural Earth rivers of scalerank <= 7, and lake "
     "centrelines of those ranks that today's lake map does not cover (reservoirs; canals left out), then the "
-    "cited hand-added delta channels of data/hydrology/rivers_extra.json, one entry per line part, upstream first (the end with the higher "
+    "cited hand-added delta channels of data/hydrology/rivers_extra.json, one entry per line part "
+    "(closed rings left out), upstream first (the cited directions of data/hydrology/rivers_orient.json, then the end with the higher "
     "lowest ETOPO 60-second cell within 2 arc-minutes goes first), simplified to 1 km, points "
     "[lat, lon] rounded to 0.001 degrees. Where the terrain is today's, the continental pass burns "
     "each course into its routing: the running minimum of the era's node elevations along it, "
@@ -181,11 +189,23 @@ def lake_cover(points: np.ndarray, ids: np.ndarray) -> float:
 
 
 @traced
+def is_ring(points) -> bool:
+    """Whether a part is a closed ring: three or more points, its ends within
+    :data:`SIMPLIFY_M` of each other."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 3:
+        return False
+    ends = _unit(pts[[0, -1]])
+    return float(_angle(ends[:1], ends[1])[0]) * EARTH_RADIUS_M <= SIMPLIFY_M
+
+
+@traced
 def select(features, cover=None) -> list[Polyline]:
     """Each part of every ``River`` feature with ``scalerank <= TODAY_RIVER_MAX_SCALERANK`` that
-    is not an artificial channel (:func:`is_artificial`), as a polyline of (lat, lon), in file
-    order; with ``cover(name, points)`` (the share of a part's length in mapped lakes), also each
-    such ``Lake Centerline`` part whose cover is under :data:`LAKE_CENTRELINE_MAX_COVER`."""
+    is not an artificial channel (:func:`is_artificial`) nor a closed ring (:func:`is_ring`), as
+    a polyline of (lat, lon), in file order; with ``cover(name, points)`` (the share of a part's
+    length in mapped lakes), also each such ``Lake Centerline`` part whose cover is under
+    :data:`LAKE_CENTRELINE_MAX_COVER`."""
     out = []
     for f in features:
         p = f["properties"]
@@ -203,6 +223,8 @@ def select(features, cover=None) -> list[Polyline]:
         for part in parts:
             lonlat = np.asarray(part, dtype=np.float64)[:, :2]
             points = lonlat[:, ::-1].copy()
+            if is_ring(points):
+                continue
             if lake and cover(name, points) >= LAKE_CENTRELINE_MAX_COVER:
                 continue
             out.append(Polyline(name, _rank(p), points, lake))
@@ -253,7 +275,9 @@ MOUTH_VOTE_M = 1.0
 
 
 @traced
-def orient_by_connections(parts, heights, fixed=(), rules=None) -> tuple[list[Polyline], dict]:
+def orient_by_connections(
+    parts, heights, fixed=(), rules=None, cited=None
+) -> tuple[list[Polyline], dict]:
     """``parts`` upstream first, the most certain first (Task 11d fix rounds 2 and 3).
 
     ``fixed`` are parts already oriented (certain); ``heights(part)`` gives ETOPO's ``(first,
@@ -271,8 +295,10 @@ def orient_by_connections(parts, heights, fixed=(), rules=None) -> tuple[list[Po
 
     The surest candidate of any part is taken first, and its junctions offer candidates to the
     parts they join. Candidates of one part equally sure in opposite directions are "ambiguous":
-    ETOPO decides. Returns the parts in their order and the counts by rule (``{"topology",
-    "etopo", "ambiguous"}``); ``rules`` (a list) gets each part's rule."""
+    ETOPO decides. ``cited`` (``{part index: keep}``, :func:`cited_orientations`) decides those
+    parts first, as certain as ``fixed``. Returns the parts in their order and the counts by rule
+    (``{"topology", "etopo", "ambiguous", "cited"}``); ``rules`` (a list) gets each part's
+    rule."""
     import heapq
 
     n = len(parts)
@@ -354,6 +380,10 @@ def orient_by_connections(parts, heights, fixed=(), rules=None) -> tuple[list[Po
     for k in range(n, len(every)):
         state[k] = True
         decided(k, float("inf"))
+    for i, keep in sorted((cited or {}).items()):
+        state[i] = keep
+        how[i] = "cited"
+        decided(i, float("inf"))
     while heap:
         sure, _, i, keep, kind = heapq.heappop(heap)
         if state[i] is not None:
@@ -367,7 +397,7 @@ def orient_by_connections(parts, heights, fixed=(), rules=None) -> tuple[list[Po
     out = []
     for i, p in enumerate(parts):
         out.append(p if state[i] else Polyline(p.name, p.scalerank, p.points[::-1].copy(), p.lake))
-    counts = {k: how.count(k) for k in ("topology", "etopo", "ambiguous")}
+    counts = {k: how.count(k) for k in ("topology", "etopo", "ambiguous", "cited")}
     if rules is not None:
         rules.extend(how)
     return out, counts
@@ -390,6 +420,44 @@ def read_extras(text: str) -> list[Polyline]:
         if not 0 <= rank <= TODAY_RIVER_MAX_SCALERANK or len(entry.get("mouth", [])) != 2:
             raise ValueError(f"{name}: needs a scalerank in 0..7 and a mouth")
         out.append(Polyline(name, rank, points))
+    return out
+
+
+@traced
+def read_orientations(text: str) -> list[dict]:
+    """The cited orientations of ``rivers_orient.json``'s text: each entry needs a ``name``, an
+    ``upstream`` and a ``downstream`` [lat, lon] (a raw part's ends, at the table's precision)
+    and a cited ``source``; anything else is a ``ValueError``."""
+    out = []
+    for entry in json.loads(text)["parts"]:
+        name = entry.get("name", "?")
+        if not str(entry.get("source", "")).strip():
+            raise ValueError(f"{name}: no source")
+        ends = [entry.get("upstream", []), entry.get("downstream", [])]
+        if any(len(e) != 2 for e in ends):
+            raise ValueError(f"{name}: needs an upstream and a downstream [lat, lon]")
+        out.append(entry)
+    return out
+
+
+@traced
+def cited_orientations(parts, entries) -> dict[int, bool]:
+    """``{part index: keep}`` for each cited orientation (:func:`read_orientations`): the part of
+    that name whose raw ends are the entry's two points (at the table's precision); ``keep`` is
+    whether its raw first end is the upstream one. A ``ValueError`` unless exactly one part
+    matches each entry."""
+    out: dict[int, bool] = {}
+    for entry in entries:
+        up, down = (_key(entry["upstream"]), _key(entry["downstream"]))
+        hits = [
+            i
+            for i, p in enumerate(parts)
+            if p.name == entry["name"]
+            and {_key(p.points[0]), _key(p.points[-1])} == {up, down}
+        ]
+        if len(hits) != 1:
+            raise ValueError(f"{entry['name']} {up} -> {down}: {len(hits)} parts match")
+        out[hits[0]] = _key(parts[hits[0]].points[0]) == up
     return out
 
 
@@ -488,7 +556,12 @@ def table_text(polylines) -> str:
 
 @traced
 def bake(
-    geojson_path, etopo_path, out_path, lake_map_path=LAKE_MAP_PATH, extra_path=EXTRA_PATH
+    geojson_path,
+    etopo_path,
+    out_path,
+    lake_map_path=LAKE_MAP_PATH,
+    extra_path=EXTRA_PATH,
+    orient_path=ORIENT_PATH,
 ) -> dict:
     """Bakes the table to ``out_path`` and returns a summary; refuses a table over
     :data:`MAX_TABLE_BYTES`."""
@@ -539,8 +612,11 @@ def bake(
         # The hand-added channels are cited upstream first: certain, and they decide the arms
         # that feed them.
         extras = read_extras(Path(extra_path).read_text(encoding="utf-8"))
+        cited = cited_orientations(
+            selected, read_orientations(Path(orient_path).read_text(encoding="utf-8"))
+        )
         oriented, orient_counts = orient_by_connections(
-            selected, lambda p: ends[index[id(p)]], fixed=extras, rules=rules
+            selected, lambda p: ends[index[id(p)]], fixed=extras, rules=rules, cited=cited
         )
     reversed_count = sum(
         1 for a, b in zip(selected, oriented) if a.points[0].tolist() != b.points[0].tolist()
@@ -609,13 +685,16 @@ __all__ = [
     "end_height",
     "Polyline",
     "bake",
+    "cited_orientations",
     "is_artificial",
+    "is_ring",
     "lake_cover",
     "main",
     "orient",
     "MOUTH_VOTE_M",
     "orient_by_connections",
     "read_extras",
+    "read_orientations",
     "select",
     "simplify",
     "table_text",

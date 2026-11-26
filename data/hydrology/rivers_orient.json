@@ -1,0 +1,6 @@
+{
+  "comment": "Cited directions for river parts whose ends ETOPO cannot tell apart (rivers Task 11d fix round 5): each entry names a Natural Earth part by its name and its two raw ends [lat, lon] (at the table's 0.001 degree precision), upstream first. Read by `timefly-bake rivers-today` (tools/bake/timefly_bake/rivers_today.py), which decides these parts first, as certain; the parts they chain to follow.",
+  "parts": [
+    {"name": "Ganges", "upstream": [23.579, 90.087], "downstream": [23.191, 90.213], "source": "Wikipedia, 'Padma River' (read 2026-11-26): the Padma, the Ganges' main distributary in Bangladesh, 'flowing generally southeast' to its confluence with the Meghna, the article's point 23 16 N, 90 36 E. The part's southern end (23.191, 90.213) lies 40 km from that point, its northern end (23.579, 90.087) 63 km. ETOPO 2022 60 arc-second ends read 2.0 m north and 3.1 m south, metre-level delta noise, so ETOPO ran the part north, and by its chain the part below it to (22.775, 90.394) north too.", "note": "Task 11d fix round 5: under the course order the two parts held the Padma's water against the delta's slope."}
+  ]
+}

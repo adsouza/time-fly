@@ -27,6 +27,85 @@ Reference timings (M4, Python): Indus 6.7 s (870 × 960 nodes), Amazon 25 s (162
 
 ## Result, 2026-11-26 (Task 11d: the world's major river systems)
 
+### Fix round 5 (2026-11-26)
+
+**1. The Aral's lost inflow (863 → 239 m³/s) is a reroute inside the Aral basin, not a loss.** The water reaches the same dry sink as before; the probe traces below come from temporary probes, not committed, at round 3 (1216a2e) and now.
+- **The Amu Darya is unchanged.** Both times it runs down Natural Earth's western arm (part 267) to a dry sink at (44.42, 58.27), on the West Aral's southern shore. That sink takes 1,992 m³/s in round 3 and 1,989 m³/s now.
+- **The Syr Darya changed route.** In round 3 it crossed the dry Aral bed westward and entered lake 857 (the West Aral) at (45.24, 58.75) with 861 m³/s. The lake's outflow, 794 m³/s, then went to the same sink. Now it runs south down the bed's eastern side, from (45.48, 59.81) to (44.35, 59.23), and reaches the sink without passing the lake.
+- **Lake 857's own balance is unchanged:** it evaporates 69 m³/s before and 68 m³/s after. The Caspian's surplus is untouched, because the water never leaves the Aral basin.
+- **No part is misoriented.** Part 216, the Syr, runs downstream to (46.02, 61.76), and parts 267 and 268, the Amu, run north from Kungrad. On the dry bed the Syr's nodes are `BasinRoute` exceptions: the present-day rewrite of the closed Aral basin routes each node one BFS step toward its sink, and there the successor is not closer. Ruling 1's holds and its chain shift which neighbour that rewrite picks among equally close ones (lowest elevation first).
+- **Open items:**
+  - The Syr Darya should end in the North Aral (lake 859, 133 m³/s). Its course stops 10 km short of part 215, which enters that lake.
+  - The Amu Darya ends in a dry sink beside lake 857 rather than in it. The burn leaves the course's last node 10 m below the lake's 27 m surface, so it is a pit of its own.
+  - Both were there in round 3. A proposed rule, not implemented: a course node within reach of a mapped lake routes no lower than the lake's surface, as a coastal node routes no lower than 0 m.
+
+**2. The lake map audit.** A new informative line, which never fails the check, lists every lake-map lake whose baked surface stands more than 20 m (`LAKE_MAP_GAP_M`) below the lowest cell of its shoreline ring.
+- **The ring** is the 3′ cells outside every lake that touch the footprint (`LakeMap::rings`, unit-tested on a seam-crossing map). The ring is sampled on the 5′ overview.
+- **The line** gives each flagged lake's position, cell count, baked surface, ring lowest and median, the gap, and the pass's lakes whose exit lies in it. It then gives a fixed list of named lakes, flagged or not.
+- **149 of 1,059 lakes are flagged.** Most are small mountain lakes (Tibet, the Alps, New Zealand, the Altai), where the 5′ overview smooths steep shores far above the water. Geneva, for example, is baked at 368 m, close to its real 372 m; its ring's lowest cell reads 413.7 m.
+- **The named lakes:**
+
+| Lake | Baked | Ring lowest (median) | Gap | Real surface | Verdict |
+|---|---|---|---|---|---|
+| Baikal | −328.0 m | −49.8 (552.9) | 278 m | 455.5 (table) | **bed: FLAGGED** |
+| Superior | 24.1 m | 122.6 (230.3) | 98 m | 183 (table) | **bed: FLAGGED** |
+| Michigan | 96.4 m | 142.7 (189.9) | 46 m | 176 (table) | **bed: FLAGGED** |
+| Huron | 124.7 m | 151.0 (191.5) | 26 m | 176 (table) | **bed: FLAGGED** |
+| Ontario | −4.4 m | 44.7 (93.8) | 49 m | 74 (table) | **bed: FLAGGED** |
+| Erie | 155.0 m | 155.1 (187.3) | 0 m | 173 (table) | ok by the bar, but 18 m below its table level: likely a bed too (Erie is shallow) |
+| Tanganyika | 770.0 m | 778.8 (969.0) | 9 m | | ok |
+| Malawi | 474.5 m | 475.1 (564.4) | 1 m | | ok |
+| Great Slave | 155.0 m | 154.7 (172.2) | 0 m | | ok |
+| Great Bear | 155.5 m | 156.5 (196.5) | 1 m | | ok |
+| Ladoga | 3.5 m | 4.7 (16.0) | 1 m | | ok |
+| Issyk-Kul | 1606.5 m | 1611.7 (1771.1) | 5 m | | ok |
+
+- **The Baikal-type errors are the lakes ETOPO 2022 carries bathymetry for:** Baikal and the Great Lakes. The map's median of the 60″ cells inside them is their bed. The level table already overrides all six for the table lakes. But the pass also makes a **Data lake from the map's footprint at the baked bed level**:
+  - Baikal's is lake 384 (−328.0 m).
+  - Ontario's is lake 15 (−4.4 m).
+  - Superior's is lake 375 (24.1 m). Round 4 mislabelled it as the Lake Nipigon area.
+  - Michigan's is lake 376 (96.4 m), and Huron's lake 377 (124.7 m).
+- **Lake 384 is a fragment of Baikal's map footprint.** Its exit lies in the same map lake (id at (53.42, 107.70)) as the table Baikal (lake 0). It holds the footprint nodes outside the table lake's basin: 1,248 km² against the table lake's 33,137.
+- **Other flagged lakes to check when the bake is fixed:**
+  - (53.46, 139.77), −106.4 m, near the Amur's mouth.
+  - Lakes the bar flags that are not baked at a bed: Assal (−153.5 m, real −155) and the Sea of Galilee (−214.5 m, real about −212), both baked about right, and Loch Ness (28.1 m, real 16 m), baked above its real surface. In each, the overview smooths a steep shore.
+- The shipped map was not re-baked, as ruled.
+
+**3. The Ganges delta's parts.**
+- **Evidence for the two parts.** Part 1099 runs (23.191, 90.213) → (23.579, 90.087) and part 1101 runs (22.775, 90.394) → (23.191, 90.213): both upstream, away from the sea.
+  - In the bake, 1099 was oriented by ETOPO: its ends read 3.1 m and 2.0 m, metre-level delta noise. 1101 then followed it as a chain (1.1 m), overruling its own correct 1.0 m fall.
+  - Wikipedia "Padma River" (read 2026-11-26) says the river flows "generally southeast" to its Meghna confluence, at the article's point (23.267, 90.600). 1099's southern end lies 40 km from that point, its northern end 63 km.
+- **New: cited orientations** (`data/hydrology/rivers_orient.json`, `read_orientations`, `cited_orientations`). One entry decides 1099 as certain, and 1101 follows by chain.
+- **New: closed rings are dropped** (`is_ring`: three or more points, ends within 1 km). Part 1100, the ring at (23.191, 90.213), is gone. So are the Iriri's ring and the Indus delta's ring, and two tiny loops that simplified to 2-point stubs (the Ottawa and the Kotuy).
+- **Re-bake.** The command is the brief's, unchanged: 963,951 bytes and 1,423 courses (1,428 before). The orientation counts are topology 606, ETOPO 819, cited 1. Besides the dropped rings, two Ganges parts were reversed by the citation, and one 350 m Indus link by the ring's removal.
+- **Ganges and Brahmaputra:** 133 → **95 km** from their mouth, ending at (22.83, 90.70) on the Meghna estuary. Pictures: [Ganges](hydro-check-outlet-ganges.svg) ([round 3](hydro-check-outlet-ganges-before.svg)).
+
+**Tests.**
+- Python, each RED first (scratch `task11d-r5/red-py.txt`), then GREEN:
+  - `test_select_drops_closed_rings`;
+  - `test_a_cited_orientation_decides_a_part_and_its_chain` (it asserts the hazard);
+  - `test_read_orientations_refuses_an_uncited_or_unmatched_entry`;
+  - `test_the_shipped_orientations_are_cited_and_match_the_table`.
+- Rust, written with the code:
+  - `a_lakes_ring_is_the_land_around_its_footprint`;
+  - `the_lake_map_audit_lists_lakes_baked_below_their_shores`.
+
+**hydro check (`dev`): FAIL, on the Indus box's links only. All 22 outlets pass.** Before is round 4 (0b1ae8c); after is this round.
+- **Changed:**
+  - Ganges and Brahmaputra 133 → 95 km.
+  - Burnt nodes 31,986 → 31,985.
+  - Course order: Follows 28,701 → 28,704; SharedNode 91 → 92; NoRiver 2,666 → 2,663; BasinRoute 95 → 93; Other 3, the same loop cuts.
+  - Pass 1.74 → 1.65 s. Nothing else was building this time, but the machine was not otherwise quiet.
+- **Unchanged, every other bar:**
+  - the Indus box (83.0%, 74/84, worst 81.3 km) and the Amazon box (91.8%, 457/482);
+  - the five lakes and the arid bar;
+  - the other 20 outlets, digit for digit;
+  - all 18 discharge gauges (the Nile 5.11 alone flagged);
+  - the Caspian's surplus (3,449 of 12,853 m³/s);
+  - pinned, 19 nodes on 10 courses;
+  - p99 439 m, and 4,611 nodes over 50 m.
+- **The lake dump:** all 861 lakes identical to round 4.
+
 ### Fix round 4 (2026-11-26)
 
 The controller's rulings, and what was built:
