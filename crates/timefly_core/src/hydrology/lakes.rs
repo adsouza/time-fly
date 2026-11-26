@@ -64,9 +64,12 @@
 //!         holds no lake today; Q_in passes through the spill).
 //!       - spill > S + OPEN_LAKE_MAP_TOL_M: Data lake at level = S, footprint = the main mapped
 //!         lake's non-ice nodes (round 2: never every basin node below S, which flooded plains
-//!         between lakes), evaporation = Σ_footprint c, outflow = Q_in − evaporation (the real
-//!         outlet is a gorge below the lattice; the exit then joins the footprint as its outlet
-//!         unless ice, while the evaporation stays that of the mapped nodes).
+//!         between lakes, and never the basin's exit off the map: fix round 1). The basin routes
+//!         as one with no lake (BFS from the exit alone); the footprint's water gathers at the
+//!         lake's outlet, its node nearest the exit by BFS steps (ties: the highest id; the exit
+//!         itself when mapped), whose inflow Q_lake gives outflow = max(0, Q_lake − Σ_footprint
+//!         c), evaporation = Q_lake − outflow; the outlet passes the outflow on toward the exit,
+//!         which passes everything over the rim. The lake's `exit` is its outlet.
 //!       - Otherwise: level = spill, evaporation = C_last, outflow = Q_in − C_last, footprint =
 //!         all non-ice basin nodes; no lake if spill − min e < MIN_LAKE_DEPTH_M.
 //!     Else Terminal: g = first group with C_g ≥ Q_in, level = e_g + (Q_in − C_{g−1}) /
@@ -121,7 +124,9 @@ pub struct Lake {
     pub outflow_m3s: f64,
     /// The footprint's area.
     pub area_km2: f64,
-    /// The basin's exit node; an outflow leaves over the basin's rim.
+    /// Where the lake's outflow leaves it: the basin's exit node (an outflow leaves over the
+    /// basin's rim), or for a past era's capped mapped lake its outlet among its own nodes, and
+    /// for a present-day mapped lake its outlet ([`super::today`]).
     pub exit: u32,
 }
 
@@ -194,6 +199,14 @@ enum Outcome {
     /// Routing's tree into the exit, then the rim. `lake` is `None` for a basin too shallow for
     /// one, which passes everything through.
     Spill { lake: Option<(Lake, Vec<bool>)> },
+    /// Routing's tree into the exit, then the rim, as with no lake, through a lake that need
+    /// not hold the exit (a past era's capped mapped lake): its footprint's water gathers at its
+    /// outlet, the footprint node nearest the exit (ties: the highest id), which passes on what
+    /// its surface does not evaporate (`capacity`, m³/s).
+    Through {
+        lake: (Lake, Vec<bool>),
+        capacity: f64,
+    },
     /// The sinks keep their water.
     Sink {
         lake: Option<(Lake, Vec<bool>)>,
@@ -924,24 +937,18 @@ impl Accumulation {
                 // below the lattice).
                 (LakeKind::Open, Some((surface, own))) if spill > surface + tol => {
                     let level = f64::from(surface);
-                    let mut footprint: Vec<bool> = (0..m).map(|k| !iced[k] && own[k]).collect();
-                    let evaporation: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
-                    // The exit joins it as its outlet (unless ice), as for every lake that
-                    // overflows: otherwise the exit would carry the whole inflow and pass on
-                    // less, a river shrinking downstream.
-                    let any = footprint.contains(&true);
-                    footprint[exit_k] |= !iced[exit_k];
-                    Outcome::Spill {
-                        lake: any.then(|| {
-                            let lake = make_lake(
-                                LakeKind::Data,
-                                level,
-                                evaporation,
-                                q_in - evaporation,
-                                &footprint,
-                            );
-                            (lake, footprint)
-                        }),
+                    // The mapped nodes alone (fix round 1: never the basin's exit off the map).
+                    // The lake overflows from its own node nearest the exit (Outcome::Through).
+                    let footprint: Vec<bool> = (0..m).map(|k| !iced[k] && own[k]).collect();
+                    let capacity: f64 = (0..m).filter(|&k| footprint[k]).map(|k| cap[k]).sum();
+                    if footprint.contains(&true) {
+                        let lake = make_lake(LakeKind::Data, level, 0.0, 0.0, &footprint);
+                        Outcome::Through {
+                            lake: (lake, footprint),
+                            capacity,
+                        }
+                    } else {
+                        Outcome::Spill { lake: None }
                     }
                 }
                 (LakeKind::Open, _) => {
@@ -981,7 +988,8 @@ impl Accumulation {
 
         // Sources: a spilling basin's footprint and exit, or a terminal basin's sinks. Every
         // other node routes to the neighbour one BFS step closer to them, lowest e first.
-        let (lake, sources, spill, sink_evaporation) = match outcome {
+        let mut through: Option<f64> = None;
+        let (mut lake, sources, spill, sink_evaporation) = match outcome {
             Outcome::Spill { lake } => {
                 let mut sources = match &lake {
                     Some((_, footprint)) => footprint.clone(),
@@ -989,6 +997,12 @@ impl Accumulation {
                 };
                 sources[exit_k] = true;
                 (lake, sources, true, 0.0)
+            }
+            Outcome::Through { lake, capacity } => {
+                through = Some(capacity);
+                let mut sources = vec![false; m];
+                sources[exit_k] = true;
+                (Some(lake), sources, true, 0.0)
             }
             Outcome::Sink {
                 lake,
@@ -1022,12 +1036,44 @@ impl Accumulation {
             receiver[nodes[k] as usize] = slot as u8;
             target[k] = j;
         }
+        // A lake the basin passes through: its outlet, and its overflow once its footprint's
+        // water has gathered there.
+        let outlet: Option<usize> = through.map(|_| {
+            let footprint = &lake.as_ref().expect("a lake to pass through").1;
+            (0..m)
+                .filter(|&k| footprint[k])
+                .min_by(|&a, &b| dist[a].cmp(&dist[b]).then(b.cmp(&a)))
+                .expect("a footprint")
+        });
+        let overflow = |q_lake: f32, lake: &mut Option<(Lake, Vec<bool>)>| -> f32 {
+            let capacity = through.expect("a lake passed through");
+            let (l, _) = lake.as_mut().expect("a lake passed through");
+            l.inflow_m3s = f64::from(q_lake);
+            l.outflow_m3s = (l.inflow_m3s - capacity).max(0.0);
+            l.evaporation_m3s = l.inflow_m3s - l.outflow_m3s;
+            l.outflow_m3s as f32
+        };
         let mut by_dist: Vec<usize> = (0..m).filter(|&k| !sources[k]).collect();
         by_dist.sort_by(|&a, &b| dist[b].cmp(&dist[a]).then(a.cmp(&b)));
         for k in by_dist {
             let (from, to) = (nodes[k] as usize, nodes[target[k]] as usize);
-            self.q[to] += self.q[from];
+            let in_lake = through.is_some() && lake.as_ref().is_some_and(|(_, f)| f[k]);
+            let pass = match outlet {
+                // The footprint gathers at the outlet (which every one of its nodes precedes).
+                Some(o) if in_lake && k != o => {
+                    let o = nodes[o] as usize;
+                    self.q[o] += self.q[from];
+                    self.area_km2[o] += self.area_km2[from];
+                    continue;
+                }
+                Some(o) if k == o => overflow(self.q[from], &mut lake),
+                _ => self.q[from],
+            };
+            self.q[to] += pass;
             self.area_km2[to] += self.area_km2[from];
+        }
+        if let Some((l, _)) = lake.as_mut().filter(|_| through.is_some()) {
+            l.exit = nodes[outlet.expect("an outlet")];
         }
         if spill {
             // The lake's nodes gather at the exit, which drains over the rim (or to a lower
@@ -1039,12 +1085,23 @@ impl Accumulation {
                 self.q[exit] += self.q[v];
                 self.area_km2[exit] += self.area_km2[v];
             }
-            let out = match &lake {
-                Some((l, _)) => {
+            let out = match (outlet, &lake) {
+                // The lake's outlet is the exit itself.
+                (Some(o), Some(_)) if o == exit_k => {
+                    let out = overflow(self.q[exit], &mut lake);
+                    self.evaporated_m3s += lake.as_ref().expect("a lake").0.evaporation_m3s;
+                    out
+                }
+                // It overflowed upstream of the exit, which passes everything on.
+                (Some(_), Some((l, _))) => {
+                    self.evaporated_m3s += l.evaporation_m3s;
+                    self.q[exit]
+                }
+                (_, Some((l, _))) => {
                     self.evaporated_m3s += l.evaporation_m3s;
                     l.outflow_m3s as f32
                 }
-                None => self.q[exit],
+                (_, None) => self.q[exit],
             };
             let down = match receiver[exit] {
                 RECEIVER_NONE => None,
@@ -2146,9 +2203,9 @@ mod tests {
         let (_, past) = valley_at(0.01, false, &mapped);
         assert_eq!(past.lakes.len(), 1, "{:?}", past.lakes);
         assert_eq!(past.lakes[0].level_m, VALLEY_SPILL - 60.0);
-        // The basin's exit joins the footprint as its outlet.
+        // Its own nodes alone, never the basin's exit (fix round 1).
         let footprint: Vec<u32> = past.lake_nodes.iter().map(|n| n.node).collect();
-        assert_eq!(footprint, [vec![g.node(3, DAM + 1)], a.clone()].concat());
+        assert_eq!(footprint, a);
         // The present day: each mapped lake over its own nodes, at its own surface.
         let (_, today) = valley_at(0.01, true, &mapped);
         assert_eq!(today.lakes.len(), 2, "{:?}", today.lakes);
@@ -2160,6 +2217,57 @@ mod tests {
         both.sort_unstable();
         assert_eq!(footprint, both);
         assert!(between.iter().all(|v| !footprint.contains(v)));
+    }
+
+    #[test]
+    fn a_capped_lake_away_from_its_basins_exit_floods_only_its_map() {
+        // A past era: the mapped lake lies 7 nodes upstream of the basin's exit (an Iron Gate far
+        // from its Balaton). The lake is capped at its surface, 60 m under the spill.
+        let (g, elevation) = dammed_valley();
+        let lake: Vec<u32> = (DAM + 8..=DAM + 12).map(|c| g.node(3, c)).collect();
+        let mapped: Vec<(u32, f32)> = lake.iter().map(|&v| (v, VALLEY_SPILL - 60.0)).collect();
+        let (r, acc) = valley_at(0.01, false, &mapped);
+        let exit = r.basins[0].exit;
+        assert_eq!(exit, g.node(3, DAM + 1));
+        assert_eq!(acc.lakes.len(), 1, "{:?}", acc.lakes);
+        let l = &acc.lakes[0];
+        assert_eq!((l.kind, l.level_m), (LakeKind::Data, VALLEY_SPILL - 60.0));
+        // No footprint node off the map: not the basin's exit, nothing between.
+        let footprint: Vec<u32> = acc.lake_nodes.iter().map(|n| n.node).collect();
+        assert_eq!(footprint, lake);
+        // The lake overflows from its mapped node nearest the exit; from there to the exit and
+        // over the rim the discharge never shrinks, and it carries the lake's outflow.
+        assert_eq!(l.exit, g.node(3, DAM + 8));
+        assert!(
+            (l.evaporation_m3s - 0.01 * lake.len() as f64).abs() < 1e-9,
+            "{l:?}"
+        );
+        assert!((l.inflow_m3s - l.evaporation_m3s - l.outflow_m3s).abs() < 1e-9);
+        let mut at = receiver_of(&g, &r, l.exit).expect("the outlet drains");
+        assert!(f64::from(acc.q[at as usize]) >= l.outflow_m3s, "{l:?}");
+        let mut last = acc.q[at as usize];
+        while at != exit {
+            assert!(!footprint.contains(&at), "{at} is the lake's");
+            at = receiver_of(&g, &r, at).expect("drains to the exit");
+            assert!(acc.q[at as usize] >= last, "shrinks at {at}");
+            last = acc.q[at as usize];
+        }
+        let rim = g.node(3, DAM);
+        assert_eq!(acc.q[rim as usize], 1.0 + acc.q[exit as usize]);
+        // Conservation: own runoff = the sea's + the lake's evaporation.
+        let own: f64 = (0..g.len())
+            .filter(|&v| elevation[v as usize] >= 0.0)
+            .count() as f64;
+        let sea: f64 = (0..g.len())
+            .filter(|&v| !r.ocean[v as usize])
+            .filter(|&v| receiver_of(&g, &r, v).is_some_and(|j| r.ocean[j as usize]))
+            .map(|v| f64::from(acc.q[v as usize]))
+            .sum();
+        assert!(
+            (sea + acc.evaporated_m3s - own).abs() < 1e-3 * own,
+            "{sea} {}",
+            acc.evaporated_m3s
+        );
     }
 
     #[test]
