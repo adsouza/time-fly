@@ -717,6 +717,25 @@ impl BurntNodes {
         self.at.get(&v).map(|&k| self.beds[k as usize].1)
     }
 
+    /// Burnt nodes at 0 m with no successors (tests of what reads the burnt set).
+    #[cfg(test)]
+    pub(crate) fn of_nodes(nodes: &[u32]) -> Self {
+        let mut b = BurntNodes::default();
+        for &node in nodes {
+            b.add(CourseLevel {
+                node,
+                level: 0.0,
+                base: 0.0,
+                own: 0.0,
+                last: false,
+                succ: None,
+                bed: 0.0,
+                anchor: DVec3::X,
+            });
+        }
+        b
+    }
+
     /// The burnt nodes and their beds, in the order first burnt.
     #[cfg(test)]
     pub(crate) fn beds(&self) -> Vec<(u32, f32)> {

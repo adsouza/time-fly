@@ -1439,7 +1439,20 @@ mod tests {
         // The trench still runs to the sea, and the result is the same for any budget.
         let end = *path(&lattice, &r, course[0]).last().unwrap();
         assert!(r.ocean[end as usize]);
-        assert_eq!(route_blocked(&lattice, elevation, blocked, 7), r);
+        assert_eq!(
+            route_blocked(&lattice, elevation.clone(), blocked.clone(), 7),
+            r
+        );
+        // A pit beside the trench, above it but below the plateau (fix round 1): were the flood
+        // to reach it from the trench, its parent, its receiver, would be the trench node.
+        let pit = at(45, 49);
+        let mut pitted = elevation;
+        pitted[pit as usize] = 500.0;
+        assert!(into(&route(&lattice, pitted.clone(), u32::MAX), pit));
+        assert!(!into(
+            &route_blocked(&lattice, pitted, blocked, u32::MAX),
+            pit
+        ));
     }
 
     /// Task 11g: where the land between them stays low (a saddle below the threshold), the

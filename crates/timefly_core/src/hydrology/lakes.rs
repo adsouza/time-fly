@@ -2291,6 +2291,73 @@ mod tests {
         }
     }
 
+    /// Task 11g fix round 1: a pocket of basin nodes walled off by ridged steps (every step from
+    /// it to the rest of the basin is ridged) is still routed, across a ridged step where it must
+    /// (the rewrite's fallback search), and reaches the pit. Without the fallback the pocket's
+    /// middle node has no neighbour a step closer, and the rewrite panics.
+    #[test]
+    fn a_basin_pocket_walled_off_by_ridged_steps_still_drains() {
+        let g = GridGraph {
+            rows: 7,
+            cols: 11,
+            spacing_m: 1_000.0,
+        };
+        let elevation: Vec<f32> = (0..g.len())
+            .map(|i| match g.row_col(i) {
+                (_, 0) => -10.0,
+                (3, 7) => 2.0,
+                (3, 1) => 50.0,
+                (r, c) if (1..=5).contains(&r) && (2..=9).contains(&c) => {
+                    10.0 + c as f32 + r as f32 * 0.5
+                }
+                _ => 90.0,
+            })
+            .collect();
+        let pit = g.node(3, 7);
+        let mut r = route(&g, elevation);
+        let nodes = r.basins[0].nodes.clone();
+        // The pocket: rows 2-4, columns 3-5 around (3, 4).
+        let pocket: Vec<u32> = (2..=4)
+            .flat_map(|row| (3..=5).map(move |col| g.node(row, col)))
+            .collect();
+        assert!(pocket.iter().all(|v| nodes.contains(v)));
+        let mut blocked: Vec<(u32, u32)> = pocket
+            .iter()
+            .flat_map(|&u| {
+                g.neighbours(u)
+                    .into_iter()
+                    .flatten()
+                    .filter(|j| nodes.contains(j) && !pocket.contains(j))
+                    .map(move |j| (u, j))
+            })
+            .collect();
+        blocked.sort_unstable();
+        r.blocked = blocked.clone();
+        accumulate(&g, &mut r, |_| 30.0, |_| 1e6, |_| false, false, u32::MAX);
+        // The middle drains within the pocket; some node leaves it across a ridged step.
+        let middle = g.node(3, 4);
+        assert!(pocket.contains(&receiver_of(&g, &r, middle).unwrap()));
+        let crossings = pocket
+            .iter()
+            .filter(|&&u| {
+                blocked
+                    .binary_search(&(u, receiver_of(&g, &r, u).unwrap()))
+                    .is_ok()
+            })
+            .count();
+        assert!(crossings > 0);
+        for &u in &pocket {
+            let mut at = u;
+            let mut steps = 0;
+            while let Some(next) = receiver_of(&g, &r, at) {
+                at = next;
+                steps += 1;
+                assert!(steps < 50);
+            }
+            assert_eq!(at, pit, "{:?}", g.row_col(u));
+        }
+    }
+
     // ---- Lakes checked against today's map (Task 8b). ----
 
     /// The dam's column in [`dammed_valley`].

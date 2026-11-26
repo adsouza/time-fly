@@ -3629,6 +3629,49 @@ mod tests {
         assert_eq!(parallel.finish(), whole);
     }
 
+    /// Task 11g fix round 1: the pass applies the shipped ridged steps where the lattice is
+    /// theirs and the shipped courses burn, each only where this era burnt its course node; on
+    /// another lattice or with other courses, none.
+    #[test]
+    fn the_shipped_ridged_steps_apply_on_their_lattice_to_burnt_nodes() {
+        use crate::hydrology::ridged::shipped_ridged_steps;
+        let shipped = &shipped_ridged_steps().steps;
+        // This era burnt every other course node the steps lead into.
+        let mut into: Vec<u32> = shipped.iter().map(|&(_, c)| c).collect();
+        into.sort_unstable();
+        into.dedup();
+        let burnt: Vec<u32> = into.iter().copied().step_by(2).collect();
+        let beds = || BurntNodes::of_nodes(&burnt);
+        let mut prep = HydroPrep::new(CubeLattice { n: 900 }, PRESENT);
+        prep.beds = beds();
+        let steps = prep.blocked_steps();
+        let want: Vec<(u32, u32)> = shipped
+            .iter()
+            .copied()
+            .filter(|&(_, c)| burnt.binary_search(&c).is_ok())
+            .collect();
+        assert!(
+            !steps.is_empty() && steps.len() < shipped.len(),
+            "{}",
+            steps.len()
+        );
+        assert_eq!(steps, want);
+        // Another lattice, or other courses: none.
+        let mut other = HydroPrep::new(CubeLattice { n: 180 }, PRESENT);
+        other.beds = beds();
+        assert!(other.blocked_steps().is_empty());
+        let mut given =
+            HydroPrep::new(CubeLattice { n: 900 }, PRESENT).with_today_rivers(Vec::new());
+        given.beds = beds();
+        assert!(given.blocked_steps().is_empty());
+        // Nothing burnt: none.
+        assert!(
+            HydroPrep::new(CubeLattice { n: 900 }, PRESENT)
+                .blocked_steps()
+                .is_empty()
+        );
+    }
+
     /// Task 11g: with ridged steps, the time-boxed pass still matches the native one bit for
     /// bit, and the steps change the routing. The steps are the shipped courses' at n = 75 over
     /// a fine terrain with ridges on the synthetic one.
