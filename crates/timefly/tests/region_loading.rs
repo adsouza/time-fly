@@ -57,6 +57,15 @@ const SMALL: RegionSettings = RegionSettings {
     mode: GenMode::Parallel,
 };
 
+/// [`SMALL`] generated in time-boxed slices of 1 ns: one slice per frame, so a job's progress
+/// counts frames, not wall time.
+const ONE_SLICE_A_FRAME: RegionSettings = RegionSettings {
+    mode: GenMode::Budgeted {
+        budget: Duration::from_nanos(1),
+    },
+    ..SMALL
+};
+
 // ---------------------------------------------------------------------------------------------
 // Fixtures (ruling R3)
 
@@ -1416,11 +1425,20 @@ fn a_neighbour_generates_without_replacing_the_active_region() {
 
 #[test]
 fn cancelling_a_preload_keeps_the_region() {
-    let mut app = app_in_region(SMALL);
+    // One slice a frame: the job moves only with updates. With `SMALL`'s pool the 129² neighbour,
+    // its tiles cached, is spawned in the first update and polled in the second, so on a busy
+    // machine it finished between them and landed before the cancel (a flake in full-suite runs).
+    let mut app = app_in_region(ONE_SLICE_A_FRAME);
     let before = active(&app);
     neighbour(&mut app, 0.0, 0.3);
     app.update();
+    // The busy machine: wall time passes between the two frames. With the pool this fails.
+    std::thread::sleep(Duration::from_millis(300));
     app.update();
+    assert!(
+        pending(&app).is_none(),
+        "the neighbour must still be in flight when it is cancelled"
+    );
     app.world_mut().write_message(RegionPreloadCancelled);
     settle(&mut app, 500);
     assert!(pending(&app).is_none(), "a cancelled job must not land");
