@@ -163,19 +163,28 @@ pub const BOULDER_CLUSTER_MAX: u32 = 6;
 pub const BOULDER_CLUSTER_REACH: f64 = 3.0;
 /// A cluster member's radius before the rule that it breaks the surface, as a share of its
 /// centre's hashed radius.
-pub const BOULDER_MEMBER_SHARE: [f64; 2] = [0.35, 0.85];
-/// The hashed radius range of a cluster's centre boulder.
-pub const BOULDER_RADIUS_M: [f64; 2] = [0.4, 3.0];
+pub const BOULDER_MEMBER_SHARE: [f64; 2] = [0.4, 0.85];
+/// The hashed radius range of a cluster's centre boulder (fix round 1, the owner's "bigger
+/// rocks": about 1.7 times Task 6's `[0.4, 3.0]`).
+pub const BOULDER_RADIUS_M: [f64; 2] = [0.7, 5.0];
 /// A boulder that breaks the surface (a cluster's first `ceil(n × rapid / 3)` members, its
 /// centre first) has its top this far above the water (m) over the sub-segment's deepest point:
 /// its centre the most, the others hashed within the range.
 pub const BOULDER_BREAK_M: [f64; 2] = [0.2, 0.8];
 /// No boulder's radius exceeds this (m), nor half the channel's half-width, so in a river
-/// deeper than about 9 m even the breakers stay under.
-pub const BOULDER_MAX_RADIUS_M: f64 = 5.0;
+/// deeper than about 15 m even the breakers stay under (fix round 1: was 5).
+pub const BOULDER_MAX_RADIUS_M: f64 = 8.0;
 /// A boulder in the water whose top is less than this far (m) under the level, or above it,
 /// marks a foam site (Task 11c's collars).
 pub const FOAM_SITE_DEPTH_M: f32 = 0.5;
+/// Rapids keep a cluster of boulders only where a hash of its `(river, k, c)` falls under this
+/// share (Task 11c fix round 1): a function of direction, so overlapping regions keep the same
+/// clusters, whole. Chosen so no bench region holds more than 75% of [`MAX_BOULDERS`]: the
+/// Himalayas' 24,964 unthinned boulders become about 11,200 (68%).
+pub const BOULDER_KEEP_FRACTION: f64 = 0.45;
+/// A guard, never reached on the bench regions: past it a region keeps its first boulders in
+/// sub-segment order and the shell warns. Overlapping regions then disagree, so the keep
+/// fraction, not this, is what bounds the boulders.
 pub const MAX_BOULDERS: u32 = 16_384;
 
 // Shell.

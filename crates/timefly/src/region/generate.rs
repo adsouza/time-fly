@@ -134,15 +134,27 @@ impl GenInputs {
 }
 
 /// Warns once when the region had more boulders than [`MAX_BOULDERS`] (core does not log).
+/// The cap is a guard (Task 11c fix round 1): the keep fraction keeps every bench region under
+/// it, and a region past it disagrees with its neighbours where they overlap.
 fn warn_dropped_boulders<F: CoarseField>(generator: &RegionGenerator<'_, F>) {
-    let dropped = generator.boulders_dropped();
-    if dropped > 0 {
-        warn!(
-            dropped,
-            kept = MAX_BOULDERS,
-            "region has more boulders than the cap; dropped the rest"
-        );
+    if let Some(msg) = boulder_cap_warning(generator.spec(), generator.boulders_dropped()) {
+        warn!("{msg}");
     }
+}
+
+/// The boulder cap's warning for a region with `dropped` boulders past it, if any: the region
+/// (its centre and age) and the overflow.
+fn boulder_cap_warning(spec: &RegionSpec, dropped: u32) -> Option<String> {
+    (dropped > 0).then(|| {
+        let (lat, lon) =
+            timefly_core::geo::geo_to_latlon(timefly_core::geo::render_to_geo(spec.center));
+        format!(
+            "region {lat:.3},{lon:.3} at {} years has {dropped} boulders past the cap of \
+             {MAX_BOULDERS}; dropped them (its rapids overflow the keep fraction, so it disagrees \
+             with its neighbours there)",
+            spec.snapshot.0
+        )
+    })
 }
 
 /// Consecutive row ranges of at most `block` rows covering `0..rows`, in order.
@@ -414,5 +426,27 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(y.as_mut().poll(&mut cx).is_pending());
         assert!(y.as_mut().poll(&mut cx).is_ready());
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use timefly_core::deep_time::YearsBp;
+    use timefly_core::geo::{geo_to_render, latlon_to_geo};
+
+    use super::*;
+
+    /// The boulder cap is a guard (Task 11c fix round 1): forced past it, the warning names the
+    /// region and the overflow; within it, nothing.
+    #[test]
+    fn the_boulder_cap_guard_warns_when_forced() {
+        let spec = RegionSpec::new(geo_to_render(latlon_to_geo(28.0, 86.9)), YearsBp(0.0), 1);
+        let msg = boulder_cap_warning(&spec, 8_580).expect("a warning past the cap");
+        assert!(msg.contains("28.000") && msg.contains("86.900"), "{msg}");
+        assert!(
+            msg.contains("8580") && msg.contains(&MAX_BOULDERS.to_string()),
+            "{msg}"
+        );
+        assert_eq!(boulder_cap_warning(&spec, 0), None);
     }
 }

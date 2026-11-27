@@ -149,8 +149,33 @@ pub const STREAK_STRETCH: f32 = 4.0;
 /// The streaks are drawn in this many fixed frames around the circle, the two either side of the
 /// flow blended. A `water.wesl` constant.
 pub const STREAK_DIRECTIONS: f32 = 24.0;
-/// How much the standing waves' crests add to white water's noise. A `water.wesl` constant.
-pub const CREST_FOAM: f32 = 0.25;
+/// Fix round 1 (the owner's "less white"): white water's foam is `smoothstep` of the standing
+/// waves' crest (their height's sine) plus the streaks over this band, so foam stands on the
+/// crests, broken by the streaks, and never in a trough. A `water.wesl` constant.
+pub const FOAM_CREST_BAND: [f32; 2] = [0.45, 0.75];
+/// Off the troughs, bright streaks show as lace this white at most... A `water.wesl` constant.
+pub const FOAM_LACE: f32 = 0.5;
+/// ...over this band of the streak noise. A `water.wesl` constant.
+pub const FOAM_LACE_BAND: [f32; 2] = [0.35, 0.7];
+/// Where the crests and streaks can't be resolved, a full rapid's foam fades to this, the mean
+/// of its foam up close (`white_water_foams_on_crests_not_troughs` checks the two agree). A `water.wesl`
+/// constant.
+pub const FOAM_MEAN: f32 = 0.28;
+
+/// White water's foam weight (fix round 1) at a rapid of `rapid`, a standing-wave `crest` (the
+/// height's sine, −1 in a trough, 1 on a crest), the `streak` noise (after
+/// [`STREAK_CONTRAST`]), and `resolve`, how far the pattern is resolved (1 up close, 0 where
+/// it shrinks below a couple of pixels). Mirrored in `water.wesl`.
+pub fn white_water_foam(rapid: f32, crest: f32, streak: f32, resolve: f32) -> f32 {
+    let step = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let foam = step(FOAM_CREST_BAND[0], FOAM_CREST_BAND[1], crest + streak);
+    let lace =
+        FOAM_LACE * step(FOAM_LACE_BAND[0], FOAM_LACE_BAND[1], streak) * step(-0.5, 0.0, crest);
+    rapid * (FOAM_MEAN + (foam.max(lace) - FOAM_MEAN) * resolve)
+}
 /// White water's streak noise is scaled by this before its threshold: up close the foam breaks
 /// into streaks and clumps over dark water, while where the noise is unresolved (at its mean, 0)
 /// a rapid is exactly as white as before. A `water.wesl` constant.
@@ -1159,7 +1184,6 @@ mod tests {
             ("STANDING_WAVE_CELL_M", STANDING_WAVE_CELL_M),
             ("STREAK_STRETCH", STREAK_STRETCH),
             ("STREAK_DIRECTIONS", STREAK_DIRECTIONS),
-            ("CREST_FOAM", CREST_FOAM),
             ("STREAK_CONTRAST", STREAK_CONTRAST),
         ] {
             assert_eq!(wesl_const_f32(WATER_WESL, name), value, "{name}");
@@ -1182,7 +1206,85 @@ mod tests {
         assert!(block.contains("let n0 = streaks(x0, dir, s, footprint, t);"));
         assert!(block.contains("let n1 = streaks(x1, dir, s, footprint, t);"));
         assert!(block.contains("* river_w);"));
-        assert!(block.contains("white = look.flow.z * rapid * broken * river_w;"));
+        assert!(
+            block.contains(
+                "white = look.flow.z * white_water_foam(rapid, waves.x, n, ww) * river_w;"
+            )
+        );
+    }
+
+    /// Fix round 1 (the owner's "less white"): foam on the standing waves' crests, none in their
+    /// troughs whatever the streaks do, lace only off the troughs, and the mean where unresolved.
+    #[test]
+    fn white_water_foams_on_crests_not_troughs() {
+        let streak_max = STREAK_CONTRAST * 0.88;
+        for k in 0..=40 {
+            let streak = -streak_max + 2.0 * streak_max * k as f32 / 40.0;
+            assert_eq!(
+                white_water_foam(1.0, -1.0, streak, 1.0),
+                0.0,
+                "a trough, streak {streak}"
+            );
+        }
+        assert!(white_water_foam(1.0, 1.0, 0.0, 1.0) > 0.9, "a crest");
+        assert!(
+            white_water_foam(1.0, 0.0, 0.0, 1.0) < 0.05,
+            "between, a quiet streak"
+        );
+        assert!(
+            white_water_foam(1.0, 0.0, streak_max, 1.0) > 0.2,
+            "between, a bright streak"
+        );
+        assert_eq!(
+            white_water_foam(0.0, 1.0, 0.5, 1.0),
+            0.0,
+            "no rapid, no foam"
+        );
+        assert_eq!(
+            white_water_foam(1.0, -1.0, 0.0, 0.0),
+            FOAM_MEAN,
+            "unresolved: the mean"
+        );
+        // The mean is the share a full rapid's near foam covers, well under half: crests and
+        // lace over a uniform crest phase and normally spread streaks (σ = 0.25 × contrast).
+        let mut sum = 0.0;
+        let n = 200;
+        for i in 0..n {
+            let crest = (std::f32::consts::TAU * (i as f32 + 0.5) / n as f32).sin();
+            for j in 0..n {
+                let u = (j as f32 + 0.5) / n as f32;
+                // A normal quantile by the logistic approximation.
+                let z = (u / (1.0 - u)).ln() / 1.702;
+                sum += white_water_foam(1.0, crest, 0.25 * STREAK_CONTRAST * z, 1.0);
+            }
+        }
+        let mean = sum / (n * n) as f32;
+        assert!(mean < 0.4, "near foam covers {mean}");
+        assert!(
+            (mean - FOAM_MEAN).abs() < 0.08,
+            "near {mean}, far {FOAM_MEAN}"
+        );
+        // The shader's copy.
+        for line in [
+            "fn white_water_foam(rapid: f32, crest: f32, streak: f32, resolve: f32) -> f32 {",
+            "    let foam = smoothstep(FOAM_CREST_BAND.x, FOAM_CREST_BAND.y, crest + streak);",
+            "    let lace = FOAM_LACE * smoothstep(FOAM_LACE_BAND.x, FOAM_LACE_BAND.y, streak)",
+            "        * smoothstep(-0.5, 0.0, crest);",
+            "    return rapid * mix(FOAM_MEAN, max(foam, lace), resolve);",
+            "white = look.flow.z * white_water_foam(rapid, waves.x, n, ww) * river_w;",
+        ] {
+            assert!(WATER_WESL.contains(line), "{line}");
+        }
+        assert_eq!(wesl_const_f32(WATER_WESL, "FOAM_MEAN"), FOAM_MEAN);
+        assert_eq!(wesl_const_f32(WATER_WESL, "FOAM_LACE"), FOAM_LACE);
+        assert!(WATER_WESL.contains(&format!(
+            "const FOAM_CREST_BAND: vec2<f32> = vec2<f32>({:?}, {:?});",
+            FOAM_CREST_BAND[0], FOAM_CREST_BAND[1]
+        )));
+        assert!(WATER_WESL.contains(&format!(
+            "const FOAM_LACE_BAND: vec2<f32> = vec2<f32>({:?}, {:?});",
+            FOAM_LACE_BAND[0], FOAM_LACE_BAND[1]
+        )));
     }
 
     /// The water is drawn after the opaque terrain (the alpha-mask phase, with a cutoff no

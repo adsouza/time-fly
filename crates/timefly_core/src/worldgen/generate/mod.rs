@@ -607,8 +607,8 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
     /// cluster may overrun the budget by its last few); true once they are done. A cluster reads
     /// its centre's bed, spreads its members by the water there
     /// ([`BoulderCluster::spread_m`](water::BoulderCluster::spread_m)), reads theirs and is
-    /// sized by the deepest ([`water::size_cluster`]); its boulders inside the square are kept,
-    /// up to [`MAX_BOULDERS`].
+    /// sized by the deepest ([`water::size_cluster`]); its boulders inside the square are kept.
+    /// Once all are placed, the [`MAX_BOULDERS`] guard applies.
     fn boulders_step(&mut self, budget: &mut u32, used_any: &mut bool) -> bool {
         let Some(rivers) = &self.rivers[0] else {
             return true;
@@ -618,13 +618,8 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
             // Hashes only, no terrain: listed with the first cluster's units.
             let mut clusters = water::boulder_clusters(rivers, &self.basis, half);
             clusters.reverse();
-            self.boulders = Vec::with_capacity(
-                clusters
-                    .iter()
-                    .map(|c| c.members.len())
-                    .sum::<usize>()
-                    .min(MAX_BOULDERS as usize),
-            );
+            self.boulders =
+                Vec::with_capacity(clusters.iter().map(|c| c.members.len()).sum::<usize>());
             self.boulder_sites = Some(clusters);
             self.boulders_dropped = 0;
         }
@@ -637,12 +632,7 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
                     .basis
                     .dir_to_local(RenderDir(b.dir))
                     .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half);
-                if !inside {
-                    continue;
-                }
-                if self.boulders.len() >= MAX_BOULDERS as usize {
-                    self.boulders_dropped += 1;
-                } else {
+                if inside {
                     self.boulders.push(b);
                 }
             }
@@ -650,7 +640,12 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
             *budget -= units.min(*budget);
             *used_any = true;
         }
-        self.boulder_sites.as_ref().is_some_and(Vec::is_empty)
+        let done = self.boulder_sites.as_ref().is_some_and(Vec::is_empty);
+        if done {
+            // The guard: the keep fraction keeps every bench region well under it.
+            self.boulders_dropped = water::cap_boulders(&mut self.boulders, MAX_BOULDERS as usize);
+        }
+        done
     }
 
     /// A cluster's boulders (all its members, in or out of the square): its centre's bed read

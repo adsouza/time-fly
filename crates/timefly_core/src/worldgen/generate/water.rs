@@ -39,9 +39,9 @@ use super::rivers::{RegionRivers, RiverHit, across, chord_point, offset_point};
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
     BANK_FREEBOARD_M, BOULDER_BREAK_M, BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH,
-    BOULDER_MAX_RADIUS_M, BOULDER_MEMBER_SHARE, BOULDER_RADIUS_M, BOULDERS_PER_SUBPOINT_MAX,
-    DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M, FOAM_SITE_DEPTH_M, NO_WATER_DROP_M,
-    OCEAN_STRAIT_M, RIBBON_NONE_M,
+    BOULDER_KEEP_FRACTION, BOULDER_MAX_RADIUS_M, BOULDER_MEMBER_SHARE, BOULDER_RADIUS_M,
+    BOULDERS_PER_SUBPOINT_MAX, DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M,
+    FOAM_SITE_DEPTH_M, NO_WATER_DROP_M, OCEAN_STRAIT_M, RIBBON_NONE_M,
 };
 use crate::hydrology::{EraHydrology, HydroGraph, LakeKind, LakeTap};
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
@@ -279,6 +279,8 @@ pub(super) struct BoulderCluster {
     pub river: u32,
     pub k: u32,
     pub rapid: f32,
+    /// Its index `c` among its sub-segment's clusters.
+    pub index: u32,
     /// Its sub-segment's ends and the arc's length (m).
     a: DVec3,
     b: DVec3,
@@ -354,6 +356,21 @@ const BOULDER_ANGLE_SALT: u32 = 0x85EB_CA6B;
 const BOULDER_SPREAD_SALT: u32 = 0xC2B2_AE35;
 const BOULDER_SHARE_SALT: u32 = 0x27D4_EB2F;
 const BOULDER_BREAK_SALT: u32 = 0x1656_67B1;
+const BOULDER_KEEP_SALT: u32 = 0xD3A2_646C;
+
+/// Whether cluster `c` of the sub-segment from sub-point `(river, k)` is kept: its hash falls
+/// under [`BOULDER_KEEP_FRACTION`]. A function of the cluster alone, so every region that holds
+/// it keeps it, whole, or drops it.
+pub(super) fn cluster_kept(river: u32, k: u32, c: u32) -> bool {
+    fraction(hash3([river as i32, k as i32, c as i32], BOULDER_KEEP_SALT)) < BOULDER_KEEP_FRACTION
+}
+
+/// The guard on a region's boulders: keeps the first `cap`, returning how many it dropped.
+pub(super) fn cap_boulders(boulders: &mut Vec<Boulder>, cap: usize) -> u32 {
+    let dropped = boulders.len().saturating_sub(cap);
+    boulders.truncate(cap);
+    u32::try_from(dropped).unwrap_or(u32::MAX)
+}
 
 fn fraction(h: u32) -> f64 {
     f64::from(h) / 4_294_967_296.0
@@ -380,6 +397,8 @@ fn lerp(range: [f64; 2], f: f64) -> f64 {
 ///   spread `lerp([1.1, BOULDER_CLUSTER_REACH], e)` (in spread radii, [`BoulderCluster::spread_m`]).
 /// - **The breakers**: the first `ceil(members × rapid / 3)` members, the centre first, rise
 ///   [`BOULDER_BREAK_M`]`[1]` (the centre) or `lerp(BOULDER_BREAK_M, b)` above the water.
+///
+/// Only the clusters [`cluster_kept`] keeps are listed (Task 11c fix round 1), whole.
 pub(super) fn boulder_clusters(
     rivers: &RegionRivers,
     basis: &FrameBasis,
@@ -397,6 +416,9 @@ pub(super) fn boulder_clusters(
         let cap = (hw / 2.0).min(BOULDER_MAX_RADIUS_M);
         let size = BOULDER_CLUSTER_MAX as i32;
         for cluster in 0..(count + size - 1) / size {
+            if !cluster_kept(a.river, a.k, cluster as u32) {
+                continue;
+            }
             let n = (count - cluster * size).min(size);
             let breakers = (f64::from(n) * f64::from(a.rapid) / 3.0).ceil() as i32;
             let cell = [river, k, cluster];
@@ -441,6 +463,7 @@ pub(super) fn boulder_clusters(
                 river: a.river,
                 k: a.k,
                 rapid: a.rapid,
+                index: cluster as u32,
                 a: a.dir,
                 b: b.dir,
                 length_m: a.dir.angle_between(b.dir) * EARTH_RADIUS_M,

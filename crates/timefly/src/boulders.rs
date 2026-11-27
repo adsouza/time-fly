@@ -83,9 +83,10 @@ pub const BOULDER_SHADE_FLOOR: f32 = 0.16;
 pub const FOAM_COLLAR_VISIBLE_M: f32 = 3_000.0;
 /// The collar quad's extent, in boulder radii: half its width across the flow, how far it
 /// reaches upstream and how far downstream of the boulder's centre.
-pub const FOAM_COLLAR_EXTENT: [f32; 3] = [2.0, 2.0, 5.5];
-/// The wake trails about this many radii downstream of the rock.
-pub const FOAM_COLLAR_WAKE_RADII: f32 = 4.0;
+pub const FOAM_COLLAR_EXTENT: [f32; 3] = [2.0, 2.0, 4.5];
+/// The wake trails about this many radii downstream of the rock: a short tail (fix round 1,
+/// the owner's look; was 4).
+pub const FOAM_COLLAR_WAKE_RADII: f32 = 3.0;
 /// A collar is pulled this much (m) nearer the camera than the water's own pull, so it wins
 /// over the water at its level, also where the water's mesh interpolates a little above it.
 pub const FOAM_COLLAR_PULL_M: f32 = 0.3;
@@ -343,6 +344,30 @@ pub fn foam_collar_mesh() -> Mesh {
     flat_mesh(&corners, &[[0, 2, 1], [0, 3, 2]])
 }
 
+/// A foam collar's shape at `p` (radii; `x` across, `y` downstream) round a rock whose
+/// waterline is `w` of its radius (0 for a rock just under), its tail `wake` radii long: 1 in
+/// the ring (from just inside the waterline to 0.45 radii out, 0.35 more on the upstream face,
+/// where the water piles) and along the tail, 0 elsewhere. A rock just under gets a boil of
+/// 0.7 radii and a short tail. `scatter.wesl`'s `collar_shape`, which breaks its edge with noise.
+pub fn collar_shape(p: Vec2, w: f32, wake: f32) -> f32 {
+    let step = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let rho = p.length();
+    let up = (-p.y / rho.max(1e-3)).clamp(0.0, 1.0);
+    let breaks = w > 0.0;
+    let inner = 0.8 * w;
+    let edge = if breaks { w + 0.45 } else { 0.7 } + 0.35 * up;
+    let ring = (1.0 - step(edge - 0.15, edge, rho)) * step(inner - 0.1, inner, rho);
+    let half = if breaks { 0.8 * w + 0.15 } else { 0.45 } * (1.0 + 0.1 * p.y.max(0.0));
+    let tail = if breaks { wake } else { 0.6 };
+    let trail = (1.0 - step(0.6 * half, half, p.x.abs()))
+        * step(-0.2, 0.4, p.y)
+        * (1.0 - step(0.5 * tail, tail, p.y));
+    ring.max(trail)
+}
+
 /// The flow at `dir` (`[east, north]` in `dir`'s own frame, m/s) as a unit vector in the
 /// region's local `(x, z)` axes of `basis`: carried through the frames exactly, not by a sign
 /// flip (they turn apart away from the region's centre). `None` where there is no flow.
@@ -398,16 +423,30 @@ pub fn foam_collar_instance(
     })
 }
 
-/// Every boulder's foam collar in `grid`, in boulder order.
+/// Every boulder's foam collar in `grid`, in boulder order (only foam sites are placed).
 pub fn foam_collar_instances(grid: &RegionGrid) -> Arc<[ScatterInstance]> {
+    region_scatter(grid).1
+}
+
+/// `grid`'s boulders and their foam collars, as drawn, in boulder order: each boulder placed
+/// once, and a collar placed only at a foam site (fix round 1: placing every boulder twice
+/// took 4.7 ms of the Himalayas' swap frame).
+pub fn region_scatter(grid: &RegionGrid) -> (Arc<[ScatterInstance]>, Arc<[ScatterInstance]>) {
     let basis = grid.spec.frame().basis();
-    grid.boulders
-        .iter()
-        .filter_map(|b| {
-            let rock = boulder_instance(grid, &basis, b)?;
-            foam_collar_instance(grid, &basis, b, &rock)
-        })
-        .collect()
+    let mut rocks = Vec::with_capacity(grid.boulders.len());
+    let mut collars = Vec::new();
+    for b in &grid.boulders {
+        let Some(rock) = boulder_instance(grid, &basis, b) else {
+            continue;
+        };
+        if b.foam_site().is_some()
+            && let Some(collar) = foam_collar_instance(grid, &basis, b, &rock)
+        {
+            collars.push(collar);
+        }
+        rocks.push(rock);
+    }
+    (rocks.into(), collars.into())
 }
 
 /// The collars' look: the foam mode, the water's white water colour (linear) and the wake's
@@ -532,8 +571,7 @@ fn sync_boulders(
     let (set, collars) = match &grid {
         Some(g) => {
             let start = Instant::now();
-            let instances = boulder_instances(g);
-            let collars = foam_collar_instances(g);
+            let (instances, collars) = region_scatter(g);
             if let Some(mut m) = materials.get_mut(&boulders.material) {
                 m.extension.look = boulder_look(g);
             }
@@ -832,6 +870,63 @@ mod tests {
         assert!(flow_local(&basis, at(0.0, 0.0), [0.0, 0.0]).is_none());
     }
 
+    /// Fix round 1: a clear ring round a rock through the surface, a short tail downstream, and
+    /// nothing upstream past the pile nor abreast past the ring. Mirrored in `scatter.wesl`.
+    #[test]
+    fn collar_shape_rings_the_rock_and_trails_downstream() {
+        let wake = FOAM_COLLAR_WAKE_RADII;
+        let w = 0.8;
+        // The ring, all round, just outside the waterline.
+        for k in 0..16 {
+            let a = std::f32::consts::TAU * k as f32 / 16.0;
+            let p = Vec2::new(a.cos(), a.sin()) * (w + 0.2);
+            assert!(collar_shape(p, w, wake) > 0.9, "the ring at {p}");
+        }
+        // Thicker upstream (-y): the pile.
+        assert!(collar_shape(Vec2::new(0.0, -(w + 0.65)), w, wake) > 0.5);
+        assert_eq!(collar_shape(Vec2::new(w + 0.65, 0.0), w, wake), 0.0);
+        // The tail downstream, then nothing.
+        assert!(
+            collar_shape(Vec2::new(0.0, w + 1.0), w, wake) > 0.8,
+            "the tail"
+        );
+        assert!(
+            collar_shape(Vec2::new(0.0, 0.6 * wake), w, wake) > 0.3,
+            "the tail's end"
+        );
+        assert_eq!(collar_shape(Vec2::new(0.0, wake + 0.5), w, wake), 0.0);
+        assert_eq!(collar_shape(Vec2::new(0.0, -2.0), w, wake), 0.0, "upstream");
+        assert_eq!(
+            collar_shape(Vec2::new(1.9, 1.0), w, wake),
+            0.0,
+            "abreast of the tail"
+        );
+        // A rock just under (w = 0): a smaller boil, no tail beyond it.
+        assert!(collar_shape(Vec2::new(0.0, 0.3), 0.0, wake) > 0.5);
+        assert_eq!(collar_shape(Vec2::new(0.0, 2.5), 0.0, wake), 0.0);
+        // The shader's copy, line for line.
+        let src = include_str!("../assets/shaders/scatter.wesl");
+        for line in COLLAR_SHAPE_WESL.lines() {
+            assert!(src.contains(line), "scatter.wesl lacks: {line}");
+        }
+        const { assert!(FOAM_COLLAR_WAKE_RADII <= 3.0, "a short tail") };
+    }
+
+    /// `collar_shape` as `scatter.wesl` writes it.
+    const COLLAR_SHAPE_WESL: &str = "fn collar_shape(p: vec2<f32>, w: f32, wake: f32) -> f32 {
+    let rho = length(p);
+    let up = clamp(-p.y / max(rho, 1e-3), 0.0, 1.0);
+    let breaks = w > 0.0;
+    let inner = 0.8 * w;
+    let edge = select(0.7, w + 0.45, breaks) + 0.35 * up;
+    let ring = (1.0 - smoothstep(edge - 0.15, edge, rho)) * smoothstep(inner - 0.1, inner, rho);
+    let half = select(0.45, 0.8 * w + 0.15, breaks) * (1.0 + 0.1 * max(p.y, 0.0));
+    let tail = select(0.6, wake, breaks);
+    let trail = (1.0 - smoothstep(0.6 * half, half, abs(p.x)))
+        * smoothstep(-0.2, 0.4, p.y)
+        * (1.0 - smoothstep(0.5 * tail, tail, p.y));
+    return max(ring, trail);";
+
     #[test]
     fn the_foam_collar_mesh_is_one_upward_quad() {
         let mesh = foam_collar_mesh();
@@ -977,7 +1072,7 @@ mod tests {
         let morph = settings.morph_range_m(0);
         let reach = f64::from(BOULDER_VISIBLE_M)
             + f64::from(BOULDER_MAX_ELEVATION_M)
-            + timefly_core::hydrology::params::BOULDER_RADIUS_M[1]
+            + timefly_core::hydrology::params::BOULDER_MAX_RADIUS_M
             + quad * std::f64::consts::SQRT_2;
         assert!(
             reach < f64::from(morph[0]),

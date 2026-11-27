@@ -127,34 +127,36 @@ fn foam_noise(q: vec2<f32>, z: f32, seed: u32) -> f32 {
     return gradient_noise3(vec3<i32>(i32(c.x), i32(c.y), i32(zc)), vec3<f32>(q - c, z - zc), seed);
 }
 
+// `collar_shape` in boulders.rs: 1 in the ring round the rock (from just inside its waterline
+// `w`, in radii, to 0.45 radii out, 0.35 more upstream, where the water piles) and along a tail
+// `wake` radii long downstream, 0 elsewhere; a rock just under (w = 0) gets a small boil.
+fn collar_shape(p: vec2<f32>, w: f32, wake: f32) -> f32 {
+    let rho = length(p);
+    let up = clamp(-p.y / max(rho, 1e-3), 0.0, 1.0);
+    let breaks = w > 0.0;
+    let inner = 0.8 * w;
+    let edge = select(0.7, w + 0.45, breaks) + 0.35 * up;
+    let ring = (1.0 - smoothstep(edge - 0.15, edge, rho)) * smoothstep(inner - 0.1, inner, rho);
+    let half = select(0.45, 0.8 * w + 0.15, breaks) * (1.0 + 0.1 * max(p.y, 0.0));
+    let tail = select(0.6, wake, breaks);
+    let trail = (1.0 - smoothstep(0.6 * half, half, abs(p.x)))
+        * smoothstep(-0.2, 0.4, p.y)
+        * (1.0 - smoothstep(0.5 * tail, tail, p.y));
+    return max(ring, trail);
+}
+
 // A foam collar's coverage at a fragment (see the header): above 0 is foam. `p` is the mesh's
 // xz in radii (x across, y downstream), `r` the radius (m), `w` the waterline share, `seed` the
-// boulder's, `footprint` the pixel's size in radii, `t` the time (s).
+// boulder's, `footprint` the pixel's size in radii, `t` the time (s). The shape holds a clear
+// ring and tail; the noise only breaks their edges (fix round 1: more visible collars).
 fn collar_cover(p: vec2<f32>, r: f32, w: f32, seed: u32, footprint: f32, t: f32) -> f32 {
-    let rho = length(p);
-    // The upstream face, 1 straight upstream, 0 abreast of the rock and downstream.
-    let up = clamp(-p.y / max(rho, 1e-3), 0.0, 1.0);
-    // A rock through the surface: a ring from just inside its waterline; one just under: a
-    // boil about its size, a little downstream of it.
-    let breaks = w > 0.0;
-    let inner = 0.75 * w;
-    let edge = select(0.9, w, breaks) + 0.3 + 0.5 * up;
-    let boil = select(vec2<f32>(0.0, -0.35), vec2<f32>(0.0), breaks);
-    let rb = length(p + boil);
-    let ring = (1.0 - smoothstep(edge - 0.3, edge, rb)) * smoothstep(inner - 0.15, inner, rho);
-    // The wake: from the rock's flanks, widening downstream, fading over its length.
-    let along = p.y;
-    let half = (select(0.7, w, breaks) + 0.2) * (1.0 + 0.12 * max(along, 0.0));
-    let wake = (1.0 - smoothstep(0.5 * half, half, abs(p.x)))
-        * smoothstep(-0.2, 0.6, along)
-        * (1.0 - smoothstep(0.45 * look.colour.w, look.colour.w, along));
-    let shape = max(ring, 0.9 * wake) * (1.0 - smoothstep(0.3, 0.8, footprint));
+    let shape = collar_shape(p, w, look.colour.w) * (1.0 - smoothstep(0.3, 0.8, footprint));
     // Churning clumps (about 0.7 m) and streaks 4:1 along the flow running downstream at 2 m/s,
     // each collar's own (offset by its seed).
     let m = p * r + vec2<f32>(f32(seed & 1023u), f32((seed >> 10u) & 1023u));
     let churn = foam_noise(m / 0.7, t * 1.3, 211u);
     let streak = foam_noise(vec2<f32>(m.x / 0.5, (m.y - 2.0 * t) / 2.0), t * 0.4, 223u);
-    return shape + 0.45 * churn + 0.4 * streak - 0.5;
+    return shape + 0.2 * churn + 0.15 * streak - 0.5;
 }
 
 @fragment

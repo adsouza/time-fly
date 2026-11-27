@@ -1684,6 +1684,151 @@ mod water {
         assert!(faces.len() >= 2, "faces {faces:?}");
     }
 
+    /// Fix round 1: rapids too dense for the cap are thinned by direction (a hash of each
+    /// cluster), not cut at a region-dependent prefix. Two steep rivers 30 km apart carry about
+    /// 28,800 boulders over a region's square before thinning, past `MAX_BOULDERS`; thinned,
+    /// both regions keep every cluster they hold, and where their squares overlap (the eastern
+    /// two thirds of the first one, where the old cap cut) they hold the same boulders, bit for
+    /// bit.
+    #[test]
+    fn thinned_rapids_agree_where_regions_overlap() {
+        use crate::hydrology::params::{BOULDERS_PER_SUBPOINT_MAX, MAX_BOULDERS};
+        let frame = RegionFrame {
+            center: dir(20.0, 30.0),
+        };
+        let (hydro, floor) = rivers_along(
+            CubeLattice { n: 900 },
+            frame,
+            &[-15_000.0, 15_000.0],
+            150.0,
+            0.03,
+        );
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let (a, b) = (frame.center, frame.local_to_dir(100_000.0, 0.0));
+        let ga = RegionGenerator::new(spec_at(a, 0.0, 1025, 33), &field, Some(&hydro));
+        let gb = RegionGenerator::new(spec_at(b, 0.0, 1025, 33), &field, Some(&hydro));
+        let half = REGION_SIZE_M / 2.0;
+        let in_square = |g: &RegionGenerator<_>, d: DVec3| {
+            g.spec()
+                .frame()
+                .dir_to_local(RenderDir(d))
+                .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
+        };
+        // The hazard: before thinning the first region's rapids hold more than the cap.
+        let unthinned: f64 = ga
+            .rivers(FieldKind::Inner)
+            .unwrap()
+            .sub_segments()
+            .filter(|(s, e)| s.rapid > 0.0 && in_square(&ga, s.dir) && in_square(&ga, e.dir))
+            .map(|(s, _)| (f64::from(s.rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX)).floor())
+            .sum();
+        assert!(
+            unthinned > f64::from(MAX_BOULDERS),
+            "{unthinned} boulders before thinning"
+        );
+        for g in [&ga, &gb] {
+            assert_eq!(g.boulders_dropped(), 0, "the cap never fires");
+            assert!(g.boulders().len() < MAX_BOULDERS as usize);
+        }
+        let key = |b: &Boulder| (b.seed, b.dir.to_array().map(f64::to_bits));
+        let bits = |b: &Boulder| {
+            [
+                b.base_m,
+                b.radius_m,
+                b.wet,
+                b.level_m,
+                b.flow_mps[0],
+                b.flow_mps[1],
+            ]
+            .map(f32::to_bits)
+        };
+        let shared = |g: &RegionGenerator<_>, other: &RegionGenerator<_>| {
+            let mut v: Vec<Boulder> = g
+                .boulders()
+                .iter()
+                .copied()
+                .filter(|bo| in_square(other, bo.dir))
+                .collect();
+            v.sort_by_key(key);
+            v
+        };
+        let (sa, sb) = (shared(&ga, &gb), shared(&gb, &ga));
+        assert!(sa.len() > 5_000, "{} shared boulders", sa.len());
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(&sb) {
+            assert_eq!(key(x), key(y));
+            assert_eq!(bits(x), bits(y));
+        }
+        // Rocks all along both rivers, out to the far end of the overlap, where a prefix cut
+        // in sub-segment order would have left none.
+        let east = |b: &Boulder| ga.spec().frame().dir_to_local(RenderDir(b.dir)).unwrap().0;
+        let far = sa.iter().map(east).fold(f64::MIN, f64::max);
+        assert!(far > 140_000.0, "the shared rocks reach x = {far} m");
+    }
+
+    /// Thinning keeps or drops whole clusters: each kept cluster has all its members, and a
+    /// cluster is kept exactly when its hash falls under `BOULDER_KEEP_FRACTION`.
+    #[test]
+    fn thinning_keeps_whole_clusters() {
+        use crate::hydrology::params::{BOULDER_CLUSTER_MAX, BOULDER_KEEP_FRACTION};
+        use crate::worldgen::generate::water::cluster_kept;
+        let g = rapids(150.0, true);
+        let clusters = clusters_of(&g);
+        let full = rapid_subsegments(&g, 0.999..=1.0);
+        let mut kept = std::collections::BTreeSet::new();
+        for (c, boulders) in &clusters {
+            assert!(
+                cluster_kept(c.river, c.k, c.index),
+                "only kept clusters are listed"
+            );
+            kept.insert((c.river, c.k, c.index));
+            if full.contains_key(&(c.river, c.k)) {
+                // 24 boulders: four clusters of six, each whole.
+                assert_eq!(c.members.len(), BOULDER_CLUSTER_MAX as usize);
+                assert_eq!(boulders.len(), c.members.len(), "the whole cluster is held");
+            }
+        }
+        let mut listed = 0;
+        for &(river, k) in full.keys() {
+            for index in 0..4 {
+                listed += 1;
+                assert_eq!(
+                    kept.contains(&(river, k, index)),
+                    cluster_kept(river, k, index),
+                    "({river}, {k}, {index})"
+                );
+            }
+        }
+        let share = full
+            .keys()
+            .map(|&(r, k)| (0..4).filter(|&c| kept.contains(&(r, k, c))).count())
+            .sum::<usize>() as f64
+            / f64::from(listed);
+        assert!(
+            (share - BOULDER_KEEP_FRACTION).abs() < 0.05,
+            "kept {share} of the clusters, the fraction {BOULDER_KEEP_FRACTION}"
+        );
+    }
+
+    /// The cap is a guard: past it, the region keeps the first boulders and counts the rest.
+    #[test]
+    fn the_boulder_cap_guard_counts_its_overflow() {
+        use crate::worldgen::generate::water::cap_boulders;
+        let g = rapids(150.0, true);
+        let all = g.boulders().to_vec();
+        assert!(all.len() > 100);
+        let mut capped = all.clone();
+        assert_eq!(cap_boulders(&mut capped, 100), all.len() as u32 - 100);
+        assert_eq!(&capped[..], &all[..100]);
+        let mut whole = all.clone();
+        assert_eq!(cap_boulders(&mut whole, all.len()), 0);
+        assert_eq!(whole, all);
+    }
+
     /// The continent's pass and a dense region at `inner`/`apron` resolution.
     fn continent_region(
         inner: u32,
@@ -2498,6 +2643,7 @@ mod water {
         use crate::hydrology::params::{
             BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH, BOULDERS_PER_SUBPOINT_MAX,
         };
+        use crate::worldgen::generate::water::cluster_kept;
         use std::collections::BTreeMap;
         for (full, range, counts) in [(true, 0.999..=1.0, 24..=24), (false, 0.4..=0.6, 9..=15)] {
             let g = rapids(150.0, full);
@@ -2517,12 +2663,22 @@ mod water {
                     0x5BD1_E995,
                 )) / 4_294_967_296.0;
                 let n = (f64::from(rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX) + h0).floor();
-                let held: usize = clusters.iter().map(|(_, b)| b.len()).sum();
-                assert_eq!(held, n as usize, "({river}, {k}) at rapid {rapid}");
-                assert!(counts.contains(&held), "({river}, {k}): {held}");
-                // Clusters of at most six, ceil(n / 6) of them, each around its largest boulder.
+                let n = n as usize;
+                assert!(counts.contains(&n), "({river}, {k}): {n}");
+                // Clusters of at most six, ceil(n / 6) of them before thinning, each around its
+                // largest boulder; the thinning keeps whole ones (fix round 1).
                 let max = BOULDER_CLUSTER_MAX as usize;
-                assert_eq!(clusters.len(), held.div_ceil(max), "({river}, {k})");
+                let kept: Vec<usize> = (0..n.div_ceil(max))
+                    .filter(|&c| cluster_kept(river, k, c as u32))
+                    .map(|c| (n - c * max).min(max))
+                    .collect();
+                let held: usize = clusters.iter().map(|(_, b)| b.len()).sum();
+                assert_eq!(
+                    held,
+                    kept.iter().sum::<usize>(),
+                    "({river}, {k}) at rapid {rapid}"
+                );
+                assert_eq!(clusters.len(), kept.len(), "({river}, {k})");
                 for (c, boulders) in clusters {
                     assert!(boulders.len() <= max && boulders.len() == c.members.len());
                     let centre = boulders[0];

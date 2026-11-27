@@ -23,7 +23,7 @@ by the Task 10 implementer; the Chrome (WebGPU) numbers are the owner's run and 
 | The pass's longest single step, time-boxed at the web's 6 ms slice (native release, real data) | was 28 ms (the step sizing), 12.8 ms (`rivers→done`, the graph build), 6.8 ms (routing's largest ocean) and 2.6 ms (one basin's resolve); **now 1.1–1.3 ms** at 0 ka and 21 ka after fix round 1, the same result, the same total time |
 | Tiles per region (the river read margin) | 2–4× in six of nine bench regions (Beringia 2 → 8) |
 | Boulder placement on the swap frame, native | 0.05–0.86 ms for 37–5,897 boulders |
-| White water (Task 11c): water and scatter passes, 2560 × 1440 | **+0.07 ms** at the Indus bench pose, −0.32 ms at a rapid close-up (budget +1.0 ms) |
+| White water (Task 11c): water and scatter passes, 2560 × 1440 | **+0.07 ms** at the Indus bench pose, −0.32 ms at a rapid close-up (budget +1.0 ms); fix round 1, by uncapped frame medians: +0.09 ms and +0.24 ms |
 | Everything on the web | **pending: the owner's Chrome run** (steps at the end) |
 
 ## Concerns
@@ -204,20 +204,53 @@ millisecond is more than that alone suggests; paced clocks may also differ. Eith
 change is not a cost. The collar albedo was brightened by one multiply after these runs (the
 committed build); its cost is the same.
 
-**Boulders and collars per region** (`region boulders placed`, which now also counts collars;
-native release, the first entry of a fresh session):
+### Fix round 1: thinning by direction, and the owner's look
 
-| Region | Boulders (Task 10, at 6 a sub-segment) | Boulders now | Dropped past `MAX_BOULDERS` | Collars | Placement on the swap frame |
+**Boulders thinned by direction (the review's Important).** Round 0 cut a region's boulders at
+`MAX_BOULDERS` in sub-segment order, a region-dependent prefix, so overlapping regions held
+different rocks. Now a cluster is kept, whole, exactly when a hash of its `(river, k, c)` falls
+under `BOULDER_KEEP_FRACTION = 0.45`, and the cap is only a guard that warns with the region and
+the overflow. The owner's "bigger rocks" (`BOULDER_RADIUS_M` 0.7–5 m, was 0.4–3; breakers up to
+8 m) came in the same round. Per bench region (`region_tour … shaded 3000`, 640 × 360, native
+release, the `region boulders placed` line):
+
+| Bench region | Boulders | Share of `MAX_BOULDERS` | Collars | Placement on the swap frame | Cap guard |
 |---|---|---|---|---|---|
-| Indus tributaries (32.5, 74.5) | 1,089 | 3,360 | 0 | 1,097 | 1.28 ms |
-| Chilean lakes (−38.5, −72.0) | not measured | 4,449 | 0 | 2,157 | 1.77 ms |
-| Himalayas (28, 86.9) | 5,897 | **16,384 (the cap)** | **8,580** | 4,816 | 4.72 ms |
+| Pangaea interior (250 Ma) | 0 | 0% | 0 | 0.12 ms | silent |
+| Red Sea (0 ka) | 0 | 0% | 0 | 0.08 ms | silent |
+| Himalayas (0 ka) | 11,159 | **68%** | 4,353 | 1.91 ms | silent |
+| Indus tributaries (0 ka) | 1,463 | 9% | 625 | 0.39 ms | silent |
+| Sundaland (21 ka) | 0 | 0% | 0 | 0.12 ms | silent |
+| Japan (1 Ma) | 70 | 0.4% | 5 | 0.13 ms | silent |
+| Beringia (21 ka) | 0 | 0% | 0 | 0.11 ms | silent |
+| Rockies ice margin (21 ka) | 644 | 4% | 280 | 0.26 ms | silent |
+| Panama (3 Ma) | 161 | 1% | 1 | 0.06 ms | silent |
 
-`MAX_BOULDERS` stays 16,384 (ledgered): at 32,768 the Himalayas would keep all 24,964, but the
-pool would grow by about nine more chunks (≈ 8 MiB by Task 9's estimate) on a hop that Task 12's
-journey bench has not measured. The drop keeps the first boulders in sub-segment order, so the
-Himalayas region's later rivers have none. The collar pool adds up to 5 chunks (4,816 collars)
-in the Himalayas. Placement grew to 4.7 ms on the Himalayas' swap frame (was 0.79).
+The Himalayas, the densest, hold 68% of the cap (under the ruling's 75%); round 0 cut 8,580 of
+its 24,964 there. `MAX_BOULDERS` stays 16,384. The swap frame's placement there fell from 4.72 ms
+(round 0 placed every boulder twice to find the collars) to 1.91 ms: boulders and collars are now
+placed in one pass, a collar only at a foam site.
+
+**The owner's "less white" (foam on the crests and in the rocks' wakes).** Measured as the share
+of near-white pixels (every channel above 140, spread under 60) among the water pixels of the
+rapid close-up's crop (`32.5735,75.8714,0`, AGL 150, 3840 × 2160, the 45° view, crop
+`1300,150 – 2500,825`; script `foamfrac.py` in the task's scratch): **55% at `d37d8e6`, 21% after**.
+A full rapid's foam fades to `FOAM_MEAN = 0.28` where unresolved (was about 0.97), so from afar
+rapids now read pale rather than white.
+
+**GPU cost, re-measured.** The GPU timer gave no readings in this session's runs, and every run
+ran uncapped (frame medians 9.5–12.7 ms; the window was not being shown), so the fallback is
+the frame-time medians, interleaved over three passes against the parent `12ef525` (GPU-bound
+uncapped, an upper bound on the GPU's share):
+
+| Frame time, median ms | Pass 1 | Pass 2 | Pass 3 | Mean | Change |
+|---|---|---|---|---|---|
+| Indus bench pose, parent | 12.24 | 12.66 | 12.69 | 12.53 | — |
+| Indus bench pose, fix round 1 | 12.56 | 12.62 | 12.69 | 12.62 | **+0.09 ms** |
+| Rapid close-up, parent | 9.51 | 9.54 | 9.67 | 9.57 | — |
+| Rapid close-up, fix round 1 | 9.70 | 9.74 | 9.98 | 9.81 | **+0.24 ms** |
+
+Both are within the +1.0 ms budget.
 
 ## Tiles, the continental pass and boulders per bench region (native)
 
