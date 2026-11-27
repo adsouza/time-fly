@@ -43,8 +43,10 @@
 //!   after it (the swap's first draw can land a frame later), the swap read from the phase
 //!   change ([`is_swap`]). Natively gated at [`SWAP_FRAME_LIMIT_MS`]; reported only on the web.
 //! - **Hop memory peak**: natively, the process footprint's peak during each hop (preload to
-//!   back flying) over the in-region baseline (the last flying frame before it), at most
-//!   [`HOP_MEMORY_LIMIT_MIB`]. On the web, the wasm linear memory never shrinks, so a route
+//!   back flying) over the flight before it, at most [`HOP_MEMORY_LIMIT_MIB`]: the baseline is
+//!   the highest footprint flown on the hop's leg ([`FlightLeg`], owner 2026-11-27), not the
+//!   last flying frame, which can sit in a trough where macOS has just returned freed memory.
+//!   The last flying frame's figure is still logged, labelled. On the web, the wasm linear memory never shrinks, so a route
 //!   larger than any before it raises it for good: a route's first visit may grow it, and no
 //!   hop of a repeat visit may ([`hop_memory_gate`], [`JourneyBenchConfig::is_repeat`]).
 //! - **Journey memory cycles**: memory on the globe after each journey within
@@ -427,7 +429,8 @@ pub fn hold_line(t: Transition, ms: f64, tag: &str, web: bool) -> (String, Optio
 /// One hop's memory samples, for [`hop_memory_gate`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HopMemory {
-    /// The in-region baseline: the last flying frame before the hop.
+    /// The baseline the hop is judged against ([`HopRecord::memory`]): natively the highest
+    /// footprint of the leg's flight, on the web the last flying frame before the hop.
     pub baseline: Option<u64>,
     /// The highest sample during the hop.
     pub peak: Option<u64>,
@@ -435,6 +438,38 @@ pub struct HopMemory {
     pub end: Option<u64>,
     /// Whether the hop is on a repeat visit of its route ([`JourneyBenchConfig::is_repeat`]).
     pub repeat: bool,
+}
+
+/// The flight before a hop (its leg): every memory sample flown since the region was entered or
+/// the last hop began. Natively a hop is judged against the leg's highest sample (the owner's
+/// ruling of 2026-11-27: "a hop does not raise peak memory above flight"). The last sample, the
+/// old baseline, can sit in a trough: in Task 12's journey runs macOS returned about 270 MiB
+/// while the fly cruised, eight seconds before the first hop, so a hop peaking 190 MiB under
+/// the flight read +78 MiB over its last flying frame.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlightLeg {
+    peak: Option<u64>,
+    last: Option<u64>,
+}
+
+impl FlightLeg {
+    /// Adds a flying frame's sample (`None`, no reading, adds nothing).
+    pub fn observe(&mut self, sample: Option<u64>) {
+        if let Some(s) = sample {
+            self.last = Some(s);
+            self.peak = Some(self.peak.map_or(s, |p| p.max(s)));
+        }
+    }
+
+    /// The highest sample flown on the leg: the native baseline.
+    pub fn peak(&self) -> Option<u64> {
+        self.peak
+    }
+
+    /// The last sample flown on the leg: the web's baseline, and the native log's extra figure.
+    pub fn last(&self) -> Option<u64> {
+        self.last
+    }
 }
 
 /// The hop memory gate. Natively (`web` false) the worst `peak − baseline` of every hop must be
@@ -932,10 +967,27 @@ pub struct HopRecord {
     pub land_share: Option<f32>,
     /// The route's site read from the region once the hop is done ([`read_site`]).
     pub site: Option<String>,
-    baseline: Option<u64>,
+    /// The leg's highest flying sample before the hop ([`FlightLeg::peak`]).
+    pub baseline: Option<u64>,
+    /// The last flying sample before the hop ([`FlightLeg::last`]).
+    pub last_flying: Option<u64>,
     peak: Option<u64>,
     end: Option<u64>,
     open: bool,
+}
+
+impl HopRecord {
+    /// The hop's samples for [`hop_memory_gate`]: natively against the leg's flight
+    /// (`baseline`), on the web against the last flying frame (`last_flying`, M3's growth rule,
+    /// unchanged).
+    pub fn memory(&self, web: bool, repeat: bool) -> HopMemory {
+        HopMemory {
+            baseline: if web { self.last_flying } else { self.baseline },
+            peak: self.peak,
+            end: self.end,
+            repeat,
+        }
+    }
 }
 
 /// The benchmark's state and measurements.
@@ -959,8 +1011,8 @@ pub struct JourneyBench {
     holds: Vec<HoldRecord>,
     swaps: Vec<SwapRecord>,
     hops: Vec<HopRecord>,
-    /// The memory sampled on the last frame flown in a region.
-    in_region: Option<u64>,
+    /// The memory flown on the current leg (since the region was entered or the last hop began).
+    leg: FlightLeg,
     /// The memory on the globe after each journey.
     on_globe: Vec<Option<u64>>,
     /// The keys the bench holds down.
@@ -986,7 +1038,7 @@ impl JourneyBench {
             holds: Vec::new(),
             swaps: Vec::new(),
             hops: Vec::new(),
-            in_region: None,
+            leg: FlightLeg::default(),
             on_globe: Vec::new(),
             keys_held: Vec::new(),
             summary: None,
@@ -1189,6 +1241,10 @@ fn measure_journey(
             now,
             swapped,
             height_m: game.fly.as_ref().map_or(0.0, |f| f.pos_m.y),
+            // Sampled only where the gates read it: flying in a region and through a hop.
+            memory: matches!(phase, NavPhase::Flying | NavPhase::Hopping { .. })
+                .then(cycle_memory)
+                .flatten(),
         };
         record_frame(bench, cycle, frame);
         // A hop just done: read the region it left the fly in.
@@ -1388,6 +1444,9 @@ struct Frame {
     swapped: bool,
     /// The region fly's height above sea level.
     height_m: f32,
+    /// The process memory, sampled where the gates read it (flying in a region and through a
+    /// hop), else `None`.
+    memory: Option<u64>,
 }
 
 /// One frame of the script: its flight time, holds, swaps, hops and memory.
@@ -1400,6 +1459,7 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
         now,
         swapped,
         height_m,
+        memory,
     } = frame;
     if density == 0.0 {
         bench.flight_ms.push(frame_ms);
@@ -1410,13 +1470,12 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
         Stage::Region { hops, .. } => hops,
         _ => 0,
     };
-    // Sampled only where the gates read it: flying in a region and through a hop.
-    let memory = matches!(phase, NavPhase::Flying | NavPhase::Hopping { .. })
-        .then(cycle_memory)
-        .flatten();
     let entered = std::mem::discriminant(&phase) != std::mem::discriminant(&before);
     match phase {
-        NavPhase::Diving { .. } if entered => bench.start_hold(Transition::Dive, cycle),
+        NavPhase::Diving { .. } if entered => {
+            bench.leg = FlightLeg::default();
+            bench.start_hold(Transition::Dive, cycle);
+        }
         NavPhase::Hopping { centre, .. } if entered => {
             let hop = hops_done + 1;
             bench.start_hold(Transition::Hop(hop), cycle);
@@ -1424,15 +1483,19 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
                 // Started again after turning back before its lift: the same hop, keyed as its
                 // hold is, its baseline kept.
                 Some(last) if last.cycle == cycle && last.hop == hop => last.open = true,
-                _ => bench.hops.push(HopRecord {
-                    cycle,
-                    hop,
-                    centre: Some(centre),
-                    baseline: bench.in_region,
-                    peak: memory,
-                    open: true,
-                    ..default()
-                }),
+                _ => {
+                    bench.hops.push(HopRecord {
+                        cycle,
+                        hop,
+                        centre: Some(centre),
+                        baseline: bench.leg.peak(),
+                        last_flying: bench.leg.last(),
+                        peak: memory,
+                        open: true,
+                        ..default()
+                    });
+                    bench.leg = FlightLeg::default();
+                }
             }
         }
         NavPhase::Climbing { .. } if entered => bench.start_hold(Transition::Climb, cycle),
@@ -1454,10 +1517,10 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
             frames_left: SWAP_WINDOW_FRAMES - 1,
         });
     }
-    // Memory: the in-region baseline while flying, the peak through a hop.
+    // Memory: the leg's flight while flying, the peak through a hop.
     match phase {
         NavPhase::Flying => {
-            bench.in_region = memory;
+            bench.leg.observe(memory);
             if let Some(hop) = bench.hops.last_mut().filter(|h| h.open) {
                 hop.end = memory;
                 hop.open = false;
@@ -1514,12 +1577,7 @@ fn failed_journey_gate(bench: &JourneyBench, web: bool) -> Option<String> {
         }
     }
     for h in bench.hops.iter().filter(|h| !h.open) {
-        let sample = HopMemory {
-            baseline: h.baseline,
-            peak: h.peak,
-            end: h.end,
-            repeat: config.is_repeat(h.cycle),
-        };
+        let sample = h.memory(web, config.is_repeat(h.cycle));
         if let Some((false, worst)) = hop_memory_gate(&[sample], web) {
             return Some(format!(
                 "hop memory peak: hop {} {} ({}) -> FAIL",
@@ -1837,18 +1895,13 @@ fn finish(
     let samples: Vec<HopMemory> = bench
         .hops
         .iter()
-        .map(|h| HopMemory {
-            baseline: h.baseline,
-            peak: h.peak,
-            end: h.end,
-            repeat: config.is_repeat(h.cycle),
-        })
+        .map(|h| h.memory(web, config.is_repeat(h.cycle)))
         .collect();
     let hop_scope = if web {
         "wasm linear memory, which grows but never shrinks; gate: no growth in any hop of a route's repeat visit (a route's first visit may grow it)".to_string()
     } else {
         format!(
-            "{}; gate: peak <= in-region baseline before the hop +{HOP_MEMORY_LIMIT_MIB} MiB",
+            "{}; gate: peak <= the flight before the hop (its leg's highest) +{HOP_MEMORY_LIMIT_MIB} MiB; in brackets, over the last flying frame (the old baseline, reported only)",
             cycle_memory_kind()
         )
     };
@@ -1856,12 +1909,23 @@ fn finish(
         .hops
         .iter()
         .map(|h| {
-            let top = if web { h.end } else { h.peak };
-            let over = match (h.baseline, top) {
+            let m = h.memory(web, false);
+            let top = if web { m.end } else { m.peak };
+            let over = |base: Option<u64>| match (base, top) {
                 (Some(b), Some(t)) => signed_mib(t as i64 - b as i64),
                 _ => "n/a".to_string(),
             };
-            format!("hop {} {over} ({})", h.hop, config.tag(h.cycle))
+            let old = if web {
+                String::new()
+            } else {
+                format!(" [{}]", over(h.last_flying))
+            };
+            format!(
+                "hop {} {}{old} ({})",
+                h.hop,
+                over(m.baseline),
+                config.tag(h.cycle)
+            )
         })
         .collect();
     match hop_memory_gate(&samples, web) {

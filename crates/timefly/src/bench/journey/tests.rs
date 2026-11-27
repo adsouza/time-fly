@@ -392,6 +392,167 @@ fn hop_memory_is_gated_on_the_peak_natively_and_on_growth_on_the_web() {
     );
 }
 
+/// Journey bench run 2 of Task 12 (2026-11-26), cycle 1 (the Andes), flying before hop 1: the
+/// process footprint in MiB, one sample every 120 frames (about a second). macOS returned about
+/// 270 MiB in two steps while the fly cruised, eight seconds before the hop, and the hop then
+/// peaked at 1,106.3 MiB, below the flight's 1,299.2.
+const TRACE_BEFORE_HOP_1_MIB: [f64; 29] = [
+    1296.9, 1297.1, 1297.8, 1298.4, 1298.4, 1298.4, 1298.4, 1298.8, 1298.8, 1299.2, 1299.1, 1299.1,
+    1230.6, 1231.4, 1231.5, 1232.7, 1233.0, 1233.3, 1233.3, 1232.8, 1233.2, 1232.0, 1027.8, 1028.4,
+    1029.2, 1029.2, 1029.5, 1028.0, 1028.0,
+];
+const TRACE_HOP_1_PEAK_MIB: f64 = 1106.3;
+
+fn trace_bytes(mib: f64) -> u64 {
+    (mib * (1u64 << 20) as f64).round() as u64
+}
+
+/// The owner's ruling (2026-11-27, "Fix the hop-memory baseline"): natively a hop is judged
+/// against the leg's flight, the highest footprint flown since the region was entered or the
+/// last hop ended, not the single last flying sample, which can sit in a reclaim trough.
+#[test]
+fn a_reclaim_trough_before_a_hop_is_not_counted_as_the_hops_growth() {
+    let mut leg = FlightLeg::default();
+    assert_eq!((leg.peak(), leg.last()), (None, None), "nothing flown yet");
+    leg.observe(None);
+    assert_eq!(
+        leg.peak(),
+        None,
+        "a frame with no memory reading adds nothing"
+    );
+    for m in TRACE_BEFORE_HOP_1_MIB {
+        leg.observe(Some(trace_bytes(m)));
+    }
+    assert_eq!(leg.peak(), Some(trace_bytes(1299.2)));
+    assert_eq!(leg.last(), Some(trace_bytes(1028.0)));
+    let peak = Some(trace_bytes(TRACE_HOP_1_PEAK_MIB));
+    // The old baseline, the last flying sample: +78.3 MiB, a FAIL the swap didn't cause.
+    let old = hop_memory_gate(&[hm(leg.last(), peak, None, false)], false).unwrap();
+    assert!(
+        !old.0,
+        "the old rule flags the trough: {}",
+        signed_mib(old.1)
+    );
+    // The new one: the hop stayed 192.9 MiB under the flight's level.
+    let new = hop_memory_gate(&[hm(leg.peak(), peak, None, false)], false).unwrap();
+    assert!(new.0, "{}", signed_mib(new.1));
+    assert_eq!(
+        new.1,
+        trace_bytes(TRACE_HOP_1_PEAK_MIB) as i64 - trace_bytes(1299.2) as i64
+    );
+}
+
+#[test]
+fn a_hop_that_grows_past_the_flights_level_still_fails() {
+    let mut leg = FlightLeg::default();
+    for m in TRACE_BEFORE_HOP_1_MIB {
+        leg.observe(Some(trace_bytes(m)));
+    }
+    let top = leg.peak().unwrap();
+    let judge =
+        |over: u64| hop_memory_gate(&[hm(leg.peak(), Some(top + over), None, false)], false);
+    assert_eq!(
+        judge(64 << 20),
+        Some((true, 64 << 20)),
+        "exactly +64 MiB over the flight"
+    );
+    assert_eq!(
+        judge(65 << 20),
+        Some((false, 65 << 20)),
+        "+65 MiB over the flight's highest"
+    );
+}
+
+/// The bench feeds the leg: the baseline is the leg's highest flying sample, the last flying
+/// sample is kept (and reported) as `last_flying`, and the next leg starts after the hop.
+#[test]
+fn the_bench_judges_each_hop_against_its_own_legs_flight() {
+    let mut bench = JourneyBench::new(JourneyBenchConfig::new(60, false));
+    bench.stage = Stage::Region {
+        cycle: 0,
+        hops: 0,
+        since: 0.0,
+        cruising: true,
+    };
+    let hop = |swapped: bool| NavPhase::Hopping {
+        centre: RenderDir(DVec3::X),
+        edge: HopEdge { axis: 0, side: 1.0 },
+        lift_from_agl_m: 19_800.0,
+        swapped,
+        elapsed_s: 0.0,
+        lift: 1.0,
+        failed: false,
+        turned_back: false,
+    };
+    let mut frames: Vec<(NavPhase, f64)> = TRACE_BEFORE_HOP_1_MIB
+        .iter()
+        .map(|&m| (NavPhase::Flying, m))
+        .collect();
+    frames.extend([
+        (hop(false), 1050.0),
+        (hop(true), TRACE_HOP_1_PEAK_MIB),
+        (NavPhase::Flying, 1061.0),
+        (NavPhase::Flying, 1060.8),
+        (hop(false), 1061.0),
+        (hop(true), 1106.3),
+        (NavPhase::Flying, 1062.0),
+    ]);
+    let mut before = NavPhase::Flying;
+    for (i, (phase, m)) in frames.into_iter().enumerate() {
+        // The script counts a hop once it is back flying (its stage, which this test plays).
+        if before != NavPhase::Flying
+            && phase == NavPhase::Flying
+            && let Stage::Region { hops, .. } = &mut bench.stage
+        {
+            *hops += 1;
+        }
+        let frame = Frame {
+            before,
+            phase,
+            density: 0.0,
+            frame_ms: 16.0,
+            now: i as f64,
+            swapped: is_swap(&before, &phase),
+            height_m: 19_800.0,
+            memory: Some(trace_bytes(m)),
+        };
+        record_frame(&mut bench, 0, frame);
+        before = phase;
+    }
+    let hops = bench.hops();
+    assert_eq!(hops.len(), 2, "{hops:?}");
+    assert_eq!(
+        hops[0].baseline,
+        Some(trace_bytes(1299.2)),
+        "hop 1: the leg's highest"
+    );
+    assert_eq!(
+        hops[0].last_flying,
+        Some(trace_bytes(1028.0)),
+        "kept for the log"
+    );
+    assert_eq!(
+        hops[1].baseline,
+        Some(trace_bytes(1061.0)),
+        "hop 2: its own leg only"
+    );
+    assert_eq!(hops[1].last_flying, Some(trace_bytes(1060.8)));
+    assert_eq!(
+        failed_journey_gate(&bench, false),
+        None,
+        "no hop raised memory over flight"
+    );
+    // The web keeps M3's growth rule on the last flying sample (its linear memory never shrinks).
+    assert_eq!(
+        hops[0].memory(true, false).baseline,
+        Some(trace_bytes(1028.0))
+    );
+    assert_eq!(
+        hops[0].memory(false, false).baseline,
+        Some(trace_bytes(1299.2))
+    );
+}
+
 #[test]
 fn web_hop_memory_on_the_route_set_lets_each_new_route_grow() {
     // The route set flies the Andes, Pangaea, the Grand Canyon, Mt Fuji (its second hop at the
@@ -506,6 +667,7 @@ fn a_hop_started_again_keeps_one_record_and_records_its_lift() {
             now: i as f64 / 60.0,
             swapped: is_swap(&before, &phase),
             height_m,
+            memory: None,
         };
         record_frame(&mut bench, 0, frame);
         before = phase;
@@ -877,6 +1039,7 @@ fn the_gates_a_journey_decides_stop_the_run_once_failed() {
         cycle: 0,
         hop: 1,
         baseline,
+        last_flying: baseline,
         peak,
         end,
         open,
