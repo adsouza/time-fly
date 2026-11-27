@@ -39,7 +39,9 @@
 //!   the boulders' material from `scatter_material` over the warm-up's own palette (held by
 //!   the material until the warm-up retires) and a `MeshTag`, as every pooled boulder has.
 //!   It carries no `VisibilityRange`: the boulders' range is abrupt, which adds nothing to the
-//!   key, while a range could cull the stand-in from this camera.
+//!   key, while a range could cull the stand-in from this camera. A stand-in foam collar
+//!   (Task 11c: `foam_collar_mesh`, `foam_collar_material`, alpha-masked, so its own key) warms
+//!   the collars' pipeline the same way.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -60,7 +62,7 @@ use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 use super::material::{TerrainMaterial, TerrainParams, palette_image, patch_instances};
 use super::view::{REGION_SKY, region_camera_parts, region_sun, region_sun_parts};
 use super::{TerrainOptions, grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
-use crate::boulders::{boulder_look, boulder_meshes};
+use crate::boulders::{boulder_look, boulder_meshes, foam_collar_material, foam_collar_mesh};
 use crate::cloud::{CloudMaterial, CloudParams};
 use crate::creature::{DragonflyMaterial, body_material, dragonfly_mesh, wing_material};
 use crate::globe::{GlobeRenderStatus, RenderProbe};
@@ -357,6 +359,16 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         NotShadowCaster,
         layer.clone(),
     );
+    let collar = (
+        Name::new("Warm-up foam collar"),
+        Mesh3d(meshes.add(foam_collar_mesh())),
+        MeshMaterial3d(scatter_m.add(foam_collar_material(&palette))),
+        MeshTag::new(0),
+        Transform::IDENTITY,
+        NoFrustumCulling,
+        NotShadowCaster,
+        layer.clone(),
+    );
     let camera = commands
         .spawn((
             Name::new("Warm-up camera"),
@@ -404,6 +416,7 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
             .spawn(fly("Warm-up dragonfly wings", fly_m.add(wing_material())))
             .id(),
         commands.spawn(boulder).id(),
+        commands.spawn(collar).id(),
         camera,
         sun,
     ];
@@ -539,15 +552,15 @@ mod tests {
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();
         let entities = app.world().resource::<RegionWarmup>().entities.clone();
-        assert_eq!(entities.len(), 9);
+        assert_eq!(entities.len(), 10);
         // Its camera has no clusters (ruling R28), without the app-wide observer.
         crate::clusters::assert_no_clusters(app.world_mut());
         // Eight textures (four height and surface fields and the two water fields the sea
-        // binds, the palette, the 1 x 1 target), three meshes (the quad, the dragonfly and a
-        // boulder), one buffer, one of each material, the transition cloud's included (M3
-        // Task 5), the dragonfly's body and wing materials (final review), and the boulders'
-        // (Task 9), over the same palette.
-        assert_eq!(asset_counts(&app), [8, 3, 1, 1, 1, 1, 1, 2, 1]);
+        // binds, the palette, the 1 x 1 target), four meshes (the quad, the dragonfly, a
+        // boulder and a foam collar), one buffer, one of each material, the transition cloud's
+        // included (M3 Task 5), the dragonfly's body and wing materials (final review), and the
+        // boulders' and the collars' (Tasks 9 and 11c), over the same palette.
+        assert_eq!(asset_counts(&app), [8, 4, 1, 1, 1, 1, 1, 2, 2]);
         {
             let world = app.world_mut();
             // Everything on its own layer, none of it the region's camera or sun.
@@ -713,8 +726,24 @@ mod tests {
             .iter(world)
             .map(|(e, m, mat, tag, range)| (e, m.0.clone(), mat.0.clone(), tag, range.cloned()))
             .collect();
-        assert_eq!(rocks.len(), 1, "one stand-in boulder");
-        let (e, mesh, material, tagged, range) = rocks[0].clone();
+        assert_eq!(rocks.len(), 2, "one stand-in boulder and one foam collar");
+        // The collar: the real collar mesh and material, alpha-masked, tagged.
+        let materials = world.resource::<Assets<ScatterMaterial>>();
+        let (collar, boulder): (Vec<_>, Vec<_>) = rocks
+            .iter()
+            .cloned()
+            .partition(|r| materials.get(&r.2).unwrap().base.alpha_mode != AlphaMode::Opaque);
+        let (ce, cmesh, cmat, ctag, crange) = collar[0].clone();
+        assert!(entities.contains(&ce) && ctag && crange.is_none());
+        let want = crate::boulders::foam_collar_material(&Handle::default());
+        let got = materials.get(&cmat).unwrap();
+        assert_eq!(got.base.alpha_mode, want.base.alpha_mode);
+        assert_eq!(got.extension.look, want.extension.look);
+        let cmesh = world.resource::<Assets<Mesh>>().get(&cmesh).unwrap();
+        let real = crate::boulders::foam_collar_mesh();
+        let ids = |m: &Mesh| m.attributes().map(|(a, _)| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(cmesh), ids(&real));
+        let (e, mesh, material, tagged, range) = boulder[0].clone();
         assert!(entities.contains(&e));
         assert!(tagged, "a MeshTag, as every pooled boulder has");
         assert!(range.is_none_or(|r| r.is_abrupt()), "no dithered pipeline");

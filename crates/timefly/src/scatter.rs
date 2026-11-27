@@ -104,7 +104,25 @@ impl ScatterInstance {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Reflect)]
 pub enum ScatterKind {
     Boulders,
+    /// The white water around rocks at the surface (Task 11c, `crate::boulders`): flat rings at
+    /// the water level with a wake downstream, alpha-masked.
+    FoamCollar,
 }
+
+impl ScatterKind {
+    /// The kind's shading mode in `scatter.wesl` (`ScatterLook::texel.z`).
+    pub fn shader_mode(self) -> u32 {
+        match self {
+            ScatterKind::Boulders => SCATTER_MODE_SOLID,
+            ScatterKind::FoamCollar => SCATTER_MODE_FOAM,
+        }
+    }
+}
+
+/// `scatter.wesl`'s mode for solid, palette-coloured instances (boulders).
+pub const SCATTER_MODE_SOLID: u32 = 0;
+/// `scatter.wesl`'s mode for foam collars.
+pub const SCATTER_MODE_FOAM: u32 = 1;
 
 /// The instances of one kind to draw, on the entity that holds the kind's [`ScatterPool`]. The
 /// owner replaces it to change what is drawn.
@@ -258,15 +276,17 @@ pub type ScatterMaterial = ExtendedMaterial<StandardMaterial, ScatterExtension>;
 /// The scatter's look uniform (`ScatterLook` in `scatter.wesl`).
 #[derive(ShaderType, Copy, Clone, Debug, PartialEq, Reflect)]
 pub struct ScatterLook {
-    /// `xy`: the palette texel holding the kind's colour; `zw`: unused.
+    /// `xy`: the palette texel holding the kind's colour; `z`: the shading mode
+    /// ([`ScatterKind::shader_mode`]); `w`: unused.
     pub texel: UVec4,
-    /// `x`: the hue jitter (± radians about the grey axis); `y`: the value jitter (± share);
-    /// `z`: how much a wet surface darkens (share); `w`: the wet band above the waterline (share
-    /// of the instance's height).
+    /// Solid: `x`: the hue jitter (± radians about the grey axis); `y`: the value jitter (±
+    /// share); `z`: how much a wet surface darkens (share); `w`: the wet band above the
+    /// waterline (share of the instance's height). Foam: `rgb`: the foam's colour (linear);
+    /// `w`: the wake's length (radii).
     pub colour: Vec4,
     /// `x`: the water's constant depth pull (m, `WATER_PULL_M`); `y`: its share of the view
     /// distance (`WATER_DEPTH_PULL`); `z`: the Earth's radius (m) for the curvature drop; `w`:
-    /// unused.
+    /// foam only, the extra pull (m) that puts it in front of the water at its level.
     pub pull: Vec4,
     /// `x`: the least light (exposure applied) a surface shows, as the terrain's light ramp
     /// floors its shade, so faces turned from the sun read as soft shade, never black; `yzw`:

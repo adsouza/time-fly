@@ -1494,15 +1494,17 @@ mod water {
 
     /// Rivers along great circles `local z = z_i` of `frame`, west to east over ±150 km: chains
     /// of the lattice's nearest nodes (consecutive nodes are lattice steps), discharge `q`, on a
-    /// gentle bed, each in a V valley. Returns the pass and the terrain.
+    /// bed falling `slope` eastward from 5,000 m at the centre (gentle: 1e-4), each in a V
+    /// valley. Returns the pass and the terrain.
     fn rivers_along(
         lattice: CubeLattice,
         frame: RegionFrame,
         lines_z: &[f64],
         q: f32,
+        slope: f64,
     ) -> (EraHydrology, impl Fn(RenderDir) -> f64 + Sync + Copy) {
         let basis = frame.basis();
-        let bed = |x: f64| 500.0 - 1e-4 * x;
+        let bed = move |x: f64| 5000.0 - slope * x;
         let chains: Vec<RiverChain> = lines_z
             .iter()
             .map(|&z| {
@@ -1552,8 +1554,13 @@ mod water {
         let frame = RegionFrame { center: corner };
         // Two meandering rivers (w = 274 m) on the recent lattice: one 8 km south of the corner,
         // crossing the PosZ/PosX edge; one 20 km north, crossing into PosY and out.
-        let (hydro, floor) =
-            rivers_along(CubeLattice { n: 900 }, frame, &[8_000.0, -20_000.0], 3000.0);
+        let (hydro, floor) = rivers_along(
+            CubeLattice { n: 900 },
+            frame,
+            &[8_000.0, -20_000.0],
+            3000.0,
+            1e-4,
+        );
         let field = FnField {
             f: floor,
             spacing_m: 1852.0,
@@ -1600,6 +1607,81 @@ mod water {
             off_line > 50,
             "{off_line} sub-points meander off the valley axes"
         );
+    }
+
+    /// The cube-corner agreement extended to boulders and their foam sites (Task 11c): two
+    /// regions either side of the PosX/PosZ edge, a rapid (a 3% bed) crossing it 8 km south of
+    /// the corner, hold the same boulders and foam sites, bit for bit, where both squares hold
+    /// them.
+    #[test]
+    fn boulders_and_foam_sites_agree_at_a_cube_corner() {
+        let corner = dir(35.26439, 45.0);
+        let frame = RegionFrame { center: corner };
+        let (hydro, floor) = rivers_along(CubeLattice { n: 900 }, frame, &[8_000.0], 150.0, 0.03);
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let (a, b) = (
+            frame.local_to_dir(-50_000.0, 30_000.0),
+            frame.local_to_dir(50_000.0, 30_000.0),
+        );
+        let ga = RegionGenerator::new(spec_at(a, 0.0, 1025, 33), &field, Some(&hydro));
+        let gb = RegionGenerator::new(spec_at(b, 0.0, 1025, 33), &field, Some(&hydro));
+        let half = REGION_SIZE_M / 2.0;
+        let in_square = |g: &RegionGenerator<_>, d: DVec3| {
+            g.spec()
+                .frame()
+                .dir_to_local(RenderDir(d))
+                .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
+        };
+        type Key = (u32, [u64; 3]);
+        let key = |d: DVec3, seed: u32| -> Key { (seed, d.to_array().map(f64::to_bits)) };
+        let bits = |b: &Boulder| {
+            (
+                [
+                    b.base_m,
+                    b.radius_m,
+                    b.wet,
+                    b.level_m,
+                    b.flow_mps[0],
+                    b.flow_mps[1],
+                ]
+                .map(f32::to_bits),
+                b.seed,
+            )
+        };
+        let shared = |g: &RegionGenerator<_>, other: &RegionGenerator<_>| {
+            let mut v: Vec<Boulder> = g
+                .boulders()
+                .iter()
+                .copied()
+                .filter(|bo| in_square(other, bo.dir))
+                .collect();
+            v.sort_by_key(|b| key(b.dir, b.seed));
+            v
+        };
+        let (sa, sb) = (shared(&ga, &gb), shared(&gb, &ga));
+        assert!(sa.len() > 300, "{} shared boulders", sa.len());
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(&sb) {
+            assert_eq!(key(x.dir, x.seed), key(y.dir, y.seed));
+            assert_eq!(bits(x), bits(y));
+        }
+        let (fa, fb): (Vec<FoamSite>, Vec<FoamSite>) =
+            (foam_sites(&sa).collect(), foam_sites(&sb).collect());
+        assert!(fa.len() > 100, "{} shared foam sites", fa.len());
+        assert_eq!(fa, fb);
+        // The shared boulders lie on both faces of the edge, beside the corner.
+        let face = |d: DVec3| {
+            let v = d.to_array();
+            (0..3)
+                .max_by(|&i, &j| v[i].abs().total_cmp(&v[j].abs()))
+                .expect("three axes")
+        };
+        let faces: std::collections::BTreeSet<usize> = sa.iter().map(|b| face(b.dir)).collect();
+        assert!(faces.len() >= 2, "faces {faces:?}");
     }
 
     /// The continent's pass and a dense region at `inner`/`apron` resolution.
@@ -2284,22 +2366,299 @@ mod water {
             );
             assert_eq!(
                 (
-                    x.base_m.to_bits(),
-                    x.radius_m.to_bits(),
+                    [
+                        x.base_m,
+                        x.radius_m,
+                        x.wet,
+                        x.level_m,
+                        x.flow_mps[0],
+                        x.flow_mps[1]
+                    ]
+                    .map(f32::to_bits),
                     x.seed,
-                    x.wet.to_bits()
                 ),
                 (
-                    y.base_m.to_bits(),
-                    y.radius_m.to_bits(),
+                    [
+                        y.base_m,
+                        y.radius_m,
+                        y.wet,
+                        y.level_m,
+                        y.flow_mps[0],
+                        y.flow_mps[1]
+                    ]
+                    .map(f32::to_bits),
                     y.seed,
-                    y.wet.to_bits()
                 )
             );
         }
         assert!(
             ga.boulders().len() > sa.len(),
             "the sets differ outside the overlap"
+        );
+    }
+
+    /// The equator river of discharge `q` on a bed that makes it a full rapid (`full`, a 2.4%
+    /// bed: `rapid` = 1) or a half one (1.3%: `rapid` ≈ 0.5).
+    fn rapids(
+        q: f32,
+        full: bool,
+    ) -> RegionGenerator<'static, FnField<impl Fn(RenderDir) -> f64 + Sync + Copy>> {
+        let bed: fn(f64) -> f64 = if full {
+            |a| 3600.0 - 0.024 * a
+        } else {
+            |a| 3000.0 - 0.013 * a
+        };
+        let (hydro, floor) = equator_river(q, bed, 0.05);
+        let field = Box::leak(Box::new(FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        }));
+        let hydro = Box::leak(Box::new(hydro));
+        RegionGenerator::new(spec_at(LAT.dir(eq(405)), 0.0, 1025, 33), field, Some(hydro))
+    }
+
+    /// The generator's boulder clusters, each with its boulders inside the region, rebuilt as the
+    /// generator builds them (its centre's bed first) and checked against its boulders.
+    fn clusters_of<F: CoarseField>(
+        g: &RegionGenerator<F>,
+    ) -> Vec<(
+        crate::worldgen::generate::water::BoulderCluster,
+        Vec<Boulder>,
+    )> {
+        use crate::worldgen::generate::water::{BoulderBed, boulder_clusters, size_cluster};
+        let rivers = g.rivers(FieldKind::Inner).unwrap();
+        let frame = g.spec().frame();
+        let half = REGION_SIZE_M / 2.0;
+        let bed = |d: DVec3| {
+            let t = g.sample_texel_in(FieldKind::Inner, RenderDir(d));
+            BoulderBed {
+                base_m: t.h,
+                level_m: t.water_level_m,
+                river: t.river,
+            }
+        };
+        let mut rest = g.boulders();
+        let out: Vec<_> = boulder_clusters(rivers, &frame.basis(), half)
+            .into_iter()
+            .map(|c| {
+                let centre = bed(c.centre());
+                let spread = c.spread_m(centre.depth_m());
+                let dirs = c.member_dirs(spread);
+                let beds: Vec<BoulderBed> = dirs.iter().map(|&d| bed(d)).collect();
+                assert_eq!(beds[0], centre);
+                let mine: Vec<Boulder> = size_cluster(&c, spread, &dirs, &beds)
+                    .into_iter()
+                    .filter(|b| {
+                        frame
+                            .dir_to_local(RenderDir(b.dir))
+                            .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
+                    })
+                    .collect();
+                let (theirs, next) = rest.split_at(mine.len());
+                assert_eq!(
+                    &mine[..],
+                    theirs,
+                    "the generator's boulders, in cluster order"
+                );
+                rest = next;
+                (c, mine)
+            })
+            .collect();
+        assert!(rest.is_empty());
+        out
+    }
+
+    /// The sub-segments whose rapid lies in `range` and whose boulders all fall in the square
+    /// (both ends 20 km inside it): `(river, k) → rapid`.
+    fn rapid_subsegments<F: CoarseField>(
+        g: &RegionGenerator<F>,
+        range: std::ops::RangeInclusive<f32>,
+    ) -> std::collections::BTreeMap<(u32, u32), f32> {
+        let frame = g.spec().frame();
+        let inside = |d: DVec3| {
+            frame
+                .dir_to_local(RenderDir(d))
+                .is_some_and(|(x, z)| x.abs().max(z.abs()) < REGION_SIZE_M / 2.0 - 20_000.0)
+        };
+        g.rivers(FieldKind::Inner)
+            .unwrap()
+            .sub_segments()
+            .filter(|(a, b)| range.contains(&a.rapid) && inside(a.dir) && inside(b.dir))
+            .map(|(a, _)| ((a.river, a.k), a.rapid))
+            .collect()
+    }
+
+    fn metres(a: DVec3, b: DVec3) -> f64 {
+        a.angle_between(b) * EARTH_RADIUS_M
+    }
+
+    #[test]
+    fn rapids_hold_clustered_boulders() {
+        use crate::hydrology::params::{
+            BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH, BOULDERS_PER_SUBPOINT_MAX,
+        };
+        use std::collections::BTreeMap;
+        for (full, range, counts) in [(true, 0.999..=1.0, 24..=24), (false, 0.4..=0.6, 9..=15)] {
+            let g = rapids(150.0, full);
+            let subs = rapid_subsegments(&g, range.clone());
+            assert!(subs.len() > 50, "full {full}: {} sub-segments", subs.len());
+            let mut by_sub: BTreeMap<(u32, u32), Vec<_>> = BTreeMap::new();
+            for (c, boulders) in clusters_of(&g) {
+                by_sub
+                    .entry((c.river, c.k))
+                    .or_default()
+                    .push((c, boulders));
+            }
+            for (&(river, k), &rapid) in &subs {
+                let clusters = by_sub.get(&(river, k)).map(Vec::as_slice).unwrap_or(&[]);
+                let h0 = f64::from(crate::worldgen::noise::hash3(
+                    [river as i32, k as i32, -1],
+                    0x5BD1_E995,
+                )) / 4_294_967_296.0;
+                let n = (f64::from(rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX) + h0).floor();
+                let held: usize = clusters.iter().map(|(_, b)| b.len()).sum();
+                assert_eq!(held, n as usize, "({river}, {k}) at rapid {rapid}");
+                assert!(counts.contains(&held), "({river}, {k}): {held}");
+                // Clusters of at most six, ceil(n / 6) of them, each around its largest boulder.
+                let max = BOULDER_CLUSTER_MAX as usize;
+                assert_eq!(clusters.len(), held.div_ceil(max), "({river}, {k})");
+                for (c, boulders) in clusters {
+                    assert!(boulders.len() <= max && boulders.len() == c.members.len());
+                    let centre = boulders[0];
+                    assert_eq!(centre.dir, c.centre(), "the centre comes first");
+                    let big = f64::from(centre.radius_m);
+                    for b in boulders {
+                        assert!(b.radius_m <= centre.radius_m, "the largest at the centre");
+                        let d = metres(b.dir, centre.dir);
+                        assert!(
+                            d <= BOULDER_CLUSTER_REACH * big * (1.0 + 1e-6) + 1e-3,
+                            "a member {d} m from its centre, radius {big} m"
+                        );
+                    }
+                    if boulders.len() > 1 {
+                        assert!(
+                            boulders[1..]
+                                .iter()
+                                .any(|b| metres(b.dir, centre.dir) > big),
+                            "members spread around the centre"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// At `rapid` = 1 a third of each cluster's rocks stand above the water, wherever the cap
+    /// lets them (water up to `2 × cap − BOULDER_BREAK_M[1]` deep over the cluster's beds).
+    #[test]
+    fn a_third_of_a_full_rapids_rocks_break_the_surface() {
+        use crate::hydrology::params::BOULDER_BREAK_M;
+        // A mid river and a deep one. The detail noise under the channel makes the water at
+        // the beds deeper than the channel's own depth (1.9 and 5.1 m), up to tens of metres.
+        for q in [150.0, 2_000.0] {
+            let g = rapids(q, true);
+            let full = rapid_subsegments(&g, 0.999..=1.0);
+            assert!(full.len() > 50, "q {q}: {} full sub-segments", full.len());
+            let (mut checked, mut too_deep) = (0, 0);
+            for (c, boulders) in clusters_of(&g) {
+                if !full.contains_key(&(c.river, c.k)) {
+                    continue;
+                }
+                let deepest = boulders
+                    .iter()
+                    .map(|b| f64::from(b.level_m - b.base_m))
+                    .fold(0.0, f64::max);
+                if deepest > 2.0 * c.cap_m - BOULDER_BREAK_M[1] {
+                    too_deep += 1;
+                    continue;
+                }
+                checked += 1;
+                let breaking = boulders
+                    .iter()
+                    .filter(|b| {
+                        let t = g.sample_texel_in(FieldKind::Inner, RenderDir(b.dir));
+                        assert_eq!(b.level_m.to_bits(), t.water_level_m.to_bits());
+                        b.top_m() > b.level_m
+                    })
+                    .count();
+                assert!(
+                    3 * breaking >= boulders.len(),
+                    "q {q}: {breaking} of {} break the surface",
+                    boulders.len()
+                );
+            }
+            println!("q {q}: {checked} clusters checked, {too_deep} in water too deep");
+            assert!(checked > 100, "{checked} clusters");
+            assert!(too_deep * 10 < checked, "{too_deep} too deep of {checked}");
+        }
+    }
+
+    #[test]
+    fn clustered_boulders_stay_in_the_channel() {
+        // A narrow river (22 m: clusters wider than the channel are clamped), a mid one and a
+        // wide one, at a full and a half rapid.
+        for (q, full) in [(20.0, true), (150.0, false), (150.0, true), (2_000.0, true)] {
+            let g = rapids(q, full);
+            let rivers = g.rivers(FieldKind::Inner).unwrap();
+            let texel = REGION_SIZE_M / 1024.0;
+            assert!(
+                g.boulders().len() > 500,
+                "q {q}: {} boulders",
+                g.boulders().len()
+            );
+            for bo in g.boulders() {
+                let hit = rivers
+                    .texel(RenderDir(bo.dir), 5000.0, texel)
+                    .hit
+                    .expect("in a valley");
+                assert!(
+                    hit.ribbon_m >= bo.radius_m - 1e-3,
+                    "q {q}: wholly in the channel: {hit:?} {bo:?}"
+                );
+                assert!(bo.radius_m <= hit.half_width_m / 2.0 + 1e-3, "{bo:?}");
+                let t = g.sample_texel_in(FieldKind::Inner, RenderDir(bo.dir));
+                assert_eq!(bo.base_m.to_bits(), t.h.to_bits(), "on the channel bed");
+                assert!(bo.base_m < t.water_level_m, "under the river: {bo:?} {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn foam_sites_mark_rocks_at_the_surface() {
+        use crate::hydrology::params::FOAM_SITE_DEPTH_M;
+        let g = rapids(150.0, false);
+        let sites: Vec<FoamSite> = foam_sites(g.boulders()).collect();
+        let (mut deep, mut breaking) = (0, 0);
+        let mut it = sites.iter();
+        for b in g.boulders() {
+            let at_surface = b.base_m < b.level_m && b.top_m() >= b.level_m - FOAM_SITE_DEPTH_M;
+            deep += usize::from(!at_surface);
+            if !at_surface {
+                assert_eq!(b.foam_site(), None);
+                continue;
+            }
+            breaking += usize::from(b.top_m() > b.level_m);
+            let s = it.next().expect("a site per rock at the surface");
+            assert_eq!(
+                (s.dir, s.seed, s.radius_m, s.top_m),
+                (b.dir, b.seed, b.radius_m, b.top_m())
+            );
+            // Its level and flow are the water's at its boulder.
+            let t = g.sample_texel_in(FieldKind::Inner, RenderDir(b.dir));
+            assert_eq!(s.level_m.to_bits(), t.water_level_m.to_bits());
+            let [_, east, north, _] = decode_river(t.river);
+            assert_eq!(s.flow_mps, [east, north]);
+            // The river runs east along the equator, at rapids speed.
+            let speed = east.hypot(north);
+            assert!(speed >= 3.0, "{s:?}");
+            assert!(east > 0.9 * speed, "downstream is east: {s:?}");
+        }
+        assert!(it.next().is_none());
+        assert!(
+            sites.len() > 200 && breaking > 100 && deep > 100,
+            "{} sites, {breaking} breaking, {deep} deep",
+            sites.len()
         );
     }
 
@@ -2330,6 +2689,9 @@ mod water {
                     b.radius_m.to_bits(),
                     b.seed,
                     b.wet.to_bits(),
+                    b.level_m.to_bits(),
+                    b.flow_mps[0].to_bits(),
+                    b.flow_mps[1].to_bits(),
                 ]
             })
             .collect();

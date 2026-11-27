@@ -133,6 +133,33 @@ pub const RIVER_SILTY: Color = Color::srgb(0.36, 0.30, 0.20);
 pub const SILT_SPEED_MPS: [f32; 2] = [1.0, 3.0];
 /// White water's colour (sRGB). A `water.wesl` constant (linear).
 pub const WHITE_WATER: Color = Color::srgb(0.92, 0.94, 0.93);
+/// Gravity (m/s²) for the standing waves' wavelength `2π v² / g` (Task 11c). A `water.wesl`
+/// constant.
+pub const GRAVITY_MPS2: f32 = 9.81;
+/// The rapids' standing waves' largest slope at `rapid` = 1 (a crest-to-trough height of about
+/// a tenth of the wavelength). A `water.wesl` constant.
+pub const STANDING_WAVE_SLOPE: f32 = 0.3;
+/// The standing waves are held in cells this big (m), each its own train about its own point,
+/// blended (`standing_waves` in `water.wesl`). At least the longest wavelength, a full rapid's
+/// 2π × 6² / g = 23 m. A `water.wesl` constant.
+pub const STANDING_WAVE_CELL_M: f32 = 32.0;
+/// White water's noise is this many times longer along the flow than across it. A `water.wesl`
+/// constant.
+pub const STREAK_STRETCH: f32 = 4.0;
+/// The streaks are drawn in this many fixed frames around the circle, the two either side of the
+/// flow blended. A `water.wesl` constant.
+pub const STREAK_DIRECTIONS: f32 = 24.0;
+/// How much the standing waves' crests add to white water's noise. A `water.wesl` constant.
+pub const CREST_FOAM: f32 = 0.25;
+/// White water's streak noise is scaled by this before its threshold: up close the foam breaks
+/// into streaks and clumps over dark water, while where the noise is unresolved (at its mean, 0)
+/// a rapid is exactly as white as before. A `water.wesl` constant.
+pub const STREAK_CONTRAST: f32 = 1.6;
+
+/// The standing waves' wavelength (m) on water flowing at `speed_mps`: `2π v² / g`.
+pub fn standing_wavelength_m(speed_mps: f32) -> f32 {
+    std::f32::consts::TAU * speed_mps * speed_mps / GRAVITY_MPS2
+}
 
 /// The flow map's two phase weights at time `t_s`, shifted by `jitter` periods: triangles half
 /// a period apart, each 0 where its phase restarts (its offset jumps back to none), so they
@@ -1120,6 +1147,42 @@ mod tests {
         let want = Vec3::from_slice(&WHITE_WATER.to_linear().to_f32_array()[..3]);
         let got = wesl_const_vec3(WATER_WESL, "WHITE_WATER");
         assert!((got - want).abs().max_element() < 5e-4, "{got} vs {want}");
+    }
+
+    /// Task 11c's white water: its constants mirrored in `water.wesl`, the wavelength rule, and
+    /// the rapids-only gate (lakes, the sea and slow rivers run none of it).
+    #[test]
+    fn white_water_constants_match_their_wesl_mirrors() {
+        for (name, value) in [
+            ("GRAVITY_MPS2", GRAVITY_MPS2),
+            ("STANDING_WAVE_SLOPE", STANDING_WAVE_SLOPE),
+            ("STANDING_WAVE_CELL_M", STANDING_WAVE_CELL_M),
+            ("STREAK_STRETCH", STREAK_STRETCH),
+            ("STREAK_DIRECTIONS", STREAK_DIRECTIONS),
+            ("CREST_FOAM", CREST_FOAM),
+            ("STREAK_CONTRAST", STREAK_CONTRAST),
+        ] {
+            assert_eq!(wesl_const_f32(WATER_WESL, name), value, "{name}");
+        }
+        assert!(WATER_WESL.contains("let lambda = TAU * speed * speed / GRAVITY_MPS2;"));
+        // The hydraulic wavelength: 5.8 m at the rapids' 3 m/s, 23 m at 6 m/s, which the cells
+        // must hold.
+        assert!((standing_wavelength_m(3.0) - 5.765).abs() < 0.01);
+        assert!((standing_wavelength_m(6.0) - 23.06).abs() < 0.01);
+        assert!(STANDING_WAVE_CELL_M >= standing_wavelength_m(6.0));
+        // Only rivers in rapids: the block sits inside the river branch, gated on the rapid,
+        // and scales by river_w; the standing waves are sampled at xz (they stay put) while the
+        // streaks ride the flow map's x0 and x1.
+        let river = WATER_WESL.find("    if river {").unwrap();
+        let gate = WATER_WESL.find("        if rapid > 0.0 {").unwrap();
+        let end = WATER_WESL.find("    let lake_tilt").unwrap();
+        assert!(river < gate && gate < end);
+        let block = &WATER_WESL[gate..end];
+        assert!(block.contains("let waves = standing_waves(xz, dir, lambda);"));
+        assert!(block.contains("let n0 = streaks(x0, dir, s, footprint, t);"));
+        assert!(block.contains("let n1 = streaks(x1, dir, s, footprint, t);"));
+        assert!(block.contains("* river_w);"));
+        assert!(block.contains("white = look.flow.z * rapid * broken * river_w;"));
     }
 
     /// The water is drawn after the opaque terrain (the alpha-mask phase, with a cutoff no

@@ -44,7 +44,8 @@ use tracing::instrument;
 use crate::deep_time::YearsBp;
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
-    APRON_RIVER_MIN_DISCHARGE_M3S, NO_WATER_DROP_M, RIVER_MIN_DISCHARGE_M3S, SUBPOINT_M,
+    APRON_RIVER_MIN_DISCHARGE_M3S, MAX_BOULDERS, NO_WATER_DROP_M, RIVER_MIN_DISCHARGE_M3S,
+    SUBPOINT_M,
 };
 use crate::hydrology::{EraHydrology, LakeTap};
 use crate::worldgen::biome::{
@@ -66,8 +67,8 @@ pub use detail::coastline_clamp;
 use detail::{Detail, octaves_for, smoothstep};
 use lattice::{Coarse, Lattice};
 use rivers::{RegionRivers, RiverBuilder, RiverHit};
-pub use water::{Boulder, RIVER_NONE};
-use water::{BoulderSite, Water};
+use water::Water;
+pub use water::{Boulder, FoamSite, RIVER_NONE, foam_sites};
 
 /// Surface byte 3's top bit: the texel is in the shoreline band (Task 8 tints Barren-era shores
 /// with it).
@@ -378,7 +379,7 @@ pub struct RegionPrep<'a, F: CoarseField> {
     rivers: [Option<RegionRivers>; 2],
     /// The inner field's boulder sites still to read (`None` before they are listed), and the
     /// boulders read so far.
-    boulder_sites: Option<Vec<BoulderSite>>,
+    boulder_sites: Option<Vec<water::BoulderCluster>>,
     boulders: Vec<Boulder>,
     boulders_dropped: u32,
     /// The chamfer's input: 0 at sea, infinity on land, filled texel by texel.
@@ -602,31 +603,74 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
         done
     }
 
-    /// The inner field's boulders, one per unit of `budget`; true once they are done.
+    /// The inner field's boulders, a cluster at a time, one unit of `budget` per bed read (a
+    /// cluster may overrun the budget by its last few); true once they are done. A cluster reads
+    /// its centre's bed, spreads its members by the water there
+    /// ([`BoulderCluster::spread_m`](water::BoulderCluster::spread_m)), reads theirs and is
+    /// sized by the deepest ([`water::size_cluster`]); its boulders inside the square are kept,
+    /// up to [`MAX_BOULDERS`].
     fn boulders_step(&mut self, budget: &mut u32, used_any: &mut bool) -> bool {
         let Some(rivers) = &self.rivers[0] else {
             return true;
         };
+        let half = self.layers[0].size_m / 2.0;
         if self.boulder_sites.is_none() {
-            // Hashes only, no terrain: listed with the first boulder's unit.
-            let (mut sites, dropped) =
-                water::boulder_sites(rivers, &self.basis, self.layers[0].size_m / 2.0);
-            sites.reverse();
-            self.boulders = Vec::with_capacity(sites.len());
-            self.boulder_sites = Some(sites);
-            self.boulders_dropped = dropped;
+            // Hashes only, no terrain: listed with the first cluster's units.
+            let mut clusters = water::boulder_clusters(rivers, &self.basis, half);
+            clusters.reverse();
+            self.boulders = Vec::with_capacity(
+                clusters
+                    .iter()
+                    .map(|c| c.members.len())
+                    .sum::<usize>()
+                    .min(MAX_BOULDERS as usize),
+            );
+            self.boulder_sites = Some(clusters);
+            self.boulders_dropped = 0;
         }
         while *budget > 0 {
-            let Some(site) = self.boulder_sites.as_mut().and_then(Vec::pop) else {
+            let Some(cluster) = self.boulder_sites.as_mut().and_then(Vec::pop) else {
                 break;
             };
-            let (carved, water) = self.sampler().texel(FieldKind::Inner, RenderDir(site.dir));
-            self.boulders
-                .push(water::boulder(&site, carved.h as f32, water.level_m));
-            *budget -= 1;
+            for b in self.cluster_boulders(&cluster) {
+                let inside = self
+                    .basis
+                    .dir_to_local(RenderDir(b.dir))
+                    .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half);
+                if !inside {
+                    continue;
+                }
+                if self.boulders.len() >= MAX_BOULDERS as usize {
+                    self.boulders_dropped += 1;
+                } else {
+                    self.boulders.push(b);
+                }
+            }
+            let units = u32::try_from(cluster.members.len()).unwrap_or(u32::MAX);
+            *budget -= units.min(*budget);
             *used_any = true;
         }
         self.boulder_sites.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    /// A cluster's boulders (all its members, in or out of the square): its centre's bed read
+    /// first, its members spread by the water there, then sized by the deepest.
+    fn cluster_boulders(&self, cluster: &water::BoulderCluster) -> Vec<Boulder> {
+        let bed = |dir: bevy_math::DVec3| {
+            let (carved, water) = self.sampler().texel(FieldKind::Inner, RenderDir(dir));
+            water::BoulderBed {
+                base_m: carved.h as f32,
+                level_m: water.level_m,
+                river: water.river,
+            }
+        };
+        let centre = bed(cluster.centre());
+        let spread = cluster.spread_m(centre.depth_m());
+        let dirs = cluster.member_dirs(spread);
+        let beds: Vec<water::BoulderBed> = std::iter::once(centre)
+            .chain(dirs[1..].iter().map(|&d| bed(d)))
+            .collect();
+        water::size_cluster(cluster, spread, &dirs, &beds)
     }
 
     /// Work units done so far (planning points, lattice nodes, river sub-points, boulders and

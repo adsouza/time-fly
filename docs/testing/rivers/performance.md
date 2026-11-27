@@ -23,6 +23,7 @@ by the Task 10 implementer; the Chrome (WebGPU) numbers are the owner's run and 
 | The pass's longest single step, time-boxed at the web's 6 ms slice (native release, real data) | was 28 ms (the step sizing), 12.8 ms (`rivers→done`, the graph build), 6.8 ms (routing's largest ocean) and 2.6 ms (one basin's resolve); **now 1.1–1.3 ms** at 0 ka and 21 ka after fix round 1, the same result, the same total time |
 | Tiles per region (the river read margin) | 2–4× in six of nine bench regions (Beringia 2 → 8) |
 | Boulder placement on the swap frame, native | 0.05–0.86 ms for 37–5,897 boulders |
+| White water (Task 11c): water and scatter passes, 2560 × 1440 | **+0.07 ms** at the Indus bench pose, −0.32 ms at a rapid close-up (budget +1.0 ms) |
 | Everything on the web | **pending: the owner's Chrome run** (steps at the end) |
 
 ## Concerns
@@ -165,6 +166,58 @@ on screen (a big braided reach) would cost more; Chrome's numbers are the owner'
 
 **Distant thin rivers stay visible** (Task 8's minor): in the shaded shot the river is a
 continuous line to the horizon, about 1 px wide in the distance, with no gaps.
+
+## White water (Task 11c): GPU cost and boulder counts (native)
+
+**Result: within the +1.0 ms budget.** At Task 10's Indus bench pose the water and scatter
+passes together add **+0.07 ms** of GPU time a frame (means; +0.14 ms by medians); at a full
+rapid close-up (150 m up, clustered rocks and foam collars in view) the after build read
+**0.32 ms less** than the parent (means; 0.40 ms by medians). Neither budget cut was needed: the
+collars' reach stays 3,000 m and the standing waves keep their single octave.
+
+**Method.** Task 10's GPU frame timer (`GpuFrameTime`, pass timestamps; its readings time the
+whole frame, so the difference between builds is the water's and the scatter's change: nothing
+else differs), `region_tour time --offscreen` at 2560 × 1440, 6 s settle then 30 s timed. The
+parent `12ef525` and the Task 11c build, both `release` and copied out (proved by
+`grep -a -c STREAK_CONTRAST`: 0 in the parent, 3 in the new one), alternated over three passes
+after each had rendered once (Metal's shader cache), each run with a fresh `TIMEFLY_LOG_DIR`:
+
+```sh
+TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=$R $T --offscreen <out> 2560x1440 32.5,74.5,0 bench-<build> time 2000
+TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=$R $T --offscreen <out> 2560x1440 32.5735,75.8714,0 rapid-<build> time 150
+```
+
+**Pacing.** Every run was display-paced: frame-time medians 16.65–16.67 ms, 1,800–1,801 frames
+each. So the GPU idled between frames, at whatever clocks it chose (see the caveats above).
+
+| GPU frame time, median (mean) ms | Pass 1 | Pass 2 | Pass 3 | Mean of means | Change |
+|---|---|---|---|---|---|
+| Indus bench pose, parent | 12.92 (12.94) | 13.12 (12.95) | 12.86 (12.94) | 12.94 | — |
+| Indus bench pose, Task 11c | 13.22 (13.03) | 13.20 (12.97) | 12.91 (13.02) | 13.01 | **+0.07 ms** |
+| Rapid close-up, parent | 11.90 (11.95) | 11.92 (11.95) | 12.48 (12.24) | 12.05 | — |
+| Rapid close-up, Task 11c | 11.67 (11.72) | 11.76 (11.74) | 11.66 (11.73) | 11.73 | **−0.32 ms** |
+
+The close-up's drop is consistent across the passes but not explained by the change: the new
+water skips its white-water noise wherever `rapid` is 0 (the parent ran it on every river pixel
+and multiplied it by 0), which saves work on the slow reaches in view, but a third of a
+millisecond is more than that alone suggests; paced clocks may also differ. Either way the
+change is not a cost. The collar albedo was brightened by one multiply after these runs (the
+committed build); its cost is the same.
+
+**Boulders and collars per region** (`region boulders placed`, which now also counts collars;
+native release, the first entry of a fresh session):
+
+| Region | Boulders (Task 10, at 6 a sub-segment) | Boulders now | Dropped past `MAX_BOULDERS` | Collars | Placement on the swap frame |
+|---|---|---|---|---|---|
+| Indus tributaries (32.5, 74.5) | 1,089 | 3,360 | 0 | 1,097 | 1.28 ms |
+| Chilean lakes (−38.5, −72.0) | not measured | 4,449 | 0 | 2,157 | 1.77 ms |
+| Himalayas (28, 86.9) | 5,897 | **16,384 (the cap)** | **8,580** | 4,816 | 4.72 ms |
+
+`MAX_BOULDERS` stays 16,384 (ledgered): at 32,768 the Himalayas would keep all 24,964, but the
+pool would grow by about nine more chunks (≈ 8 MiB by Task 9's estimate) on a hop that Task 12's
+journey bench has not measured. The drop keeps the first boulders in sub-segment order, so the
+Himalayas region's later rivers have none. The collar pool adds up to 5 chunks (4,816 collars)
+in the Himalayas. Placement grew to 4.7 ms on the Himalayas' swap frame (was 0.79).
 
 ## Tiles, the continental pass and boulders per bench region (native)
 

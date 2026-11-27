@@ -21,6 +21,16 @@
 //!   radius and turned by its seed. Its colour is the terrain palette's rock for the region's
 //!   look ([`boulder_look`]), jittered in hue and value by the seed, and wet-dark at and above
 //!   the waterline.
+//! - **Foam collars** (Task 11c). Every boulder at a foam site (`Boulder::foam_site`: standing
+//!   in the water, its top less than half a metre under it or above it) that stands in drawn
+//!   water gets a collar, the second scatter kind ([`ScatterKind::FoamCollar`]): one flat quad
+//!   ([`foam_collar_mesh`]) at the drawn water level, scaled by the boulder's radius and turned
+//!   so its `+z` runs downstream along the boulder's flow ([`foam_collar_instance`]). Its tag
+//!   carries the drawn rock's radius at the waterline (as a share of its radius) and the seed.
+//!   `scatter.wesl` cuts it out (alpha-masked: no sorting): a ring hugging the rock, thicker on
+//!   its upstream face, and a wake about [`FOAM_COLLAR_WAKE_RADII`] radii long, its edge broken
+//!   by noise that churns with time and runs downstream. It takes the water's own depth pull
+//!   plus [`FOAM_COLLAR_PULL_M`], so the water at its level never hides it.
 
 use std::sync::Arc;
 
@@ -30,7 +40,7 @@ use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use timefly_core::geo::RenderDir;
 use timefly_core::terrain::{LodSettings, blended_height_m, blended_surface_m};
-use timefly_core::worldgen::frame::FrameBasis;
+use timefly_core::worldgen::frame::{FrameBasis, RegionFrame};
 use timefly_core::worldgen::generate::RegionGrid;
 use timefly_core::worldgen::generate::water::Boulder;
 
@@ -41,7 +51,7 @@ use crate::scatter::{
 use crate::terrain::material::{PaletteKind, palette_image};
 use crate::terrain::view::full_sun_illumination;
 use crate::terrain::{TerrainScene, TerrainSceneSystems};
-use crate::water::{WATER_DEPTH_PULL, WATER_PULL_M};
+use crate::water::{WATER_DEPTH_PULL, WATER_F0, WATER_PULL_M, WHITE_WATER};
 
 /// Boulders are drawn out to this distance from the camera (m).
 pub const BOULDER_VISIBLE_M: f32 = 6_000.0;
@@ -68,6 +78,17 @@ pub const BOULDER_MAX_ELEVATION_M: f32 = 7_500.0;
 /// The least light a boulder's face shows, as a share of full sun: the terrain light ramp's
 /// shade band, so a face turned from the sun reads as the terrain's shade, never black.
 pub const BOULDER_SHADE_FLOOR: f32 = 0.16;
+/// Foam collars are drawn out to this distance from the camera (m); farther, a collar is a
+/// pixel or two and the water's own white water stands for it.
+pub const FOAM_COLLAR_VISIBLE_M: f32 = 3_000.0;
+/// The collar quad's extent, in boulder radii: half its width across the flow, how far it
+/// reaches upstream and how far downstream of the boulder's centre.
+pub const FOAM_COLLAR_EXTENT: [f32; 3] = [2.0, 2.0, 5.5];
+/// The wake trails about this many radii downstream of the rock.
+pub const FOAM_COLLAR_WAKE_RADII: f32 = 4.0;
+/// A collar is pulled this much (m) nearer the camera than the water's own pull, so it wins
+/// over the water at its level, also where the water's mesh interpolates a little above it.
+pub const FOAM_COLLAR_PULL_M: f32 = 0.3;
 
 /// The four boulder shapes: jittered icospheres of one subdivision (80 triangles), flat
 /// normals, positions and normals only, spanning `y ∈ [−1, 1]` exactly (so a tag's wetness is a
@@ -293,7 +314,7 @@ pub fn boulder_look(grid: &RegionGrid) -> ScatterLook {
         texel: UVec4::new(
             biome as u32 * 3 + PaletteKind::Rock as u32,
             era as u32,
-            0,
+            ScatterKind::Boulders.shader_mode(),
             0,
         ),
         colour: Vec4::new(
@@ -307,15 +328,128 @@ pub fn boulder_look(grid: &RegionGrid) -> ScatterLook {
     }
 }
 
+/// The foam collar's quad: `x ∈ ±FOAM_COLLAR_EXTENT[0]` across, `z` from
+/// `−FOAM_COLLAR_EXTENT[1]` (upstream) to `FOAM_COLLAR_EXTENT[2]` (downstream), at `y = 0`,
+/// facing up; positions and normals only, as the boulders' meshes.
+pub fn foam_collar_mesh() -> Mesh {
+    let [w, up, down] = FOAM_COLLAR_EXTENT;
+    let corners = [
+        Vec3::new(-w, 0.0, -up),
+        Vec3::new(w, 0.0, -up),
+        Vec3::new(w, 0.0, down),
+        Vec3::new(-w, 0.0, down),
+    ];
+    // Counter-clockwise seen from above.
+    flat_mesh(&corners, &[[0, 2, 1], [0, 3, 2]])
+}
+
+/// The flow at `dir` (`[east, north]` in `dir`'s own frame, m/s) as a unit vector in the
+/// region's local `(x, z)` axes of `basis`: carried through the frames exactly, not by a sign
+/// flip (they turn apart away from the region's centre). `None` where there is no flow.
+pub fn flow_local(basis: &FrameBasis, dir: bevy::math::DVec3, flow_mps: [f32; 2]) -> Option<Vec2> {
+    let (north, east) = RegionFrame {
+        center: RenderDir(dir),
+    }
+    .north_east();
+    let v = east * f64::from(flow_mps[0]) + north * f64::from(flow_mps[1]);
+    let speed = v.length();
+    if speed.is_nan() || speed <= 1e-6 {
+        return None;
+    }
+    // 10 m along the flow.
+    let a = 10.0 / (f64::from(EARTH_RADIUS_M));
+    let ahead = (dir * a.cos() + v / speed * a.sin()).normalize();
+    let (x0, z0) = basis.dir_to_local(RenderDir(dir))?;
+    let (x1, z1) = basis.dir_to_local(RenderDir(ahead))?;
+    Vec2::new((x1 - x0) as f32, (z1 - z0) as f32).try_normalize()
+}
+
+/// The foam collar of boulder `b`, drawn as `rock` (its [`boulder_instance`]): at a foam site
+/// standing in drawn water, a collar at the drawn level over its centre, scaled by its radius
+/// and turned so its `+z` runs along the flow (by its seed where there is none). Its tag holds
+/// the drawn rock's radius at the waterline as a share of its radius (0 for a rock just under
+/// the water) and the seed.
+pub fn foam_collar_instance(
+    grid: &RegionGrid,
+    basis: &FrameBasis,
+    b: &Boulder,
+    rock: &ScatterInstance,
+) -> Option<ScatterInstance> {
+    b.foam_site()?;
+    let (x, z) = (f64::from(rock.translation.x), f64::from(rock.translation.z));
+    let level = blended_surface_m(grid, x, z);
+    if level <= blended_height_m(grid, x, z) {
+        return None;
+    }
+    let r = rock.scale;
+    // The drawn rock's waterline, in its own height: -1 at its bottom, 1 at its top.
+    let y = (level - rock.translation.y) / r;
+    if y > 1.0 + timefly_core::hydrology::params::FOAM_SITE_DEPTH_M / r {
+        return None;
+    }
+    let share = (1.0 - y.clamp(-1.0, 1.0).powi(2)).sqrt();
+    let yaw = flow_local(basis, b.dir, b.flow_mps)
+        .map_or_else(|| boulder_yaw(b.seed), |f| f.x.atan2(f.y));
+    Some(ScatterInstance {
+        translation: Vec3::new(rock.translation.x, level, rock.translation.z),
+        scale: r,
+        yaw: yaw.rem_euclid(std::f32::consts::TAU),
+        tag: ScatterInstance::tag_of(if y < 1.0 { share } else { 0.0 }, b.seed),
+    })
+}
+
+/// Every boulder's foam collar in `grid`, in boulder order.
+pub fn foam_collar_instances(grid: &RegionGrid) -> Arc<[ScatterInstance]> {
+    let basis = grid.spec.frame().basis();
+    grid.boulders
+        .iter()
+        .filter_map(|b| {
+            let rock = boulder_instance(grid, &basis, b)?;
+            foam_collar_instance(grid, &basis, b, &rock)
+        })
+        .collect()
+}
+
+/// The collars' look: the foam mode, the water's white water colour (linear) and the wake's
+/// length, the water's depth pull plus [`FOAM_COLLAR_PULL_M`], and the boulders' shade floor.
+pub fn foam_collar_look() -> ScatterLook {
+    let white = WHITE_WATER.to_linear();
+    ScatterLook {
+        texel: UVec4::new(0, 0, ScatterKind::FoamCollar.shader_mode(), 0),
+        colour: Vec4::new(white.red, white.green, white.blue, FOAM_COLLAR_WAKE_RADII),
+        pull: Vec4::new(
+            WATER_PULL_M,
+            WATER_DEPTH_PULL,
+            EARTH_RADIUS_M,
+            FOAM_COLLAR_PULL_M,
+        ),
+        light: Vec4::new(BOULDER_SHADE_FLOOR * full_sun_illumination(), 0.0, 0.0, 0.0),
+    }
+}
+
+/// The collars' material (shared with the pipeline warm-up so its key matches): the scatter
+/// material, alpha-masked (drawn in the alpha-mask phase with the water: no sorting), rough as
+/// the water's foam and with its reflectance.
+pub fn foam_collar_material(palette: &Handle<Image>) -> ScatterMaterial {
+    let mut m = scatter_material(palette, foam_collar_look());
+    m.base.alpha_mode = AlphaMode::Mask(0.5);
+    m.base.perceptual_roughness = 0.9;
+    m.base.reflectance = (WATER_F0 / 0.16).sqrt();
+    m
+}
+
 /// The Earth's radius (m) the scatter's curvature drop uses, as the terrain's.
 const EARTH_RADIUS_M: f32 = (crate::globe::EARTH_RADIUS_KM * 1000.0) as f32;
 
-/// The boulders' set entity, its material and the grid it draws.
+/// The boulders' and their foam collars' set entities, the boulders' material and the grid
+/// they draw.
 #[derive(Resource, Debug)]
 pub struct RegionBoulders {
     pub set: Entity,
     pub material: Handle<ScatterMaterial>,
-    /// The scene grid whose boulders the set holds.
+    /// The foam collars' set entity (its pool holds the collar mesh and material).
+    pub collars: Entity,
+    /// The scene grid whose boulders the sets hold.
     pub grid: Option<Arc<RegionGrid>>,
 }
 
@@ -357,15 +491,28 @@ fn spawn_boulder_set(
             ScatterPool::new(shapes, material.clone(), BOULDER_VISIBLE_M),
         ))
         .id();
+    // The collars' look is the same in every region: one material for good.
+    let collars = commands
+        .spawn((
+            Name::new("Region foam collars"),
+            ScatterSet::empty(ScatterKind::FoamCollar),
+            ScatterPool::new(
+                vec![meshes.add(foam_collar_mesh())],
+                materials.add(foam_collar_material(&palette)),
+                FOAM_COLLAR_VISIBLE_M,
+            ),
+        ))
+        .id();
     commands.insert_resource(RegionBoulders {
         set,
         material,
+        collars,
         grid: None,
     });
 }
 
-/// Follows the terrain scene's grid: a new grid's boulders replace the set (and the look), and
-/// no scene empties it.
+/// Follows the terrain scene's grid: a new grid's boulders and collars replace the sets (and
+/// the boulders' look), and no scene empties them.
 fn sync_boulders(
     mut commands: Commands,
     scene: Option<Res<TerrainScene>>,
@@ -382,29 +529,41 @@ fn sync_boulders(
     if same {
         return;
     }
-    let set = match &grid {
+    let (set, collars) = match &grid {
         Some(g) => {
             let start = Instant::now();
             let instances = boulder_instances(g);
+            let collars = foam_collar_instances(g);
             if let Some(mut m) = materials.get_mut(&boulders.material) {
                 m.extension.look = boulder_look(g);
             }
             info!(
                 boulders = instances.len(),
+                collars = collars.len(),
                 ms = format!("{:.2}", start.elapsed().as_secs_f64() * 1e3),
                 "region boulders placed"
             );
-            ScatterSet {
-                kind: ScatterKind::Boulders,
-                instances,
-            }
+            (
+                ScatterSet {
+                    kind: ScatterKind::Boulders,
+                    instances,
+                },
+                ScatterSet {
+                    kind: ScatterKind::FoamCollar,
+                    instances: collars,
+                },
+            )
         }
         None => {
             info!("region boulders removed");
-            ScatterSet::empty(ScatterKind::Boulders)
+            (
+                ScatterSet::empty(ScatterKind::Boulders),
+                ScatterSet::empty(ScatterKind::FoamCollar),
+            )
         }
     };
     commands.entity(boulders.set).insert(set);
+    commands.entity(boulders.collars).insert(collars);
     boulders.grid = grid;
 }
 
@@ -426,6 +585,7 @@ mod tests {
     use crate::scatter::{ScatterSlot, add_scatter_systems};
     use crate::terrain::material::{TerrainMaterial, palette_texel_index};
     use crate::terrain::{TerrainSettings, add_terrain_systems};
+    use bevy::camera::visibility::VisibilityRange;
 
     /// Mesh positions as exact keys (every vertex comes from one shared position).
     fn key(p: [f32; 3]) -> [u32; 3] {
@@ -558,7 +718,148 @@ mod tests {
             radius_m,
             seed,
             wet,
+            level_m: 0.0,
+            flow_mps: [0.0; 2],
         }
+    }
+
+    /// A boulder of radius `r` whose core water stands `wet` of its height up it (so its top is
+    /// `(1 − wet) × 2r` above the level), flowing `flow` (east, north) m/s.
+    fn rock_at(
+        grid: &RegionGrid,
+        x: f64,
+        z: f64,
+        r: f32,
+        wet: f32,
+        flow: [f32; 2],
+        seed: u32,
+    ) -> Boulder {
+        Boulder {
+            level_m: wet * 2.0 * r,
+            flow_mps: flow,
+            ..boulder_at(grid, x, z, r, wet, seed)
+        }
+    }
+
+    #[test]
+    fn foam_collars_ring_rocks_at_the_surface() {
+        let water = plane_grid(3.0, Vec::new());
+        let basis = water.spec.frame().basis();
+        let (x, z) = (120.0, -340.0);
+        let level = blended_surface_m(&water, x, z);
+        // A rock breaking the surface, flowing east: a collar at the drawn level over its centre,
+        // its radius, turned so +z runs east (+x), its tag the waterline's share of the radius.
+        let b = rock_at(&water, x, z, 1.5, 0.75, [4.0, 0.0], 9);
+        assert!(b.foam_site().is_some());
+        let rock = boulder_instance(&water, &basis, &b).unwrap();
+        let c = foam_collar_instance(&water, &basis, &b, &rock).unwrap();
+        assert_eq!(
+            c.translation,
+            Vec3::new(rock.translation.x, level, rock.translation.z)
+        );
+        assert_eq!(c.scale, 1.5);
+        let downstream = c.transform().rotation * Vec3::Z;
+        assert!(downstream.abs_diff_eq(Vec3::X, 1e-3), "{downstream}");
+        // The waterline is half way up the top half: sqrt(1 − 0.5²) of the radius.
+        let y = (level - rock.translation.y) / 1.5;
+        assert!((y - 0.5).abs() < 1e-3, "{y}");
+        assert!(
+            (c.wet() - 0.75f32.sqrt()).abs() < 1.0 / 255.0,
+            "{}",
+            c.wet()
+        );
+        assert_eq!(c.seed(), 9);
+        // Flowing north: +z runs north, which is region -z.
+        let n = rock_at(&water, x, z, 1.5, 0.75, [0.0, 3.5], 9);
+        let c = foam_collar_instance(&water, &basis, &n, &rock).unwrap();
+        let downstream = c.transform().rotation * Vec3::Z;
+        assert!(downstream.abs_diff_eq(Vec3::NEG_Z, 1e-3), "{downstream}");
+        // A rock just under the water (its top 0.3 m down) gets a collar with no ring hole; one
+        // a metre under gets none; a dry rock (no drawn water) gets none.
+        let under = Boulder {
+            level_m: 3.3,
+            ..rock_at(&water, x, z, 1.5, 1.0, [4.0, 0.0], 9)
+        };
+        assert!(under.foam_site().is_some());
+        let rock = boulder_instance(&water, &basis, &under).unwrap();
+        assert_eq!(
+            foam_collar_instance(&water, &basis, &under, &rock)
+                .unwrap()
+                .wet(),
+            0.0
+        );
+        let deep = Boulder {
+            level_m: 4.0,
+            ..under
+        };
+        assert!(deep.foam_site().is_none());
+        assert!(foam_collar_instance(&water, &basis, &deep, &rock).is_none());
+        let dry = plane_grid(0.0, Vec::new());
+        let rock = boulder_instance(&dry, &basis, &b).unwrap();
+        assert!(foam_collar_instance(&dry, &basis, &b, &rock).is_none());
+        // No flow: turned by its seed instead.
+        let still = rock_at(&water, x, z, 1.5, 0.75, [0.0, 0.0], 9);
+        let rock = boulder_instance(&water, &basis, &still).unwrap();
+        assert_eq!(
+            foam_collar_instance(&water, &basis, &still, &rock)
+                .unwrap()
+                .yaw,
+            boulder_yaw(9)
+        );
+    }
+
+    /// The flow is carried into region axes through the frames: at the centre east is +x and
+    /// north −z; 140 km east at 34° N, a due-north flow turns off the region's −z by the
+    /// meridians' convergence, `(d / R) · tan(latitude)` (about 0.85°), which a sign flip misses.
+    #[test]
+    fn collar_flow_follows_the_region_axes() {
+        let grid = plane_grid(3.0, Vec::new());
+        let frame = grid.spec.frame();
+        let basis = frame.basis();
+        let at = |x: f64, z: f64| frame.local_to_dir(x, z).0;
+        let f = flow_local(&basis, at(0.0, 0.0), [2.0, 0.0]).unwrap();
+        assert!(f.abs_diff_eq(Vec2::X, 1e-6), "{f}");
+        let f = flow_local(&basis, at(0.0, 0.0), [0.0, 2.0]).unwrap();
+        assert!(f.abs_diff_eq(Vec2::NEG_Y, 1e-6), "{f}");
+        let f = flow_local(&basis, at(140_000.0, 0.0), [0.0, 2.0]).unwrap();
+        let turn = f.x.atan2(-f.y).to_degrees();
+        let lat = 34.2f64.to_radians();
+        let want = (140_000.0 / 6_371_000.0 * lat.tan()).to_degrees() as f32;
+        assert!(
+            (turn.abs() - want).abs() < 0.1,
+            "turned {turn}°, want about {want}°"
+        );
+        assert!(flow_local(&basis, at(0.0, 0.0), [0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn the_foam_collar_mesh_is_one_upward_quad() {
+        let mesh = foam_collar_mesh();
+        assert_eq!(mesh.primitive_topology(), PrimitiveTopology::TriangleList);
+        let ids: Vec<_> = mesh.attributes().map(|(a, _)| a.id).collect();
+        let rock = boulder_meshes();
+        let rock_ids: Vec<_> = rock[0].attributes().map(|(a, _)| a.id).collect();
+        assert_eq!(ids, rock_ids, "the boulders' vertex layout");
+        let p = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .and_then(|a| a.as_float3())
+            .unwrap();
+        let n = mesh
+            .attribute(Mesh::ATTRIBUTE_NORMAL)
+            .and_then(|a| a.as_float3())
+            .unwrap();
+        assert_eq!(p.len(), 6, "two triangles");
+        for t in p.chunks(3) {
+            let [a, b, c] = [t[0], t[1], t[2]].map(Vec3::from_array);
+            assert!((b - a).cross(c - a).y > 0.0, "counter-clockwise from above");
+        }
+        assert!(n.iter().all(|&n| n == [0.0, 1.0, 0.0]));
+        let (lo, hi) = p.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), &q| {
+            (lo.min(Vec3::from(q)), hi.max(Vec3::from(q)))
+        });
+        let [w, up, down] = FOAM_COLLAR_EXTENT;
+        assert_eq!((lo, hi), (Vec3::new(-w, 0.0, -up), Vec3::new(w, 0.0, down)));
+        assert!(down > FOAM_COLLAR_WAKE_RADII + 1.0, "room for the wake");
     }
 
     #[test]
@@ -778,6 +1079,156 @@ mod tests {
                 center: grid.spec.center,
             },
         });
+    }
+
+    fn drawn_collars(app: &App) -> Arc<[ScatterInstance]> {
+        let set = app.world().resource::<RegionBoulders>().collars;
+        app.world()
+            .get::<ScatterSet>(set)
+            .unwrap()
+            .instances
+            .clone()
+    }
+
+    /// The slot entities of the collars' pool.
+    fn collar_slots(app: &App) -> Vec<Entity> {
+        let set = app.world().resource::<RegionBoulders>().collars;
+        app.world()
+            .get::<ScatterPool>(set)
+            .unwrap()
+            .slots()
+            .to_vec()
+    }
+
+    /// A grid under 3 m of water holding `n` rocks at the surface (and as many deep ones,
+    /// which get no collar), flowing east.
+    fn rapids_grid(n: u32, east_m: f64) -> Arc<RegionGrid> {
+        let mut g = plane_grid(3.0, Vec::new());
+        g.spec.center = g.spec.frame().local_to_dir(east_m, 0.0);
+        let boulders = (0..n)
+            .flat_map(|k| {
+                let x = 7.0 * f64::from(k % 400) - 1_400.0;
+                let z = 9.0 * f64::from(k / 400) - 300.0;
+                let surface = rock_at(&g, x, z, 1.0, 0.8, [4.0, 0.5], k);
+                let deep = Boulder {
+                    level_m: 5.0,
+                    ..rock_at(&g, x + 3.0, z, 1.0, 1.0, [4.0, 0.5], 50_000 + k)
+                };
+                [surface, deep]
+            })
+            .collect();
+        Arc::new(RegionGrid { boulders, ..g })
+    }
+
+    #[test]
+    fn collars_follow_the_active_region() {
+        let mut app = boulder_app();
+        let (a, b) = (rapids_grid(5, 0.0), rapids_grid(3, 40_000.0));
+        app.update();
+        assert!(drawn_collars(&app).is_empty(), "no region, no collars");
+        enter(&mut app, &a);
+        app.update();
+        app.update();
+        assert_eq!(&drawn_collars(&app)[..], &foam_collar_instances(&a)[..]);
+        assert_eq!(drawn_collars(&app).len(), 5, "one per rock at the surface");
+        // A held swap keeps the collars the terrain draws.
+        app.world_mut().resource_mut::<TerrainSettings>().hold_swap = true;
+        enter(&mut app, &b);
+        app.update();
+        assert_eq!(&drawn_collars(&app)[..], &foam_collar_instances(&a)[..]);
+        // Released: the new region's, in its own frame.
+        app.world_mut().resource_mut::<TerrainSettings>().hold_swap = false;
+        app.update();
+        app.update();
+        assert_eq!(&drawn_collars(&app)[..], &foam_collar_instances(&b)[..]);
+        assert_eq!(drawn_collars(&app).len(), 3);
+        // Torn down: empty, and the slots gone.
+        app.world_mut().remove_resource::<ActiveRegion>();
+        app.update();
+        app.update();
+        assert!(drawn_collars(&app).is_empty());
+        assert!(collar_slots(&app).is_empty());
+    }
+
+    #[test]
+    fn collars_share_one_mesh_and_material() {
+        let mut app = boulder_app();
+        enter(&mut app, &rapids_grid(1_500, 0.0));
+        for _ in 0..4 {
+            app.update();
+        }
+        let set = app.world().resource::<RegionBoulders>().collars;
+        let pool = app.world().get::<ScatterPool>(set).unwrap();
+        assert_eq!(pool.meshes().len(), 1, "one collar mesh");
+        let (mesh, material) = (pool.meshes()[0].clone(), pool.material().clone());
+        let slots = collar_slots(&app);
+        assert_eq!(slots.len(), 2_048);
+        for e in &slots {
+            let entity = app.world().entity(*e);
+            assert_eq!(entity.get::<Mesh3d>().unwrap().0, mesh);
+            assert_eq!(
+                entity.get::<MeshMaterial3d<ScatterMaterial>>().unwrap().0,
+                material
+            );
+            let range = entity.get::<VisibilityRange>().unwrap();
+            assert!(range.is_abrupt());
+            assert!(range.is_visible_at_all(FOAM_COLLAR_VISIBLE_M - 1.0));
+            assert!(range.is_culled(FOAM_COLLAR_VISIBLE_M + 1.0));
+        }
+        // The collars' material: alpha-masked foam over the shared palette, apart from the
+        // boulders' (whose look changes per region).
+        let boulders = app.world().resource::<RegionBoulders>().material.clone();
+        assert_ne!(material, boulders);
+        let materials = app.world().resource::<Assets<ScatterMaterial>>();
+        assert_eq!(materials.len(), 2, "the boulders' and the collars'");
+        let m = materials.get(&material).unwrap();
+        assert_eq!(m.base.alpha_mode, AlphaMode::Mask(0.5));
+        assert_eq!(m.extension.look, foam_collar_look());
+        assert_eq!(m.extension.look.texel.z, crate::scatter::SCATTER_MODE_FOAM);
+        assert_eq!(
+            m.extension.palette,
+            materials.get(&boulders).unwrap().extension.palette
+        );
+        let mesh = app.world().resource::<Assets<Mesh>>().get(&mesh).unwrap();
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap().len(),
+            foam_collar_mesh()
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .len()
+        );
+    }
+
+    #[test]
+    fn collar_sets_reuse_their_pool() {
+        let mut app = boulder_app();
+        let grids = [
+            rapids_grid(1_500, 0.0),
+            rapids_grid(600, 40_000.0),
+            rapids_grid(1_900, 80_000.0),
+        ];
+        enter(&mut app, &grids[0]);
+        for _ in 0..4 {
+            app.update();
+        }
+        let pool = collar_slots(&app);
+        assert_eq!(pool.len(), 2_048, "1,500 collars in whole chunks");
+        for g in &grids[1..] {
+            enter(&mut app, g);
+            for _ in 0..4 {
+                app.update();
+            }
+            assert_eq!(&drawn_collars(&app)[..], &foam_collar_instances(g)[..]);
+            assert_eq!(collar_slots(&app), pool, "the same slot entities");
+        }
+        let world = app.world_mut();
+        let collar_set = world.resource::<RegionBoulders>().collars;
+        let mut q = world.query::<(&ScatterSlot, &ChildOf, &Visibility)>();
+        let shown = q
+            .iter(world)
+            .filter(|(_, c, v)| c.parent() == collar_set && **v != Visibility::Hidden)
+            .count();
+        assert_eq!(shown, 1_900);
     }
 
     fn drawn_set(app: &App) -> Arc<[ScatterInstance]> {

@@ -17,6 +17,15 @@
 // is silty brown when slow, clear when fast (`river_tint`). Lakes and the sea (ribbon at least
 // RIBBON_NONE_M) keep the swell, the swash and the shore's foam below.
 //
+// White water in rapids (Task 11c), only where `rapid` > 0:
+// - Standing waves: a normal-only pattern that holds still while the foam runs through it, its
+//   crests across the flow at the hydraulic wavelength 2π v² / g (`standing_waves`), its slope
+//   growing with the rapid.
+// - Foam streaked along the flow: noise stretched STREAK_STRETCH : 1 along it (`streaks`),
+//   carried by the flow map, gathering on the standing waves' crests, its coarse clumps breaking
+//   and re-forming with time; faded to its mean where unresolved, so rapids still read white
+//   from afar.
+//
 // Waves (art pass §5.4, waves.wesl):
 // - Swell: below 1 km the vertex stage raises and lowers the surface by three directional
 //   components around the region's wind. Each fades where the mesh has too few vertices per
@@ -31,7 +40,7 @@
 import package::terrain_cdlod::{
     TerrainBuffer, TerrainParams, WaterSample, blended_water, fog_position, texel_step,
 };
-import package::noise::gradient_noise3;
+import package::noise::{gradient_noise3, hash3};
 import package::waves::{
     TAU, SWASH_MAX_AMPLITUDE_M, SWASH_PROBE_M, swash_amplitude_m, swash_level_m, swash_reach_factor,
     wave_phase, swell_spacing_weight,
@@ -116,6 +125,23 @@ const WHITE_WATER: vec3<f32> = vec3<f32>(0.8276, 0.8689, 0.8481);
 const RIVER_SPEED_MPS: vec2<f32> = vec2<f32>(0.05, 0.3);
 // A river's ripples' largest slope (before the rapids' gain).
 const RIVER_RIPPLE_SLOPE: f32 = 0.06;
+// `GRAVITY_MPS2` in water.rs: the standing waves' wavelength is 2π v² / g.
+const GRAVITY_MPS2: f32 = 9.81;
+// `STANDING_WAVE_SLOPE` in water.rs: the standing waves' largest slope in a full rapid.
+const STANDING_WAVE_SLOPE: f32 = 0.3;
+// `STANDING_WAVE_CELL_M` in water.rs: the cells (m) whose own frames hold the standing waves.
+const STANDING_WAVE_CELL_M: f32 = 32.0;
+// `STREAK_STRETCH` in water.rs: the white water's noise is this many times longer along the
+// flow than across it.
+const STREAK_STRETCH: f32 = 4.0;
+// `STREAK_DIRECTIONS` in water.rs: the streaks' frames, this many evenly around the circle.
+const STREAK_DIRECTIONS: f32 = 24.0;
+// `CREST_FOAM` in water.rs: how much the standing waves' crests add to the foam's noise.
+const CREST_FOAM: f32 = 0.25;
+// `STREAK_CONTRAST` in water.rs: the streaks' noise is scaled by this before the foam's
+// threshold, so up close the foam breaks into streaks and clumps over dark water, while where
+// it is unresolved (the noise at its mean, 0) the rapid is as white as before.
+const STREAK_CONTRAST: f32 = 1.6;
 
 // The water at xz (`blended_water` over this material's water textures).
 fn water_at(params: TerrainParams, xz: vec2<f32>) -> WaterSample {
@@ -233,6 +259,61 @@ fn brush(xz: vec2<f32>, scale_m: f32, z: f32, seed: u32) -> f32 {
     return gradient_noise3(vec3<i32>(i32(c.x), i32(c.y), i32(zc)), vec3<f32>(q - c, z - zc), seed);
 }
 
+// Standing waves at xz in water flowing along unit `dir`, wavelength `lambda` (m): the height
+// pattern's (sin, cos) of its phase, so the height is `sin` and its slope along `dir` is `cos`
+// (times 2π / λ and the amplitude). Its crests run across the flow and never move. A single
+// phase `dot(xz, dir) / λ` would sweep the crests round wherever the flow turns or λ changes
+// (xz is hundreds of kilometres from the origin), so each cell of a STANDING_WAVE_CELL_M lattice
+// holds its own train about its own point with its own phase, and the four around xz are
+// blended with smooth weights, normalised so the blend keeps the pattern's strength.
+fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32) -> vec2<f32> {
+    let g = xz / STANDING_WAVE_CELL_M - 0.5;
+    let c = floor(g);
+    let f = smoothstep(vec2<f32>(0.0), vec2<f32>(1.0), g - c);
+    var sum = vec2<f32>(0.0);
+    var norm = 0.0;
+    for (var j = 0; j < 2; j++) {
+        for (var i = 0; i < 2; i++) {
+            let cell = c + vec2<f32>(f32(i), f32(j));
+            let point = (cell + 0.5) * STANDING_WAVE_CELL_M;
+            let offset = f32(hash3(vec3<i32>(i32(cell.x), i32(cell.y), 0), 229u) >> 8u) / 16777216.0;
+            let a = TAU * fract(dot(xz - point, dir) / lambda + offset);
+            let w = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
+            sum += w * vec2<f32>(sin(a), cos(a));
+            norm += w * w;
+        }
+    }
+    return sum * inverseSqrt(max(norm, 1e-6));
+}
+
+// White water's noise at xz, in frames turned to the unit flow `dir` and stretched
+// STREAK_STRETCH : 1 along it: streaks `s` metres across (a fine octave churning at t × 0.5) and
+// clumps four times larger (a coarse one at t × 0.3, so they break and re-form), each faded to
+// its mean as it shrinks below a couple of pixels. Frames are fixed for each of
+// STREAK_DIRECTIONS directions (a frame turned with the flow itself would sweep the pattern
+// round where it bends, xz being far from the origin); the two either side of `dir` are
+// blended, normalised so the blend keeps the noise's strength.
+fn streaks(xz: vec2<f32>, dir: vec2<f32>, s: f32, footprint: f32, t: f32) -> f32 {
+    let wf = octave_weight(footprint, s);
+    let wc = octave_weight(footprint, 4.0 * s);
+    let k = atan2(dir.y, dir.x) / TAU * STREAK_DIRECTIONS;
+    let k0 = floor(k);
+    let a = k - k0;
+    var n = vec2<f32>(0.0);
+    for (var i = 0; i < 2; i++) {
+        let bin = k0 + f32(i);
+        let angle = bin * TAU / STREAK_DIRECTIONS;
+        let along_dir = vec2<f32>(cos(angle), sin(angle));
+        let q = vec2<f32>(dot(xz, vec2<f32>(-along_dir.y, along_dir.x)), dot(xz, along_dir));
+        // The bin's own seed, the same either side of the turn at ±π.
+        let seed = u32(bin - STREAK_DIRECTIONS * floor(bin / STREAK_DIRECTIONS));
+        let fine = brush(q * vec2<f32>(1.0, 1.0 / STREAK_STRETCH), s, t * 0.5, 241u + seed);
+        let coarse = brush(q * vec2<f32>(1.0, 1.0 / STREAK_STRETCH), 4.0 * s, t * 0.3, 307u + seed);
+        n[i] = fine * wf + 0.7 * coarse * wc;
+    }
+    return (n.x * (1.0 - a) + n.y * a) * inverseSqrt((1.0 - a) * (1.0 - a) + a * a);
+}
+
 // The thinnest water (m) the shore's foam band ends at (FOAM_MIN_DEPTH_M in water.rs).
 const FOAM_MIN_DEPTH_M: f32 = 0.02;
 // The swash's foam line: water thinner than this fraction of the amplitude, and never thinner
@@ -346,15 +427,25 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
         );
         flow_tilt = (weights.x * r0 + weights.y * r1) * RIVER_RIPPLE_SLOPE
             * (1.0 + RAPID_NORMAL_GAIN * rapid) * river_w;
-        // White water: bright, broken foam, churning as it goes; where its noise can't be
-        // resolved it fades to its mean, so rapids still read white from afar.
-        let wf = octave_weight(footprint, 2.0 * s);
-        let wc = octave_weight(footprint, 8.0 * s);
-        let n0 = brush(x0, 2.0 * s, t * 0.5, 173u) * wf + 0.7 * brush(x0, 8.0 * s, t * 0.2, 179u) * wc;
-        let n1 = brush(x1, 2.0 * s, t * 0.5, 173u) * wf + 0.7 * brush(x1, 8.0 * s, t * 0.2, 179u) * wc;
-        let n = weights.x * n0 + weights.y * n1;
-        let broken = smoothstep(0.15 - 0.5 * rapid, 0.35 - 0.3 * rapid, n);
-        white = look.flow.z * rapid * broken * river_w;
+        if rapid > 0.0 {
+            let speed = length(w.flow);
+            let dir = w.flow / speed;
+            // Standing waves: still, so sampled at xz (not carried by the flow map); the normal
+            // tilts by minus the height's slope.
+            let lambda = TAU * speed * speed / GRAVITY_MPS2;
+            let waves = standing_waves(xz, dir, lambda);
+            let ww = octave_weight(footprint, lambda);
+            flow_tilt -= dir * (STANDING_WAVE_SLOPE * rapid * ww * waves.y * river_w);
+            // White water: bright, broken foam streaked along the flow, churning as it goes,
+            // heaped on the crests the flow carries it through; where its noise can't be
+            // resolved it fades to its mean, so rapids still read white from afar.
+            let n0 = streaks(x0, dir, s, footprint, t);
+            let n1 = streaks(x1, dir, s, footprint, t);
+            let n = STREAK_CONTRAST * (weights.x * n0 + weights.y * n1)
+                + CREST_FOAM * rapid * ww * waves.x;
+            let broken = smoothstep(0.15 - 0.5 * rapid, 0.35 - 0.3 * rapid, n);
+            white = look.flow.z * rapid * broken * river_w;
+        }
     }
     let lake_tilt = (ripple - wave_slope) * (1.0 - river_w);
     let tilt = rel / params.lattice.z + lake_tilt + flow_tilt;

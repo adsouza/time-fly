@@ -38,8 +38,10 @@ use half::f16;
 use super::rivers::{RegionRivers, RiverHit, across, chord_point, offset_point};
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
-    BANK_FREEBOARD_M, BOULDER_RADIUS_M, BOULDERS_PER_SUBPOINT_MAX, DATA_LAKE_DEPTH_RAMP_NODES,
-    DATA_LAKE_MAX_DEPTH_M, MAX_BOULDERS, NO_WATER_DROP_M, OCEAN_STRAIT_M, RIBBON_NONE_M,
+    BANK_FREEBOARD_M, BOULDER_BREAK_M, BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH,
+    BOULDER_MAX_RADIUS_M, BOULDER_MEMBER_SHARE, BOULDER_RADIUS_M, BOULDERS_PER_SUBPOINT_MAX,
+    DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M, FOAM_SITE_DEPTH_M, NO_WATER_DROP_M,
+    OCEAN_STRAIT_M, RIBBON_NONE_M,
 };
 use crate::hydrology::{EraHydrology, HydroGraph, LakeKind, LakeTap};
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
@@ -62,6 +64,55 @@ pub struct Boulder {
     /// The fraction of the boulder's height under the water surface:
     /// `clamp((level − base) / (2 × radius), 0, 1)`, for wet-darkening.
     pub wet: f32,
+    /// The water level at `dir` (m): the inner field's texel water there.
+    pub level_m: f32,
+    /// The river's flow at `dir` (m/s), `[east, north]` in `dir`'s own frame, as the river
+    /// texel stores it; zero where the water there is not a river.
+    pub flow_mps: [f32; 2],
+}
+
+impl Boulder {
+    /// Its top (m): the bed plus its height.
+    pub fn top_m(&self) -> f32 {
+        self.base_m + 2.0 * self.radius_m
+    }
+
+    /// Its foam site: a boulder standing in the water (its base under the level) whose top is
+    /// less than [`FOAM_SITE_DEPTH_M`] under the level, or above it.
+    pub fn foam_site(&self) -> Option<FoamSite> {
+        (self.base_m < self.level_m && self.top_m() >= self.level_m - FOAM_SITE_DEPTH_M).then_some(
+            FoamSite {
+                dir: self.dir,
+                radius_m: self.radius_m,
+                top_m: self.top_m(),
+                level_m: self.level_m,
+                flow_mps: self.flow_mps,
+                seed: self.seed,
+            },
+        )
+    }
+}
+
+/// Where the water churns white around a rock at the surface (Task 11c): the shell's foam
+/// collars. A function of its boulder, so of the direction and the pass.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FoamSite {
+    /// Its boulder's foot (unit, era frame).
+    pub dir: DVec3,
+    /// Its boulder's radius (m).
+    pub radius_m: f32,
+    /// Its boulder's top (m).
+    pub top_m: f32,
+    /// The water level there (m).
+    pub level_m: f32,
+    /// The flow there (m/s), `[east, north]` in `dir`'s own frame ([`Boulder::flow_mps`]).
+    pub flow_mps: [f32; 2],
+    pub seed: u32,
+}
+
+/// The foam sites of `boulders`, in their order.
+pub fn foam_sites(boulders: &[Boulder]) -> impl Iterator<Item = FoamSite> + '_ {
+    boulders.iter().filter_map(Boulder::foam_site)
 }
 
 /// The f16 bits of a river texel.
@@ -206,12 +257,92 @@ pub(super) fn choose_water(
     }
 }
 
-/// Where a boulder goes, before its base is read.
+/// A member of a [`BoulderCluster`]: its hashes.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub(super) struct BoulderSite {
-    pub dir: DVec3,
-    pub radius_m: f32,
+pub(super) struct MemberHash {
+    /// Its hashed radius as a share of the centre's (1 for the centre).
+    pub share: f64,
+    /// Its bearing from the centre (radians, from along the arc toward its left).
+    pub angle: f64,
+    /// Its distance from the centre, in spread radii (0 for the centre).
+    pub spread: f64,
+    /// A breaker's rise (m): how far its top stands above the cluster's deepest water.
+    pub rise_m: Option<f64>,
     pub seed: u32,
+}
+
+/// A rapid's cluster of boulders, before the water they stand in is read: where its centre is
+/// and its members' hashes, the centre first.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct BoulderCluster {
+    /// Its sub-segment's first sub-point `(river, k)`, and its rapid.
+    pub river: u32,
+    pub k: u32,
+    pub rapid: f32,
+    /// Its sub-segment's ends and the arc's length (m).
+    a: DVec3,
+    b: DVec3,
+    length_m: f64,
+    /// The centre's arc parameter and across offset (m).
+    t: f64,
+    x: f64,
+    /// How far across the arc a member may sit (m): `hw − cap`.
+    reach_m: f64,
+    /// The largest radius any member may take (m): `min(hw / 2, BOULDER_MAX_RADIUS_M)`.
+    pub cap_m: f64,
+    /// The centre's hashed radius `H` (m), within the cap.
+    pub hashed_m: f64,
+    pub members: Vec<MemberHash>,
+}
+
+impl BoulderCluster {
+    /// The point `x` metres across its arc at `t`.
+    fn at(&self, t: f64, x: f64) -> DVec3 {
+        let on_arc = chord_point(self.a, self.b, t);
+        let normal = self.a.cross(self.b);
+        if normal.length() > 1e-15 {
+            offset_point(on_arc, across(on_arc, normal.normalize()), x)
+        } else {
+            on_arc
+        }
+    }
+
+    /// Its centre (unit, era frame).
+    pub fn centre(&self) -> DVec3 {
+        self.at(self.t, self.x)
+    }
+
+    /// The radius its members spread by, with the water `centre_depth_m` deep over the centre's
+    /// bed: `min(max(H, (depth + rise) / 2), cap)`, the centre's radius if that water were the
+    /// cluster's deepest.
+    pub fn spread_m(&self, centre_depth_m: f64) -> f64 {
+        let rise = self.members[0].rise_m.unwrap_or(0.0);
+        self.hashed_m
+            .max((centre_depth_m.max(0.0) + rise) / 2.0)
+            .min(self.cap_m)
+    }
+
+    /// Its members' directions, the members spread by `spread_m`: member `m ≥ 1` at its bearing
+    /// and `spread × spread_m` from the centre (metres along and across the arc), clamped back
+    /// into `t ∈ [0, 1]` and `|x| ≤ hw − cap`, which only brings it closer.
+    pub fn member_dirs(&self, spread_m: f64) -> Vec<DVec3> {
+        self.members
+            .iter()
+            .map(|m| {
+                if m.spread == 0.0 {
+                    return self.centre();
+                }
+                let rho = m.spread * spread_m;
+                let t = if self.length_m > 0.0 {
+                    (self.t + rho * m.angle.cos() / self.length_m).clamp(0.0, 1.0)
+                } else {
+                    self.t
+                };
+                let x = (self.x + rho * m.angle.sin()).clamp(-self.reach_m, self.reach_m);
+                self.at(t, x)
+            })
+            .collect()
+    }
 }
 
 const BOULDER_COUNT_SALT: u32 = 0x5BD1_E995;
@@ -219,28 +350,42 @@ const BOULDER_ALONG_SALT: u32 = 0x1B87_3593;
 const BOULDER_ACROSS_SALT: u32 = 0xCC9E_2D51;
 const BOULDER_RADIUS_SALT: u32 = 0xE654_6B64;
 const BOULDER_SEED_SALT: u32 = 0x9E37_79B1;
+const BOULDER_ANGLE_SALT: u32 = 0x85EB_CA6B;
+const BOULDER_SPREAD_SALT: u32 = 0xC2B2_AE35;
+const BOULDER_SHARE_SALT: u32 = 0x27D4_EB2F;
+const BOULDER_BREAK_SALT: u32 = 0x1656_67B1;
 
 fn fraction(h: u32) -> f64 {
     f64::from(h) / 4_294_967_296.0
 }
 
-/// The boulders of every rapid sub-segment whose boulders fall inside the square `|x|, |z| ≤
-/// half_m` of `basis`, in sub-segment order, at most [`MAX_BOULDERS`]; and how many more there
-/// were.
+fn lerp(range: [f64; 2], f: f64) -> f64 {
+    range[0] + (range[1] - range[0]) * f
+}
+
+/// The boulder clusters of every rapid sub-segment that could put a boulder inside the square
+/// `|x|, |z| ≤ half_m` of `basis` (the centre within the square widened by the cluster's
+/// reach), in sub-segment order.
 ///
-/// A sub-segment starting at sub-point `(river, k)` with `rapid > 0` holds
-/// `floor(rapid × BOULDERS_PER_SUBPOINT_MAX + h0)` boulders, `h0` the hash fraction of
-/// `(river, k)`. Boulder `j`'s fractions `u`, `c`, `r` and its seed are hashes of
-/// `(river, k, j)`: it sits at `t = u` along the sub-segment's arc, `c × (w/2 − radius)` across
-/// it (`c` in [−1, 1]), with `radius = min(lerp(BOULDER_RADIUS_M, r), w/4)`, so it lies wholly
-/// in the channel.
-pub(super) fn boulder_sites(
+/// A sub-segment from sub-point `a = (river, k)` with `rapid > 0` holds
+/// `n = floor(rapid × BOULDERS_PER_SUBPOINT_MAX + h0)` boulders, `h0` the hash fraction of
+/// `(river, k)`, in `ceil(n / BOULDER_CLUSTER_MAX)` clusters of [`BOULDER_CLUSTER_MAX`] (the
+/// last one the rest). Every value below is a hash of `(river, k, c)` for cluster `c` or of
+/// `(river, k, j)` for boulder `j`. With `hw` the sub-segment's half-width and `cap =
+/// min(hw / 2, BOULDER_MAX_RADIUS_M)`:
+///
+/// - **The centre** (member 0) sits at arc parameter `t = u` and `x = c × (hw − cap)` across
+///   the arc (`c` in [−1, 1]), its hashed radius `H = min(lerp(BOULDER_RADIUS_M, r), cap)`.
+/// - **Member `m ≥ 1`**: hashed radius `lerp(BOULDER_MEMBER_SHARE, s) × H`, a bearing, and a
+///   spread `lerp([1.1, BOULDER_CLUSTER_REACH], e)` (in spread radii, [`BoulderCluster::spread_m`]).
+/// - **The breakers**: the first `ceil(members × rapid / 3)` members, the centre first, rise
+///   [`BOULDER_BREAK_M`]`[1]` (the centre) or `lerp(BOULDER_BREAK_M, b)` above the water.
+pub(super) fn boulder_clusters(
     rivers: &RegionRivers,
     basis: &FrameBasis,
     half_m: f64,
-) -> (Vec<BoulderSite>, u32) {
+) -> Vec<BoulderCluster> {
     let mut out = Vec::new();
-    let mut dropped = 0u32;
     for (a, b) in rivers.sub_segments() {
         if a.rapid <= 0.0 {
             continue;
@@ -249,53 +394,140 @@ pub(super) fn boulder_sites(
         let h0 = fraction(hash3([river, k, -1], BOULDER_COUNT_SALT));
         let count = (f64::from(a.rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX) + h0).floor() as i32;
         let hw = f64::from(a.half_width_m);
-        let normal = a.dir.cross(b.dir);
-        for j in 0..count {
-            let cell = [river, k, j];
-            let u = fraction(hash3(cell, BOULDER_ALONG_SALT));
-            let c = 2.0 * fraction(hash3(cell, BOULDER_ACROSS_SALT)) - 1.0;
-            let r = fraction(hash3(cell, BOULDER_RADIUS_SALT));
-            let radius = (BOULDER_RADIUS_M[0] + (BOULDER_RADIUS_M[1] - BOULDER_RADIUS_M[0]) * r)
-                .min(hw / 2.0);
-            let on_arc = chord_point(a.dir, b.dir, u);
-            let dir = if normal.length() > 1e-15 {
-                offset_point(
-                    on_arc,
-                    across(on_arc, normal.normalize()),
-                    c * (hw - radius),
-                )
-            } else {
-                on_arc
+        let cap = (hw / 2.0).min(BOULDER_MAX_RADIUS_M);
+        let size = BOULDER_CLUSTER_MAX as i32;
+        for cluster in 0..(count + size - 1) / size {
+            let n = (count - cluster * size).min(size);
+            let breakers = (f64::from(n) * f64::from(a.rapid) / 3.0).ceil() as i32;
+            let cell = [river, k, cluster];
+            let members = (0..n)
+                .map(|m| {
+                    let cell = [river, k, cluster * size + m];
+                    let rise_m = (m < breakers).then(|| {
+                        if m == 0 {
+                            BOULDER_BREAK_M[1]
+                        } else {
+                            lerp(BOULDER_BREAK_M, fraction(hash3(cell, BOULDER_BREAK_SALT)))
+                        }
+                    });
+                    let seed = hash3(cell, BOULDER_SEED_SALT);
+                    if m == 0 {
+                        MemberHash {
+                            share: 1.0,
+                            angle: 0.0,
+                            spread: 0.0,
+                            rise_m,
+                            seed,
+                        }
+                    } else {
+                        MemberHash {
+                            share: lerp(
+                                BOULDER_MEMBER_SHARE,
+                                fraction(hash3(cell, BOULDER_SHARE_SALT)),
+                            ),
+                            angle: std::f64::consts::TAU
+                                * fraction(hash3(cell, BOULDER_ANGLE_SALT)),
+                            spread: lerp(
+                                [1.1, BOULDER_CLUSTER_REACH],
+                                fraction(hash3(cell, BOULDER_SPREAD_SALT)),
+                            ),
+                            rise_m,
+                            seed,
+                        }
+                    }
+                })
+                .collect();
+            let c = BoulderCluster {
+                river: a.river,
+                k: a.k,
+                rapid: a.rapid,
+                a: a.dir,
+                b: b.dir,
+                length_m: a.dir.angle_between(b.dir) * EARTH_RADIUS_M,
+                t: fraction(hash3(cell, BOULDER_ALONG_SALT)),
+                x: (2.0 * fraction(hash3(cell, BOULDER_ACROSS_SALT)) - 1.0) * (hw - cap),
+                reach_m: hw - cap,
+                cap_m: cap,
+                hashed_m: lerp(BOULDER_RADIUS_M, fraction(hash3(cell, BOULDER_RADIUS_SALT)))
+                    .min(cap),
+                members,
             };
-            let inside = basis
-                .dir_to_local(RenderDir(dir))
-                .is_some_and(|(x, z)| x.abs() <= half_m && z.abs() <= half_m);
-            if !inside {
-                continue;
+            let margin = BOULDER_CLUSTER_REACH * cap + 1.0;
+            let near = basis
+                .dir_to_local(RenderDir(c.centre()))
+                .is_some_and(|(x, z)| x.abs().max(z.abs()) <= half_m + margin);
+            if near {
+                out.push(c);
             }
-            if out.len() >= MAX_BOULDERS as usize {
-                dropped += 1;
-                continue;
-            }
-            out.push(BoulderSite {
-                dir,
-                radius_m: radius as f32,
-                seed: hash3(cell, BOULDER_SEED_SALT),
-            });
         }
     }
-    (out, dropped)
+    out
 }
 
-/// A boulder at `site`, on a texel of height `base_m` under water at `level_m`.
-pub(super) fn boulder(site: &BoulderSite, base_m: f32, level_m: f32) -> Boulder {
-    let wet = ((level_m - base_m) / (2.0 * site.radius_m)).clamp(0.0, 1.0);
+/// What a boulder stands on: the bed's height, the water's level and its river texel there.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct BoulderBed {
+    pub base_m: f32,
+    pub level_m: f32,
+    pub river: [u16; 4],
+}
+
+impl BoulderBed {
+    /// The water's depth over the bed (m), at least 0.
+    pub fn depth_m(&self) -> f64 {
+        (f64::from(self.level_m) - f64::from(self.base_m)).max(0.0)
+    }
+}
+
+/// The boulders of `cluster`, its members spread by `spread_m` to `dirs` and standing on `beds`
+/// (all in member order). With `D` the deepest water over any member's bed, the centre's
+/// radius is `R = min(max(spread_m, (D + rise) / 2), cap)`; a member's is `min(share × H, R)`,
+/// or for a breaker `min(max(that, (D + rise) / 2), R)`. So the centre is the largest, every
+/// member lies within [`BOULDER_CLUSTER_REACH`] × `R` of it and wholly in the channel, and the
+/// breakers' tops stand above the water wherever the cap allows (water up to `2 × cap − rise`
+/// deep).
+pub(super) fn size_cluster(
+    cluster: &BoulderCluster,
+    spread_m: f64,
+    dirs: &[DVec3],
+    beds: &[BoulderBed],
+) -> Vec<Boulder> {
+    assert!(cluster.members.len() == dirs.len() && dirs.len() == beds.len());
+    let depth = beds.iter().map(BoulderBed::depth_m).fold(0.0f64, f64::max);
+    let breaking = |rise: Option<f64>| rise.map_or(0.0, |r| (depth + r) / 2.0);
+    let big = spread_m
+        .max(breaking(cluster.members[0].rise_m))
+        .min(cluster.cap_m);
+    cluster
+        .members
+        .iter()
+        .zip(dirs.iter().zip(beds))
+        .enumerate()
+        .map(|(i, (m, (&dir, bed)))| {
+            let radius = if i == 0 {
+                big
+            } else {
+                (m.share * cluster.hashed_m)
+                    .max(breaking(m.rise_m))
+                    .min(big)
+            };
+            boulder(dir, radius as f32, m.seed, bed)
+        })
+        .collect()
+}
+
+/// A boulder at `dir` of radius `radius_m` on `bed`.
+pub(super) fn boulder(dir: DVec3, radius_m: f32, seed: u32, bed: &BoulderBed) -> Boulder {
+    let wet = ((bed.level_m - bed.base_m) / (2.0 * radius_m)).clamp(0.0, 1.0);
+    let [_, east, north, _] = decode_river(bed.river);
     Boulder {
-        dir: site.dir,
-        base_m,
-        radius_m: site.radius_m,
-        seed: site.seed,
+        dir,
+        base_m: bed.base_m,
+        radius_m,
+        seed,
         wet: if wet.is_nan() { 0.0 } else { wet },
+        level_m: bed.level_m,
+        flow_mps: [east, north],
     }
 }
 

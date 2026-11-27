@@ -155,8 +155,27 @@ pub const RIBBON_NONE_M: f64 = 1_000.0;
 
 // Boulders.
 
-pub const BOULDERS_PER_SUBPOINT_MAX: u32 = 6;
+/// A sub-segment at `rapid` holds `floor(rapid × this + h0)` boulders (Task 11c: 24, was 6).
+pub const BOULDERS_PER_SUBPOINT_MAX: u32 = 24;
+/// A sub-segment's boulders fall in clusters of at most this many (Task 11c).
+pub const BOULDER_CLUSTER_MAX: u32 = 6;
+/// A cluster's members lie within this many cluster radii (its centre boulder's) of its centre.
+pub const BOULDER_CLUSTER_REACH: f64 = 3.0;
+/// A cluster member's radius before the rule that it breaks the surface, as a share of its
+/// centre's hashed radius.
+pub const BOULDER_MEMBER_SHARE: [f64; 2] = [0.35, 0.85];
+/// The hashed radius range of a cluster's centre boulder.
 pub const BOULDER_RADIUS_M: [f64; 2] = [0.4, 3.0];
+/// A boulder that breaks the surface (a cluster's first `ceil(n × rapid / 3)` members, its
+/// centre first) has its top this far above the water (m) over the sub-segment's deepest point:
+/// its centre the most, the others hashed within the range.
+pub const BOULDER_BREAK_M: [f64; 2] = [0.2, 0.8];
+/// No boulder's radius exceeds this (m), nor half the channel's half-width, so in a river
+/// deeper than about 9 m even the breakers stay under.
+pub const BOULDER_MAX_RADIUS_M: f64 = 5.0;
+/// A boulder in the water whose top is less than this far (m) under the level, or above it,
+/// marks a foam site (Task 11c's collars).
+pub const FOAM_SITE_DEPTH_M: f32 = 0.5;
 pub const MAX_BOULDERS: u32 = 16_384;
 
 // Shell.
