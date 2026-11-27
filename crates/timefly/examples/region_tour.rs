@@ -1515,9 +1515,8 @@ fn main() -> AppExit {
         }
         None => None,
     };
-    let (flags, args): (Vec<String>, Vec<String>) = argv
-        .into_iter()
-        .partition(|a| FLAGS.contains(&a.as_str()));
+    let (flags, args): (Vec<String>, Vec<String>) =
+        argv.into_iter().partition(|a| FLAGS.contains(&a.as_str()));
     let no_dunes = flags.iter().any(|f| f == "--no-dunes");
     let offscreen = flags.iter().any(|f| f == "--offscreen");
     let no_rivers = flags.iter().any(|f| f == "--no-rivers");
