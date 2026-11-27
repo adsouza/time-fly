@@ -1143,10 +1143,11 @@ fn headless_runs_judge_holds_by_their_own_limit_and_the_bench_keeps_3_s() {
     assert_eq!(
         JourneyBenchConfig {
             hold_limit_ms: HOLD_LIMIT_NATIVE_MS,
+            memory_cycle_floor_bytes: 0,
             ..headless.clone()
         },
         bench_config,
-        "headless() changes the hold limit only"
+        "headless() changes the hold limit and the memory cycles' floor only"
     );
 
     // A dive held 9 s in fixed steps while a slow region job ran in wall time.
@@ -1203,4 +1204,49 @@ fn headless_runs_judge_holds_by_their_own_limit_and_the_bench_keeps_3_s() {
             Some(false)
         )
     );
+}
+
+#[test]
+fn headless_memory_cycles_allow_an_absolute_floor_and_the_bench_keeps_10_percent() {
+    let mib = |m: f64| Some((m * 1_048_576.0) as u64);
+    let bench_config = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    assert_eq!(
+        bench_config.memory_cycle_floor_bytes, 0,
+        "the game's bench: 10% alone"
+    );
+    assert_eq!(
+        JourneyBenchConfig::new(60, true).memory_cycle_floor_bytes,
+        0
+    );
+    let headless = bench_config.clone().headless();
+    assert_eq!(HEADLESS_MEMORY_CYCLE_FLOOR_MIB, 8);
+    assert_eq!(
+        headless.memory_cycle_floor_bytes,
+        HEADLESS_MEMORY_CYCLE_FLOOR_MIB << 20
+    );
+    let verdict = |config: &JourneyBenchConfig, samples: &[Option<u64>], web| {
+        let judged = config.memory_cycle_verdicts(samples, web);
+        assert_eq!(judged.len(), 1, "{judged:?}");
+        judged[0].2
+    };
+
+    // The flaky headless run: 29.4 -> 32.8 MiB, +3.4 MiB (+11.6%).
+    let flaky = [mib(29.4), mib(32.8), mib(31.0)];
+    let (ok, increase) = verdict(&bench_config, &flaky, false);
+    assert!(
+        !ok && increase > CYCLE_MEMORY_TOLERANCE,
+        "the bench still fails it"
+    );
+    let (ok, same) = verdict(&headless, &flaky, false);
+    assert!(ok, "within the headless floor");
+    assert_eq!(same, increase, "the reported increase is unchanged");
+    // Over both the floor and 10%: 29.4 -> 38.0 MiB (+8.6 MiB, +29%) fails headless too.
+    assert!(!verdict(&headless, &[mib(29.4), mib(38.0)], false).0);
+    // At a native footprint the floor changes nothing: 10% is the larger allowance.
+    assert!(verdict(&headless, &[mib(1_000.0), mib(1_099.0)], false).0);
+    assert!(!verdict(&headless, &[mib(1_000.0), mib(1_101.0)], false).0);
+    // The web's rule, each repeat's own growth, gets the same allowance (one repeat, +3.4 MiB).
+    assert!(!verdict(&bench_config, &flaky[..2], true).0);
+    assert!(verdict(&headless, &flaky[..2], true).0);
+    assert!(!verdict(&headless, &[mib(29.4), mib(38.0)], true).0);
 }

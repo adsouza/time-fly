@@ -14,11 +14,11 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::args::RegionArg;
-use timefly::bench::bench_exit;
 use timefly::bench::region::banner::BenchBannerText;
 use timefly::bench::region::{
     BENCH_REGIONS, BenchRegion, RegionBench, RegionBenchConfig, RegionBenchPlugin,
 };
+use timefly::bench::{bench_exit, record_summary};
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::globe::GlobeRenderStatus;
 use timefly::hydro::{HydroPlugin, HydroSettings};
@@ -198,6 +198,7 @@ fn region_bench_reports_all_regions() {
     }
 
     let summary = bench.summary().unwrap();
+    record_summary("region_bench_reports_all_regions", summary);
     assert!(
         summary.starts_with("===== Time Fly region bench summary ====="),
         "{summary}"
@@ -258,7 +259,9 @@ fn region_bench_reports_all_regions() {
 
 /// Runs a single-region bench over the Red Sea stop's centre to its summary, with `options` if
 /// given (otherwise the app has no `TerrainOptions`, as a test app may not).
-fn run_single(options: Option<TerrainOptions>) -> (App, Vec<AppExit>) {
+/// Runs one region to its summary, recorded as `test`'s ([`record_summary`]: only when
+/// `TIMEFLY_BENCH_SUMMARY_DIR` is set).
+fn run_single(options: Option<TerrainOptions>, test: &str) -> (App, Vec<AppExit>) {
     let arg = RegionArg {
         lat_deg: 20.0,
         lon_deg: 37.5,
@@ -282,12 +285,16 @@ fn run_single(options: Option<TerrainOptions>) -> (App, Vec<AppExit>) {
         assert!(Instant::now() < deadline, "the bench did not finish");
         std::thread::sleep(Duration::from_millis(1));
     }
+    record_summary(
+        test,
+        app.world().resource::<RegionBench>().summary().unwrap(),
+    );
     (app, exit)
 }
 
 #[test]
 fn a_single_region_run_reaches_the_summary() {
-    let (app, exit) = run_single(None);
+    let (app, exit) = run_single(None, "a_single_region_run_reaches_the_summary");
     let bench = app.world().resource::<RegionBench>();
     let reports = bench.reports();
     assert_eq!(reports.len(), 1, "{reports:#?}");
@@ -336,7 +343,7 @@ fn a_single_region_run_reaches_the_summary() {
 
 #[test]
 fn the_region_bench_reports_the_continental_pass() {
-    let (app, _) = run_single(None);
+    let (app, _) = run_single(None, "the_region_bench_reports_the_continental_pass");
     let bench = app.world().resource::<RegionBench>();
     let summary = bench.summary().unwrap();
     let line = summary
@@ -362,7 +369,10 @@ fn the_region_bench_reports_the_continental_pass() {
 
 #[test]
 fn a_no_dunes_run_says_so() {
-    let (app, _) = run_single(Some(TerrainOptions { dunes: false }));
+    let (app, _) = run_single(
+        Some(TerrainOptions { dunes: false }),
+        "a_no_dunes_run_says_so",
+    );
     let bench = app.world().resource::<RegionBench>();
     for text in [&bench.reports()[0], bench.summary().unwrap()] {
         assert!(text.contains("\ndunes: off\n"), "{text}");
@@ -399,7 +409,7 @@ fn failing_from_stop_2(keep_going: bool) -> RegionBenchConfig {
 }
 
 /// Runs a bench to its summary: `(the summary, the exits written)`.
-fn run_to_summary(app: &mut App) -> (String, Vec<AppExit>) {
+fn run_to_summary(app: &mut App, test: &str) -> (String, Vec<AppExit>) {
     let deadline = Instant::now() + WALL_LIMIT;
     let mut exit = Vec::new();
     while app.world().resource::<RegionBench>().summary().is_none() {
@@ -412,13 +422,14 @@ fn run_to_summary(app: &mut App) -> (String, Vec<AppExit>) {
         std::thread::sleep(Duration::from_millis(1));
     }
     let summary = app.world().resource::<RegionBench>().summary().unwrap();
+    record_summary(test, summary);
     (summary.to_string(), exit)
 }
 
 #[test]
 fn a_failed_gate_stops_the_region_bench() {
     let mut app = bench_app(failing_from_stop_2(false));
-    let (summary, exit) = run_to_summary(&mut app);
+    let (summary, exit) = run_to_summary(&mut app, "a_failed_gate_stops_the_region_bench");
     println!("{summary}");
     let bench = app.world().resource::<RegionBench>();
     // Stop 1 passed (its failing flight is reported only); stop 2's block is out, then the run
@@ -455,7 +466,7 @@ fn a_failed_gate_stops_the_region_bench() {
 #[test]
 fn keep_going_runs_every_stop() {
     let mut app = bench_app(failing_from_stop_2(true));
-    let (summary, exit) = run_to_summary(&mut app);
+    let (summary, exit) = run_to_summary(&mut app, "keep_going_runs_every_stop");
     println!("{summary}");
     let bench = app.world().resource::<RegionBench>();
     assert_eq!(bench.reports().len(), 8);
@@ -480,6 +491,7 @@ fn a_failed_globe_ends_the_region_bench() {
     app.update();
     let bench = app.world().resource::<RegionBench>();
     let summary = bench.summary().expect("a summary");
+    record_summary("a_failed_globe_ends_the_region_bench", summary);
     assert!(
         summary.contains("result: FAIL (the globe failed: no adapter)"),
         "{summary}"

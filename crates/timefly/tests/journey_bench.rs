@@ -20,12 +20,12 @@ use bevy::math::DVec3;
 use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
-use timefly::bench::bench_exit;
 use timefly::bench::journey::{
     ALPS_ROUTE, CRUISE_AGL_M, Crossing, HOLD_LIMIT_HEADLESS_MS, JourneyBench, JourneyBenchConfig,
     JourneyBenchPlugin, JourneyRoute, WEST_YAW,
 };
 use timefly::bench::region::BenchRegion;
+use timefly::bench::{bench_exit, record_summary};
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
 use timefly::fly_camera::FlyCameraPlugin;
 use timefly::globe::GlobeRenderStatus;
@@ -144,6 +144,7 @@ fn a_journey_run_reaches_the_summary() {
         .summary()
         .unwrap()
         .to_string();
+    record_summary("a_journey_run_reaches_the_summary", &summary);
     println!("{summary}");
     assert!(
         summary.starts_with("===== Time Fly journey bench summary ====="),
@@ -225,8 +226,9 @@ fn a_journey_run_reaches_the_summary() {
     assert!(exits(&mut app).is_empty());
 }
 
-/// Runs the bench to its summary.
-fn run_to_summary(app: &mut App) -> (String, Vec<AppExit>) {
+/// Runs the bench to its summary, recorded as `test`'s ([`record_summary`]: only when
+/// `TIMEFLY_BENCH_SUMMARY_DIR` is set).
+fn run_to_summary(app: &mut App, test: &str) -> (String, Vec<AppExit>) {
     let deadline = Instant::now() + WALL_LIMIT;
     let mut exit = Vec::new();
     while app.world().resource::<JourneyBench>().summary().is_none() {
@@ -239,6 +241,7 @@ fn run_to_summary(app: &mut App) -> (String, Vec<AppExit>) {
         std::thread::sleep(Duration::from_millis(1));
     }
     let summary = app.world().resource::<JourneyBench>().summary().unwrap();
+    record_summary(test, summary);
     (summary.to_string(), exit)
 }
 
@@ -261,7 +264,10 @@ fn a_route_set_flies_each_route_its_own_way_and_compares_like_with_like() {
         ..JourneyBenchConfig::new(60, true)
     };
     let mut app = journey_app(config);
-    let (summary, exit) = run_to_summary(&mut app);
+    let (summary, exit) = run_to_summary(
+        &mut app,
+        "a_route_set_flies_each_route_its_own_way_and_compares_like_with_like",
+    );
     println!("{summary}");
     assert!(!summary.contains("result: FAIL ("), "{summary}");
     assert!(summary.contains("\nroutes: Alps (46.5, 10 at 0 years) east, Alps west (46.5, 10 at 0 years) west; 3 journeys of a dive, 2 hops and a climb: Alps, Alps west, Alps\n"), "{summary}");
@@ -296,6 +302,11 @@ fn a_route_set_flies_each_route_its_own_way_and_compares_like_with_like() {
         .unwrap_or_else(|| panic!("{summary}"));
     assert!(
         cycles.contains("each route against its own first visit"),
+        "{cycles}"
+    );
+    // Judged as a headless run: 10% or the absolute floor, whichever is larger.
+    assert!(
+        cycles.ends_with(" (limit +10% or +8 MiB, the larger (headless floor)) -> PASS"),
         "{cycles}"
     );
     assert!(cycles.contains("; Alps west 1: "), "{cycles}");
@@ -341,7 +352,7 @@ fn failing_at_journey_2(keep_going: bool) -> JourneyBenchConfig {
 #[test]
 fn a_failed_gate_stops_the_journey_bench() {
     let mut app = journey_app(failing_at_journey_2(false));
-    let (summary, exit) = run_to_summary(&mut app);
+    let (summary, exit) = run_to_summary(&mut app, "a_failed_gate_stops_the_journey_bench");
     println!("{summary}");
     // Journey 1 flew whole; journey 2 ended with its first hop, whose route check failed.
     let hops: Vec<(u32, u32)> = app
@@ -386,7 +397,7 @@ fn a_failed_gate_stops_the_journey_bench() {
 #[test]
 fn keep_going_runs_every_journey() {
     let mut app = journey_app(failing_at_journey_2(true));
-    let (summary, exit) = run_to_summary(&mut app);
+    let (summary, exit) = run_to_summary(&mut app, "keep_going_runs_every_journey");
     println!("{summary}");
     assert_eq!(app.world().resource::<JourneyBench>().hops().len(), 6);
     let holds = summary
@@ -413,7 +424,7 @@ fn a_journey_run_reports_the_continental_pass() {
     let mut config = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
     config.journeys.truncate(1);
     let mut app = journey_app(config);
-    let (summary, _) = run_to_summary(&mut app);
+    let (summary, _) = run_to_summary(&mut app, "a_journey_run_reports_the_continental_pass");
     let line = summary
         .lines()
         .find(|l| l.starts_with("continental pass (0 ka): "))
@@ -437,6 +448,7 @@ fn a_failed_globe_ends_the_journey_bench() {
         .summary()
         .expect("a summary")
         .to_string();
+    record_summary("a_failed_globe_ends_the_journey_bench", &summary);
     assert!(
         summary.contains("result: FAIL (the globe failed: no adapter)"),
         "{summary}"

@@ -34,6 +34,8 @@
 pub mod journey;
 pub mod region;
 
+use std::path::{Path, PathBuf};
+
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
@@ -71,6 +73,32 @@ pub const MAX_MISSED_SHARE: f64 = 0.01;
 pub const MEDIAN_TOLERANCE: f32 = 0.05;
 /// Refresh rates tried when the display's own rate is unknown.
 const COMMON_REFRESH_HZ: [f32; 8] = [50.0, 60.0, 75.0, 90.0, 100.0, 120.0, 144.0, 165.0];
+
+/// The environment variable naming a folder for bench summaries: when set (and not empty), the
+/// headless bench tests write each run's summary there as `<test name>.txt`
+/// ([`record_summary`]), so CI keeps them (the dives' holds, the memory cycles) for later.
+pub const SUMMARY_DIR_ENV: &str = "TIMEFLY_BENCH_SUMMARY_DIR";
+
+/// Writes `summary` to `<dir>/<name>.txt` (creating `dir`, replacing the file) when `dir` is
+/// given, and returns the path. A failed write is reported on stderr, not raised: the file is a
+/// record, never a verdict.
+pub fn write_summary_file(dir: Option<&Path>, name: &str, summary: &str) -> Option<PathBuf> {
+    let dir = dir?;
+    let path = dir.join(format!("{name}.txt"));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, summary)) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            eprintln!("bench summary not written to {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// [`write_summary_file`] into the folder [`SUMMARY_DIR_ENV`] names; nothing when it is unset.
+pub fn record_summary(name: &str, summary: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os(SUMMARY_DIR_ENV).filter(|d| !d.is_empty())?;
+    write_summary_file(Some(Path::new(&dir)), name, summary)
+}
 
 /// The age at `elapsed_secs` into the scrub: linear in slider position, present to 540 Ma over
 /// [`SCRUB_SECS`], then back to the present; clamped outside `[0, 2 * SCRUB_SECS]`.
@@ -879,6 +907,26 @@ pub(crate) use crate::diagnostics::memory;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_summary_file_is_written_only_when_a_folder_is_given() {
+        let summary = "===== summary =====\nhold: dive 2500 ms (cycle 1) -> PASS\n";
+        assert_eq!(write_summary_file(None, "a_test", summary), None);
+        let dir = std::env::temp_dir().join(format!(
+            "timefly-summary-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let nested = dir.join("bench-summaries");
+        let path = write_summary_file(Some(&nested), "a_test", summary).expect("written");
+        assert_eq!(path, nested.join("a_test.txt"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), summary);
+        // A second run of the same test replaces its file.
+        write_summary_file(Some(&nested), "a_test", "again").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "again");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(SUMMARY_DIR_ENV, "TIMEFLY_BENCH_SUMMARY_DIR");
+    }
 
     #[test]
     fn scrub_bench_reports_percentiles() {

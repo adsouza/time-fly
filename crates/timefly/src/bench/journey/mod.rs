@@ -315,6 +315,15 @@ pub const HOLD_LIMIT_NATIVE_MS: f64 = 3_000.0;
 /// The tests check the script (stops, routes, summaries), not the hold's length; a hold that
 /// never ends still fails here, before a stage's [`STAGE_TIMEOUT_SECS`].
 pub const HOLD_LIMIT_HEADLESS_MS: f64 = 60_000.0;
+/// The headless tests' floor on the journey memory cycles' allowance (MiB): a repeat visit may
+/// grow by [`CYCLE_MEMORY_TOLERANCE`] or by this much, whichever is larger
+/// ([`JourneyBenchConfig::headless`]). Headless, with no renderer, the process holds about
+/// 30 MiB, so 10% is about 3 MiB, and what the allocator keeps from earlier tests in the same
+/// process moves it that much: one full-suite run read +3.4 MiB (29.4 → 32.8 MiB, +11.6%) on a
+/// visit that passed 3 of 3 alone. 8 MiB is over twice that swing, so it is not a verdict on
+/// noise, yet a repeat that kept a whole extra headless region would still fail. The game's
+/// bench (about 1 GiB natively, 10% about 100 MiB) has no floor.
+pub const HEADLESS_MEMORY_CYCLE_FLOOR_MIB: u64 = 8;
 /// The web's hold target, per transition (design §8, reported only).
 pub const HOLD_TARGET_WEB_MS: f64 = 8_000.0;
 /// The longest swap frame natively (design §11, gated).
@@ -615,6 +624,10 @@ pub struct JourneyBenchConfig {
     /// Each hold's native gate: [`HOLD_LIMIT_NATIVE_MS`] for the game's bench,
     /// [`HOLD_LIMIT_HEADLESS_MS`] for the headless tests ([`Self::headless`]).
     pub hold_limit_ms: f64,
+    /// The journey memory cycles' absolute floor (bytes): a repeat visit passes within the
+    /// larger of [`CYCLE_MEMORY_TOLERANCE`] and this. 0 for the game's bench (10% alone),
+    /// [`HEADLESS_MEMORY_CYCLE_FLOOR_MIB`] for the headless tests ([`Self::headless`]).
+    pub memory_cycle_floor_bytes: u64,
 }
 
 impl JourneyBenchConfig {
@@ -627,6 +640,7 @@ impl JourneyBenchConfig {
             exit_when_done,
             keep_going: false,
             hold_limit_ms: HOLD_LIMIT_NATIVE_MS,
+            memory_cycle_floor_bytes: 0,
         }
     }
 
@@ -639,15 +653,38 @@ impl JourneyBenchConfig {
             exit_when_done,
             keep_going: false,
             hold_limit_ms: HOLD_LIMIT_NATIVE_MS,
+            memory_cycle_floor_bytes: 0,
         }
     }
 
     /// The same run judged as the headless tests run it: holds at [`HOLD_LIMIT_HEADLESS_MS`],
-    /// every other gate as the bench's.
+    /// the journey memory cycles within the larger of 10% and
+    /// [`HEADLESS_MEMORY_CYCLE_FLOOR_MIB`], every other gate as the bench's.
     pub fn headless(self) -> Self {
         JourneyBenchConfig {
             hold_limit_ms: HOLD_LIMIT_HEADLESS_MS,
+            memory_cycle_floor_bytes: HEADLESS_MEMORY_CYCLE_FLOOR_MIB << 20,
             ..self
+        }
+    }
+
+    /// Whether a memory cycle that grew `grown` bytes over `base` passes: within
+    /// [`CYCLE_MEMORY_TOLERANCE`] of `base`, or within [`Self::memory_cycle_floor_bytes`].
+    fn cycle_growth_passes(&self, grown: f64, base: f64) -> bool {
+        grown <= (CYCLE_MEMORY_TOLERANCE * base).max(self.memory_cycle_floor_bytes as f64)
+    }
+
+    /// The memory cycles' limit as the summary names it: `+10%`, or headless
+    /// `+10% or +8 MiB, the larger`.
+    pub fn memory_cycle_limit(&self) -> String {
+        let pct = format!("+{:.0}%", CYCLE_MEMORY_TOLERANCE * 100.0);
+        if self.memory_cycle_floor_bytes == 0 {
+            pct
+        } else {
+            format!(
+                "{pct} or +{} MiB, the larger (headless floor)",
+                self.memory_cycle_floor_bytes >> 20
+            )
         }
     }
 
@@ -713,8 +750,9 @@ impl JourneyBenchConfig {
     /// visit. On the web the linear memory never shrinks, so after a larger route a repeat
     /// starts higher than its first visit did; like with like is what the repeats themselves
     /// added: each repeat visit's growth over the sample before it (the journey just before),
-    /// summed, against the memory before the route's first repeat, within
-    /// [`CYCLE_MEMORY_TOLERANCE`].
+    /// summed, against the memory before the route's first repeat. Either way a route passes
+    /// within [`CYCLE_MEMORY_TOLERANCE`], or within [`Self::memory_cycle_floor_bytes`] if larger;
+    /// the increase reported is the fraction either way.
     pub fn memory_cycle_verdicts(
         &self,
         on_globe: &[Option<u64>],
@@ -725,7 +763,10 @@ impl JourneyBenchConfig {
                 .by_route(on_globe)
                 .into_iter()
                 .filter_map(|(r, samples)| {
-                    memory_cycles_pass(&samples).map(|result| (r, samples.len(), result))
+                    let (_, increase) = memory_cycles_pass(&samples)?;
+                    let first = (samples[0]? as f64).max(1.0);
+                    let ok = self.cycle_growth_passes(increase * first, first);
+                    Some((r, samples.len(), (ok, increase)))
                 })
                 .collect();
         }
@@ -741,11 +782,8 @@ impl JourneyBenchConfig {
                     grown += on_globe[j]? as f64 - on_globe[j - 1]? as f64;
                 }
                 let increase = grown / base.max(1.0);
-                Some((
-                    r,
-                    visits.len(),
-                    (increase <= CYCLE_MEMORY_TOLERANCE, increase),
-                ))
+                let ok = self.cycle_growth_passes(grown, base.max(1.0));
+                Some((r, visits.len(), (ok, increase)))
             })
             .collect()
     }
@@ -2118,7 +2156,7 @@ fn finish(
             .collect::<Vec<_>>()
             .join(", ");
         out.push(format!(
-            "journey memory cycles ({}, on the globe after each climb{}): {listed}; {worst} (limit +{:.0}%) -> {}",
+            "journey memory cycles ({}, on the globe after each climb{}): {listed}; {worst} (limit {}) -> {}",
             cycle_memory_kind(),
             if web {
                 "; each repeat visit's own growth, as the memory only grows"
@@ -2127,7 +2165,7 @@ fn finish(
             } else {
                 "; each route against its own first visit"
             },
-            CYCLE_MEMORY_TOLERANCE * 100.0,
+            config.memory_cycle_limit(),
             gate_word(ok)
         ));
     }
