@@ -29,7 +29,12 @@ use timefly::time::TimePlugin;
 use timefly_core::hydrology::LatticeSizes;
 
 const STEP: Duration = Duration::from_micros(16_667);
-const WALL_LIMIT: Duration = Duration::from_secs(120);
+/// A hang guard, not a gate. The bench runs fixed-step, but its region jobs run in wall time, so
+/// a run's length follows the machine: `keep_going_runs_every_stop` (8 stops, 2 cycles) takes
+/// about 30 s on the M4's dev profile and passed 120 s on CI's `ci-test` profile (dependencies
+/// at opt-level 0) with the rivers milestone's heavier regions. 10 minutes stays well inside
+/// CI's 45-minute job timeout.
+const WALL_LIMIT: Duration = Duration::from_secs(600);
 /// Continental pass lattices small enough for a test: 6 × 16² nodes in recent eras, 6 × 8² in
 /// deep ones.
 const HYDRO_SIZES: LatticeSizes = LatticeSizes {
