@@ -22,6 +22,10 @@ pub use status::StatusUiPlugin;
 
 /// Space between the UI and the window edges.
 pub const GUTTER_PX: f32 = 16.0;
+/// The bug-shot button's size (px), in the window's top-right corner (Task 11c fix round 2).
+pub const CORNER_BUTTON_PX: Vec2 = Vec2::new(26.0, 20.0);
+/// The gap (px) between the button and the frame-rate readout just left of it, on its row.
+pub const CORNER_GAP_PX: f32 = 6.0;
 /// UI text.
 pub const TEXT_COLOR: Color = Color::srgb(0.93, 0.93, 0.95);
 /// Panels behind text.

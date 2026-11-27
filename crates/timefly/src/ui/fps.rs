@@ -5,7 +5,7 @@
 
 use bevy::prelude::*;
 
-use super::{GUTTER_PX, TEXT_COLOR};
+use super::{CORNER_BUTTON_PX, CORNER_GAP_PX, GUTTER_PX, TEXT_COLOR};
 
 /// Seconds of real time each shown rate averages over (and how often it changes).
 pub const FPS_REFRESH_S: f32 = 0.5;
@@ -37,7 +37,7 @@ struct FpsWindow {
     secs: f32,
 }
 
-/// The top-right frame-rate readout.
+/// The frame-rate readout, in the top-right corner just left of the bug-shot button.
 pub struct FpsOverlayPlugin;
 
 impl Plugin for FpsOverlayPlugin {
@@ -54,11 +54,14 @@ fn spawn_fps_overlay(mut commands: Commands) {
         Text::new(""),
         TextFont::from_font_size(14.0),
         TextColor(TEXT_COLOR),
+        // Just left of the bug-shot button in the corner, on its row: the button's height,
+        // the 14 px text (about 17 px a line) centred in it.
         Node {
             position_type: PositionType::Absolute,
             top: px(GUTTER_PX),
-            right: px(GUTTER_PX),
-            padding: UiRect::axes(px(8), px(3)),
+            right: px(GUTTER_PX + CORNER_BUTTON_PX.x + CORNER_GAP_PX),
+            height: px(CORNER_BUTTON_PX.y),
+            padding: UiRect::axes(px(8), px(1.5)),
             border_radius: BorderRadius::all(px(6)),
             ..default()
         },
@@ -130,8 +133,21 @@ mod tests {
             let (node, text) = q.single(world).unwrap();
             (node.clone(), text.0.clone())
         };
-        assert_eq!(node.top, px(crate::ui::GUTTER_PX));
-        assert_eq!(node.right, px(crate::ui::GUTTER_PX));
+        // Just left of the bug-shot button in the top-right corner, on its row, centred on it
+        // (fix round 2, the owner's request): the button's height, the button's width and a
+        // gap in from the gutter.
+        use crate::ui::{CORNER_BUTTON_PX, CORNER_GAP_PX, GUTTER_PX};
+        assert_eq!(node.position_type, PositionType::Absolute);
+        assert_eq!(node.top, px(GUTTER_PX));
+        assert_eq!(
+            node.right,
+            px(GUTTER_PX + CORNER_BUTTON_PX.x + CORNER_GAP_PX)
+        );
+        assert_eq!(node.height, px(CORNER_BUTTON_PX.y));
+        assert_eq!(
+            node.padding.top, node.padding.bottom,
+            "the text centred on the row"
+        );
         assert_eq!(text, "", "nothing measured before the first refresh");
         // Past one refresh interval at 60 updates a second.
         for _ in 0..40 {
