@@ -2325,6 +2325,7 @@ fn wesl_white_water_matches_rust() {
         "CREST_PATCH_BAND",
         "CREST_FLICKER_M",
         "CREST_FLICKER_RATE",
+        "CREST_FLICKER_PERIOD_S",
     ] {
         src += &format!("{}\n", wesl_const(WATER, c));
     }

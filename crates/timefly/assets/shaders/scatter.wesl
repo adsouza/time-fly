@@ -184,12 +184,14 @@ fn collar_shape(p: vec2<f32>, w: f32, wake: f32, surge: f32, breathe: f32, bloom
 
 // `collar_pulses` in boulders.rs: (surge, breathe, bloom) at time `t` (s) for a collar of seed
 // `seed`: the pillow surges between 0.85 and 1 and the wake breathes between 0.8 and 1, each two
-// incommensurate sines of 1.3–2.9 s; a boil blooms between 0.35 and 1 on its own 2–4 s cycle.
+// sines (`COLLAR_PULSE_PERIODS_S`); a boil blooms between 0.35 and 1 over a period its seed picks
+// (`BOIL_PERIODS_S`). Every period divides Bevy's hour-long time wrap.
 fn collar_pulses(t: f32, seed: u32) -> vec3<f32> {
     let phase = f32(seed & 255u) / 256.0;
-    let q = 0.6 * sin(TAU * (t / 1.3 + phase)) + 0.4 * sin(TAU * (t / 2.9 + 2.3 * phase));
-    let b = 0.55 * sin(TAU * (t / 1.7 + 1.7 * phase)) + 0.45 * sin(TAU * (t / 2.6 + 0.4 * phase));
-    let period = 2.0 + 2.0 * fract(7.13 * phase);
+    let q = 0.6 * sin(TAU * (t / 1.2 + phase)) + 0.4 * sin(TAU * (t / 3.0 + 2.3 * phase));
+    let b = 0.55 * sin(TAU * (t / 1.8 + 1.7 * phase)) + 0.45 * sin(TAU * (t / 2.4 + 0.4 * phase));
+    let k = (seed >> 2u) & 3u;
+    let period = select(select(2.0, 2.4, k == 1u), select(3.0, 3.6, k == 3u), k >= 2u);
     let bloom = 0.35 + 0.65 * (0.5 + 0.5 * sin(TAU * (t / period + phase)));
     return vec3<f32>(0.925 + 0.075 * q, 0.9 + 0.1 * b, bloom);
 }

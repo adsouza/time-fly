@@ -158,14 +158,27 @@ pub const STREAK_DIRECTIONS: f32 = 24.0;
 pub const FOAM_CREST_BAND: [f32; 2] = [0.05, 0.6];
 /// The crests' foam flickers in still noise cells this big (m)... A `water.wesl` constant.
 pub const CREST_FLICKER_M: f32 = 7.0;
-/// ...that change at this rate (cells a second). A `water.wesl` constant.
+/// ...that change at this rate (cells a second)... A `water.wesl` constant.
 pub const CREST_FLICKER_RATE: f32 = 0.8;
+/// ...looping over this period (s), which divides Bevy's hour-long time wrap
+/// ([`crate::art::TIME_WRAP_S`]): two phases half a period apart, cross-faded as the flow map's
+/// are. A `water.wesl` constant.
+pub const CREST_FLICKER_PERIOD_S: f32 = 10.0;
 
 /// How much of the crests' foam stands at `xz` at time `t` (s), 0 to 1 (fix round 5): still
 /// noise that changes with time, so crest foam flickers, breaks and re-forms while the crests
-/// stay put. Mirrored in `water.wesl`.
+/// stay put. Its time axis loops ([`CREST_FLICKER_PERIOD_S`]): two phases, each restarting
+/// while its weight is 0, their noise normalised by the weights' length so the contrast holds.
+/// Mirrored in `water.wesl`.
 pub fn crest_flicker(xz: Vec2, t: f32) -> f32 {
-    (0.55 + 0.6 * brush(xz, CREST_FLICKER_M, t * CREST_FLICKER_RATE, 251)).clamp(0.0, 1.0)
+    let p = CREST_FLICKER_PERIOD_S;
+    let a = (t / p).rem_euclid(1.0);
+    let b = (a + 0.5).rem_euclid(1.0);
+    let (wa, wb) = (1.0 - (2.0 * a - 1.0).abs(), 1.0 - (2.0 * b - 1.0).abs());
+    let na = brush(xz, CREST_FLICKER_M, a * p * CREST_FLICKER_RATE, 251);
+    let nb = brush(xz, CREST_FLICKER_M, b * p * CREST_FLICKER_RATE + 37.5, 251);
+    let n = (wa * na + wb * nb) / (wa * wa + wb * wb).sqrt();
+    (0.55 + 0.6 * n).clamp(0.0, 1.0)
 }
 /// Where the crests and streaks can't be resolved, a full rapid's foam fades to this, the mean
 /// of its foam up close: the crests' own plus [`FOAM_ROCK_SHARE`]
@@ -706,7 +719,10 @@ pub(crate) fn add_water_systems(app: &mut App) {
 
 /// The scene's water textures, when both exist: on a replace's swap frame the scene holds no
 /// water (its handles are empty, `Handle::default()`, which Bevy's default image answers to).
-fn scene_water(scene: &TerrainScene, images: &Assets<Image>) -> Option<[Handle<Image>; 2]> {
+pub(crate) fn scene_water(
+    scene: &TerrainScene,
+    images: &Assets<Image>,
+) -> Option<[Handle<Image>; 2]> {
     let ready = |h: &Handle<Image>| *h != Handle::default() && images.contains(h);
     (ready(&scene.inner_water) && ready(&scene.apron_water))
         .then(|| [scene.inner_water.clone(), scene.apron_water.clone()])
@@ -1370,7 +1386,10 @@ mod tests {
             "        flicker * (0.5 + 0.5 * crests) * (0.3 + 0.7 * streak),",
             "    ) * smoothstep(-0.5, 0.5, crest);",
             "    return rapid * mix(FOAM_MEAN, foam, resolve);",
-            "    return clamp(0.55 + 0.6 * brush(xz, CREST_FLICKER_M, t * CREST_FLICKER_RATE, 251u), 0.0, 1.0);",
+            "    let na = brush(xz, CREST_FLICKER_M, a * p * CREST_FLICKER_RATE, 251u);",
+            "    let nb = brush(xz, CREST_FLICKER_M, b * p * CREST_FLICKER_RATE + 37.5, 251u);",
+            "    let n = (wa * na + wb * nb) * inverseSqrt(wa * wa + wb * wb);",
+            "    return clamp(0.55 + 0.6 * n, 0.0, 1.0);",
             "fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32, warp: f32) -> vec2<f32> {",
             "            let a = TAU * fract(dot(xz - point, dir) / lambda + offset + warp);",
             "            let offset = f32(hash3(vec3<i32>(i32(cell.x), i32(cell.y), 0), 229u) >> 8u) / 16777216.0;",
@@ -1403,6 +1422,22 @@ mod tests {
     /// Fix round 5: the crests' foam flickers with time while the crests stay put. At a fixed
     /// point the flicker swings over seconds (its mean over time near its mean over space), and
     /// the standing waves take no time at all.
+    /// Bevy wraps `globals.time` every hour: the crests' flicker must not jump there.
+    #[test]
+    fn crest_flicker_is_continuous_across_the_time_wrap() {
+        assert_divides_wrap(CREST_FLICKER_PERIOD_S);
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "CREST_FLICKER_PERIOD_S"),
+            CREST_FLICKER_PERIOD_S
+        );
+        let (before, after) = (crate::art::TIME_WRAP_S - 0.005, 0.005);
+        for k in 0..200 {
+            let xz = Vec2::new(151_234.0 + 3.7 * k as f32, -87_321.0 + 2.9 * k as f32);
+            let jump = (crest_flicker(xz, before) - crest_flicker(xz, after)).abs();
+            assert!(jump < 0.03, "{xz}: flicker jumps {jump}");
+        }
+    }
+
     #[test]
     fn crest_foam_flickers_while_the_crests_stay() {
         let mut spread = 0.0f32;

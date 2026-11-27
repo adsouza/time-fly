@@ -324,9 +324,13 @@ pub struct ScatterWater {
 }
 
 impl ScatterWater {
-    /// Stand-ins until a region's scene exists: dry 2 × 2 water textures (a `u_int` binding
-    /// can't take the default image, which is a float one) and an empty terrain buffer.
-    pub fn placeholder(images: &mut Assets<Image>, buffers: &mut Assets<ShaderBuffer>) -> Self {
+    /// Stand-ins while no region's water is ready: dry 2 × 2 water textures (a `u_int` binding
+    /// can't take the default image, which is a float one) and an empty terrain buffer (the
+    /// default handle when there are no shader buffers: headless apps).
+    pub fn placeholder(
+        images: &mut Assets<Image>,
+        buffers: Option<&mut Assets<ShaderBuffer>>,
+    ) -> Self {
         use crate::terrain::material::{TerrainParams, terrain_buffer_bytes, water_image};
         use bevy::asset::RenderAssetUsages;
         use bevy::render::render_resource::BufferUsages;
@@ -338,7 +342,7 @@ impl ScatterWater {
         );
         buffer.buffer_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
         ScatterWater {
-            patches: buffers.add(buffer),
+            patches: buffers.map(|b| b.add(buffer)).unwrap_or_default(),
             inner_water: images.add(water_image(&dry)),
             apron_water: images.add(water_image(&dry)),
         }

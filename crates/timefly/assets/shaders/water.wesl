@@ -139,12 +139,13 @@ const STANDING_WAVE_CELL_M: f32 = 32.0;
 const STREAK_STRETCH: f32 = 4.0;
 // `STREAK_DIRECTIONS` in water.rs: the streaks' frames, this many evenly around the circle.
 const STREAK_DIRECTIONS: f32 = 24.0;
-// `FOAM_CREST_BAND`, `FOAM_MEAN`, `CREST_FLICKER_M`, `CREST_FLICKER_RATE` in water.rs: white water's
-// foam stands on the standing waves' crests, broken by the streaks, with lace off the troughs,
+// `FOAM_CREST_BAND`, `FOAM_MEAN`, `CREST_FLICKER_M`, `CREST_FLICKER_RATE`,
+// `CREST_FLICKER_PERIOD_S` in water.rs: white water's foam stands on the standing waves' crests, broken by the streaks, with lace off the troughs,
 // and fades to its mean where unresolved (`white_water_foam`).
 const FOAM_CREST_BAND: vec2<f32> = vec2<f32>(0.05, 0.6);
 const CREST_FLICKER_M: f32 = 7.0;
 const CREST_FLICKER_RATE: f32 = 0.8;
+const CREST_FLICKER_PERIOD_S: f32 = 10.0;
 const FOAM_MEAN: f32 = 0.19;
 // `CREST_WARP`, `CREST_NOISE_M`, `CREST_PATCH_BAND`, `CREST_WAVE_FLOOR` in water.rs: the
 // standing waves' still phase warp (wavelengths) and patches (`crest_warp`, `crest_patch`).
@@ -343,9 +344,18 @@ fn streaks(xz: vec2<f32>, dir: vec2<f32>, s: f32, footprint: f32, t: f32) -> f32
 
 // `crest_flicker` in water.rs: how much of the crests' foam stands at xz at time t (s), 0 to 1:
 // still noise about CREST_FLICKER_M across that changes with time, so crest foam flickers,
-// breaks and re-forms while the crests themselves stay put.
+// breaks and re-forms while the crests themselves stay put. Its time axis loops over
+// CREST_FLICKER_PERIOD_S (a divisor of the time wrap): two phases cross-faded as the flow map's.
 fn crest_flicker(xz: vec2<f32>, t: f32) -> f32 {
-    return clamp(0.55 + 0.6 * brush(xz, CREST_FLICKER_M, t * CREST_FLICKER_RATE, 251u), 0.0, 1.0);
+    let p = CREST_FLICKER_PERIOD_S;
+    let a = fract(t / p);
+    let b = fract(a + 0.5);
+    let wa = 1.0 - abs(2.0 * a - 1.0);
+    let wb = 1.0 - abs(2.0 * b - 1.0);
+    let na = brush(xz, CREST_FLICKER_M, a * p * CREST_FLICKER_RATE, 251u);
+    let nb = brush(xz, CREST_FLICKER_M, b * p * CREST_FLICKER_RATE + 37.5, 251u);
+    let n = (wa * na + wb * nb) * inverseSqrt(wa * wa + wb * wb);
+    return clamp(0.55 + 0.6 * n, 0.0, 1.0);
 }
 
 // `white_water_foam` in water.rs: the foam weight at a rapid, a standing-wave crest (−1 in a

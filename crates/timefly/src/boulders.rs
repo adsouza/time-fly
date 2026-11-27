@@ -58,7 +58,7 @@ use crate::scatter::{
 use crate::terrain::material::{PaletteKind, palette_image};
 use crate::terrain::view::full_sun_illumination;
 use crate::terrain::{TerrainScene, TerrainSceneSystems};
-use crate::water::{WATER_DEPTH_PULL, WATER_F0, WATER_PULL_M, WHITE_WATER};
+use crate::water::{WATER_DEPTH_PULL, WATER_F0, WATER_PULL_M, WHITE_WATER, scene_water};
 use bevy::render::storage::ShaderBuffer;
 
 /// Boulders are drawn out to this distance from the camera (m).
@@ -408,17 +408,29 @@ pub fn collar_shape(p: Vec2, w: f32, wake: f32, pulses: Vec3) -> f32 {
     }
 }
 
+/// The periods (s) of [`collar_pulses`]' sines: the surge's two, then the breath's two. Each
+/// divides Bevy's hour-long time wrap ([`crate::art::TIME_WRAP_S`]), so nothing jumps there.
+/// `scatter.wesl` literals.
+pub const COLLAR_PULSE_PERIODS_S: [f32; 4] = [1.2, 3.0, 1.8, 2.4];
+/// A boil's bloom period (s), picked by bits 2–3 of its seed; each divides the time wrap.
+/// `scatter.wesl` literals.
+pub const BOIL_PERIODS_S: [f32; 4] = [2.0, 2.4, 3.0, 3.6];
+/// The periods (s) of [`collar_foam`]'s fine and coarse flow-map layers (each divides the time
+/// wrap). `scatter.wesl` literals.
+pub const COLLAR_FOAM_PERIODS_S: [f32; 2] = [1.0, 1.6];
+
 /// A collar's pulses at time `t` (s) for its seed (low byte): (surge, breathe, bloom). The
-/// pillow surges between 0.85 and 1 and the wake breathes between 0.8 and 1, each two
-/// incommensurate sines of 1.3–2.9 s; a boil blooms between 0.35 and 1 on its own 2–4 s
-/// cycle. `scatter.wesl`'s `collar_pulses`.
+/// pillow surges between 0.85 and 1 and the wake breathes between 0.8 and 1, each two sines of
+/// [`COLLAR_PULSE_PERIODS_S`]; a boil blooms between 0.35 and 1 over one of
+/// [`BOIL_PERIODS_S`]. `scatter.wesl`'s `collar_pulses`.
 pub fn collar_pulses(t: f32, seed: u32) -> Vec3 {
     let tau = std::f32::consts::TAU;
+    let [q1, q2, b1, b2] = COLLAR_PULSE_PERIODS_S;
     let phase = (seed & 255) as f32 / 256.0;
-    let q = 0.6 * (tau * (t / 1.3 + phase)).sin() + 0.4 * (tau * (t / 2.9 + 2.3 * phase)).sin();
+    let q = 0.6 * (tau * (t / q1 + phase)).sin() + 0.4 * (tau * (t / q2 + 2.3 * phase)).sin();
     let b =
-        0.55 * (tau * (t / 1.7 + 1.7 * phase)).sin() + 0.45 * (tau * (t / 2.6 + 0.4 * phase)).sin();
-    let period = 2.0 + 2.0 * (7.13 * phase).fract();
+        0.55 * (tau * (t / b1 + 1.7 * phase)).sin() + 0.45 * (tau * (t / b2 + 0.4 * phase)).sin();
+    let period = BOIL_PERIODS_S[((seed >> 2) & 3) as usize];
     let bloom = 0.35 + 0.65 * (0.5 + 0.5 * (tau * (t / period + phase)).sin());
     Vec3::new(0.925 + 0.075 * q, 0.9 + 0.1 * b, bloom)
 }
@@ -454,8 +466,9 @@ pub fn foam_layer(m: Vec2, speed: f32, t: f32, period: f32, scale: Vec2, seed: u
 /// collar's own (offset by its seed). `scatter.wesl`'s `collar_foam`.
 pub fn collar_foam(m: Vec2, speed: f32, t: f32, seed: u32) -> f32 {
     let q = m + Vec2::new(seed as f32 * 3.7, seed as f32 * 1.9);
-    let fine = foam_layer(q, speed, t, 1.0, Vec2::new(0.35, 1.4), 211);
-    let coarse = foam_layer(q, 0.75 * speed, t, 1.6, Vec2::new(1.2, 4.8), 223);
+    let [fine_s, coarse_s] = COLLAR_FOAM_PERIODS_S;
+    let fine = foam_layer(q, speed, t, fine_s, Vec2::new(0.35, 1.4), 211);
+    let coarse = foam_layer(q, 0.75 * speed, t, coarse_s, Vec2::new(1.2, 4.8), 223);
     0.65 * fine + 0.5 * coarse
 }
 
@@ -627,6 +640,12 @@ pub struct RegionBoulders {
     pub collar_material: Handle<ScatterMaterial>,
     /// The scene grid whose boulders the sets hold.
     pub grid: Option<Arc<RegionGrid>>,
+    /// Dry stand-in water, bound while the scene has no water ready (a replace's swap frame,
+    /// the frame before its new water) and with no scene: the `u_int` water slots can't take
+    /// the default image, and an old region's water must not stay bound.
+    pub stand_in: ScatterWater,
+    /// The water both materials bind now.
+    pub bound: ScatterWater,
 }
 
 pub struct BoulderPlugin;
@@ -648,15 +667,12 @@ fn spawn_boulder_set(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
-    buffers: Option<ResMut<Assets<ShaderBuffer>>>,
+    mut buffers: Option<ResMut<Assets<ShaderBuffer>>>,
     mut materials: ResMut<Assets<ScatterMaterial>>,
 ) {
     let palette = images.add(palette_image());
-    // Stand-ins until the first region's scene (headless apps have no shader buffers).
-    let water = match buffers {
-        Some(mut buffers) => ScatterWater::placeholder(&mut images, &mut buffers),
-        None => ScatterWater::default(),
-    };
+    // Stand-ins until the first region's scene, and whenever it has no water ready.
+    let water = ScatterWater::placeholder(&mut images, buffers.as_deref_mut());
     // The look is a stand-in until the first region's.
     let look = ScatterLook {
         texel: UVec4::ZERO,
@@ -693,21 +709,44 @@ fn spawn_boulder_set(
         collars,
         collar_material,
         grid: None,
+        stand_in: water.clone(),
+        bound: water,
     });
 }
 
-/// Follows the terrain scene's grid: a new grid's boulders and collars replace the sets (and
-/// the boulders' look), and no scene empties them.
+/// Follows the terrain scene: both materials bind its water once it is ready and the dry
+/// stand-in otherwise, and a new grid's boulders and collars replace the sets (and the
+/// boulders' look); no scene empties them.
+///
+/// The water follows the handles, not the grid: a replace takes the scene's water on its swap
+/// frame (the grid already new) and makes the new water a frame later. The default image a
+/// taken handle leaves is a float one, which in a `u_int` slot is a wgpu validation error that
+/// quits the app. Binding the stand-in (uploaded at startup, so the bind group is rebuilt at
+/// once) also lets the old water's textures go on the swap frame, as the water's own material
+/// does (Task 7's hop memory).
 fn sync_boulders(
     mut commands: Commands,
     scene: Option<Res<TerrainScene>>,
     boulders: Option<ResMut<RegionBoulders>>,
+    images: Res<Assets<Image>>,
     mut materials: ResMut<Assets<ScatterMaterial>>,
 ) {
     let Some(mut boulders) = boulders else { return };
     let water = scene
         .as_ref()
-        .map(|s| ScatterWater::of(&s.buffer, &s.inner_water, &s.apron_water));
+        .and_then(|s| {
+            scene_water(s, &images)
+                .map(|[inner, apron]| ScatterWater::of(&s.buffer, &inner, &apron))
+        })
+        .unwrap_or_else(|| boulders.stand_in.clone());
+    if water != boulders.bound {
+        for handle in [&boulders.material, &boulders.collar_material] {
+            if let Some(mut m) = materials.get_mut(handle) {
+                water.bind(&mut m.extension);
+            }
+        }
+        boulders.bound = water;
+    }
     let grid = scene.map(|s| s.grid.clone());
     let same = match (&grid, &boulders.grid) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -723,14 +762,6 @@ fn sync_boulders(
             let (instances, collars) = region_scatter(g);
             if let Some(mut m) = materials.get_mut(&boulders.material) {
                 m.extension.look = boulder_look(g);
-            }
-            // Both bind the scene's water (the collars clip their foam at it).
-            if let Some(water) = &water {
-                for handle in [&boulders.material, &boulders.collar_material] {
-                    if let Some(mut m) = materials.get_mut(handle) {
-                        water.bind(&mut m.extension);
-                    }
-                }
             }
             info!(
                 boulders = instances.len(),
@@ -1137,6 +1168,35 @@ mod tests {
     /// Fix round 5 ("softer"): every edge ramps. Across an arm, at the pillow's rim and at the
     /// wake's end the shape climbs from 10% to 90% over at least 0.3 radii, and the coverage
     /// takes values between nothing and full across it (no step).
+    /// Bevy wraps `globals.time` every hour: the collars' animation must not jump there.
+    #[test]
+    fn collar_animation_is_continuous_across_the_time_wrap() {
+        use crate::art::{TIME_WRAP_S, assert_divides_wrap};
+        for p in COLLAR_PULSE_PERIODS_S
+            .into_iter()
+            .chain(BOIL_PERIODS_S)
+            .chain(COLLAR_FOAM_PERIODS_S)
+        {
+            assert_divides_wrap(p);
+        }
+        // Every boil period is used (bits 2–3 of the seed pick it).
+        let used: BTreeSet<u32> = (0..256u32)
+            .map(|s| BOIL_PERIODS_S[((s >> 2) & 3) as usize].to_bits())
+            .collect();
+        assert_eq!(used.len(), BOIL_PERIODS_S.len());
+        let (before, after) = (TIME_WRAP_S - 0.005, 0.005);
+        for seed in 0..256 {
+            let jump = (collar_pulses(before, seed) - collar_pulses(after, seed)).abs();
+            assert!(jump.max_element() < 0.03, "seed {seed}: pulses jump {jump}");
+            for k in 0..8 {
+                let m = Vec2::new(0.7 * k as f32 - 2.0, 1.3 * k as f32);
+                let jump =
+                    (collar_foam(m, 4.0, before, seed) - collar_foam(m, 4.0, after, seed)).abs();
+                assert!(jump < 0.05, "seed {seed}, {m}: foam jumps {jump}");
+            }
+        }
+    }
+
     #[test]
     fn collar_edges_are_soft() {
         let (w, wake) = (0.8, 10.0);
@@ -1351,9 +1411,10 @@ mod tests {
 }
 fn collar_pulses(t: f32, seed: u32) -> vec3<f32> {
     let phase = f32(seed & 255u) / 256.0;
-    let q = 0.6 * sin(TAU * (t / 1.3 + phase)) + 0.4 * sin(TAU * (t / 2.9 + 2.3 * phase));
-    let b = 0.55 * sin(TAU * (t / 1.7 + 1.7 * phase)) + 0.45 * sin(TAU * (t / 2.6 + 0.4 * phase));
-    let period = 2.0 + 2.0 * fract(7.13 * phase);
+    let q = 0.6 * sin(TAU * (t / 1.2 + phase)) + 0.4 * sin(TAU * (t / 3.0 + 2.3 * phase));
+    let b = 0.55 * sin(TAU * (t / 1.8 + 1.7 * phase)) + 0.45 * sin(TAU * (t / 2.4 + 0.4 * phase));
+    let k = (seed >> 2u) & 3u;
+    let period = select(select(2.0, 2.4, k == 1u), select(3.0, 3.6, k == 3u), k >= 2u);
     let bloom = 0.35 + 0.65 * (0.5 + 0.5 * sin(TAU * (t / period + phase)));
     return vec3<f32>(0.925 + 0.075 * q, 0.9 + 0.1 * b, bloom);
 }
@@ -1863,5 +1924,104 @@ fn collar_coverage(shape: f32, foam: f32) -> f32 {
             .get(palette)
             .unwrap();
         assert_eq!(image.data, palette_image().data);
+    }
+
+    /// The water both scatter materials bind (slots 102–104).
+    fn bound_water(app: &App) -> [ScatterWater; 2] {
+        let b = app.world().resource::<RegionBoulders>();
+        let materials = app.world().resource::<Assets<ScatterMaterial>>();
+        [&b.material, &b.collar_material].map(|h| {
+            let e = &materials.get(h).unwrap().extension;
+            ScatterWater::of(&e.patches, &e.inner_water, &e.apron_water)
+        })
+    }
+
+    /// The scene's water, once both textures exist (the water's own rule).
+    fn ready_scene_water(app: &App) -> Option<ScatterWater> {
+        let scene = app.world().get_resource::<TerrainScene>()?;
+        let images = app.world().resource::<Assets<Image>>();
+        crate::water::scene_water(scene, images)
+            .map(|[inner, apron]| ScatterWater::of(&scene.buffer, &inner, &apron))
+    }
+
+    /// A replace takes the scene's water on its swap frame and makes the new water a frame
+    /// later. The scatter materials' `u_int` water slots must never take the default image (a
+    /// float one: wgpu's `InvalidTextureSampleType`, which quits the app): they hold the dry
+    /// stand-in until the scene's water is ready, then the scene's, and the stand-in again once
+    /// the region is torn down (no old region's water kept alive on the globe).
+    #[test]
+    fn scatter_water_never_binds_the_default_image() {
+        let mut app = boulder_app();
+        app.update();
+        // Before any region: the stand-in, in both materials.
+        let [stand_in, collar_stand_in] = bound_water(&app);
+        assert_eq!(stand_in, collar_stand_in);
+        assert_ne!(stand_in.inner_water, Handle::default());
+        assert_ne!(stand_in.apron_water, Handle::default());
+        let check = |app: &App, frame: &str| {
+            for w in bound_water(app) {
+                assert_ne!(
+                    w.inner_water,
+                    Handle::default(),
+                    "{frame}: slot 103 default"
+                );
+                assert_ne!(
+                    w.apron_water,
+                    Handle::default(),
+                    "{frame}: slot 104 default"
+                );
+                match ready_scene_water(app) {
+                    Some(scene) => assert!(
+                        w == scene || w == stand_in,
+                        "{frame}: neither the scene's water nor the stand-in"
+                    ),
+                    None => assert_eq!(w, stand_in, "{frame}: not the stand-in while unready"),
+                }
+            }
+        };
+        let (a, b) = (rapids_grid(5, 0.0), rapids_grid(3, 40_000.0));
+        enter(&mut app, &a);
+        for k in 0..4 {
+            app.update();
+            check(&app, &format!("enter a, frame {k}"));
+        }
+        let water_a = ready_scene_water(&app).expect("a's water is ready");
+        assert_eq!(bound_water(&app), [water_a.clone(), water_a.clone()]);
+        // The hop: a replace at the same settings.
+        enter(&mut app, &b);
+        let mut unready = 0;
+        for k in 0..8 {
+            app.update();
+            check(&app, &format!("hop to b, frame {k}"));
+            let scene = app.world().resource::<TerrainScene>();
+            if scene.inner_water == Handle::default() {
+                unready += 1;
+            }
+            for w in bound_water(&app) {
+                assert_ne!(
+                    w.inner_water, water_a.inner_water,
+                    "a's water kept, frame {k}"
+                );
+                assert_ne!(
+                    w.apron_water, water_a.apron_water,
+                    "a's water kept, frame {k}"
+                );
+            }
+        }
+        assert!(
+            unready > 0,
+            "the fixture must reach a swap frame with no scene water"
+        );
+        let water_b = ready_scene_water(&app).expect("b's water is ready");
+        assert_ne!(water_b, water_a);
+        assert_eq!(bound_water(&app), [water_b.clone(), water_b.clone()]);
+        // Torn down: the stand-in again, no region's water held.
+        app.world_mut().remove_resource::<ActiveRegion>();
+        for k in 0..3 {
+            app.update();
+            check(&app, &format!("teardown, frame {k}"));
+        }
+        assert!(app.world().get_resource::<TerrainScene>().is_none());
+        assert_eq!(bound_water(&app), [stand_in.clone(), stand_in]);
     }
 }
