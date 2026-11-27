@@ -635,21 +635,38 @@ pub(super) struct DrawnTexel {
     pub river: [u16; 4],
 }
 
-/// The boulders of `sized` (a cluster's) that every lattice of [`DRAWN_LATTICES`] draws in the
-/// water, each marked `collar` where it is a foam site whose collar's footprint they all draw
-/// wet: a rock needs drawn water over its centre with a ribbon of its radius plus
-/// [`DRAWN_ROCK_MARGIN_M`](crate::terrain::drawn::DRAWN_ROCK_MARGIN_M), and wet a radius out on
-/// all four sides. Each cell (`cells`, with its corners' `texels`) is drawn exactly as a region
-/// draws its water, by [`blended_water`](crate::terrain::blended_water) over a 2 × 2 field of
-/// them. A pure function of the pass and the directions, so overlapping regions keep the same
-/// rocks.
+/// A rock that the drawn water doesn't hold where it was sized is moved toward its channel's
+/// centreline by these shares of its distance from it, the least first...
+pub(super) const FIT_MOVES: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+/// ...and, failing every move, shrunk by these shares of its radius, the least first, down to
+/// [`FIT_MIN_RADIUS_M`] (Task 11c fix round 3).
+pub(super) const FIT_SHRINKS: [f64; 6] = [1.0, 0.8, 0.65, 0.5, 0.35, 0.2];
+/// The smallest a fitted rock may be (m): Task 6's least radius. A rock that doesn't fit at it
+/// is dropped.
+pub(super) const FIT_MIN_RADIUS_M: f64 = 0.4;
+
+/// The boulders of `sized` (a cluster's) fitted to the water every lattice of
+/// [`DRAWN_LATTICES`] draws, each marked `collar` where it is a foam site whose collar's
+/// footprint they all draw wet. A rock fits where every lattice draws its centre wet with a
+/// ribbon of its radius plus [`DRAWN_ROCK_MARGIN_M`](crate::terrain::drawn::DRAWN_ROCK_MARGIN_M)
+/// and [`DRAWN_SPREAD_FACTOR`](crate::terrain::drawn::DRAWN_SPREAD_FACTOR) times the lattices'
+/// disagreement there, and wet a radius out on all four sides. One that doesn't fit where it was
+/// sized is tried at [`FIT_SHRINKS`] of its radius (the largest first, not below
+/// [`FIT_MIN_RADIUS_M`]), each at [`FIT_MOVES`] of the way across to its channel's centreline
+/// (the least first; across is square to its flow, its distance from the centreline its river
+/// texel's offset); the first that fits is kept, re-seated on the bed read by `bed` there, and
+/// the rock is dropped only if none does (fix round 3). Each cell (`cells`, with its corners'
+/// `texels`) is drawn exactly as a region draws its water, by
+/// [`blended_water`](crate::terrain::blended_water) over a 2 × 2 field of them. A pure function of
+/// the pass and the directions, so overlapping regions keep the same rocks.
 pub(super) fn hold_in_drawn_water(
     spec: RegionSpec,
     centre: DVec3,
     texel_m: f64,
     cells: &[DrawnCell],
     texels: &[[DrawnTexel; 4]],
-    sized: Vec<Boulder>,
+    sized: Vec<(Boulder, BoulderBed)>,
+    bed: &dyn Fn(DVec3) -> BoulderBed,
 ) -> Vec<Boulder> {
     use crate::terrain::blended_water;
     use crate::terrain::drawn::{DRAWN_ROCK_MARGIN_M, DRAWN_SPREAD_FACTOR, collar_footprint};
@@ -677,7 +694,7 @@ pub(super) fn hold_in_drawn_water(
             }
         })
         .collect();
-    // Metres east and south of the centre.
+    // Metres east and south of the centre, and back.
     let tangent = |d: DVec3| {
         let v = (d - centre) * EARTH_RADIUS_M;
         (v.dot(east), -v.dot(north))
@@ -687,9 +704,9 @@ pub(super) fn hold_in_drawn_water(
         let w = blended_water(g, x, z);
         (w.thickness_m > 0.0 && w.ribbon_m >= 0.0, w.ribbon_m)
     };
-    // A footprint point: wet on every lattice, the least ribbon reaching the margin past it and
-    // DRAWN_SPREAD_FACTOR times as much again as the lattices disagree.
-    let wide = |e: f64, s: f64| {
+    // Every lattice wet at (e, s); the least ribbon less DRAWN_SPREAD_FACTOR times their
+    // disagreement (where the lattices disagree, a region's own may draw the bank farther in).
+    let held = |e: f64, s: f64| {
         let (mut lo, mut hi, mut all_wet) = (f64::MAX, f64::MIN, true);
         for (g, cell) in grids.iter().zip(cells) {
             let (is_wet, ribbon) = wet(g, cell, e, s);
@@ -697,40 +714,62 @@ pub(super) fn hold_in_drawn_water(
             lo = lo.min(f64::from(ribbon));
             hi = hi.max(f64::from(ribbon));
         }
-        all_wet && lo - DRAWN_SPREAD_FACTOR * (hi - lo) >= DRAWN_ROCK_MARGIN_M
+        all_wet.then_some(lo - DRAWN_SPREAD_FACTOR * (hi - lo))
+    };
+    let fits = |e: f64, s: f64, r: f64| {
+        held(e, s).is_some_and(|ribbon| ribbon >= r + DRAWN_ROCK_MARGIN_M)
+            && [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
+                .iter()
+                .all(|&(de, ds)| held(e + de, s + ds).is_some())
     };
     sized
         .into_iter()
-        .filter_map(|b| {
+        .filter_map(|(b, b_bed)| {
             let (e, s) = tangent(b.dir);
             let r = f64::from(b.radius_m);
-            // The lattices' ribbons over the centre: the least must hold the rock with the
-            // margin to spare, and with DRAWN_SPREAD_FACTOR times as much again as they disagree
-            // (where the lattices disagree, a region's own may draw the bank farther in still).
-            let mut ribbons = Vec::with_capacity(cells.len());
-            let mut all_wet = true;
-            for (g, cell) in grids.iter().zip(cells) {
-                let (centre_wet, ribbon) = wet(g, cell, e, s);
-                all_wet &= centre_wet
-                    && [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
-                        .iter()
-                        .all(|&(de, ds)| wet(g, cell, e + de, s + ds).0);
-                ribbons.push(f64::from(ribbon));
-            }
-            let (lo, hi) = ribbons
+            // Toward the centreline: square to the flow, the offset's sign saying which side
+            // (positive on the left of travel). No flow: it can only shrink.
+            let [_, fe, fnorth, offset] = decode_river(b_bed.river);
+            let flow = bevy_math::DVec2::new(f64::from(fe), -f64::from(fnorth)).try_normalize();
+            // Left of travel, in (east, south): the flow turned a quarter anticlockwise seen from
+            // above, which is (−south, east) in these axes.
+            let to_centre = flow.map(|f| bevy_math::DVec2::new(f.y, -f.x) * -f64::from(offset));
+            let (fit_e, fit_s, fit_r) = FIT_SHRINKS
                 .iter()
-                .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
-            let rock = all_wet && lo - DRAWN_SPREAD_FACTOR * (hi - lo) >= r + DRAWN_ROCK_MARGIN_M;
-            if !rock {
-                return None;
-            }
-            let down = bevy_math::DVec2::new(f64::from(b.flow_mps[0]), -f64::from(b.flow_mps[1]))
-                .try_normalize();
-            let collar = b.foam_site().is_some()
-                && collar_footprint(e, s, b.radius_m, down)
+                .map(|k| r * k)
+                .filter(|&rr| rr >= FIT_MIN_RADIUS_M.min(r))
+                .find_map(|rr| {
+                    FIT_MOVES
+                        .iter()
+                        .filter(|&&m| m == 0.0 || to_centre.is_some())
+                        .map(|&m| {
+                            let v = to_centre.unwrap_or_default() * m;
+                            (e + v.x, s + v.y, rr)
+                        })
+                        .find(|&(fe, fs, rr)| fits(fe, fs, rr))
+                })?;
+            let fitted = if (fit_e, fit_s, fit_r) == (e, s, r) {
+                b
+            } else {
+                let v = east * (fit_e - e) - north * (fit_s - s);
+                let len = v.length();
+                let dir = if len > 0.0 {
+                    offset_point(b.dir, v / len, len)
+                } else {
+                    b.dir
+                };
+                boulder(dir, fit_r as f32, b.seed, &bed(dir))
+            };
+            let down = bevy_math::DVec2::new(
+                f64::from(fitted.flow_mps[0]),
+                -f64::from(fitted.flow_mps[1]),
+            )
+            .try_normalize();
+            let collar = fitted.foam_site().is_some()
+                && collar_footprint(fit_e, fit_s, fitted.radius_m, down)
                     .iter()
-                    .all(|p| wide(p.x, p.y));
-            Some(Boulder { collar, ..b })
+                    .all(|p| held(p.x, p.y).is_some_and(|ribbon| ribbon >= DRAWN_ROCK_MARGIN_M));
+            Some(Boulder { collar, ..fitted })
         })
         .collect()
 }

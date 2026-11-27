@@ -1988,6 +1988,63 @@ mod water {
         }
     }
 
+    /// Fix round 3: a rock the drawn water doesn't hold is moved toward the channel's centre and
+    /// shrunk until it fits, not dropped. A narrow (22 m, Q 20) steep river on a course that
+    /// kinks at every node keeps most of its clusters away from the apron-blend band: at least
+    /// 74% of those sized there keep most of their rocks. Round 2's drop-only rule kept 68%; with
+    /// the fitting, 77% (11,825 of 15,362 rocks). The rest sit by kinks, where the lattices
+    /// disagree by more than the channel holds, even at its centreline.
+    #[test]
+    fn narrow_kinked_rapids_keep_their_clusters() {
+        let frame = RegionFrame {
+            center: dir(20.0, 30.0),
+        };
+        let (hydro, floor) = rivers_along(
+            CubeLattice { n: 900 },
+            frame,
+            &[-15_000.0, 37_000.0],
+            20.0,
+            0.03,
+        );
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let c = frame.local_to_dir(20_000.0, 0.0);
+        let g = RegionGenerator::new(spec_at(c, 0.0, 1025, 513), &field, Some(&hydro));
+        let band = REGION_SIZE_M / 2.0 - 4.0 * APRON_SIZE_M / 512.0;
+        let basis = g.spec().frame().basis();
+        let interior = |d: DVec3| {
+            basis
+                .dir_to_local(RenderDir(d))
+                .is_some_and(|(x, z)| x.abs().max(z.abs()) < band - 100.0)
+        };
+        let kept: std::collections::BTreeSet<u32> = g.boulders().iter().map(|b| b.seed).collect();
+        // A cluster is kept when most of its members are: its rocks stay together.
+        let (mut sized, mut holding, mut rocks, mut rocks_kept) = (0, 0, 0, 0);
+        for (c, members) in clusters_of(&g) {
+            if !interior(c.centre()) || members.is_empty() {
+                continue;
+            }
+            let n = members.iter().filter(|m| kept.contains(&m.seed)).count();
+            sized += 1;
+            holding += usize::from(2 * n > members.len());
+            rocks += members.len();
+            rocks_kept += n;
+        }
+        let share = holding as f64 / sized as f64;
+        println!(
+            "{holding} of {sized} clusters keep most of their rocks ({share:.2}); \
+             {rocks_kept} of {rocks} rocks"
+        );
+        assert!(sized > 500, "{sized} clusters");
+        assert!(
+            share >= 0.74,
+            "only {holding} of {sized} clusters keep most of their rocks"
+        );
+    }
+
     /// The continent's pass and a dense region at `inner`/`apron` resolution.
     fn continent_region(
         inner: u32,
@@ -2785,7 +2842,8 @@ mod water {
                     texel_m,
                     &cells,
                     &texels,
-                    sized.clone(),
+                    sized.iter().copied().zip(beds.iter().copied()).collect(),
+                    &bed,
                 );
                 held_all.extend(held.into_iter().filter(inside));
                 (c, sized.into_iter().filter(inside).collect())

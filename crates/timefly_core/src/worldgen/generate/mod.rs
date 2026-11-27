@@ -684,7 +684,16 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
                 })
             })
             .collect();
-        water::hold_in_drawn_water(self.spec, cluster.centre(), texel_m, &cells, &texels, sized)
+        let with_beds = sized.into_iter().zip(beds.iter().copied()).collect();
+        water::hold_in_drawn_water(
+            self.spec,
+            cluster.centre(),
+            texel_m,
+            &cells,
+            &texels,
+            with_beds,
+            &bed,
+        )
     }
 
     /// Work units done so far (planning points, lattice nodes, river sub-points, boulders and

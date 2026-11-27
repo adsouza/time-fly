@@ -526,6 +526,23 @@ The check reads 64 more texels for each kept cluster, on the region job's prep t
 costs the Himalayas about +320 ms of prep, which is not on a frame. The cap guard stayed silent
 everywhere.
 
+### Fix round 3: rocks fitted to the drawn water
+
+A rock the drawn water doesn't hold is now moved toward its channel's centreline and shrunk
+until it fits, down to 0.4 m; only then is it dropped. The keep fraction stays 0.6.
+
+| Bench region | Boulders | Share of `MAX_BOULDERS` | Collars | Placement | Prep (region job) |
+|---|---|---|---|---|---|
+| Himalayas (0 ka) | 9,015 | **55%** | 3,001 | 1.31 ms | 648 ms (536 ms in round 2) |
+| Indus tributaries (0 ka) | 1,175 | 7% | 417 | 0.31 ms | 283 ms |
+| Rockies ice margin (21 ka) | 621 | 4% | 214 | 0.21 ms | 453 ms |
+| Japan (1 Ma) | 5 | 0% | 3 | 0.12 ms | 1,746 ms |
+| Pangaea, Red Sea, Sundaland, Beringia, Panama | 0 | 0% | 0 | ≤ 0.13 ms | 102–277 ms |
+
+The cap guard stayed silent everywhere. The fitting re-reads one texel for each moved rock, and
+its tries run on the emulated cells, not on new texels: the Himalayas' prep grew by about
+110 ms.
+
 ## Tiles, the continental pass and boulders per bench region (native)
 
 `region_tour … shaded 3000` at each bench region's centre, 640 × 360, rivers on and with
