@@ -139,20 +139,19 @@ and white water (11c).
 - [ ] Rocks break the surface in clusters, with a foam collar on each, piling white on the
       upstream face and trailing downstream.
 - [ ] Standing waves hold still while the foam runs through them.
-- [ ] The amount of white is right (your "less white" of 2026-11-26: foam on the crests and in
-      the rocks' wakes, about a fifth of the water at a full rapid).
-- [ ] From afar a rapid reads pale, not white (`FOAM_MEAN` 0.28): is that right, or should
+- [ ] The amount of white is right (your "softer, whiter wakes" of 2026-11-27: white at the
+      rocks, 10–28% of the water at the wide reference poses, crests sparse and irregular).
+- [ ] From afar a rapid reads pale, not white (`FOAM_MEAN` 0.19): is that right, or should
       distant rapids read whiter? ______
 
-**This shot predates Task 11c's rounds 2–5** (rocks held to the drawn water, the rock-driven,
-animated white water); a render at the final HEAD replaces it in Task 12's fix round 1, after
-Task 11c's round 6. At `9814212` some rocks sat on the bank beside the drawn water; that is
-fixed since round 2.
-
-Shot: `render-rapid-closeup.jpg` (a crop of a 3840 × 2160 frame at 150 m). Foam streaks and
-rock clusters with collars up close. Note for this check: farther up the reach the standing
-waves read as regular, evenly spaced stripes across the channel (a ladder pattern), and the
-river lies on a smooth grassy slope with no visible banks or gorge at this place.
+Shot: `render-rapid-closeup.jpg`, re-rendered at the final HEAD (`385bdfc`, Task 11c's round 6;
+a crop of a 3840 × 2160 frame at 150 m). Every rock in view sits in the drawn water (since 11c's
+round 2; at `9814212` some sat on the bank). The near breaker trails one broad, solid white wake
+downstream, a fluffy triangle with a feathered edge: the round-5 look the owner shipped
+("Ship, tune later"), with lacier wakes a follow-up. Two small clusters with short wakes sit
+farther up. The background crest foam is sparse and irregular (the old ladder of white stripes
+is gone), though the distant reach still shows fine, regular ripples across the flow. The river
+lies on a smooth grassy slope with no visible banks or gorge at this place.
 
 ### 10. Hells Canyon: the Snake in its canyon
 

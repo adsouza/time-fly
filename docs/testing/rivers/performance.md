@@ -34,7 +34,7 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory
 | `--region-bench` run 1 (first launch) | FAIL (exit 3): R14 in Sundaland, Beringia, the Rockies (and its globe pan) and Panama, during the other session's build and a display change mid-run; everything else passes |
 | `--journey-bench` run 2 (judged) | **FAIL (exit 3) on hop memory alone: the first hop +78.1 MiB** against +64; every other hop +22.0 to +45.4 MiB; every other gate passes (holds, flight, swap worst frame 33.75 ms, route checks, journey memory +3.5%) |
 | `--journey-bench` run 1 | FAIL (exit 3) on hop memory alone: the first hop +72.0 MiB; the others +44.4 to +54.8 MiB (uncapped, which reads higher, as Task 7 found) |
-| Hop-memory baseline (owner, 2026-11-27: "Fix the hop-memory baseline") | **Changed in Task 12's fix round 1** (`bffa796`): the native gate judges a hop against the highest footprint of the flight before it, not the last flying frame. **The two journey runs under it are pending** (they wait for Task 11c's round 6, which fixes a crash on a hop); see "The baseline, fixed" below |
+| Hop-memory baseline (owner, 2026-11-27: "Fix the hop-memory baseline") | **Changed in Task 12's fix round 1** (`bffa796`): the native gate judges a hop against the highest footprint of the flight before it, not the last flying frame. **Re-run at the final HEAD (`385bdfc`) under it: hop memory PASSES in every run** (worst +32.6, +30.5 and +41.5 MiB). Run 1 PASS; run 2 FAIL on the Andes flight alone (uncapped p95 16.81 ms against 16.67, 50 missed frames), not repeated in run 1 or a third run (PASS). See "Journey bench at the final HEAD" below |
 | Hop-memory escalation (plan Step 3) | (1) `APRON_RIVER_MIN_DISCHARGE_M3S` 200 → 1,000, two runs: **still FAIL** (worst +71.0 and +64.5 MiB, again on hops whose baseline fell into a trough). (2) Dropping the CPU river array after upload: already in place since Task 7 (`free_rivers`). **The gate is the owner's call** (below) |
 | `--scrub-bench` (one run) | **PASS** (display-paced; older 16.70 / 18.47 / 32.12 ms, 0.08% missed; younger 16.68 / 18.41 / 22.52 ms) |
 | The continental pass, native (target ≤ 1,000 ms, reported) | 0 ka 1,033–1,449 ms wall; 21 ka 1,099–1,231 ms; deep eras 433–755 ms: **over the native target at 0 ka and 21 ka** (Task 10: 930–1,050 ms), under it deep |
@@ -164,8 +164,41 @@ web on the last flying frame). The old rule fails the first and the third.
 
 Under the new baseline, run 2's hops read: hop 1 1,106.3 − 1,299.2 = −192.9 MiB, hop 2 +45.3
 (its leg flew at 1,061.0), and every later hop at most what it read before (the new baseline is
-never below the last flying frame), so at most +45.4: by the trace, the run would pass. **The two native journey runs under the new code are pending** (Task 11c's round 6
-first: at `03d96b9` the app can quit on the first hop).
+never below the last flying frame), so at most +45.4: by the trace, the run would pass. The journey runs under the new code follow.
+
+#### Journey bench at the final HEAD under the new baseline (Task 12's fix round 1)
+
+HEAD `385bdfc` (Task 11c's round 6, after this round's `bffa796`), `release`, launched through
+the scratch `.app` with `open` (window in front, the 4K monitor: 2560 × 1440, **uncapped** in
+all three runs, medians 12.0–12.2 ms; GPU readings 8–15 ms, so the main pass was drawn), a fresh
+`TIMEFLY_LOG_DIR` each, `--keep-going`. 1-minute load averages at the starts: run 1 16.4 (it started
+right after the release build), run 2 2.6, run 3 3.2. The binary holds the new summary
+text (`grep -a -c "its leg's highest"` = 1).
+
+| | Run 1 (judged) | Run 2 (judged) | Run 3 (extra) | Round-6 implementer's run (supporting) |
+|---|---|---|---|---|
+| Exit, result | 0, **PASS** | 3, **FAIL: flight** | 0, **PASS** | 0, PASS |
+| Holds (≤ 3,000 ms) | dives 404–720, hops 45–69, climbs 26–39 ms: PASS | PASS | dives 400–725 ms: PASS | PASS |
+| Flight per route (uncapped rule, p95 ≤ 16.67 ms) | Andes 12.89 / 15.52 / 37.20 (4 missed), Grand Canyon 12.27 / 14.20, Mt Fuji 9.49 / 12.31: PASS; Pangaea 15.31 / 18.06, FAIL reported only | **Andes 12.85 / p95 16.81 / 55.51 ms, 50 missed: FAIL**; Grand Canyon, Mt Fuji PASS; Pangaea FAIL reported only | Andes 12.73 / 15.98 (10 missed), Grand Canyon 12.96 / 16.60, Mt Fuji 9.48 / 12.77: PASS; Pangaea FAIL reported only | PASS (uncapped, median 12.09 ms) |
+| Swap worst frame (≤ 100 ms) | 20.20 ms | 23.01 ms | 21.20 ms | 19.99 ms |
+| **Hop memory (≤ +64 MiB over the leg's flight)** | **PASS, worst +32.6** | **PASS, worst +30.5** | **PASS, worst +41.5** | PASS, worst +43.2 |
+| Each hop, new [old baseline] | +31.9 [+32.3], +26.8 [+26.8], +22.3 [+23.0], −0.3 [+0.2], +27.3 [+28.4], +25.1 [+25.4], +28.4 [+29.6], +32.6 [+33.0], +21.3 [+21.9], +22.3 [+22.6] | **−253.9 [+68.9]**, +27.8 [+28.0], +21.6 [+22.9], +22.6 [+23.4], +24.2 [+25.3], +26.1 [+26.4], +29.7 [+30.8], +30.5 [+30.9], +20.8 [+22.5], +21.5 [+21.8] | −144.5 [+10.2], +24.6 [+24.7], +21.7 [+23.1], +23.0 [+23.2], −2.7 [+28.3], +25.4 [+25.6], +41.5 [+42.7], +28.6 [+29.3], +21.1 [+22.8], +22.6 [+22.7] | first hop +32.0 [+32.1] |
+| Route checks; journey memory cycles | PASS; Andes −6.3% | PASS; Andes +3.5% | PASS; Andes +5.8% | PASS; Andes +5.6% |
+| Continental pass, 0 ka / 250 Ma (wall ms) | 1,141 / 639 | 1,162 / 652 | — | — |
+
+**What the new baseline changed.** Run 2's first hop is the trough case again: the old baseline
+read **+68.9 MiB, which would have failed** the gate; against the leg's flight it is −253.9 MiB
+(the hop peaked 254 MiB under the flight). Every other hop reads within 0–1.7 MiB of its old
+figure, except run 3's Grand Canyon hop 1 (−2.7 against +28.3, another smaller trough). No hop in
+the four runs came within 20 MiB of the gate.
+
+**Run 2's flight failure.** The Andes route's uncapped p95 read 16.81 ms against the uncapped
+rule's 16.67, with 50 frames over 25 ms; run 1 read 15.52 ms (4 missed) and run 3 15.98 ms (10
+missed) on the same binary, and the round-6 run passed too. It is a gated failure on one of the
+two judged runs, so it is recorded as such; it looks like a disturbance in that session (an
+activity log ran only during run 3, so run 2's cause can't be shown). Uncapped runs on this 4K
+monitor sit close to the rule (Andes medians 12.7–12.9 ms, p95 15.5–16.8 ms), unlike the
+display-paced runs on the 1080p display, where the paced rule applies.
 
 **`MAX_BOULDERS` stays 16,384.** Task 11c's ruling let it rise to 32,768 only if this task's hop
 memory stayed under the gate; it did not.
@@ -259,12 +292,14 @@ this run changed only rocks and the water's look, not the pass.)
 
 ### Chrome WebGPU (Task 12, Step 2): PENDING, the controller's run in the owner's Chrome
 
-**The build** (Task 12): `web-release` (wasm32, no features) of HEAD `9814212`, built 2026-11-26:
+**The build** (Task 12's fix round 1): `web-release` (wasm32, no features) of HEAD `385bdfc`
+(Task 11c's round 6, after this task's `bffa796`), built 2026-11-27:
 
-- `timefly-task12.wasm`, 73,887,711 bytes, sha256
-  `1f352c216bf85569ba76941417b6286bb206462a905d9ae1542b6708c430f943`;
-- `grep -a -c 'fn white_water_foam'` finds 1 (Task 11c's fix round, the last code commit; the
-  shaders are embedded), and `grep -a -c 'Indus tributaries'` finds 1.
+- `timefly-task12-fr1.wasm`, 73,925,135 bytes, sha256
+  `2d13e17468e94a6b10506868aa7bdf3fee0b79e7399362cd800566a8e21a1aa7`;
+- `grep -a -c CREST_FLICKER_PERIOD_S` finds 4 (a WESL constant new in round 6; the shaders are
+  embedded), `'fn white_water_foam'` 1 and `'Indus tributaries'` 1. (The first round's build of
+  `9814212` is superseded.)
 
 Serve it as in Task 10's Chrome section below (`cd <root with assets/>; wasm-server-runner <wasm>`, then
 `http://127.0.0.1:1334/?region-bench` and `?journey-bench` in an Incognito window, in front,
