@@ -1462,4 +1462,13 @@ Disk-guard bookkeeping is left out, as in M3.
 
 - **The native gate keeps +64 MiB; its baseline becomes the flight before the hop**, not the sample at the hop's start, which lands in macOS's reclaim trough. What the gate means: a hop does not raise peak memory above flight.
   - As built (Task 12's fix round 1, the implementer's call): the baseline is the **highest** footprint flown on the hop's leg (`FlightLeg`: since the region was entered or the last hop began), not a median or maximum over the last few seconds. The trace showed the trough arriving eight seconds before the first hop (1,296.9 → 1,231 → 1,028 MiB while cruising), so any window of the last few seconds sat wholly inside it. The maximum is "peak over flight"; the footprint is a slow, steady series within a leg, so a spike isn't a practical risk. The last flying frame's figure is still logged, labelled, and the web keeps M3's growth rule on it.
-  - Cost if wrong: a real hop growth hidden by a high flight footprint earlier on the same leg (just after a dive, with the pass's working set still resident).
+  - Cost if wrong: a real hop growth hidden by a high flight footprint earlier on the same leg, by up to the gap between that footprint and the hop's start: about 190 MiB just after a dive, with the pass's working set still resident (the recorded first hops peaked 193 MiB at `9814212` and 254 MiB at `385bdfc` under their legs' peaks; `docs/testing/rivers/performance.md`).
+
+**The final review's fix wave (2026-11-27)**
+
+- **The climate grids are baked and packaged by CI**: Pages and the Linux packages cache `crates/timefly/assets/data/climate` under shared keys (`data/sources.json` and `tools/bake/**`), run `timefly-bake climate` on a miss, and stage it with `packaging/stage_climate.py`, which leaves `bake.log` out and fails a package without all 35 grids.
+  - Why: the bake folder is git-ignored and neither workflow baked it, so every shipped build ran on the zonal climate (`ClimateIndex::fail`), not the Beyer grids every verification used.
+  - Cost: about 40 MB of figshare range reads on a cache miss.
+- **The headless journey tests judge holds by their own limit** (`HOLD_LIMIT_HEADLESS_MS`, 60 s, through `JourneyBenchConfig::headless`); `--journey-bench` keeps the native 3 s gate.
+  - Why: at a fixed step a hold counts updates while the jobs run in wall time, so its length follows the machine's load; the tests check the script, not the hold.
+  - Cost if wrong: a hold regression under 60 s goes unnoticed by the tests; the real bench still gates it.

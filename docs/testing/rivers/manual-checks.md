@@ -22,15 +22,18 @@ in a region; without it the game starts on the globe.
 to the globe; `[` and `]` step to the older and younger snapshot. The HUD shows the altitude,
 the latitude and longitude, and a compass rose.
 
-**Reporting a problem: press `F12`** (`fn`+`F12` on Apple keyboards, or the camera button under
-the compass). The game saves a bug shot, a PNG and a JSON sidecar with the place, the era and the
+**Reporting a problem: press `F12`** (`fn`+`F12` on Apple keyboards, or the camera button in
+the window's top-right corner, with the frame-rate readout just left of it). The game saves a bug shot, a PNG and a JSON sidecar with the place, the era and the
 view, in `~/Pictures/Time Fly/`. Send the pair; `--from-shot <sidecar.json>` starts the game at
 that pose, so the builder sees what you saw.
 
 Tick a box when it passes. If one fails, note what you saw next to it, with a bug shot.
 
 **Reference shots** (this folder; `examples/region_tour.rs` offscreen at 1280 × 720 unless
-stated, HEAD `9814212`, the Task 12 tree; listed with each check below).
+stated; listed with each check below). They were rendered at `9814212`, the Task 12 tree,
+except `render-rapid-closeup.jpg`, re-rendered at `385bdfc` (check 9). Task 11c's rounds 2–6,
+after `9814212`, changed the rocks and the white water, so the other shots that show rapids
+predate that look.
 
 ## Design §7 checks
 
@@ -144,7 +147,7 @@ and white water (11c).
 - [ ] From afar a rapid reads pale, not white (`FOAM_MEAN` 0.19): is that right, or should
       distant rapids read whiter? ______
 
-Shot: `render-rapid-closeup.jpg`, re-rendered at the final HEAD (`385bdfc`, Task 11c's round 6;
+Shot: `render-rapid-closeup.jpg`, re-rendered at `385bdfc` (Task 11c's round 6;
 a crop of a 3840 × 2160 frame at 150 m). Every rock in view sits in the drawn water (since 11c's
 round 2; at `9814212` some sat on the bank). The near breaker trails one broad, solid white wake
 downstream, a fluffy triangle with a feathered edge: the round-5 look the owner shipped
