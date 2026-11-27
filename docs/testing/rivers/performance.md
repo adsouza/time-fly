@@ -3,7 +3,8 @@
 Task 10 (benches) and Task 12 (verification) of the rivers and lakes milestone. **Task 12's
 final numbers come first, each labelled with the commit it was measured at**; Task 10's and
 Task 11c's records follow unchanged. The
-Chrome (WebGPU) numbers are the controller's run in the owner's Chrome and are pending.
+Chrome (WebGPU) numbers are the owner's run of `385bdfc` in Chrome 158 on 2026-11-27: both benches
+**PASS**.
 
 ## Task 12: final verification (2026-11-26/27)
 
@@ -48,7 +49,7 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory
 | `cargo fmt --check` | failed at `9814212` (`examples/region_tour.rs:1515`, from M3's merge); **fixed at `f30ba91`** |
 | White water's GPU cost (budget +1.0 ms) | `9814212`'s look: **−0.01 ms** (bench pose) and **+0.04 ms** (rapid close-up) against `12ef525`, GPU timestamps, display-paced, window shown: within noise. **The shipped look is Task 11c's rounds 4–6**: its figures are in "Fix round 4" (by uncapped frame medians, up to +0.45 ms at a wide rapid) and "Fix round 5" (like-for-like GPU timer pairs −0.81 to +0.38 ms; +0.6 ms upper bound at the wide rapid), all within the budget; round 6 (`385bdfc`) changed the scatter materials' bindings and the animation periods and has no GPU record of its own |
 | The reality check (`--hydro-check`), `9814212` | outlets **22/22**, lakes **8/8**, Amazon box PASS (91.8%), ridged joins 0/4,714, arid PASS; **Indus box FAIL on "every link" (74/84)**, as since Task 11 (the owner's) |
-| Chrome WebGPU | **PENDING: the controller's run** (the build is ready, below) |
+| Chrome WebGPU, `385bdfc` (Chrome 158, 3440 × 1981) | **region bench PASS** (all nine regions, R11 40.90 ms, warm generation median 2,960 ms, memory cycles +0.0%) and **journey bench PASS** (holds 0.05–2.2 s against the 8 s web target, hop memory +0.0 MiB, journey cycles +0.0%); the continental pass 2.07–3.77 s per era (≤ 5 s); details below |
 
 ### Region bench (`9814212`)
 
@@ -358,7 +359,7 @@ Every number above matches Task 11e's record digit for digit (Indus 82.7%, 74/84
 this run changed only rocks and the water's look, not the pass; the fix wave's corridor-search
 fallback changes only a case that used to panic, and this run did not.)
 
-### Chrome WebGPU (Task 12, Step 2): PENDING, the controller's run in the owner's Chrome
+### Chrome WebGPU (Task 12, Step 2): the owner's run, 2026-11-27 — both benches PASS
 
 **The build** (Task 12's fix round 1): `web-release` (wasm32, no features) of `385bdfc`
 (Task 11c's round 6, after this task's `bffa796`), built 2026-11-27:
@@ -373,16 +374,31 @@ Serve it as in Task 10's Chrome section below (`cd <root with assets/>; wasm-ser
 `http://127.0.0.1:1334/?region-bench` and `?journey-bench` in an Incognito window, in front,
 hands off; add `&keep-going` to get every verdict).
 
+The owner ran both benches with `&keep-going` in Chrome 158 (macOS, `BrowserWebGpu`; the
+adapter reports no name) at a render resolution of **3440 × 1981**, display-paced (30 fps target),
+on 2026-11-27: region bench session `bff62854`, journey bench session `0af0c612`. "WebGPU
+Developer Features" was off: timestamps are rounded to 100 µs (7,396 and 3,577 readings dropped).
+
 | What | Web result | Rule |
 |---|---|---|
-| Chrome version, WebGPU adapter, "WebGPU Developer Features" on or off | **PENDING (controller)** | recorded |
-| `?region-bench` summary lines, every gate | **PENDING (controller)** | M3's gates |
-| `?journey-bench` summary lines, every gate | **PENDING (controller)** | M3's gates; holds reported against 8 s |
-| The continental pass per era: wall and CPU (`continental pass (<age>): …`) | **PENDING (controller)**: 250 Ma ___, 0 ka ___, 21 ka ___, 1 Ma ___, 3 Ma ___, 5 Ma ___ | ≤ 5,000 ms, reported |
-| The pass's longest step and slice (`continental pass done … longest_step_ms=… longest_slice_ms=…`) | **PENDING (controller)** | each step within 6 ms |
-| Boulder placement on the swap frame (`region boulders placed`), Himalayas and Indus | **PENDING (controller)** | reported |
-| GPU frame time per region (`gpu frame time (<name>)`) | **PENDING (controller)** | reported |
-| Task 8's renders in Chrome (Manaus, the Indus gorge, Titicaca, the Caspian, Qattara) | **PENDING (controller)** | by eye, against the Metal shots in `manual-checks.md` |
+| `?region-bench`, every gate | **PASS**. R14: all nine regions PASS (Pangaea and the Red Sea's flights PASS too, reported only). R11 first-region worst frame **40.90 ms** (≤ 250). Warm generation (10 Himalayas re-entries) median **2,960 ms**, max 2,977 (≤ 8,000). First entries 1,288–4,777 ms (Japan the slowest; each ≤ 8,000). Memory cycles **475.1 MiB in every cycle, +0.0%** | M3's gates |
+| `?journey-bench`, every gate | **PASS**. Holds: dives 1,449–2,232 ms, hops 435–2,149 ms, climbs 50–71 ms (reported against 8,000 ms). Swap worst frame 39.03 ms (reported). Hop memory **+0.0 MiB** in every hop. Journey memory cycles **+0.0%**. Route checks PASS (the Mt Fuji coast and cube corner). Flight per route PASS: Andes 22.70 / 26.90 / 129.28 ms (one missed frame), Pangaea 26.55 / 30.07 / 37.53 (reported only), Grand Canyon 20.60 / 24.19 / 47.60, Mt Fuji 18.20 / 21.60 / 26.73 | M3's gates; holds reported against 8 s |
+| The continental pass per era: wall / CPU ms | 250 Ma 2,437 / 1,884 (journey: 2,585 / 2,012); 0 ka 2,937 / 2,201 (repeat 2,936 / 2,200; journey's first, during start-up: 3,765 / 2,768); 21 ka 3,179 / 2,404; 1 Ma 2,072 / 1,624; 3 Ma 2,170 / 1,683; 5 Ma 3,211 / 1,710 (on the globe, at the 6 ms budget) | ≤ 5,000 ms, reported: **met in every era** |
+| The pass's longest step and slice | Longest slices 13.5–17.5 ms against the 12 ms large budget, and **46.3 ms** for the journey's 0 ka pass at start-up. Longest steps: 2.2–3.4 ms in the recent eras (walk, rivers, route), but the deep eras' `sample` stage runs **6.5–17.0 ms**, and **38.7 ms** in the 0 ka pass at start-up | each step within 6 ms: **not met** by the `sample` stage (reported; a follow-up) |
+| Boulder placement on the swap frame | Himalayas 11,991 boulders and 7,438 collars in **3.73–4.58 ms**; Indus 1,133 and 663 in 0.47 ms; Rockies 1,090 and 499 in 0.40 ms; on the journey's hops 0.11–0.88 ms (up to 1,704 boulders near Mt Fuji) | reported |
+| GPU frame time per region, median / p95 ms | region bench: Pangaea 24.77 / 32.24, Red Sea 19.73 / 27.79, Himalayas 15.73 / 23.00, Indus 19.01 / 24.31, Sundaland 16.25 / 21.69, Japan 15.60 / 20.51, Beringia 15.60 / 20.97, Rockies 16.32 / 22.74, Panama 17.76 / 21.04; journey: Andes 19.60 / 24.71, Pangaea 25.95 / 28.44, Grand Canyon 18.61 / 22.22, Mt Fuji 15.40 / 19.53 | reported |
+| Climate source on the web | `climate=beyer` at 0 and 21 ka; `zonal` in the deep eras, as designed (the grids end at 120 ka) | — |
+| Task 8's renders in Chrome | not taken (the owner ran the benches only) | by eye |
+
+**Notes from the logs.**
+- The Himalayas flight's one 880.80 ms frame (2 stalls, still PASS) is the owner's F12 bug shot
+  at 228.3 s, in the apron sweep: the screenshot's readback, not the game.
+- At 21 ka the pass warns that the lake level table's entries for Superior, Michigan, Huron, Erie
+  and Ontario fit no depression: the basins lay under the Laurentide ice. A follow-up (the table's
+  present-day levels shouldn't be tried in glacial eras).
+- Region generation's longest slice reaches 20–64 ms on first entries and about 35 ms on the
+  Himalayas' re-entries, against the 12 ms large budget; all of it is under the cloud.
+- Each fetched tile logs an empty-message `DEBUG timefly::region::job: return=true`; cosmetic.
 
 If the pass misses 5 s, the plan's escalation, in order, each ledgered: sample the ICE-6G terms on
 a coarser sub-lattice; raise `WEB_HYDRO_BUDGET_MS` to 8 if the globe's frame gate still passes;
@@ -980,9 +996,11 @@ compares the later cycles with the first). The in-region minus on-globe differen
 undrawn main pass (above) and the pass's resident working set. The hop peaks (+20–31 MiB after
 the first hop) bound what a region adds during a swap.
 
-## Chrome WebGPU: pending (the owner's run)
+## Chrome WebGPU: Task 10's build (never run)
 
-**Not yet run.** Every web number in this section is pending the owner's Chrome run.
+**Not run: superseded.** Task 10's web build was never benched; Task 12's Chrome run of `385bdfc`
+(above, "Chrome WebGPU (Task 12, Step 2)") replaces it. The steps below still describe how to run
+the benches.
 
 **The build.** `web-release` (wasm32, no features: system spans off, R29) of this task's last
 code: the commit that adds this document ("fix: the region bench's generation figure no longer

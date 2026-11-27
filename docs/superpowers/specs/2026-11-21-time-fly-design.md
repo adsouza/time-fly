@@ -296,7 +296,7 @@ Watercraft appear on rivers, lakes, coasts and seas **only where and when the hi
 3. **Zoom-and-swap:** globe ↔ region and region ↔ region (M3). Region ↔ local moves to the local-worlds milestone, since local worlds don't exist before it *(builder's call, proposed in the M3 design §1.1 item 8; the owner did not object)*.
    - Then **lakes and rivers** at region scale, from the generator's hydrology (§7.5): a milestone of their own between M3 and M4 *(owner, 2026-11-24)*. **Built, with open items** (2026-11-27; `docs/testing/rivers/`):
      - The reality check's Indus box fails its "every reference link has a game river" bar (74 of 84; the Shyok and the Arghandab are not in Natural Earth's rivers); the owner's call.
-     - The Chrome WebGPU numbers are pending; the controller fills them in `docs/testing/rivers/performance.md`.
+     - Chrome WebGPU (2026-11-27, the owner's run of `385bdfc` in Chrome 158): region bench and journey bench **PASS**; the continental pass 2.1–3.8 s per era (target ≤ 5 s); the deep eras' `sample` step runs past the 6 ms step goal (up to 17 ms, 39 ms at start-up), a follow-up.
      - The white-water look ships as it is *(owner, 2026-11-27: "Ship, tune later")*; lacier wakes are a follow-up.
      - The native hop-memory gate (+64 MiB) now judges a hop against the flight before it *(owner, 2026-11-27: "Fix the hop-memory baseline")*. At the final HEAD hop memory passes in every run (worst +32.6, +30.5 and +41.5 MiB; a first hop the old baseline read at +68.9 MiB now reads −253.9). One of the two judged journey runs failed its Andes flight (uncapped p95 16.81 ms against 16.67), which a third run did not repeat; the owner's call.
 
