@@ -158,7 +158,9 @@ impl JoinGrid {
         len * (1.0 + JOIN_PATH_CLIMB_WEIGHT * above)
     }
 
-    /// The least-cost path's point indices from `(0, 0)` to `(I, 0)`, and its cost.
+    /// The least-cost path's point indices from `(0, 0)` to `(I, 0)`, and its cost. When no
+    /// path reaches the goal (a wall of non-finite floors across the half-width), the chord
+    /// (row 0), at an infinite cost.
     pub(super) fn search(&self, floors: &[f64]) -> (Vec<usize>, f64) {
         debug_assert_eq!(floors.len(), self.len());
         let (start, goal) = (self.index(0, 0), self.index(self.ni, 0));
@@ -190,6 +192,12 @@ impl JoinGrid {
                     heap.push(Reverse((next.to_bits(), v)));
                 }
             }
+        }
+        if !cost[goal].is_finite() {
+            return (
+                (0..=self.ni).map(|i| self.index(i, 0)).collect(),
+                f64::INFINITY,
+            );
         }
         let mut path = vec![goal];
         while let Some(&k) = path.last() {
@@ -359,5 +367,32 @@ mod tests {
         assert!(path.iter().all(|&k| floors[k] == 500.0));
         let line = g.centreline(&floors, 500.0);
         assert!(line.iter().all(|&d| east_north(d).1.abs() <= 6_000.0 + 1.0));
+    }
+
+    /// A wall of non-finite floors across the whole half-width (no data, read as NaN, which
+    /// `clean` makes infinite) leaves the goal unreachable: the search falls back to the chord,
+    /// at an infinite cost, rather than following an unset predecessor, and the centreline still
+    /// runs from end to end.
+    #[test]
+    fn an_unreachable_goal_falls_back_to_the_chord() {
+        let field = |d: RenderDir| {
+            let (e, _) = east_north(d.0);
+            if (4_000.0..5_000.0).contains(&e) {
+                f64::NAN
+            } else {
+                500.0
+            }
+        };
+        let (p0, p1) = (at(0.0, 0.0), at(10_000.0, 0.0));
+        let g = grid(p0, p1);
+        let floors = g.read_all(&field);
+        let (path, cost) = g.search(&floors);
+        assert!(cost.is_infinite() && cost > 0.0, "{cost}");
+        let chord: Vec<usize> = (0..=g.ni).map(|i| g.index(i, 0)).collect();
+        assert_eq!(path, chord);
+        let line = g.centreline(&floors, 500.0);
+        assert_eq!(line[0], p0);
+        assert_eq!(*line.last().unwrap(), p1);
+        assert!(line.iter().all(|&d| east_north(d).1.abs() <= 1.0));
     }
 }
