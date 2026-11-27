@@ -8,6 +8,7 @@
 //! Units: region local metres, `+x` east, `−z` north, `+y` up, sea level at `y = 0`.
 
 mod cdlod;
+pub mod drawn;
 
 pub use cdlod::{LodSettings, Patch, morph_factor, morph_vertex, select_patches};
 

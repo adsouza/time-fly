@@ -40,7 +40,7 @@ use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use timefly_core::geo::RenderDir;
 use timefly_core::terrain::{LodSettings, blended_height_m, blended_surface_m};
-use timefly_core::worldgen::frame::{FrameBasis, RegionFrame};
+use timefly_core::worldgen::frame::FrameBasis;
 use timefly_core::worldgen::generate::RegionGrid;
 use timefly_core::worldgen::generate::water::Boulder;
 
@@ -369,24 +369,10 @@ pub fn collar_shape(p: Vec2, w: f32, wake: f32) -> f32 {
 }
 
 /// The flow at `dir` (`[east, north]` in `dir`'s own frame, m/s) as a unit vector in the
-/// region's local `(x, z)` axes of `basis`: carried through the frames exactly, not by a sign
-/// flip (they turn apart away from the region's centre). `None` where there is no flow.
+/// region's local `(x, z)` axes of `basis` (`timefly_core::terrain::drawn::flow_local`, which
+/// the core's collar footprint uses too). `None` where there is no flow.
 pub fn flow_local(basis: &FrameBasis, dir: bevy::math::DVec3, flow_mps: [f32; 2]) -> Option<Vec2> {
-    let (north, east) = RegionFrame {
-        center: RenderDir(dir),
-    }
-    .north_east();
-    let v = east * f64::from(flow_mps[0]) + north * f64::from(flow_mps[1]);
-    let speed = v.length();
-    if speed.is_nan() || speed <= 1e-6 {
-        return None;
-    }
-    // 10 m along the flow.
-    let a = 10.0 / (f64::from(EARTH_RADIUS_M));
-    let ahead = (dir * a.cos() + v / speed * a.sin()).normalize();
-    let (x0, z0) = basis.dir_to_local(RenderDir(dir))?;
-    let (x1, z1) = basis.dir_to_local(RenderDir(ahead))?;
-    Vec2::new((x1 - x0) as f32, (z1 - z0) as f32).try_normalize()
+    timefly_core::terrain::drawn::flow_local(basis, dir, flow_mps).map(|v| v.as_vec2())
 }
 
 /// The foam collar of boulder `b`, drawn as `rock` (its [`boulder_instance`]): at a foam site
@@ -400,7 +386,10 @@ pub fn foam_collar_instance(
     b: &Boulder,
     rock: &ScatterInstance,
 ) -> Option<ScatterInstance> {
-    b.foam_site()?;
+    // Only where the generator found the drawn water holds the collar's footprint (fix round 2).
+    if !b.collar || b.foam_site().is_none() {
+        return None;
+    }
     let (x, z) = (f64::from(rock.translation.x), f64::from(rock.translation.z));
     let level = blended_surface_m(grid, x, z);
     if level <= blended_height_m(grid, x, z) {
@@ -758,6 +747,7 @@ mod tests {
             wet,
             level_m: 0.0,
             flow_mps: [0.0; 2],
+            collar: false,
         }
     }
 
@@ -775,6 +765,7 @@ mod tests {
         Boulder {
             level_m: wet * 2.0 * r,
             flow_mps: flow,
+            collar: true,
             ..boulder_at(grid, x, z, r, wet, seed)
         }
     }
@@ -835,6 +826,9 @@ mod tests {
         let dry = plane_grid(0.0, Vec::new());
         let rock = boulder_instance(&dry, &basis, &b).unwrap();
         assert!(foam_collar_instance(&dry, &basis, &b, &rock).is_none());
+        // Where the generator found the drawn water doesn't hold its footprint: none.
+        let held_off = Boulder { collar: false, ..b };
+        assert!(foam_collar_instance(&water, &basis, &held_off, &rock).is_none());
         // No flow: turned by its seed instead.
         let still = rock_at(&water, x, z, 1.5, 0.75, [0.0, 0.0], 9);
         let rock = boulder_instance(&water, &basis, &still).unwrap();
@@ -910,6 +904,37 @@ mod tests {
             assert!(src.contains(line), "scatter.wesl lacks: {line}");
         }
         const { assert!(FOAM_COLLAR_WAKE_RADII <= 3.0, "a short tail") };
+    }
+
+    /// The drawn collar never leaves the footprint the core checks against the drawn water
+    /// (fix round 2): nothing past `COLLAR_RING_RADII` but the tail, which stays within
+    /// `COLLAR_TAIL_RADII` downstream and `COLLAR_TAIL_HALF_RADII` either side.
+    #[test]
+    fn collar_shape_stays_in_the_checked_footprint() {
+        use timefly_core::terrain::drawn::{
+            COLLAR_RING_RADII, COLLAR_TAIL_HALF_RADII, COLLAR_TAIL_RADII,
+        };
+        let (ring, tail, half) = (
+            COLLAR_RING_RADII as f32,
+            COLLAR_TAIL_RADII as f32,
+            COLLAR_TAIL_HALF_RADII as f32,
+        );
+        for w in [0.0, 0.3, 0.7, 1.0] {
+            for i in -60..=60 {
+                for j in -40..=80 {
+                    let p = Vec2::new(i as f32 * 0.05, j as f32 * 0.075);
+                    let in_tail = p.y >= 0.0 && p.y <= tail && p.x.abs() <= half;
+                    if p.length() > ring && !in_tail {
+                        assert_eq!(
+                            collar_shape(p, w, FOAM_COLLAR_WAKE_RADII),
+                            0.0,
+                            "w {w}, {p}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(FOAM_COLLAR_WAKE_RADII, tail);
     }
 
     /// `collar_shape` as `scatter.wesl` writes it.

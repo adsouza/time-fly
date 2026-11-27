@@ -36,6 +36,7 @@ use bevy_math::DVec3;
 use half::f16;
 
 use super::rivers::{RegionRivers, RiverHit, across, chord_point, offset_point};
+use super::{Field, RegionGrid, RegionSpec};
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
     BANK_FREEBOARD_M, BOULDER_BREAK_M, BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH,
@@ -69,6 +70,11 @@ pub struct Boulder {
     /// The river's flow at `dir` (m/s), `[east, north]` in `dir`'s own frame, as the river
     /// texel stores it; zero where the water there is not a river.
     pub flow_mps: [f32; 2],
+    /// Whether its foam collar is drawn: a foam site whose collar's footprint the region's
+    /// drawn water holds (set when the grid is assembled,
+    /// [`place_boulders`](crate::terrain::drawn::place_boulders); false in the generator's own
+    /// list).
+    pub collar: bool,
 }
 
 impl Boulder {
@@ -539,6 +545,196 @@ pub(super) fn size_cluster(
         .collect()
 }
 
+/// The texel lattices a cluster is checked against (Task 11c fix round 2): the drawn water is
+/// the region's own texels bilinearly blended, and no two regions share a lattice, so a rock is
+/// kept only where every one of these draws water over it. Each is a turn of the lattice
+/// (degrees; it repeats every 90°) and where the cluster's centre falls in its cell (fractions
+/// of a texel across and down), spread so a rock near a bank meets the cell's corners from
+/// several sides.
+pub(super) const DRAWN_LATTICES: [(f64, f64, f64); 16] = [
+    (0.0, 0.15, 0.35),
+    (0.0, 0.4, 0.85),
+    (0.0, 0.65, 0.1),
+    (0.0, 0.9, 0.6),
+    (22.5, 0.4, 0.85),
+    (22.5, 0.65, 0.1),
+    (22.5, 0.9, 0.6),
+    (22.5, 0.15, 0.35),
+    (45.0, 0.65, 0.1),
+    (45.0, 0.9, 0.6),
+    (45.0, 0.15, 0.35),
+    (45.0, 0.4, 0.85),
+    (67.5, 0.9, 0.6),
+    (67.5, 0.15, 0.35),
+    (67.5, 0.4, 0.85),
+    (67.5, 0.65, 0.1),
+];
+
+/// One of [`DRAWN_LATTICES`] about a cluster's centre: its cell's four texel corners (in field
+/// order: the first row, then the second, each west to east in the turned frame) and the map
+/// from the centre's tangent plane (metres east and south) to the cell's field coordinates.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct DrawnCell {
+    pub corners: [DVec3; 4],
+    turn: f64,
+    centre_xz: (f64, f64),
+}
+
+impl DrawnCell {
+    /// The cell's field coordinates of a point `(east, south)` metres from the cluster's centre.
+    fn field_xz(&self, east: f64, south: f64) -> (f64, f64) {
+        let (s, c) = self.turn.sin_cos();
+        (
+            self.centre_xz.0 + east * c + south * s,
+            self.centre_xz.1 - east * s + south * c,
+        )
+    }
+}
+
+/// The cells of [`DRAWN_LATTICES`] about `centre` for texels `texel_m` apart.
+pub(super) fn drawn_cells(centre: DVec3, texel_m: f64) -> Vec<DrawnCell> {
+    let (north, east) = RegionFrame {
+        center: RenderDir(centre),
+    }
+    .north_east();
+    let south = -north;
+    DRAWN_LATTICES
+        .iter()
+        .map(|&(deg, a, b)| {
+            let turn = deg.to_radians();
+            let (s, c) = turn.sin_cos();
+            let (x_axis, z_axis) = (east * c + south * s, -east * s + south * c);
+            let corner = |i: f64, j: f64| {
+                let v = x_axis * ((j - a) * texel_m) + z_axis * ((i - b) * texel_m);
+                let len = v.length();
+                if len > 0.0 {
+                    offset_point(centre, v / len, len)
+                } else {
+                    centre
+                }
+            };
+            DrawnCell {
+                corners: [
+                    corner(0.0, 0.0),
+                    corner(0.0, 1.0),
+                    corner(1.0, 0.0),
+                    corner(1.0, 1.0),
+                ],
+                turn,
+                centre_xz: ((a - 0.5) * texel_m, (b - 0.5) * texel_m),
+            }
+        })
+        .collect()
+}
+
+/// A texel's drawn quantities: its carved height, water level and river bits.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) struct DrawnTexel {
+    pub h_m: f32,
+    pub level_m: f32,
+    pub river: [u16; 4],
+}
+
+/// The boulders of `sized` (a cluster's) that every lattice of [`DRAWN_LATTICES`] draws in the
+/// water, each marked `collar` where it is a foam site whose collar's footprint they all draw
+/// wet: a rock needs drawn water over its centre with a ribbon of its radius plus
+/// [`DRAWN_ROCK_MARGIN_M`](crate::terrain::drawn::DRAWN_ROCK_MARGIN_M), and wet a radius out on
+/// all four sides. Each cell (`cells`, with its corners' `texels`) is drawn exactly as a region
+/// draws its water, by [`blended_water`](crate::terrain::blended_water) over a 2 × 2 field of
+/// them. A pure function of the pass and the directions, so overlapping regions keep the same
+/// rocks.
+pub(super) fn hold_in_drawn_water(
+    spec: RegionSpec,
+    centre: DVec3,
+    texel_m: f64,
+    cells: &[DrawnCell],
+    texels: &[[DrawnTexel; 4]],
+    sized: Vec<Boulder>,
+) -> Vec<Boulder> {
+    use crate::terrain::blended_water;
+    use crate::terrain::drawn::{DRAWN_ROCK_MARGIN_M, DRAWN_SPREAD_FACTOR, collar_footprint};
+    let (north, east) = RegionFrame {
+        center: RenderDir(centre),
+    }
+    .north_east();
+    let grids: Vec<RegionGrid> = texels
+        .iter()
+        .map(|t| {
+            let field = Field {
+                res: 2,
+                size_m: texel_m,
+                elevation_m: t.iter().map(|x| x.h_m).collect(),
+                surface: vec![[0; 4]; 4],
+                water_level_m: t.iter().map(|x| x.level_m).collect(),
+                river: t.iter().map(|x| x.river).collect(),
+                river_mask: Vec::new(),
+            };
+            RegionGrid {
+                spec,
+                inner: field.clone(),
+                apron: field,
+                boulders: Vec::new(),
+            }
+        })
+        .collect();
+    // Metres east and south of the centre.
+    let tangent = |d: DVec3| {
+        let v = (d - centre) * EARTH_RADIUS_M;
+        (v.dot(east), -v.dot(north))
+    };
+    let wet = |g: &RegionGrid, cell: &DrawnCell, e: f64, s: f64| {
+        let (x, z) = cell.field_xz(e, s);
+        let w = blended_water(g, x, z);
+        (w.thickness_m > 0.0 && w.ribbon_m >= 0.0, w.ribbon_m)
+    };
+    // A footprint point: wet on every lattice, the least ribbon reaching the margin past it and
+    // DRAWN_SPREAD_FACTOR times as much again as the lattices disagree.
+    let wide = |e: f64, s: f64| {
+        let (mut lo, mut hi, mut all_wet) = (f64::MAX, f64::MIN, true);
+        for (g, cell) in grids.iter().zip(cells) {
+            let (is_wet, ribbon) = wet(g, cell, e, s);
+            all_wet &= is_wet;
+            lo = lo.min(f64::from(ribbon));
+            hi = hi.max(f64::from(ribbon));
+        }
+        all_wet && lo - DRAWN_SPREAD_FACTOR * (hi - lo) >= DRAWN_ROCK_MARGIN_M
+    };
+    sized
+        .into_iter()
+        .filter_map(|b| {
+            let (e, s) = tangent(b.dir);
+            let r = f64::from(b.radius_m);
+            // The lattices' ribbons over the centre: the least must hold the rock with the
+            // margin to spare, and with DRAWN_SPREAD_FACTOR times as much again as they disagree
+            // (where the lattices disagree, a region's own may draw the bank farther in still).
+            let mut ribbons = Vec::with_capacity(cells.len());
+            let mut all_wet = true;
+            for (g, cell) in grids.iter().zip(cells) {
+                let (centre_wet, ribbon) = wet(g, cell, e, s);
+                all_wet &= centre_wet
+                    && [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
+                        .iter()
+                        .all(|&(de, ds)| wet(g, cell, e + de, s + ds).0);
+                ribbons.push(f64::from(ribbon));
+            }
+            let (lo, hi) = ribbons
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+            let rock = all_wet && lo - DRAWN_SPREAD_FACTOR * (hi - lo) >= r + DRAWN_ROCK_MARGIN_M;
+            if !rock {
+                return None;
+            }
+            let down = bevy_math::DVec2::new(f64::from(b.flow_mps[0]), -f64::from(b.flow_mps[1]))
+                .try_normalize();
+            let collar = b.foam_site().is_some()
+                && collar_footprint(e, s, b.radius_m, down)
+                    .iter()
+                    .all(|p| wide(p.x, p.y));
+            Some(Boulder { collar, ..b })
+        })
+        .collect()
+}
+
 /// A boulder at `dir` of radius `radius_m` on `bed`.
 pub(super) fn boulder(dir: DVec3, radius_m: f32, seed: u32, bed: &BoulderBed) -> Boulder {
     let wet = ((bed.level_m - bed.base_m) / (2.0 * radius_m)).clamp(0.0, 1.0);
@@ -551,6 +747,7 @@ pub(super) fn boulder(dir: DVec3, radius_m: f32, seed: u32, bed: &BoulderBed) ->
         wet: if wet.is_nan() { 0.0 } else { wet },
         level_m: bed.level_m,
         flow_mps: [east, north],
+        collar: false,
     }
 }
 

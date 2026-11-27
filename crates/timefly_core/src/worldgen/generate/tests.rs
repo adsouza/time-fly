@@ -1757,7 +1757,7 @@ mod water {
             v
         };
         let (sa, sb) = (shared(&ga, &gb), shared(&gb, &ga));
-        assert!(sa.len() > 5_000, "{} shared boulders", sa.len());
+        assert!(sa.len() > 3_000, "{} shared boulders", sa.len());
         assert_eq!(sa.len(), sb.len());
         for (x, y) in sa.iter().zip(&sb) {
             assert_eq!(key(x), key(y));
@@ -1768,6 +1768,44 @@ mod water {
         let east = |b: &Boulder| ga.spec().frame().dir_to_local(RenderDir(b.dir)).unwrap().0;
         let far = sa.iter().map(east).fold(f64::MIN, f64::max);
         assert!(far > 140_000.0, "the shared rocks reach x = {far} m");
+        // Fix round 2: the regions' grids drop the rocks in their own blend band at the inner
+        // field's edge, where the river fades out; elsewhere they keep the same rocks.
+        let drawn = |g: &RegionGenerator<_>| {
+            let grid = RegionGenerator::new(
+                RegionSpec {
+                    apron_res: 513,
+                    ..*g.spec()
+                },
+                &field,
+                Some(&hydro),
+            )
+            .finish();
+            grid.boulders
+                .iter()
+                .map(&key)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let (ka, kb) = (drawn(&ga), drawn(&gb));
+        let band = |g: &RegionGenerator<_>, b: &Boulder| {
+            let (x, z) = g.spec().frame().dir_to_local(RenderDir(b.dir)).unwrap();
+            x.abs().max(z.abs()) > half - 4.0 * APRON_SIZE_M / 512.0
+        };
+        let (mut both, mut in_a_band) = (0, 0);
+        for b in &sa {
+            if band(&ga, b) || band(&gb, b) {
+                in_a_band += 1;
+                continue;
+            }
+            assert!(
+                ka.contains(&key(b)) && kb.contains(&key(b)),
+                "{b:?} drawn by one region only"
+            );
+            both += 1;
+        }
+        assert!(
+            both > 2_000,
+            "{both} shared rocks outside the bands, {in_a_band} inside one"
+        );
     }
 
     /// Thinning keeps or drops whole clusters: each kept cluster has all its members, and a
@@ -1829,6 +1867,127 @@ mod water {
         assert_eq!(whole, all);
     }
 
+    /// Fix round 2: the region keeps a boulder only where the drawn water (the water shader's
+    /// own quantities, `blended_water` over the region's texels) holds it, and draws its collar
+    /// only where the drawn water holds the collar's footprint. Real widths: a narrow steep river
+    /// (Q 20 m³/s, 22 m) and a 61 m one (Q 150), each on a 3% bed along a line oblique to the
+    /// lattice, so the course kinks at every node; and the straight equator rapid. Non-vacuous:
+    /// the generator's rocks near the banks stand outside the drawn water in each fixture.
+    #[test]
+    fn placed_boulders_and_collars_lie_in_the_drawn_water() {
+        use crate::terrain::drawn::{collar_footprint, flow_local};
+        let frame = RegionFrame {
+            center: dir(20.0, 30.0),
+        };
+        let oblique = |q: f32| {
+            let (hydro, floor) = rivers_along(
+                CubeLattice { n: 900 },
+                frame,
+                &[-15_000.0, 37_000.0],
+                q,
+                0.03,
+            );
+            let field = Box::leak(Box::new(FnField {
+                f: floor,
+                spacing_m: 1852.0,
+                koppen: Some(26),
+            }));
+            let hydro = Box::leak(Box::new(hydro));
+            let c = frame.local_to_dir(20_000.0, 0.0);
+            // The real apron resolution: the drawn water blends toward the apron over four of
+            // its texels from the inner field's edge.
+            let g: RegionGenerator<'static, _> =
+                RegionGenerator::new(spec_at(c, 0.0, 1025, 513), &*field, Some(&*hydro));
+            let unplaced: Vec<Boulder> = clusters_of(&g).into_iter().flat_map(|(_, b)| b).collect();
+            (unplaced, g.finish())
+        };
+        let straight = || {
+            let (hydro, floor) = equator_river(150.0, |a| 3600.0 - 0.024 * a, 0.05);
+            let field = FnField {
+                f: floor,
+                spacing_m: 1852.0,
+                koppen: Some(26),
+            };
+            let g = RegionGenerator::new(
+                spec_at(LAT.dir(eq(405)), 0.0, 1025, 513),
+                &field,
+                Some(&hydro),
+            );
+            let unplaced: Vec<Boulder> = clusters_of(&g).into_iter().flat_map(|(_, b)| b).collect();
+            (unplaced, g.finish())
+        };
+        for (name, (unplaced, grid), kinked) in [
+            ("narrow, kinked", oblique(20.0), true),
+            ("61 m, kinked", oblique(150.0), true),
+            ("61 m, straight", straight(), false),
+        ] {
+            let basis = grid.spec.frame().basis();
+            let local = |b: &Boulder| basis.dir_to_local(RenderDir(b.dir)).unwrap();
+            let outside = |b: &Boulder| {
+                let (x, z) = local(b);
+                let w = blended_water(&grid, x, z);
+                w.thickness_m <= 0.0 || w.ribbon_m < b.radius_m
+            };
+            // The hazard: the rocks as sized on the routing geometry, away from the blend band,
+            // that the drawn water doesn't hold (where the course kinks between the 293 m texels).
+            let interior = |b: &Boulder| {
+                let (x, z) = local(b);
+                crate::terrain::drawn::drawn_from_the_inner_field(&grid, x, z)
+            };
+            let hazard = unplaced
+                .iter()
+                .filter(|b| interior(b) && outside(b))
+                .count();
+            println!(
+                "{name}: {} generated, {hazard} outside the drawn water, {} placed",
+                unplaced.len(),
+                grid.boulders.len()
+            );
+            assert!(unplaced.len() > 200, "{name}: {} boulders", unplaced.len());
+            if kinked {
+                assert!(
+                    hazard > 10,
+                    "{name}: only {hazard} rocks outside the drawn water"
+                );
+            }
+            // Not too many lost: the blend band is a quarter of the square.
+            assert!(
+                grid.boulders.len() * 3 > unplaced.len(),
+                "{name}: {} of {} kept",
+                grid.boulders.len(),
+                unplaced.len()
+            );
+            let mut collars = 0;
+            for b in &grid.boulders {
+                let (x, z) = local(b);
+                let w = blended_water(&grid, x, z);
+                assert!(
+                    w.thickness_m > 0.0,
+                    "{name}: a rock on dry ground: {b:?} {w:?}"
+                );
+                assert!(
+                    w.ribbon_m >= b.radius_m,
+                    "{name}: a rock {} m across a ribbon of {} m: {b:?}",
+                    b.radius_m,
+                    w.ribbon_m
+                );
+                if b.collar {
+                    collars += 1;
+                    assert!(b.foam_site().is_some());
+                    let down = flow_local(&basis, b.dir, b.flow_mps);
+                    for p in collar_footprint(x, z, b.radius_m, down) {
+                        let w = blended_water(&grid, p.x, p.y);
+                        assert!(
+                            w.thickness_m > 0.0 && w.ribbon_m >= 0.0,
+                            "{name}: a collar spills onto dry ground at {p}: {w:?}"
+                        );
+                    }
+                }
+            }
+            assert!(collars > 20, "{name}: {collars} collars");
+        }
+    }
+
     /// The continent's pass and a dense region at `inner`/`apron` resolution.
     fn continent_region(
         inner: u32,
@@ -1875,7 +2034,10 @@ mod water {
             }
         }
         assert!(rivers > 100, "{rivers} river texels");
-        assert_eq!(grid.boulders, g.boulders());
+        assert_eq!(
+            grid.boulders,
+            crate::terrain::drawn::region_boulders(&grid, g.boulders())
+        );
     }
 
     /// Walks every refined centreline in the inner field (away from the apron blend)
@@ -2563,18 +2725,23 @@ mod water {
         RegionGenerator::new(spec_at(LAT.dir(eq(405)), 0.0, 1025, 33), field, Some(hydro))
     }
 
-    /// The generator's boulder clusters, each with its boulders inside the region, rebuilt as the
-    /// generator builds them (its centre's bed first) and checked against its boulders.
+    /// The generator's boulder clusters, each with its boulders inside the region as sized
+    /// (before the drawn-water hold), rebuilt as the generator builds them (its centre's bed
+    /// first); the held ones, in cluster order, are checked to be the generator's boulders.
     fn clusters_of<F: CoarseField>(
         g: &RegionGenerator<F>,
     ) -> Vec<(
         crate::worldgen::generate::water::BoulderCluster,
         Vec<Boulder>,
     )> {
-        use crate::worldgen::generate::water::{BoulderBed, boulder_clusters, size_cluster};
+        use crate::worldgen::generate::water::{
+            BoulderBed, DrawnTexel, boulder_clusters, drawn_cells, hold_in_drawn_water,
+            size_cluster,
+        };
         let rivers = g.rivers(FieldKind::Inner).unwrap();
         let frame = g.spec().frame();
         let half = REGION_SIZE_M / 2.0;
+        let texel_m = REGION_SIZE_M / f64::from(g.spec().inner_res - 1);
         let bed = |d: DVec3| {
             let t = g.sample_texel_in(FieldKind::Inner, RenderDir(d));
             BoulderBed {
@@ -2583,7 +2750,12 @@ mod water {
                 river: t.river,
             }
         };
-        let mut rest = g.boulders();
+        let inside = |b: &Boulder| {
+            frame
+                .dir_to_local(RenderDir(b.dir))
+                .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
+        };
+        let mut held_all = Vec::new();
         let out: Vec<_> = boulder_clusters(rivers, &frame.basis(), half)
             .into_iter()
             .map(|c| {
@@ -2592,25 +2764,38 @@ mod water {
                 let dirs = c.member_dirs(spread);
                 let beds: Vec<BoulderBed> = dirs.iter().map(|&d| bed(d)).collect();
                 assert_eq!(beds[0], centre);
-                let mine: Vec<Boulder> = size_cluster(&c, spread, &dirs, &beds)
-                    .into_iter()
-                    .filter(|b| {
-                        frame
-                            .dir_to_local(RenderDir(b.dir))
-                            .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
+                let sized = size_cluster(&c, spread, &dirs, &beds);
+                let cells = drawn_cells(c.centre(), texel_m);
+                let texels: Vec<[DrawnTexel; 4]> = cells
+                    .iter()
+                    .map(|cell| {
+                        cell.corners.map(|d| {
+                            let b = bed(d);
+                            DrawnTexel {
+                                h_m: b.base_m,
+                                level_m: b.level_m,
+                                river: b.river,
+                            }
+                        })
                     })
                     .collect();
-                let (theirs, next) = rest.split_at(mine.len());
-                assert_eq!(
-                    &mine[..],
-                    theirs,
-                    "the generator's boulders, in cluster order"
+                let held = hold_in_drawn_water(
+                    *g.spec(),
+                    c.centre(),
+                    texel_m,
+                    &cells,
+                    &texels,
+                    sized.clone(),
                 );
-                rest = next;
-                (c, mine)
+                held_all.extend(held.into_iter().filter(inside));
+                (c, sized.into_iter().filter(inside).collect())
             })
             .collect();
-        assert!(rest.is_empty());
+        assert_eq!(
+            &held_all[..],
+            g.boulders(),
+            "the generator's boulders, in cluster order"
+        );
         out
     }
 
@@ -2869,8 +3054,10 @@ mod water {
             koppen: Some(26),
         };
         let spec = spec_at(LAT.dir(eq(405)), 0.0, 65, 17);
-        let whole = all_bits(&RegionGenerator::new(spec, &field, Some(&hydro)).finish());
-        assert!(!whole.4.is_empty(), "boulders");
+        let generator = RegionGenerator::new(spec, &field, Some(&hydro));
+        // The generator's boulders (at 4.7 km texels the drawn water holds none of them).
+        assert!(!generator.boulders().is_empty(), "boulders");
+        let whole = all_bits(&generator.finish());
         assert!(whole.2.iter().any(|&r| r != RIVER_NONE), "river texels");
         for max_nodes in [1, 97, 4096, u32::MAX] {
             let mut prep = RegionPrep::new(spec, &field, Some(&hydro));

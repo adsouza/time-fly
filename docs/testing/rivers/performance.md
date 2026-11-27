@@ -503,6 +503,29 @@ uncapped, an upper bound on the GPU's share):
 
 Both are within the +1.0 ms budget.
 
+### Fix round 2: rocks only where the water is drawn
+
+The owner found rocks and collars on a grass bank. A rock is now kept only where a spread of
+texel lattices draw water over it (`water::hold_in_drawn_water`), and none in the band where
+the inner field blends into the apron. The keep fraction rose from 0.45 to 0.6 to offset the
+drop. Per bench region (the same command as above):
+
+| Bench region | Boulders | Share of `MAX_BOULDERS` | Collars | Placement | Prep (region job) |
+|---|---|---|---|---|---|
+| Pangaea interior (250 Ma) | 0 | 0% | 0 | 0.13 ms | 102 ms |
+| Red Sea (0 ka) | 0 | 0% | 0 | 0.12 ms | 278 ms |
+| Himalayas (0 ka) | 7,320 | **45%** | 2,850 | 1.15 ms | 536 ms (217 ms at `d37d8e6`) |
+| Indus tributaries (0 ka) | 930 | 6% | 396 | 0.27 ms | 272 ms (219 ms at `d37d8e6`) |
+| Sundaland (21 ka) | 0 | 0% | 0 | 0.13 ms | 180 ms |
+| Japan (1 Ma) | 5 | 0% | 3 | 0.11 ms | 1,737 ms |
+| Beringia (21 ka) | 0 | 0% | 0 | 0.11 ms | 214 ms |
+| Rockies ice margin (21 ka) | 520 | 3% | 202 | 0.22 ms | 450 ms |
+| Panama (3 Ma) | 0 | 0% | 0 | 0.04 ms | 104 ms |
+
+The check reads 64 more texels for each kept cluster, on the region job's prep thread. That
+costs the Himalayas about +320 ms of prep, which is not on a frame. The cap guard stayed silent
+everywhere.
+
 ## Tiles, the continental pass and boulders per bench region (native)
 
 `region_tour … shaded 3000` at each bench region's centre, 640 × 360, rivers on and with

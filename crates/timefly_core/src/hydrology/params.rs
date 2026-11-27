@@ -179,9 +179,10 @@ pub const BOULDER_MAX_RADIUS_M: f64 = 8.0;
 pub const FOAM_SITE_DEPTH_M: f32 = 0.5;
 /// Rapids keep a cluster of boulders only where a hash of its `(river, k, c)` falls under this
 /// share (Task 11c fix round 1): a function of direction, so overlapping regions keep the same
-/// clusters, whole. Chosen so no bench region holds more than 75% of [`MAX_BOULDERS`]: the
-/// Himalayas' 24,964 unthinned boulders become about 11,200 (68%).
-pub const BOULDER_KEEP_FRACTION: f64 = 0.45;
+/// clusters, whole. Chosen so no bench region holds more than 75% of [`MAX_BOULDERS`]. Fix round
+/// 2 keeps only the rocks the drawn water holds, about half of the rest, so it rose from 0.45:
+/// the Himalayas, the densest, hold about 7,200 (44%).
+pub const BOULDER_KEEP_FRACTION: f64 = 0.6;
 /// A guard, never reached on the bench regions: past it a region keeps its first boulders in
 /// sub-segment order and the shell warns. Overlapping regions then disagree, so the keep
 /// fraction, not this, is what bounds the boulders.

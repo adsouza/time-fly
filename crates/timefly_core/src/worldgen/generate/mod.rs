@@ -648,8 +648,11 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
         done
     }
 
-    /// A cluster's boulders (all its members, in or out of the square): its centre's bed read
-    /// first, its members spread by the water there, then sized by the deepest.
+    /// A cluster's boulders that the drawn water holds (all its members, in or out of the
+    /// square): its centre's bed read first, its members spread by the water there, then sized
+    /// by the deepest; then kept, and given a collar, where the cells of
+    /// [`water::DRAWN_LATTICES`] all draw water over them ([`water::hold_in_drawn_water`], Task
+    /// 11c fix round 2).
     fn cluster_boulders(&self, cluster: &water::BoulderCluster) -> Vec<Boulder> {
         let bed = |dir: bevy_math::DVec3| {
             let (carved, water) = self.sampler().texel(FieldKind::Inner, RenderDir(dir));
@@ -665,7 +668,23 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
         let beds: Vec<water::BoulderBed> = std::iter::once(centre)
             .chain(dirs[1..].iter().map(|&d| bed(d)))
             .collect();
-        water::size_cluster(cluster, spread, &dirs, &beds)
+        let sized = water::size_cluster(cluster, spread, &dirs, &beds);
+        let texel_m = self.layers[0].size_m / f64::from(self.layers[0].res - 1);
+        let cells = water::drawn_cells(cluster.centre(), texel_m);
+        let texels: Vec<[water::DrawnTexel; 4]> = cells
+            .iter()
+            .map(|c| {
+                c.corners.map(|d| {
+                    let b = bed(d);
+                    water::DrawnTexel {
+                        h_m: b.base_m,
+                        level_m: b.level_m,
+                        river: b.river,
+                    }
+                })
+            })
+            .collect();
+        water::hold_in_drawn_water(self.spec, cluster.centre(), texel_m, &cells, &texels, sized)
     }
 
     /// Work units done so far (planning points, lattice nodes, river sub-points, boulders and
@@ -869,12 +888,15 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
             );
             field
         };
-        RegionGrid {
+        let mut grid = RegionGrid {
             spec: self.spec,
             inner: join(FieldKind::Inner, inner),
             apron: join(FieldKind::Apron, apron),
-            boulders: self.boulders.clone(),
-        }
+            boulders: Vec::new(),
+        };
+        // Not where the river fades into the apron's (Task 11c fix round 2).
+        grid.boulders = crate::terrain::drawn::region_boulders(&grid, &self.boulders);
+        grid
     }
 
     /// Rows not yet produced by [`generate_rows`](Self::generate_rows), over both fields.
