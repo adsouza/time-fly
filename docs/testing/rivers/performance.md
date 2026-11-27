@@ -389,6 +389,7 @@ Developer Features" was off: timestamps are rounded to 100 µs (7,396 and 3,577 
 | GPU frame time per region, median / p95 ms | region bench: Pangaea 24.77 / 32.24, Red Sea 19.73 / 27.79, Himalayas 15.73 / 23.00, Indus 19.01 / 24.31, Sundaland 16.25 / 21.69, Japan 15.60 / 20.51, Beringia 15.60 / 20.97, Rockies 16.32 / 22.74, Panama 17.76 / 21.04; journey: Andes 19.60 / 24.71, Pangaea 25.95 / 28.44, Grand Canyon 18.61 / 22.22, Mt Fuji 15.40 / 19.53 | reported |
 | Climate source on the web | `climate=beyer` at 0 and 21 ka; `zonal` in the deep eras, as designed (the grids end at 120 ka) | — |
 | Task 8's renders in Chrome | not taken (the owner ran the benches only) | by eye |
+| Chrome's console (WebGPU validation and pipeline errors) | **none** (the owner, 2026-11-27) | none expected |
 
 **Notes from the logs.**
 - The Himalayas flight's one 880.80 ms frame (2 stalls, still PASS) is the owner's F12 bug shot
