@@ -222,14 +222,14 @@ fn a_broken_shader_fails_the_compile_check() {
         (
             "water.wesl",
             water,
-            "fn white_water_foam(rapid: f32, crest: f32, crests: f32,",
-            "fn white_water_foam(rapid: f32, crest: f32, patch: f32,",
+            "    crests: f32,\n    streak: f32,",
+            "    patch: f32,\n    streak: f32,",
         ),
         (
             "scatter.wesl",
             scatter,
-            "    let reach = max(wake, 1e-3);",
-            "    let reach = max(wake, 1u);",
+            "    let reach = max(wake * breathe, 1e-3);",
+            "    let reach = max(wake * breathe, 1u);",
         ),
         (
             "water.wesl",

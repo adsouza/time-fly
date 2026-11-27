@@ -22,19 +22,22 @@
 //!   look ([`boulder_look`]), jittered in hue and value by the seed, and wet-dark at and above
 //!   the waterline.
 //! - **Foam collars** (Task 11c). Every boulder at a foam site (`Boulder::foam_site`: standing
-//!   in the water, its top less than half a metre under it or above it) whose collar the
-//!   generator found the drawn water holds (`Boulder::collar`) gets one, the second scatter kind
-//!   ([`ScatterKind::FoamCollar`]): one flat quad ([`foam_collar_mesh`]) at the drawn water
-//!   level, scaled by the boulder's radius and turned so its `+z` runs downstream along the
-//!   boulder's flow ([`foam_collar_instance`]). Its tag carries the drawn rock's radius at the
-//!   waterline (as a share of its radius), its V wake's length (`Boulder::wake_radii`, which
-//!   grows with the flow's speed) and the seed ([`collar_tag_seed`]). `scatter.wesl` cuts it out
-//!   (alpha-masked: no sorting) by [`collar_shape`] (fix round 4, the owner's "rework the
-//!   look"): round a rock through the surface, foam piled on its upstream face (the pillow), a
-//!   V of two arms trailing downstream and churn just behind it; over a rock just under the
-//!   surface, a dimmer boil just downstream of it. Its edge is broken by noise that churns with
-//!   time and runs downstream. It takes the water's own depth pull plus [`FOAM_COLLAR_PULL_M`],
-//!   so the water at its level never hides it.
+//!   in the water, its top less than half a metre under it or above it) gets a collar, the
+//!   second scatter kind ([`ScatterKind::FoamCollar`]): one flat quad ([`foam_collar_mesh`]) at
+//!   the drawn water level, scaled by the boulder's radius and turned so its `+z` runs
+//!   downstream along the boulder's flow ([`foam_collar_instance`]). Its tag carries the drawn
+//!   rock's radius at the waterline (as a share of its radius), its V wake's length
+//!   (`Boulder::wake_radii`, which grows with the flow's speed), the flow's speed and the seed
+//!   ([`collar_tag_seed`]). `scatter.wesl` shapes it by [`collar_shape`]: round a rock through
+//!   the surface, foam piled on its upstream face (the pillow), a V of two arms trailing
+//!   downstream and churn behind it; over a rock just under the surface, a dimmer boil just
+//!   downstream of it. Fix round 5 ("softer, whiter wakes", animated): the shapes are feathered
+//!   and stay put but pulse ([`collar_pulses`]), while the foam inside them ([`collar_foam`],
+//!   streaks along the flow) is carried downstream at the water's speed; the coverage
+//!   ([`collar_coverage`]) is written as a dithered sample mask (the material stays
+//!   alpha-masked, drawn after the opaque pass), and the foam is clipped where the region draws
+//!   no water (the material binds the region's water, [`ScatterWater`]). It takes the water's
+//!   own depth pull plus [`FOAM_COLLAR_PULL_M`], so the water at its level never hides it.
 
 use std::sync::Arc;
 
@@ -50,12 +53,13 @@ use timefly_core::worldgen::generate::water::Boulder;
 
 use crate::scatter::{
     ScatterInstance, ScatterKind, ScatterLook, ScatterMaterial, ScatterPool, ScatterSet,
-    scatter_material,
+    ScatterWater, scatter_material,
 };
 use crate::terrain::material::{PaletteKind, palette_image};
 use crate::terrain::view::full_sun_illumination;
 use crate::terrain::{TerrainScene, TerrainSceneSystems};
 use crate::water::{WATER_DEPTH_PULL, WATER_F0, WATER_PULL_M, WHITE_WATER};
+use bevy::render::storage::ShaderBuffer;
 
 /// Boulders are drawn out to this distance from the camera (m).
 pub const BOULDER_VISIBLE_M: f32 = 6_000.0;
@@ -87,8 +91,8 @@ pub const BOULDER_SHADE_FLOOR: f32 = 0.16;
 pub const FOAM_COLLAR_VISIBLE_M: f32 = 3_000.0;
 /// The collar quad's extent, in boulder radii: half its width across the flow, how far it
 /// reaches upstream and how far downstream of the boulder's centre. It holds [`collar_shape`]
-/// with the longest wake (`COLLAR_WAKE_MAX_RADII`): the V's arms reach `±(1.55 + 0.5 × 12)`.
-pub const FOAM_COLLAR_EXTENT: [f32; 3] = [7.6, 2.7, 12.2];
+/// with the longest wake (`COLLAR_WAKE_MAX_RADII`): the V's arms reach `±(1.7 + 0.6 × 16)`.
+pub const FOAM_COLLAR_EXTENT: [f32; 3] = [11.4, 3.6, 16.2];
 /// A boil (the collar of a rock just under the surface) is this much dimmer than the foam
 /// round a rock through it.
 pub const FOAM_BOIL_SHADE: f32 = 0.8;
@@ -351,40 +355,52 @@ pub fn foam_collar_mesh() -> Mesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0f32, 1.0, 0.0]; 6])
 }
 
-/// A foam collar's shape at `p` (radii; `x` across, `y` downstream) round a rock whose
-/// waterline is `w` of its radius (0 for a rock just under), its V wake `wake` radii long (fix
-/// round 4): 1 where it is white, 0 elsewhere. `scatter.wesl`'s `collar_shape`, which breaks its
-/// edge with noise.
+/// `smoothstep(e0, e1, x)` as WGSL computes it.
+fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The still pulses: `collar_shape` at these draws its full extent.
+pub const COLLAR_STILL: Vec3 = Vec3::ONE;
+
+/// How white a foam collar is (0 to 1, soft-edged) at `p` (radii; `x` across, `y` downstream)
+/// round a rock whose waterline is `w` of its radius (0 for a rock just under), its V wake
+/// `wake` radii long, pulsed by `pulses` = (surge, breathe, bloom) ([`collar_pulses`], each at
+/// most 1, so the shape never leaves its still extent, [`COLLAR_STILL`]). `scatter.wesl`'s
+/// `collar_shape`. Fix round 5 ("softer, whiter wakes"): every part ramps over most of its
+/// width.
 /// - A rock through the surface (`w > 0` and a wake): the pillow, piled on its upstream face
-///   from just inside the waterline to 0.5 radii out abreast and 1.6 radii out upstream; the
-///   V, two arms from its flanks spreading downstream at about 19° (`|x| = 0.8 w + 0.3 +
-///   0.35 y`, 0.9 radii wide and widening), gone by the wake's end; and churn just behind it,
-///   widening, for 0.8 of the wake.
-/// - A rock just under: a boil 1.2 radii round, 0.9 radii downstream of it, and a short trail.
-pub fn collar_shape(p: Vec2, w: f32, wake: f32) -> f32 {
-    let step = |e0: f32, e1: f32, x: f32| {
-        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
+///   from just inside the waterline to 0.9 radii out abreast and 2.5 radii out upstream (times
+///   the surge), feathered over 0.6 radii; the V, two arms from its flanks spreading downstream
+///   at about 19° (`|x| = 0.8 w + 0.3 + 0.35 y`, 1.2 radii wide and widening, feathered over
+///   all but their core), fading out over the last half of the (breathing) wake; and churn
+///   behind it, widening, for most of the wake.
+/// - A rock just under: a boil 1.5 radii round, 1 radius downstream of it, and a short trail,
+///   both blooming with `bloom`.
+pub fn collar_shape(p: Vec2, w: f32, wake: f32, pulses: Vec3) -> f32 {
+    let step = smooth;
     let rho = p.length();
     let up = (-p.y / rho.max(1e-3)).clamp(0.0, 1.0);
     let breaks = w > 0.0 && wake > 0.0;
     let inner = 0.8 * w;
-    let edge = w + 0.5 + 1.1 * up;
-    let pillow = (1.0 - step(edge - 0.2, edge, rho)) * step(inner - 0.1, inner, rho);
+    let edge = (w + 0.9 + 1.6 * up) * pulses.x;
+    let pillow = (1.0 - step(edge - 0.6, edge, rho)) * step(inner - 0.15, inner, rho);
     let along = p.y.max(0.0);
     let arm = 0.8 * w + 0.3 + 0.35 * along;
-    let arm_half = 0.45 + 0.15 * along;
-    let reach = wake.max(1e-3);
-    let fade = step(-0.3, 0.3, p.y) * (1.0 - step(0.5 * reach, reach, p.y));
-    let arms = (1.0 - step(0.3 * arm_half, arm_half, (p.x.abs() - arm).abs())) * fade;
-    let core = w + 0.5 + 0.15 * along;
-    let churn = (1.0 - step(0.5 * core, core, p.x.abs()))
-        * step(-0.2, 0.4, p.y)
-        * (1.0 - step(0.4 * reach, 0.8 * reach, p.y));
-    let boil = 1.0 - step(0.8, 1.2, (p - Vec2::new(0.0, 0.9)).length());
-    let trail =
-        (1.0 - step(0.2, 0.4, p.x.abs())) * step(0.5, 1.0, p.y) * (1.0 - step(1.6, 2.5, p.y));
+    let arm_half = 0.6 + 0.25 * along;
+    let reach = (wake * pulses.y).max(1e-3);
+    let fade = step(-0.3, 0.5, p.y) * (1.0 - step(0.5 * reach, reach, p.y));
+    let arms = (1.0 - step(0.1 * arm_half, arm_half, (p.x.abs() - arm).abs())) * fade;
+    let core = w + 0.8 + 0.2 * along;
+    let churn = (1.0 - step(0.2 * core, core, p.x.abs()))
+        * step(-0.3, 0.4, p.y)
+        * (1.0 - step(0.4 * reach, 0.95 * reach, p.y));
+    let boil = (1.0 - step(0.4, 1.5, (p - Vec2::new(0.0, 1.0)).length())) * pulses.z;
+    let trail = (1.0 - step(0.1, 0.6, p.x.abs()))
+        * step(0.5, 1.2, p.y)
+        * (1.0 - step(1.4, 2.9, p.y))
+        * pulses.z;
     if breaks {
         pillow.max(arms.max(churn))
     } else {
@@ -392,22 +408,99 @@ pub fn collar_shape(p: Vec2, w: f32, wake: f32) -> f32 {
     }
 }
 
-/// A collar instance's seed field: its V wake's length in its top byte (a share of
-/// `COLLAR_WAKE_MAX_RADII`, rounded to 1/255), the boulder's seed's low 16 bits below.
-pub fn collar_tag_seed(wake_radii: f32, seed: u32) -> u32 {
+/// A collar's pulses at time `t` (s) for its seed (low byte): (surge, breathe, bloom). The
+/// pillow surges between 0.85 and 1 and the wake breathes between 0.8 and 1, each two
+/// incommensurate sines of 1.3–2.9 s; a boil blooms between 0.35 and 1 on its own 2–4 s
+/// cycle. `scatter.wesl`'s `collar_pulses`.
+pub fn collar_pulses(t: f32, seed: u32) -> Vec3 {
+    let tau = std::f32::consts::TAU;
+    let phase = (seed & 255) as f32 / 256.0;
+    let q = 0.6 * (tau * (t / 1.3 + phase)).sin() + 0.4 * (tau * (t / 2.9 + 2.3 * phase)).sin();
+    let b =
+        0.55 * (tau * (t / 1.7 + 1.7 * phase)).sin() + 0.45 * (tau * (t / 2.6 + 0.4 * phase)).sin();
+    let period = 2.0 + 2.0 * (7.13 * phase).fract();
+    let bloom = 0.35 + 0.65 * (0.5 + 0.5 * (tau * (t / period + phase)).sin());
+    Vec3::new(0.925 + 0.075 * q, 0.9 + 0.1 * b, bloom)
+}
+
+/// `scatter.wesl`'s `foam_noise`: gradient noise at `q` (cells), its third axis `z`.
+fn foam_noise(q: Vec2, z: f32, seed: u32) -> f32 {
+    let c = q.floor();
+    let zc = z.floor();
+    timefly_core::worldgen::noise::gradient_noise3(
+        [c.x as i32, c.y as i32, zc as i32],
+        [q.x - c.x, q.y - c.y, z - zc],
+        seed,
+    )
+}
+
+/// One flow-map layer of [`collar_foam`]: noise at `m` (m; `x` across, `y` downstream)
+/// stretched `scale` (m across, m along), scrolled downstream at `speed` (m/s) over `period`
+/// (s) and restarted, two phases half a period apart cross-faded (each weight 0 at its own
+/// restart). `scatter.wesl`'s `foam_layer`.
+pub fn foam_layer(m: Vec2, speed: f32, t: f32, period: f32, scale: Vec2, seed: u32) -> f32 {
+    let a = (t / period).fract();
+    let b = (a + 0.5).fract();
+    let wa = 1.0 - (2.0 * a - 1.0).abs();
+    let wb = 1.0 - (2.0 * b - 1.0).abs();
+    let na = foam_noise((m - Vec2::new(0.0, speed * period * a)) / scale, 0.0, seed);
+    let nb = foam_noise((m - Vec2::new(0.0, speed * period * b)) / scale, 7.5, seed);
+    (wa * na + wb * nb) / (wa * wa + wb * wb).sqrt()
+}
+
+/// A collar's foam texture at `m` (m from the rock; `x` across, `y` downstream), carried
+/// downstream with the water at `speed` (m/s): fine streaks 4:1 along the flow at the water's
+/// speed and coarse clumps at three quarters of it, each its own flow-map layer and each
+/// collar's own (offset by its seed). `scatter.wesl`'s `collar_foam`.
+pub fn collar_foam(m: Vec2, speed: f32, t: f32, seed: u32) -> f32 {
+    let q = m + Vec2::new(seed as f32 * 3.7, seed as f32 * 1.9);
+    let fine = foam_layer(q, speed, t, 1.0, Vec2::new(0.35, 1.4), 211);
+    let coarse = foam_layer(q, 0.75 * speed, t, 1.6, Vec2::new(1.2, 4.8), 223);
+    0.65 * fine + 0.5 * coarse
+}
+
+/// The share of a pixel a collar covers (0 to 1) where its shape is `shape` and its foam
+/// `foam`: dark water shows between the streaks, most in the fringe, so an edge feathers out
+/// over the shape's own ramps. `scatter.wesl`'s `collar_coverage`, written as a dithered
+/// sample mask.
+pub fn collar_coverage(shape: f32, foam: f32) -> f32 {
+    ((shape - 0.12) / 0.6 * (0.85 + 1.0 * foam)).clamp(0.0, 1.0)
+}
+
+/// A collar's tag holds its flow's speed in steps of this (m/s), up to 255 of them. A
+/// `scatter.wesl` constant.
+pub const COLLAR_SPEED_STEP: f32 = 0.05;
+/// A collar's coverage is dithered over this many samples (the region camera's MSAA). A
+/// `scatter.wesl` constant.
+pub const COLLAR_SAMPLES: u32 = 4;
+
+/// A collar instance's seed field (24 bits): its V wake's length in the top byte (a share of
+/// `COLLAR_WAKE_MAX_RADII`, rounded to 1/255), its flow's speed in [`COLLAR_SPEED_STEP`]s in
+/// the next, and the boulder's seed's low byte.
+pub fn collar_tag_seed(wake_radii: f32, speed_mps: f32, seed: u32) -> u32 {
     let max = timefly_core::terrain::drawn::COLLAR_WAKE_MAX_RADII as f32;
     let share = if wake_radii.is_nan() {
         0.0
     } else {
         (wake_radii / max).clamp(0.0, 1.0)
     };
-    ((share * 255.0).round() as u32) << 16 | seed & 0xFFFF
+    let speed = if speed_mps.is_nan() {
+        0.0
+    } else {
+        (speed_mps / COLLAR_SPEED_STEP).round().clamp(0.0, 255.0)
+    };
+    ((share * 255.0).round() as u32) << 16 | (speed as u32) << 8 | seed & 0xFF
 }
 
 /// A collar instance's V wake (radii), as `scatter.wesl` decodes it.
 pub fn collar_wake(c: &ScatterInstance) -> f32 {
     let max = timefly_core::terrain::drawn::COLLAR_WAKE_MAX_RADII as f32;
     ((c.seed() >> 16) & 0xFF) as f32 / 255.0 * max
+}
+
+/// A collar instance's flow speed (m/s), as `scatter.wesl` decodes it.
+pub fn collar_speed(c: &ScatterInstance) -> f32 {
+    ((c.seed() >> 8) & 0xFF) as f32 * COLLAR_SPEED_STEP
 }
 
 /// The flow at `dir` (`[east, north]` in `dir`'s own frame, m/s) as a unit vector in the
@@ -421,14 +514,14 @@ pub fn flow_local(basis: &FrameBasis, dir: bevy::math::DVec3, flow_mps: [f32; 2]
 /// standing in drawn water, a collar at the drawn level over its centre, scaled by its radius
 /// and turned so its `+z` runs along the flow (by its seed where there is none). Its tag holds
 /// the drawn rock's radius at the waterline as a share of its radius (0 for a rock just under
-/// the water: a boil), and [`collar_tag_seed`] of its wake and seed.
+/// the water: a boil), and [`collar_tag_seed`] of its wake, its flow's speed and its seed.
 pub fn foam_collar_instance(
     grid: &RegionGrid,
     basis: &FrameBasis,
     b: &Boulder,
     rock: &ScatterInstance,
 ) -> Option<ScatterInstance> {
-    // Only where the generator found the drawn water holds the collar's footprint (fix round 2).
+    // Every foam site the generator kept (the shader clips the foam at the drawn water).
     if !b.collar || b.foam_site().is_none() {
         return None;
     }
@@ -452,7 +545,7 @@ pub fn foam_collar_instance(
         yaw: yaw.rem_euclid(std::f32::consts::TAU),
         tag: ScatterInstance::tag_of(
             if y < 1.0 { share } else { 0.0 },
-            collar_tag_seed(b.wake_radii, b.seed),
+            collar_tag_seed(b.wake_radii, b.flow_mps[0].hypot(b.flow_mps[1]), b.seed),
         ),
     })
 }
@@ -508,10 +601,11 @@ pub fn foam_collar_look() -> ScatterLook {
 }
 
 /// The collars' material (shared with the pipeline warm-up so its key matches): the scatter
-/// material, alpha-masked (drawn in the alpha-mask phase with the water: no sorting), rough as
-/// the water's foam and with its reflectance.
-pub fn foam_collar_material(palette: &Handle<Image>) -> ScatterMaterial {
-    let mut m = scatter_material(palette, foam_collar_look());
+/// material binding the region's `water`, alpha-masked (drawn in the alpha-mask phase with the
+/// water: no sorting; its coverage is a sample mask), rough as the water's foam and with its
+/// reflectance.
+pub fn foam_collar_material(palette: &Handle<Image>, water: &ScatterWater) -> ScatterMaterial {
+    let mut m = scatter_material(palette, foam_collar_look(), water);
     m.base.alpha_mode = AlphaMode::Mask(0.5);
     m.base.perceptual_roughness = 0.9;
     m.base.reflectance = (WATER_F0 / 0.16).sqrt();
@@ -529,6 +623,8 @@ pub struct RegionBoulders {
     pub material: Handle<ScatterMaterial>,
     /// The foam collars' set entity (its pool holds the collar mesh and material).
     pub collars: Entity,
+    /// The foam collars' material (it binds the region's water, rebound with each scene).
+    pub collar_material: Handle<ScatterMaterial>,
     /// The scene grid whose boulders the sets hold.
     pub grid: Option<Arc<RegionGrid>>,
 }
@@ -552,9 +648,15 @@ fn spawn_boulder_set(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
+    buffers: Option<ResMut<Assets<ShaderBuffer>>>,
     mut materials: ResMut<Assets<ScatterMaterial>>,
 ) {
     let palette = images.add(palette_image());
+    // Stand-ins until the first region's scene (headless apps have no shader buffers).
+    let water = match buffers {
+        Some(mut buffers) => ScatterWater::placeholder(&mut images, &mut buffers),
+        None => ScatterWater::default(),
+    };
     // The look is a stand-in until the first region's.
     let look = ScatterLook {
         texel: UVec4::ZERO,
@@ -562,7 +664,7 @@ fn spawn_boulder_set(
         pull: Vec4::ZERO,
         light: Vec4::ZERO,
     };
-    let material = materials.add(scatter_material(&palette, look));
+    let material = materials.add(scatter_material(&palette, look, &water));
     let shapes = boulder_meshes().map(|m| meshes.add(m)).to_vec();
     let set = commands
         .spawn((
@@ -571,14 +673,16 @@ fn spawn_boulder_set(
             ScatterPool::new(shapes, material.clone(), BOULDER_VISIBLE_M),
         ))
         .id();
-    // The collars' look is the same in every region: one material for good.
+    // The collars' look is the same in every region: one material for good, its water rebound
+    // with each scene.
+    let collar_material = materials.add(foam_collar_material(&palette, &water));
     let collars = commands
         .spawn((
             Name::new("Region foam collars"),
             ScatterSet::empty(ScatterKind::FoamCollar),
             ScatterPool::new(
                 vec![meshes.add(foam_collar_mesh())],
-                materials.add(foam_collar_material(&palette)),
+                collar_material.clone(),
                 FOAM_COLLAR_VISIBLE_M,
             ),
         ))
@@ -587,6 +691,7 @@ fn spawn_boulder_set(
         set,
         material,
         collars,
+        collar_material,
         grid: None,
     });
 }
@@ -600,6 +705,9 @@ fn sync_boulders(
     mut materials: ResMut<Assets<ScatterMaterial>>,
 ) {
     let Some(mut boulders) = boulders else { return };
+    let water = scene
+        .as_ref()
+        .map(|s| ScatterWater::of(&s.buffer, &s.inner_water, &s.apron_water));
     let grid = scene.map(|s| s.grid.clone());
     let same = match (&grid, &boulders.grid) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -615,6 +723,14 @@ fn sync_boulders(
             let (instances, collars) = region_scatter(g);
             if let Some(mut m) = materials.get_mut(&boulders.material) {
                 m.extension.look = boulder_look(g);
+            }
+            // Both bind the scene's water (the collars clip their foam at it).
+            if let Some(water) = &water {
+                for handle in [&boulders.material, &boulders.collar_material] {
+                    if let Some(mut m) = materials.get_mut(handle) {
+                        water.bind(&mut m.extension);
+                    }
+                }
             }
             info!(
                 boulders = instances.len(),
@@ -851,9 +967,14 @@ mod tests {
             "{}",
             c.wet()
         );
-        assert_eq!(c.seed() & 0xFFFF, 9);
+        assert_eq!(c.seed() & 0xFF, 9);
         assert!(
-            (collar_wake(&c) - 5.0).abs() < 12.0 / 255.0,
+            (collar_speed(&c) - 4.0).abs() < 1e-3,
+            "{}",
+            collar_speed(&c)
+        );
+        assert!(
+            (collar_wake(&c) - 5.0).abs() < 16.0 / 255.0,
             "{}",
             collar_wake(&c)
         );
@@ -923,76 +1044,182 @@ mod tests {
         assert!(flow_local(&basis, at(0.0, 0.0), [0.0, 0.0]).is_none());
     }
 
-    /// Fix round 4 (the owner's "rework the look"): round a rock through the surface, the
-    /// pillow piles on its upstream face and the V trails downstream, nothing upstream past the
-    /// pillow, nothing abreast past it, and none of the V beyond its wake; over a rock just
-    /// under, a boil just downstream. Mirrored in `scatter.wesl`, line for line.
+    /// Fix rounds 4 and 5: round a rock through the surface, the pillow piles on its upstream
+    /// face and the V trails downstream, nothing upstream past the pillow, nothing abreast past
+    /// it, and none of the V beyond its wake; over a rock just under, a boil just downstream.
+    /// Mirrored in `scatter.wesl`, line for line (with the pulses, the foam and the coverage).
     #[test]
     fn collar_pillow_is_upstream_and_the_v_wake_downstream() {
-        let (w, wake) = (0.8, 6.0);
-        // The pillow: thick upstream (−y), thin abreast, and none downstream of the waterline
-        // but the V and the churn.
-        assert!(
-            collar_shape(Vec2::new(0.0, -(w + 0.8)), w, wake) > 0.9,
-            "pillow"
-        );
-        assert!(
-            collar_shape(Vec2::new(w + 0.1, 0.0), w, wake) > 0.9,
-            "abreast"
-        );
-        assert_eq!(collar_shape(Vec2::new(w + 0.9, -0.05), w, wake), 0.0);
-        assert_eq!(
-            collar_shape(Vec2::new(0.0, -(w + 1.8)), w, wake),
-            0.0,
-            "upstream"
-        );
+        let (w, wake, still) = (0.8, 10.0, COLLAR_STILL);
+        let at = |x: f32, y: f32, w: f32, wake: f32| collar_shape(Vec2::new(x, y), w, wake, still);
+        assert!(at(0.0, -(w + 1.0), w, wake) > 0.9, "pillow");
+        assert!(at(w + 0.1, 0.0, w, wake) > 0.9, "abreast");
+        assert_eq!(at(w + 1.6, -0.05, w, wake), 0.0, "past the pillow abreast");
+        assert_eq!(at(0.0, -(w + 2.8), w, wake), 0.0, "upstream");
         // The V: on its arms (|x| = 0.8 w + 0.3 + 0.35 y), clear between them past the churn,
         // and gone by the end of the wake.
-        for y in [1.0f32, 2.0, 2.5] {
+        for y in [1.0f32, 2.0, 3.0] {
             let arm = 0.8 * w + 0.3 + 0.35 * y;
             for side in [-1.0, 1.0] {
-                assert!(
-                    collar_shape(Vec2::new(side * arm, y), w, wake) > 0.9,
-                    "an arm at {y}"
-                );
+                assert!(at(side * arm, y, w, wake) > 0.9, "an arm at {y}");
             }
         }
-        assert_eq!(
-            collar_shape(Vec2::new(0.0, 5.5), w, wake),
-            0.0,
-            "between the arms"
-        );
-        assert!(
-            collar_shape(Vec2::new(0.0, 1.0), w, wake) > 0.9,
-            "churn behind it"
-        );
+        assert_eq!(at(0.0, 9.7, w, wake), 0.0, "between the arms");
+        assert!(at(0.0, 1.0, w, wake) > 0.9, "churn behind it");
         let arm_end = 0.8 * w + 0.3 + 0.35 * wake;
-        assert_eq!(collar_shape(Vec2::new(arm_end, wake), w, wake), 0.0);
-        // Upstream of the rock there is no V.
-        assert_eq!(collar_shape(Vec2::new(1.8, -1.8), w, wake), 0.0);
+        assert_eq!(at(arm_end, wake, w, wake), 0.0);
+        assert_eq!(at(2.3, -2.3, w, wake), 0.0, "no V upstream");
         // A rock just under (w = 0): a boil downstream of it, none upstream nor far down.
-        assert!(
-            collar_shape(Vec2::new(0.0, 0.7), 0.0, wake) > 0.9,
-            "the boil"
-        );
-        assert_eq!(collar_shape(Vec2::new(0.0, -0.5), 0.0, wake), 0.0);
-        assert_eq!(collar_shape(Vec2::new(0.0, 2.6), 0.0, wake), 0.0);
-        assert_eq!(collar_shape(Vec2::new(1.2, 1.5), 0.0, wake), 0.0, "no V");
-        // A rock through the surface with no wake left (the drawn water held none): a boil.
-        assert_eq!(
-            collar_shape(Vec2::new(0.0, 0.7), w, 0.0),
-            collar_shape(Vec2::new(0.0, 0.7), 0.0, 0.0)
-        );
+        assert!(at(0.0, 1.0, 0.0, wake) > 0.9, "the boil");
+        assert_eq!(at(0.0, -0.6, 0.0, wake), 0.0);
+        assert_eq!(at(0.0, 3.0, 0.0, wake), 0.0);
+        assert_eq!(at(1.6, 1.5, 0.0, wake), 0.0, "no V");
+        // A rock through the surface with no wake left: a boil.
+        assert_eq!(at(0.0, 1.0, w, 0.0), at(0.0, 1.0, 0.0, 0.0));
         // The shader's copy, line for line.
         let src = include_str!("../assets/shaders/scatter.wesl");
-        for line in COLLAR_SHAPE_WESL.lines() {
+        for line in COLLAR_WESL.lines() {
             assert!(src.contains(line), "scatter.wesl lacks: {line}");
+        }
+        assert!(src.contains(&format!(
+            "const COLLAR_SPEED_STEP: f32 = {COLLAR_SPEED_STEP:?};"
+        )));
+        assert!(src.contains(&format!("const COLLAR_SAMPLES: u32 = {COLLAR_SAMPLES}u;")));
+    }
+
+    /// Fix round 5: the shapes stay put. Over 10 s and several seeds the pulses stay in their
+    /// bounds (surge 0.85–1, breathe 0.8–1, bloom 0.35–1) and swing within them; the pulsed
+    /// shape never exceeds the still one; and the pillow's, the arms' and the churn's cores stay
+    /// white throughout. A boil blooms and fades on its own 2–4 s cycle.
+    #[test]
+    fn collar_shapes_stay_put_while_they_pulse() {
+        let (w, wake) = (0.8, 10.0);
+        let points: Vec<Vec2> = (-30..=30)
+            .flat_map(|i| (-30..=120).map(move |j| Vec2::new(i as f32 * 0.2, j as f32 * 0.1)))
+            .collect();
+        let cores = [
+            Vec2::new(0.0, -(w + 1.0)),
+            Vec2::new(0.8 * w + 0.3 + 0.7, 2.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        for seed in [0u32, 77, 200, 255] {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for k in 0..200 {
+                let pulses = collar_pulses(k as f32 * 0.05, seed);
+                lo = lo.min(pulses);
+                hi = hi.max(pulses);
+                for &p in points.iter().step_by(7) {
+                    for ww in [0.0, w] {
+                        assert!(
+                            collar_shape(p, ww, wake, pulses)
+                                <= collar_shape(p, ww, wake, COLLAR_STILL) + 1e-6,
+                            "seed {seed}, {p}"
+                        );
+                    }
+                }
+                for c in cores {
+                    assert!(collar_shape(c, w, wake, pulses) > 0.9, "core {c} at {k}");
+                }
+            }
+            assert!(lo.x >= 0.85 - 1e-6 && hi.x <= 1.0 + 1e-6, "surge {lo} {hi}");
+            assert!(
+                lo.y >= 0.8 - 1e-6 && hi.y <= 1.0 + 1e-6,
+                "breathe {lo} {hi}"
+            );
+            assert!(lo.z >= 0.35 - 1e-6 && hi.z <= 1.0 + 1e-6, "bloom {lo} {hi}");
+            assert!(
+                hi.x - lo.x > 0.08 && hi.y - lo.y > 0.1 && hi.z - lo.z > 0.5,
+                "seed {seed}: swings {lo} {hi}"
+            );
         }
     }
 
+    /// Fix round 5 ("softer"): every edge ramps. Across an arm, at the pillow's rim and at the
+    /// wake's end the shape climbs from 10% to 90% over at least 0.3 radii, and the coverage
+    /// takes values between nothing and full across it (no step).
+    #[test]
+    fn collar_edges_are_soft() {
+        let (w, wake) = (0.8, 10.0);
+        let width = |line: &dyn Fn(f32) -> Vec2| {
+            let v: Vec<f32> = (0..=400)
+                .map(|k| collar_shape(line(k as f32 * 0.01), w, wake, COLLAR_STILL))
+                .collect();
+            let first = |th: f32| v.iter().position(|&s| s <= th).unwrap() as f32 * 0.01;
+            let mid = v.iter().filter(|&&s| s > 0.2 && s < 0.6).count();
+            (first(0.1) - first(0.9), mid)
+        };
+        let arm = 0.8 * w + 0.3 + 0.35 * 3.0;
+        for (name, line) in [
+            (
+                "arm",
+                Box::new(move |d: f32| Vec2::new(arm + d, 3.0)) as Box<dyn Fn(f32) -> Vec2>,
+            ),
+            (
+                "pillow",
+                Box::new(move |d: f32| Vec2::new(0.0, -(w + 0.8) - d)),
+            ),
+            (
+                "wake's end",
+                Box::new(move |d: f32| Vec2::new(arm + 0.35 * 2.0, 5.0 + d * 2.0)),
+            ),
+        ] {
+            let (ramp, mid) = width(&*line);
+            println!("{name}: ramps over {ramp:.2} radii");
+            assert!(ramp >= 0.3, "{name}: ramps over {ramp}");
+            assert!(mid >= 10, "{name}: {mid} partial samples");
+        }
+        // Coverage feathers: half the shape covers a share, not all or nothing.
+        let c = collar_coverage(0.5, 0.0);
+        assert!(c > 0.2 && c < 0.6, "{c}");
+        assert_eq!(collar_coverage(0.12, 1.0), 0.0);
+        assert_eq!(collar_coverage(1.0, 0.5), 1.0);
+        // Dark water through the wake: where the streaks are low the core is only partly
+        // covered.
+        assert!(collar_coverage(1.0, -0.6) < 0.4);
+    }
+
+    /// Fix round 5 ("animated"): the foam inside a collar is carried downstream at the water's
+    /// speed. Over a 0.1 s step the texture moved `v × 0.1` m downstream matches itself (its
+    /// correlation with the shifted field is near 1), much better than the field left in place,
+    /// and better than one moved at half the speed.
+    #[test]
+    fn collar_foam_is_carried_downstream_with_the_flow() {
+        let (v, t, dt) = (5.0f32, 3.21, 0.1);
+        let corr = |shift: f32| {
+            let mut pairs = Vec::new();
+            for i in 0..40 {
+                for j in 0..80 {
+                    let m = Vec2::new(i as f32 * 0.17 - 3.0, j as f32 * 0.13);
+                    pairs.push((
+                        collar_foam(m, v, t, 41),
+                        collar_foam(m + Vec2::new(0.0, shift), v, t + dt, 41),
+                    ));
+                }
+            }
+            let n = pairs.len() as f32;
+            let (ma, mb) = pairs
+                .iter()
+                .fold((0.0, 0.0), |(x, y), &(a, b)| (x + a / n, y + b / n));
+            let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
+            for &(a, b) in &pairs {
+                c += (a - ma) * (b - mb);
+                va += (a - ma) * (a - ma);
+                vb += (b - mb) * (b - mb);
+            }
+            c / (va * vb).sqrt()
+        };
+        let (moved, half, still) = (corr(v * dt), corr(0.5 * v * dt), corr(0.0));
+        println!("carried {moved:.3}, at half speed {half:.3}, left in place {still:.3}");
+        assert!(moved > 0.9, "{moved}");
+        assert!(
+            moved > still + 0.2 && moved > half + 0.05,
+            "{moved} {half} {still}"
+        );
+    }
+
     /// The V wake lengthens with the flow's speed (`collar_wake_radii`, up to its longest), and
-    /// the shape follows it: a point 7 radii down the arm is white behind a fast rock, not a
-    /// slow one; the tag carries it to the shader.
+    /// the shape follows it: a point 9.5 radii down the arm is white behind a fast rock, not a
+    /// slow one; the tag carries the wake, the speed and the seed to the shader.
     #[test]
     fn the_wake_lengthens_with_speed() {
         use timefly_core::terrain::drawn::{COLLAR_WAKE_MAX_RADII, collar_wake_radii};
@@ -1002,24 +1229,32 @@ mod tests {
             assert!(wake > last, "{v} m/s: {wake}");
             last = wake;
         }
-        assert_eq!(collar_wake_radii(3.0), 6.5);
-        assert_eq!(collar_wake_radii(6.0), 11.0);
+        assert_eq!(collar_wake_radii(3.0), 9.0);
+        assert_eq!(collar_wake_radii(6.0), 15.0);
         assert_eq!(collar_wake_radii(20.0), COLLAR_WAKE_MAX_RADII);
         let w = 0.8;
         let p = |y: f32| Vec2::new(0.8 * w + 0.3 + 0.35 * y, y);
         let (slow, fast) = (collar_wake_radii(3.0) as f32, collar_wake_radii(6.0) as f32);
-        assert_eq!(collar_shape(p(7.0), w, slow), 0.0);
-        assert!(collar_shape(p(7.0), w, fast) > 0.5);
+        assert_eq!(collar_shape(p(9.5), w, slow, COLLAR_STILL), 0.0);
+        assert!(collar_shape(p(9.5), w, fast, COLLAR_STILL) > 0.5);
         // The tag round trip.
-        for wake in [0.0, 1.4, 4.0, 7.0, 12.0] {
+        let max = COLLAR_WAKE_MAX_RADII as f32;
+        for (wake, speed) in [
+            (0.0, 0.0),
+            (1.4, 3.0),
+            (7.0, 4.55),
+            (16.0, 6.0),
+            (16.0, 12.75),
+        ] {
             let c = ScatterInstance {
                 translation: Vec3::ZERO,
                 scale: 1.0,
                 yaw: 0.0,
-                tag: ScatterInstance::tag_of(0.5, collar_tag_seed(wake, 0xABCD_1234)),
+                tag: ScatterInstance::tag_of(0.5, collar_tag_seed(wake, speed, 0xABCD_1234)),
             };
-            assert!((collar_wake(&c) - wake).abs() <= 0.5 * 12.0 / 255.0 + 1e-6);
-            assert_eq!(c.seed() & 0xFFFF, 0x1234);
+            assert!((collar_wake(&c) - wake).abs() <= 0.5 * max / 255.0 + 1e-6);
+            assert!((collar_speed(&c) - speed).abs() <= 0.5 * COLLAR_SPEED_STEP + 1e-6);
+            assert_eq!(c.seed() & 0xFF, 0x34);
         }
     }
 
@@ -1056,10 +1291,10 @@ mod tests {
         assert!(src.contains("let shade = select(look.light.y, 1.0, w > 0.0 && wake > 0.0);"));
     }
 
-    /// The drawn collar never leaves the footprint the core checks against the drawn water
-    /// (fix round 2; round 4's shape): nothing past `COLLAR_RING_RADII` but the V, which stays
-    /// within its wake downstream and `COLLAR_WAKE_HALF_RADII + COLLAR_WAKE_SPREAD × y` either
-    /// side; and the quad holds it all.
+    /// The collar's shape (still, its largest) stays within `COLLAR_RING_RADII` but for the V,
+    /// which stays within its wake downstream and `COLLAR_WAKE_HALF_RADII + COLLAR_WAKE_SPREAD ×
+    /// y` either side; and the quad holds it all. Fix round 5: the shader clips the foam at the
+    /// drawn water itself, so the core no longer checks this footprint against the lattices.
     #[test]
     fn collar_shape_stays_in_the_checked_footprint() {
         use timefly_core::terrain::drawn::{
@@ -1067,15 +1302,15 @@ mod tests {
         };
         let ring = COLLAR_RING_RADII as f32;
         let [across, up, down] = FOAM_COLLAR_EXTENT;
-        for wake in [0.0, 1.4, 4.0, COLLAR_WAKE_MAX_RADII as f32] {
+        for wake in [0.0, 1.4, 6.0, COLLAR_WAKE_MAX_RADII as f32] {
             for w in [0.0, 0.3, 0.7, 1.0] {
-                for i in -120..=120 {
-                    for j in -60..=240 {
-                        let p = Vec2::new(i as f32 * 0.05, j as f32 * 0.05);
+                for i in -115..=115 {
+                    for j in -35..=170 {
+                        let p = Vec2::new(i as f32 * 0.1, j as f32 * 0.1);
                         let half =
                             (COLLAR_WAKE_HALF_RADII + COLLAR_WAKE_SPREAD * f64::from(p.y)) as f32;
                         let in_wake = p.y >= 0.0 && p.y <= wake && p.x.abs() <= half;
-                        let shape = collar_shape(p, w, wake);
+                        let shape = collar_shape(p, w, wake, COLLAR_STILL);
                         if p.length() > ring && !in_wake {
                             assert_eq!(shape, 0.0, "w {w}, wake {wake}, {p}");
                         }
@@ -1091,27 +1326,55 @@ mod tests {
         }
     }
 
-    /// `collar_shape` as `scatter.wesl` writes it.
-    const COLLAR_SHAPE_WESL: &str = "fn collar_shape(p: vec2<f32>, w: f32, wake: f32) -> f32 {
+    /// `collar_shape`, `collar_pulses`, `foam_layer`, `collar_foam` and `collar_coverage` as
+    /// `scatter.wesl` writes them.
+    const COLLAR_WESL: &str = "fn collar_shape(p: vec2<f32>, w: f32, wake: f32, surge: f32, breathe: f32, bloom: f32) -> f32 {
     let rho = length(p);
     let up = clamp(-p.y / max(rho, 1e-3), 0.0, 1.0);
     let breaks = w > 0.0 && wake > 0.0;
     let inner = 0.8 * w;
-    let edge = w + 0.5 + 1.1 * up;
-    let pillow = (1.0 - smoothstep(edge - 0.2, edge, rho)) * smoothstep(inner - 0.1, inner, rho);
+    let edge = (w + 0.9 + 1.6 * up) * surge;
+    let pillow = (1.0 - smoothstep(edge - 0.6, edge, rho)) * smoothstep(inner - 0.15, inner, rho);
     let along = max(p.y, 0.0);
     let arm = 0.8 * w + 0.3 + 0.35 * along;
-    let arm_half = 0.45 + 0.15 * along;
-    let reach = max(wake, 1e-3);
-    let fade = smoothstep(-0.3, 0.3, p.y) * (1.0 - smoothstep(0.5 * reach, reach, p.y));
-    let arms = (1.0 - smoothstep(0.3 * arm_half, arm_half, abs(abs(p.x) - arm))) * fade;
-    let core = w + 0.5 + 0.15 * along;
-    let churn = (1.0 - smoothstep(0.5 * core, core, abs(p.x))) * smoothstep(-0.2, 0.4, p.y)
-        * (1.0 - smoothstep(0.4 * reach, 0.8 * reach, p.y));
-    let boil = 1.0 - smoothstep(0.8, 1.2, length(p - vec2<f32>(0.0, 0.9)));
-    let trail = (1.0 - smoothstep(0.2, 0.4, abs(p.x))) * smoothstep(0.5, 1.0, p.y)
-        * (1.0 - smoothstep(1.6, 2.5, p.y));
-    return select(max(boil, trail), max(pillow, max(arms, churn)), breaks);";
+    let arm_half = 0.6 + 0.25 * along;
+    let reach = max(wake * breathe, 1e-3);
+    let fade = smoothstep(-0.3, 0.5, p.y) * (1.0 - smoothstep(0.5 * reach, reach, p.y));
+    let arms = (1.0 - smoothstep(0.1 * arm_half, arm_half, abs(abs(p.x) - arm))) * fade;
+    let core = w + 0.8 + 0.2 * along;
+    let churn = (1.0 - smoothstep(0.2 * core, core, abs(p.x))) * smoothstep(-0.3, 0.4, p.y)
+        * (1.0 - smoothstep(0.4 * reach, 0.95 * reach, p.y));
+    let boil = (1.0 - smoothstep(0.4, 1.5, length(p - vec2<f32>(0.0, 1.0)))) * bloom;
+    let trail = (1.0 - smoothstep(0.1, 0.6, abs(p.x))) * smoothstep(0.5, 1.2, p.y)
+        * (1.0 - smoothstep(1.4, 2.9, p.y)) * bloom;
+    return select(max(boil, trail), max(pillow, max(arms, churn)), breaks);
+}
+fn collar_pulses(t: f32, seed: u32) -> vec3<f32> {
+    let phase = f32(seed & 255u) / 256.0;
+    let q = 0.6 * sin(TAU * (t / 1.3 + phase)) + 0.4 * sin(TAU * (t / 2.9 + 2.3 * phase));
+    let b = 0.55 * sin(TAU * (t / 1.7 + 1.7 * phase)) + 0.45 * sin(TAU * (t / 2.6 + 0.4 * phase));
+    let period = 2.0 + 2.0 * fract(7.13 * phase);
+    let bloom = 0.35 + 0.65 * (0.5 + 0.5 * sin(TAU * (t / period + phase)));
+    return vec3<f32>(0.925 + 0.075 * q, 0.9 + 0.1 * b, bloom);
+}
+fn foam_layer(m: vec2<f32>, speed: f32, t: f32, period: f32, scale: vec2<f32>, seed: u32) -> f32 {
+    let a = fract(t / period);
+    let b = fract(a + 0.5);
+    let wa = 1.0 - abs(2.0 * a - 1.0);
+    let wb = 1.0 - abs(2.0 * b - 1.0);
+    let na = foam_noise((m - vec2<f32>(0.0, speed * period * a)) / scale, 0.0, seed);
+    let nb = foam_noise((m - vec2<f32>(0.0, speed * period * b)) / scale, 7.5, seed);
+    return (wa * na + wb * nb) * inverseSqrt(wa * wa + wb * wb);
+}
+fn collar_foam(m: vec2<f32>, speed: f32, t: f32, seed: u32) -> f32 {
+    let q = m + vec2<f32>(f32(seed) * 3.7, f32(seed) * 1.9);
+    let fine = foam_layer(q, speed, t, 1.0, vec2<f32>(0.35, 1.4), 211u);
+    let coarse = foam_layer(q, 0.75 * speed, t, 1.6, vec2<f32>(1.2, 4.8), 223u);
+    return 0.65 * fine + 0.5 * coarse;
+}
+fn collar_coverage(shape: f32, foam: f32) -> f32 {
+    return clamp((shape - 0.12) / 0.6 * (0.85 + 1.0 * foam), 0.0, 1.0);
+}";
 
     #[test]
     fn the_foam_collar_mesh_is_one_upward_quad() {

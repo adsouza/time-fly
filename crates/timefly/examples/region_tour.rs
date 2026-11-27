@@ -33,7 +33,9 @@
 //!
 //! A fifth argument `high` checks a region from high up (M3 Task 6; give a large `AGL_M`): after
 //! the start shot (looking north at the start pitch) it sets the steepest view pitch
-//! ([`MIN_PITCH_DEG`], the chase camera looking 45° down) and saves `<prefix>-down.png`.
+//! ([`MIN_PITCH_DEG`], the chase camera looking 45° down) and saves `<prefix>-down.png`. Given
+//! a `LATER_S`, it then saves [`DOWN_BURST`] more down shots `LATER_S` seconds apart,
+//! `<prefix>-down-1.png` …, for a clip of the animated water (Task 11c fix round 5).
 //!
 //! A fifth argument `cruise` checks the chase camera in sustained flight (M3 Task 3): after the
 //! start shot it holds `W` for [`FLIGHT_SHOT_SECS`] and saves `<prefix>-cruise.png` while still
@@ -176,6 +178,8 @@ use timefly_core::worldgen::frame::RegionFrame;
 const SETTLE_SECS: f32 = 6.0;
 /// Frames between a shot and the next change, and between toggling the wireframe and its shot.
 const WIRE_FRAMES: u32 = 20;
+/// `high` mode with a `LATER_S`: this many more down shots, `LATER_S` seconds apart.
+const DOWN_BURST: u32 = 6;
 /// Frames after the last shot before exiting.
 const DONE_FRAMES: u32 = 240;
 /// Seconds to wait for the region.
@@ -315,8 +319,11 @@ struct Tour {
     requested: RegionRequested,
     /// Camera height above `max(ground, 0)` at the centre.
     agl_m: f32,
-    /// Seconds after the shaded shot to save the `later` one (`shaded` mode only).
+    /// Seconds after the shaded shot to save the `later` one (`shaded` mode), or between the
+    /// down burst's shots (`high` mode).
     later_s: Option<f32>,
+    /// The down burst's shots taken so far (`high` mode).
+    burst: u32,
     /// When the shaded shot was requested.
     shot_at: f32,
     step: Step,
@@ -625,6 +632,16 @@ fn tour(
         Step::Down => {
             if tour.frames == 2 * WIRE_FRAMES {
                 shoot(&mut commands, &tour, "down");
+                tour.shot_at = now;
+            } else if let Some(dt) = tour.later_s.filter(|_| tour.burst < DOWN_BURST) {
+                if tour.frames > 2 * WIRE_FRAMES && now - tour.shot_at >= dt {
+                    tour.burst += 1;
+                    let name = format!("down-{}", tour.burst);
+                    shoot(&mut commands, &tour, &name);
+                    tour.shot_at = now;
+                    // Let the last shot resolve before the tour ends.
+                    tour.frames = 2 * WIRE_FRAMES + 1;
+                }
             } else if tour.frames > 3 * WIRE_FRAMES {
                 tour.step = Step::Done;
                 tour.frames = 0;
@@ -1687,6 +1704,7 @@ fn main() -> AppExit {
         requested: launch_request(&region),
         agl_m,
         later_s,
+        burst: 0,
         shot_at: 0.0,
         step: Step::WaitRegion,
         changing: false,
@@ -1751,6 +1769,7 @@ mod tests {
                 requested: request,
                 agl_m,
                 later_s: None,
+                burst: 0,
                 shot_at: 0.0,
                 step: Step::Timing,
                 changing: false,

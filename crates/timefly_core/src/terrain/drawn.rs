@@ -16,24 +16,22 @@ use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
 use crate::worldgen::generate::RegionGrid;
 use crate::worldgen::generate::water::Boulder;
 
-/// A foam collar's footprint, in its boulder's radii (Task 11c fix round 4): a ring this far
+/// A foam collar's footprint, in its boulder's radii (Task 11c fix rounds 4 and 5; the
+/// collar shader clips its foam at the drawn water, so this bounds its shape and quad): a ring this far
 /// out all round, which holds the pillow piled on its upstream face and the boil over a rock
 /// just under...
-pub const COLLAR_RING_RADII: f64 = 2.7;
+pub const COLLAR_RING_RADII: f64 = 3.6;
 /// ...and a V wake downstream, as long as the collar's wake (radii), whose arms reach this far
 /// either side of the flow line at the rock...
-pub const COLLAR_WAKE_HALF_RADII: f64 = 1.6;
+pub const COLLAR_WAKE_HALF_RADII: f64 = 1.7;
 /// ...widening by this much a radius downstream.
-pub const COLLAR_WAKE_SPREAD: f64 = 0.5;
+pub const COLLAR_WAKE_SPREAD: f64 = 0.6;
 /// A collar's wake is `COLLAR_WAKE_BASE_RADII + COLLAR_WAKE_RADII_PER_MPS × speed` radii long
-/// (`collar_wake_radii`): longer in faster water...
-pub const COLLAR_WAKE_BASE_RADII: f64 = 2.0;
-pub const COLLAR_WAKE_RADII_PER_MPS: f64 = 1.5;
+/// (`collar_wake_radii`): longer in faster water (fix round 5: longer, "whiter wakes")...
+pub const COLLAR_WAKE_BASE_RADII: f64 = 3.0;
+pub const COLLAR_WAKE_RADII_PER_MPS: f64 = 2.0;
 /// ...up to this.
-pub const COLLAR_WAKE_MAX_RADII: f64 = 12.0;
-/// Where the drawn water doesn't hold a collar's full wake, these shares of it are tried, the
-/// longest first; a collar whose shortest doesn't fit isn't drawn.
-pub const COLLAR_WAKE_FITS: [f64; 4] = [1.0, 0.6, 0.35, 0.2];
+pub const COLLAR_WAKE_MAX_RADII: f64 = 16.0;
 /// A rock is kept only where the drawn ribbon holds it with this much water (m) to spare, and a
 /// collar's footprint only where the drawn ribbon reaches this far past it: the slack for a
 /// region's own lattice drawing the bank differently from every one checked (on the test's

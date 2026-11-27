@@ -599,6 +599,68 @@ still worth doing in Task 12's next run.
 when it was committed); this round's, 655–663 ms over six runs. So the region job takes about
 6 ms (1%) more, for 20% more rocks and 48% more collars with footprints several times larger.
 
+### Fix round 5: softer, whiter, animated white water
+
+The owner chose "softer, whiter wakes", with the foam animated like surf. The collars are still
+in the alpha-mask phase after the opaque pass (never blended): each fragment writes a dithered
+`@builtin(sample_mask)` (coverage 0–4 of the MSAA samples, by interleaved gradient noise), so
+edges feather instead of cutting. The foam is a flow-advected noise (two layers at the local
+speed and 0.75 of it, cross-faded), the pillow surges and the wake breathes over 1–3 s, and boils
+bloom over 2–4 s with a per-rock phase. A V wake now reaches 3 + 2·v radii (at most 16), and the
+collar shader clips its foam to the drawn water (it reads the terrain buffer and the water
+textures, as the water shader does), so the core no longer shrinks collar footprints to fit the
+water. Rocks: one cluster per 3,400 m² (from 3,500), at most 20 a sub-segment (from 16).
+
+| Bench region | Boulders | Share of `MAX_BOULDERS` | Collars | Placement | Prep (region job) |
+|---|---|---|---|---|---|
+| Pangaea interior (250 Ma) | 0 | 0% | 0 | 0.13 ms | 98 ms |
+| Red Sea (0 ka) | 0 | 0% | 0 | 0.09 ms | 276 ms |
+| Himalayas (0 ka) | 11,991 | **73.2%** | 7,438 | 3.04 ms | 598 ms (600–601 ms alone) |
+| Indus tributaries (0 ka) | 1,133 | 7% | 663 | 0.43 ms | 273 ms |
+| Sundaland (21 ka) | 0 | 0% | 0 | — | 178 ms |
+| Japan (1 Ma) | 17 | 0.1% | 17 | — | 1,744 ms |
+| Beringia (21 ka) | 0 | 0% | 0 | — | 215 ms |
+| Rockies ice margin (21 ka) | 1,090 | 7% | 499 | 0.37 ms | 475 ms |
+| Panama (3 Ma) | 0 | 0% | 0 | — | 106 ms |
+
+Every region is under the 75% budget. Prep fell from about 660 ms to about 600 ms: removing the
+core's collar-footprint hold (the shader clips instead) saved more than the extra rocks cost.
+
+**GPU cost** (the budget: within +1.0 ms of `12ef525`). Method as in round 4 (`region_tour time
+--offscreen`, 2560 × 1440, the window raised and shown, `12ef525` from `git archive` against
+this round's build, alternating pose by pose over four passes). This time the GPU timer gave
+readings in most runs, but pacing was mixed: most runs were display-paced (16.67 ms frames), a
+few ran uncapped and read no timer. Only like-for-like pairs (the same pass, both paced, both
+with readings) are compared:
+
+| GPU timer median, ms | Pass 0 | Pass 1 | Pass 2 | Pass 3 |
+|---|---|---|---|---|
+| Indus bench pose (2,000 m), parent | 12.58 | 13.23 | 12.93 | no readings (uncapped) |
+| Indus bench pose, fix round 5 | 12.51 | 12.42 | 12.39 | 12.77 |
+| Rapid close-up (150 m), parent | 12.00 | 10.89 (1,197 frames) | exit 1 (window raise) | 11.83 |
+| Rapid close-up, fix round 5 | 12.38 | no readings (uncapped) | no readings (uncapped) | 11.51 |
+| Wide rapid (`28.14479,87.34929,0`, 150 m), parent | 12.11 | no readings (uncapped) | no readings (uncapped) | 11.30 |
+| Wide rapid, fix round 5 | 12.02 | 154 frames: 11.05 | 1 frame | 11.31 |
+
+Like-for-like changes: bench −0.07, −0.81, −0.54 ms; rapid +0.38, −0.32 ms; wide −0.09,
++0.01 ms. Where both wide runs ran uncapped (passes 1 and 2), the frame-time medians read
+10.27 / 10.31 ms (parent) against 10.88 / 10.88 ms (round 5): **+0.6 ms**, an upper bound on the
+GPU's share. All within the +1.0 ms budget.
+
+**Foam share** (the share of the river crop's pixels that read as foam, `region_tour` at
+3840 × 2160, high quality):
+
+| Pose | Round 4 | Round 5 |
+|---|---|---|
+| Wide rapid 1 (150 m) | 7.3% | 15.6% |
+| Wide rapid 2 (150 m) | 13.1% | 28.1% |
+| Narrow rapid (150 m) | 4.3% | 9.6% |
+| Wide rapid, far (600 m; the river crop) | 8.1% | 14.1% |
+
+Wide rapid 2 is inside the owner's 20–30% target, and wide rapid 1 is under it: only about five
+clusters are in its view, with open water between them. The background crests average 4.6% foam
+away from rocks (`background_crest_foam_stays_under_its_cap`).
+
 
 `region_tour … shaded 3000` at each bench region's centre, 640 × 360, rivers on and with
 `--no-rivers`, one run each with a fresh `TIMEFLY_LOG_DIR`; the numbers are the session log's

@@ -347,12 +347,19 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
             layer.clone(),
         )
     };
-    // The boulders' vertex layout (positions and normals) and material.
+    // The boulders' vertex layout (positions and normals) and material, binding the stand-in's
+    // water as the real ones bind the region's.
+    let scatter_water =
+        crate::scatter::ScatterWater::of(&buffer, &fields.inner_water, &fields.apron_water);
     let [boulder_mesh, ..] = boulder_meshes();
     let boulder = (
         Name::new("Warm-up boulder"),
         Mesh3d(meshes.add(boulder_mesh)),
-        MeshMaterial3d(scatter_m.add(scatter_material(&palette, boulder_look(&grid)))),
+        MeshMaterial3d(scatter_m.add(scatter_material(
+            &palette,
+            boulder_look(&grid),
+            &scatter_water,
+        ))),
         MeshTag::new(0),
         Transform::IDENTITY,
         NoFrustumCulling,
@@ -362,7 +369,7 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
     let collar = (
         Name::new("Warm-up foam collar"),
         Mesh3d(meshes.add(foam_collar_mesh())),
-        MeshMaterial3d(scatter_m.add(foam_collar_material(&palette))),
+        MeshMaterial3d(scatter_m.add(foam_collar_material(&palette, &scatter_water))),
         MeshTag::new(0),
         Transform::IDENTITY,
         NoFrustumCulling,
@@ -735,7 +742,10 @@ mod tests {
             .partition(|r| materials.get(&r.2).unwrap().base.alpha_mode != AlphaMode::Opaque);
         let (ce, cmesh, cmat, ctag, crange) = collar[0].clone();
         assert!(entities.contains(&ce) && ctag && crange.is_none());
-        let want = crate::boulders::foam_collar_material(&Handle::default());
+        let want = crate::boulders::foam_collar_material(
+            &Handle::default(),
+            &crate::scatter::ScatterWater::default(),
+        );
         let got = materials.get(&cmat).unwrap();
         assert_eq!(got.base.alpha_mode, want.base.alpha_mode);
         assert_eq!(got.extension.look, want.extension.look);
@@ -764,7 +774,11 @@ mod tests {
             .get(&material)
             .unwrap()
             .clone();
-        let want = scatter_material(&material.extension.palette, boulder_look(&warmup_grid()));
+        let want = scatter_material(
+            &material.extension.palette,
+            boulder_look(&warmup_grid()),
+            &crate::scatter::ScatterWater::default(),
+        );
         assert_eq!(material.base.alpha_mode, want.base.alpha_mode);
         assert_eq!(material.extension.look, want.extension.look);
         let palette = world

@@ -160,9 +160,9 @@ pub const RIBBON_NONE_M: f64 = 1_000.0;
 /// [`BOULDER_CLUSTERS_PER_SUBPOINT_MAX`] (Task 11c fix round 4, the owner's "rework the look":
 /// a cluster every 30–60 m along a 100–150 m river; was 24 boulders a sub-segment in clusters
 /// of 6, whatever its width).
-pub const BOULDER_CLUSTER_AREA_M2: f64 = 3_500.0;
+pub const BOULDER_CLUSTER_AREA_M2: f64 = 3_400.0;
 /// The most clusters one sub-segment holds.
-pub const BOULDER_CLUSTERS_PER_SUBPOINT_MAX: u32 = 16;
+pub const BOULDER_CLUSTERS_PER_SUBPOINT_MAX: u32 = 20;
 /// A cluster at `rapid` = 1 holds a hashed count of boulders in this range (fewer at lesser
 /// rapids: the count times `rapid`, at least 1).
 pub const BOULDER_CLUSTER_MEMBERS: [u32; 2] = [2, 5];

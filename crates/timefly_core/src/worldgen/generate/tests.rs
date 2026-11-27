@@ -1878,8 +1878,8 @@ mod water {
     }
 
     /// Fix round 2: the region keeps a boulder only where the drawn water (the water shader's
-    /// own quantities, `blended_water` over the region's texels) holds it, and draws its collar
-    /// only where the drawn water holds the collar's footprint. Real widths: a narrow steep river
+    /// own quantities, `blended_water` over the region's texels) holds it; every foam site gets
+    /// a collar (fix round 5: the collar shader clips its foam at the drawn water). Real widths: a narrow steep river
     /// (Q 20 m³/s, 22 m), a 61 m one (Q 150) and a 200 m one (Q 1,600, fix round 4: clusters
     /// spread across it and fitting slides reach far from each cluster's centre), each on a 3%
     /// bed along a line oblique to the lattice, so the course kinks at every node; and the
@@ -1887,7 +1887,7 @@ mod water {
     /// the generator's rocks near the banks stand outside the drawn water in each fixture.
     #[test]
     fn placed_boulders_and_collars_lie_in_the_drawn_water() {
-        use crate::terrain::drawn::{collar_footprint, flow_local};
+        use crate::terrain::drawn::collar_wake_radii;
         let frame = RegionFrame {
             center: dir(20.0, 30.0),
         };
@@ -1990,17 +1990,18 @@ mod water {
                     b.radius_m,
                     w.ribbon_m
                 );
+                // Fix round 5: every foam site has a collar, a breaker's with the full wake of
+                // its speed (the collar shader clips the foam at the drawn water).
+                assert_eq!(b.collar, b.foam_site().is_some(), "{name}: {b:?}");
                 if b.collar {
                     collars += 1;
-                    assert!(b.foam_site().is_some());
-                    let down = flow_local(&basis, b.dir, b.flow_mps);
-                    for p in collar_footprint(x, z, b.radius_m, down, f64::from(b.wake_radii)) {
-                        let w = blended_water(&grid, p.x, p.y);
-                        assert!(
-                            w.thickness_m > 0.0 && w.ribbon_m >= 0.0,
-                            "{name}: a collar spills onto dry ground at {p}: {w:?}"
-                        );
-                    }
+                    let speed = b.flow_mps[0].hypot(b.flow_mps[1]);
+                    let want = if b.top_m() > b.level_m && speed > 1e-6 {
+                        collar_wake_radii(speed) as f32
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(b.wake_radii, want, "{name}: {b:?}");
                 }
             }
             assert!(collars > 20, "{name}: {collars} collars");

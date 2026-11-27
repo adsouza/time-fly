@@ -71,14 +71,14 @@ pub struct Boulder {
     /// The river's flow at `dir` (m/s), `[east, north]` in `dir`'s own frame, as the river
     /// texel stores it; zero where the water there is not a river.
     pub flow_mps: [f32; 2],
-    /// Whether its foam collar is drawn: a foam site whose collar's footprint every lattice the
-    /// generator checks draws wet ([`hold_in_drawn_water`]; the region then drops the rocks in
-    /// its own apron-blend band, [`region_boulders`](crate::terrain::drawn::region_boulders)).
+    /// Whether its foam collar is drawn: every foam site where the drawn-water fitting lands it
+    /// ([`hold_in_drawn_water`]; the collar shader clips its foam at the drawn water, fix round
+    /// 5; the region then drops the rocks in its own apron-blend band,
+    /// [`region_boulders`](crate::terrain::drawn::region_boulders)).
     pub collar: bool,
-    /// Its collar's V wake (radii downstream): the full
-    /// [`collar_wake_radii`](crate::terrain::drawn::collar_wake_radii) of its flow, or the
-    /// longest share of it the drawn water holds; 0 without a collar, or for a boil (a rock under
-    /// the water, whose collar has no V).
+    /// Its collar's V wake (radii downstream): the
+    /// [`collar_wake_radii`](crate::terrain::drawn::collar_wake_radii) of its flow's speed; 0
+    /// without a collar, or for a boil (a rock under the water, whose collar has no V).
     pub wake_radii: f32,
 }
 
@@ -826,16 +826,13 @@ pub(super) const FIT_MIN_RADIUS_M: f64 = 0.4;
 /// break there (`(depth + rise) / 2`, within the cluster's cap) if that still fits, and passed
 /// over otherwise. Only if no try breaks is the first that fits kept, under the water.
 ///
-/// A foam site's collar is drawn with the longest of [`COLLAR_WAKE_FITS`] of its full wake
-/// ([`collar_wake_radii`] of its flow) whose footprint ([`collar_footprint`]) every lattice
-/// holds with [`DRAWN_ROCK_MARGIN_M`] to spare, tested where the rock lands; none: no collar. A
-/// rock under the water (a boil) has no wake. A pure function of the pass and the directions,
-/// so overlapping regions keep the same rocks.
+/// Every foam site where it lands gets a collar: a breaker with a flow the full wake of its
+/// speed ([`collar_wake_radii`]), a rock under the water (a boil) none. Fix round 5: the collar
+/// shader clips its foam at the region's own drawn water, so a collar's footprint is no longer
+/// held to the emulated lattices (round 4 shortened or dropped the wakes near banks). A pure
+/// function of the pass and the directions, so overlapping regions keep the same rocks.
 ///
-/// [`COLLAR_WAKE_FITS`]: crate::terrain::drawn::COLLAR_WAKE_FITS
 /// [`collar_wake_radii`]: crate::terrain::drawn::collar_wake_radii
-/// [`collar_footprint`]: crate::terrain::drawn::collar_footprint
-/// [`DRAWN_ROCK_MARGIN_M`]: crate::terrain::drawn::DRAWN_ROCK_MARGIN_M
 pub(super) fn hold_in_drawn_water(
     lattices: &mut DrawnLattices,
     cluster: &BoulderCluster,
@@ -857,9 +854,7 @@ pub(super) fn fit_rock(
     b_bed: BoulderBed,
     rise_m: Option<f64>,
 ) -> Option<Boulder> {
-    use crate::terrain::drawn::{
-        COLLAR_WAKE_FITS, DRAWN_ROCK_MARGIN_M, collar_footprint, collar_wake_radii,
-    };
+    use crate::terrain::drawn::collar_wake_radii;
     let p0 = lattices.tangent(b.dir);
     let r = f64::from(b.radius_m);
     // Toward the centreline: square to the flow, the offset's sign saying which side (positive
@@ -919,37 +914,10 @@ pub(super) fn fit_rock(
         ..fitted
     };
     if fitted.foam_site().is_some() {
-        let down = DVec2::new(
-            f64::from(fitted.flow_mps[0]),
-            -f64::from(fitted.flow_mps[1]),
-        )
-        .try_normalize();
-        let full = if fitted.top_m() > fitted.level_m && down.is_some() {
-            collar_wake_radii(fitted.flow_mps[0].hypot(fitted.flow_mps[1]))
-        } else {
-            0.0
-        };
-        let tries: &[f64] = if full > 0.0 {
-            &COLLAR_WAKE_FITS
-        } else {
-            &[0.0]
-        };
-        for &share in tries {
-            let wake = full * share;
-            // The wake's far end first, where a footprint most often leaves the water.
-            let holds = collar_footprint(p.x, p.y, fitted.radius_m, down, wake)
-                .iter()
-                .rev()
-                .all(|q| {
-                    lattices
-                        .held(*q)
-                        .is_some_and(|ribbon| ribbon >= DRAWN_ROCK_MARGIN_M)
-                });
-            if holds {
-                out.collar = true;
-                out.wake_radii = wake as f32;
-                break;
-            }
+        let speed = fitted.flow_mps[0].hypot(fitted.flow_mps[1]);
+        out.collar = true;
+        if fitted.top_m() > fitted.level_m && speed > 1e-6 {
+            out.wake_radii = collar_wake_radii(speed) as f32;
         }
     }
     Some(out)
@@ -1097,11 +1065,10 @@ mod tests {
     /// Fix round 4 (Important 3 of the rounds 2–3 re-review): `hold_in_drawn_water`'s fitting
     /// on a hand-built cell. A 3 m rock 37 m off the centreline of an 80 m river has a ribbon of
     /// 3 m, short of its radius plus the 1.5 m margin, so it is moved (by a quarter, to 27.75 m)
-    /// rather than shrunk; re-seated on the bed where it lands; and its collar is tested there,
-    /// where only the shortest wake fits (it would not at all where it was sized).
+    /// rather than shrunk; re-seated on the bed where it lands; and given its collar there.
     #[test]
     fn fitting_moves_a_bank_rock_toward_the_centreline() {
-        use crate::terrain::drawn::{DRAWN_ROCK_MARGIN_M, collar_footprint, collar_wake_radii};
+        use crate::terrain::drawn::collar_wake_radii;
         let (origin, bed) = hand_built_river(40.0, 96.0, 0.05);
         let texel_m = 300_000.0 / 1024.0;
         let mut cache = DrawnCache::default();
@@ -1133,21 +1100,11 @@ mod tests {
             "re-seated on the bed where it lands"
         );
         assert_eq!(got.wet, boulder(got.dir, 3.0, 77, &landed).wet);
-        // The collar, tested where the rock landed: the shortest wake (9.5 radii at 5 m/s, a
-        // 0.35 share) fits; at the sized place not even its ring does.
-        let full = collar_wake_radii(5.0);
-        assert_eq!(full, 9.5);
+        // The collar where the rock landed: a breaker's, the full wake of its speed (fix round
+        // 5: the shader clips the foam at the drawn water, so the wake isn't shortened here).
         assert!(got.collar);
-        assert!((f64::from(got.wake_radii) - 0.35 * full).abs() < 1e-6);
-        let p1 = lattices.tangent(got.dir);
-        let held = |l: &mut DrawnLattices, p: DVec2, wake: f64| {
-            collar_footprint(p.x, p.y, 3.0, Some(DVec2::X), wake)
-                .iter()
-                .all(|q| l.held(*q).is_some_and(|r| r >= DRAWN_ROCK_MARGIN_M))
-        };
-        assert!(!held(&mut lattices, p1, 0.6 * full));
-        let p0 = lattices.tangent(dir0);
-        assert!(!held(&mut lattices, p0, 0.0));
+        assert_eq!(f64::from(got.wake_radii), collar_wake_radii(5.0));
+        assert_eq!(collar_wake_radii(5.0), 13.0);
     }
 
     /// Fix round 4 (Important 2): a breaker that the fitting slides into deeper water is grown

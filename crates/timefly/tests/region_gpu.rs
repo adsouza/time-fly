@@ -2282,43 +2282,49 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     // (x, z) region metres, made on the CPU (a fused multiply-add here would move them by an
-    // ulp of 151 km, 1.6 cm), then two unit values.
+    // ulp of 151 km, 1.6 cm), then two unit values; the time and the seed come from them.
     let q = queries[n];
     let xz = q.xy;
     let p = vec2<f32>(8.0 * q.z - 4.0, 10.0 * q.w - 2.0);
+    let t = 3.0 + 7.0 * q.w;
+    let seed = u32(q.w * 255.0);
     let dir = normalize(vec2<f32>(cos(q.z * 6.0), sin(q.z * 6.0)));
     let lambda = 6.0 + 17.0 * q.w;
     let crests = crest_patch(xz);
     let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+    let flicker = crest_flicker(xz, t);
+    let pulses = collar_pulses(t, seed);
     out[n] = vec4<f32>(
-        collar_shape(p, q.z, 8.0 * q.w),
-        white_water_foam(1.0, crest, crests, q.z - 0.5, q.w),
-        crest,
-        crests,
+        collar_shape(p, q.z, 16.0 * q.w, pulses.x, pulses.y, pulses.z),
+        white_water_foam(1.0, crest, crests, q.z - 0.5, flicker, q.w),
+        collar_foam(p * 3.0, 6.0 * q.z, t, seed),
+        flicker,
     );
 }
 "#;
 
-/// Fix round 4: the white water's shape functions as the shipped shaders write them (cut from
-/// `scatter.wesl` and `water.wesl`, with `noise.wesl`) agree with their Rust mirrors on the GPU:
-/// the collars' pillow, V and boil, the crests' warped standing waves and patches, and the
-/// foam weight.
+/// Fix rounds 4 and 5: the white water's functions as the shipped shaders write them (cut from
+/// `scatter.wesl` and `water.wesl`, with `noise.wesl`) agree with their Rust mirrors on the GPU,
+/// at times from 3 to 10 s: the collars' pulsed shape and their flowing foam, the crests' warped
+/// standing waves, patches and flicker, and the foam weight.
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn wesl_white_water_matches_rust() {
     use bevy::math::Vec2;
-    use timefly::boulders::collar_shape;
-    use timefly::water::{crest_patch, crest_warp, standing_waves, white_water_foam};
+    use timefly::boulders::{collar_foam, collar_pulses, collar_shape};
+    use timefly::water::{
+        crest_flicker, crest_patch, crest_warp, standing_waves, white_water_foam,
+    };
     let mut src = String::from(NOISE);
     for c in [
         "STANDING_WAVE_CELL_M",
         "FOAM_CREST_BAND",
-        "FOAM_LACE",
-        "FOAM_LACE_BAND",
         "FOAM_MEAN",
         "CREST_WARP",
         "CREST_NOISE_M",
         "CREST_PATCH_BAND",
+        "CREST_FLICKER_M",
+        "CREST_FLICKER_RATE",
     ] {
         src += &format!("{}\n", wesl_const(WATER, c));
     }
@@ -2327,11 +2333,21 @@ fn wesl_white_water_matches_rust() {
         "standing_waves",
         "crest_warp",
         "crest_patch",
+        "crest_flicker",
         "white_water_foam",
     ] {
         src += &format!("{}\n", wesl_fn(WATER, f));
     }
-    src += &format!("{}\n{WHITE_WATER_ENTRY}", wesl_fn(SCATTER, "collar_shape"));
+    for f in [
+        "foam_noise",
+        "collar_shape",
+        "collar_pulses",
+        "foam_layer",
+        "collar_foam",
+    ] {
+        src += &format!("{}\n", wesl_fn(SCATTER, f));
+    }
+    src += WHITE_WATER_ENTRY;
     let mut rng = SplitMix(0xC011A5);
     let queries: Vec<[f32; 4]> = (0..16_384)
         .map(|_| {
@@ -2421,16 +2437,19 @@ fn wesl_white_water_matches_rust() {
     for (q, g) in queries.iter().zip(&got) {
         let xz = Vec2::new(q[0], q[1]);
         let p = Vec2::new(8.0 * q[2] - 4.0, 10.0 * q[3] - 2.0);
+        let t = 3.0 + 7.0 * q[3];
+        let seed = (q[3] * 255.0) as u32;
         let a = q[2] * 6.0;
         let dir = Vec2::new(a.cos(), a.sin()).normalize();
         let lambda = 6.0 + 17.0 * q[3];
         let crests = crest_patch(xz);
         let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+        let flicker = crest_flicker(xz, t);
         let want = [
-            collar_shape(p, q[2], 8.0 * q[3]),
-            white_water_foam(1.0, crest, crests, q[2] - 0.5, q[3]),
-            crest,
-            crests,
+            collar_shape(p, q[2], 16.0 * q[3], collar_pulses(t, seed)),
+            white_water_foam(1.0, crest, crests, q[2] - 0.5, flicker, q[3]),
+            collar_foam(p * 3.0, 6.0 * q[2], t, seed),
+            flicker,
         ];
         shaped += usize::from(want[0] > 0.5);
         foamed += usize::from(want[1] > 0.5);
@@ -2438,13 +2457,13 @@ fn wesl_white_water_matches_rust() {
             d.push((got - want).abs());
         }
     }
-    // The shape: a few ulps. The noise itself agrees to 1e-6 (`wesl_noise_matches_golden`), but
-    // `brush` divides region metres by its cell (16,800 cells out here), and WGSL's division may
-    // be 2.5 ulps off, which the patches' smoothstep over a 0.3 band steepens; the waves' phase
-    // runs through sin on hashed offsets; the foam's smoothsteps steepen both again. So the
-    // worst and the 99th percentile are bounded separately.
+    // The shape (its pulses run through sin) and the collar foam (small coordinates): a few
+    // ulps. The noise itself agrees to 1e-6 (`wesl_noise_matches_golden`), but `brush` divides
+    // region metres by its cell (thousands of cells out here), and WGSL's division may be 2.5
+    // ulps off; the waves' phase runs through sin on hashed offsets; the foam's smoothsteps
+    // steepen both. So the worst and the 99th percentile are bounded separately.
     let mut worst = [0.0f32; 4];
-    for (k, (max, p99)) in [(1e-4f32, 1e-4f32), (0.1, 1e-2), (2e-2, 5e-3), (3e-2, 5e-3)]
+    for (k, (max, p99)) in [(2e-3f32, 2e-4f32), (0.1, 1e-2), (2e-3, 2e-4), (3e-2, 5e-3)]
         .into_iter()
         .enumerate()
     {
@@ -2460,7 +2479,7 @@ fn wesl_white_water_matches_rust() {
     }
     println!("worst differences {worst:?}; {shaped} in a collar, {foamed} foamed");
     assert!(
-        shaped > 600 && foamed > 100,
+        shaped > 600 && foamed > 15,
         "{shaped} shaped, {foamed} foamed"
     );
 }

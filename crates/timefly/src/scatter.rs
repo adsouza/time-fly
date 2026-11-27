@@ -36,6 +36,7 @@ use bevy::mesh::MeshTag;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 use bevy::transform::TransformSystems;
 
@@ -294,7 +295,9 @@ pub struct ScatterLook {
     pub light: Vec4,
 }
 
-/// The scatter's extension of `StandardMaterial`: the terrain palette and the look.
+/// The scatter's extension of `StandardMaterial`: the terrain palette, the look, and the
+/// region's terrain buffer and water textures (Task 11c fix round 5: a foam collar draws only
+/// where the water does, read as the water's material reads it).
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 pub struct ScatterExtension {
     /// `palette_image()` (`Rgba8UnormSrgb`, read with `textureLoad`).
@@ -302,6 +305,64 @@ pub struct ScatterExtension {
     pub palette: Handle<Image>,
     #[uniform(101)]
     pub look: ScatterLook,
+    /// `TerrainScene::buffer` (its header's field layout).
+    #[storage(102, read_only)]
+    pub patches: Handle<ShaderBuffer>,
+    /// `TerrainScene::inner_water` (`Rgba32Uint`, read with `textureLoad`).
+    #[texture(103, sample_type = "u_int")]
+    pub inner_water: Handle<Image>,
+    #[texture(104, sample_type = "u_int")]
+    pub apron_water: Handle<Image>,
+}
+
+/// The region water a scatter material binds ([`ScatterExtension`]'s last three).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScatterWater {
+    pub patches: Handle<ShaderBuffer>,
+    pub inner_water: Handle<Image>,
+    pub apron_water: Handle<Image>,
+}
+
+impl ScatterWater {
+    /// Stand-ins until a region's scene exists: dry 2 × 2 water textures (a `u_int` binding
+    /// can't take the default image, which is a float one) and an empty terrain buffer.
+    pub fn placeholder(images: &mut Assets<Image>, buffers: &mut Assets<ShaderBuffer>) -> Self {
+        use crate::terrain::material::{TerrainParams, terrain_buffer_bytes, water_image};
+        use bevy::asset::RenderAssetUsages;
+        use bevy::render::render_resource::BufferUsages;
+        use timefly_core::worldgen::generate::Field;
+        let dry = Field::dry(2, 1.0, vec![0.0; 4], vec![[0; 4]; 4]);
+        let mut buffer = ShaderBuffer::new(
+            terrain_buffer_bytes(&TerrainParams::default(), &[], 1),
+            RenderAssetUsages::default(),
+        );
+        buffer.buffer_usage = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+        ScatterWater {
+            patches: buffers.add(buffer),
+            inner_water: images.add(water_image(&dry)),
+            apron_water: images.add(water_image(&dry)),
+        }
+    }
+
+    /// The region water of the terrain scene's buffer and textures.
+    pub fn of(
+        patches: &Handle<ShaderBuffer>,
+        inner_water: &Handle<Image>,
+        apron_water: &Handle<Image>,
+    ) -> Self {
+        ScatterWater {
+            patches: patches.clone(),
+            inner_water: inner_water.clone(),
+            apron_water: apron_water.clone(),
+        }
+    }
+
+    /// Binds this water to `extension`.
+    pub fn bind(&self, extension: &mut ScatterExtension) {
+        extension.patches = self.patches.clone();
+        extension.inner_water = self.inner_water.clone();
+        extension.apron_water = self.apron_water.clone();
+    }
 }
 
 impl MaterialExtension for ScatterExtension {
@@ -321,9 +382,13 @@ impl MaterialExtension for ScatterExtension {
     }
 }
 
-/// A scatter material over `palette` with `look` (shared with the pipeline warm-up,
-/// `crate::terrain::warmup`, so its pipeline keys match).
-pub fn scatter_material(palette: &Handle<Image>, look: ScatterLook) -> ScatterMaterial {
+/// A scatter material over `palette` with `look`, binding `water` (shared with the pipeline
+/// warm-up, `crate::terrain::warmup`, so its pipeline keys match).
+pub fn scatter_material(
+    palette: &Handle<Image>,
+    look: ScatterLook,
+    water: &ScatterWater,
+) -> ScatterMaterial {
     ScatterMaterial {
         base: StandardMaterial {
             base_color: Color::WHITE,
@@ -334,6 +399,9 @@ pub fn scatter_material(palette: &Handle<Image>, look: ScatterLook) -> ScatterMa
         extension: ScatterExtension {
             palette: palette.clone(),
             look,
+            patches: water.patches.clone(),
+            inner_water: water.inner_water.clone(),
+            apron_water: water.apron_water.clone(),
         },
     }
 }
@@ -459,7 +527,11 @@ mod tests {
             .collect();
         let material = world
             .resource_mut::<Assets<ScatterMaterial>>()
-            .add(scatter_material(&Handle::default(), test_look()));
+            .add(scatter_material(
+                &Handle::default(),
+                test_look(),
+                &ScatterWater::default(),
+            ));
         let set = world
             .spawn((
                 ScatterSet::empty(ScatterKind::Boulders),

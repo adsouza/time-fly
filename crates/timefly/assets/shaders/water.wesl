@@ -139,13 +139,13 @@ const STANDING_WAVE_CELL_M: f32 = 32.0;
 const STREAK_STRETCH: f32 = 4.0;
 // `STREAK_DIRECTIONS` in water.rs: the streaks' frames, this many evenly around the circle.
 const STREAK_DIRECTIONS: f32 = 24.0;
-// `FOAM_CREST_BAND`, `FOAM_LACE`, `FOAM_LACE_BAND`, `FOAM_MEAN` in water.rs: white water's
+// `FOAM_CREST_BAND`, `FOAM_MEAN`, `CREST_FLICKER_M`, `CREST_FLICKER_RATE` in water.rs: white water's
 // foam stands on the standing waves' crests, broken by the streaks, with lace off the troughs,
 // and fades to its mean where unresolved (`white_water_foam`).
-const FOAM_CREST_BAND: vec2<f32> = vec2<f32>(0.45, 0.75);
-const FOAM_LACE: f32 = 0.5;
-const FOAM_LACE_BAND: vec2<f32> = vec2<f32>(0.35, 0.7);
-const FOAM_MEAN: f32 = 0.105;
+const FOAM_CREST_BAND: vec2<f32> = vec2<f32>(0.05, 0.6);
+const CREST_FLICKER_M: f32 = 7.0;
+const CREST_FLICKER_RATE: f32 = 0.8;
+const FOAM_MEAN: f32 = 0.19;
 // `CREST_WARP`, `CREST_NOISE_M`, `CREST_PATCH_BAND`, `CREST_WAVE_FLOOR` in water.rs: the
 // standing waves' still phase warp (wavelengths) and patches (`crest_warp`, `crest_patch`).
 const CREST_WARP: f32 = 0.5;
@@ -341,14 +341,31 @@ fn streaks(xz: vec2<f32>, dir: vec2<f32>, s: f32, footprint: f32, t: f32) -> f32
     return (n.x * (1.0 - a) + n.y * a) * inverseSqrt((1.0 - a) * (1.0 - a) + a * a);
 }
 
+// `crest_flicker` in water.rs: how much of the crests' foam stands at xz at time t (s), 0 to 1:
+// still noise about CREST_FLICKER_M across that changes with time, so crest foam flickers,
+// breaks and re-forms while the crests themselves stay put.
+fn crest_flicker(xz: vec2<f32>, t: f32) -> f32 {
+    return clamp(0.55 + 0.6 * brush(xz, CREST_FLICKER_M, t * CREST_FLICKER_RATE, 251u), 0.0, 1.0);
+}
+
 // `white_water_foam` in water.rs: the foam weight at a rapid, a standing-wave crest (−1 in a
 // trough, 1 on a crest), the crests' patch strength (`patch` is a WGSL reserved word), the
-// streak noise and how far they are resolved: none in a trough, none where the patch is gone.
-fn white_water_foam(rapid: f32, crest: f32, crests: f32, streak: f32, resolve: f32) -> f32 {
-    let foam = smoothstep(FOAM_CREST_BAND.x, FOAM_CREST_BAND.y, crest * crests + streak * crests);
-    let lace = FOAM_LACE * smoothstep(FOAM_LACE_BAND.x, FOAM_LACE_BAND.y, streak)
-        * smoothstep(-0.5, 0.0, crest) * crests;
-    return rapid * mix(FOAM_MEAN, max(foam, lace), resolve);
+// streak noise (4:1 along the flow, carried by it), the crests' flicker and how far they are
+// resolved: soft streaks on the crests, none in a trough, none where the patch is gone.
+fn white_water_foam(
+    rapid: f32,
+    crest: f32,
+    crests: f32,
+    streak: f32,
+    flicker: f32,
+    resolve: f32,
+) -> f32 {
+    let foam = smoothstep(
+        FOAM_CREST_BAND.x,
+        FOAM_CREST_BAND.y,
+        flicker * (0.5 + 0.5 * crests) * (0.3 + 0.7 * streak),
+    ) * smoothstep(-0.5, 0.5, crest);
+    return rapid * mix(FOAM_MEAN, foam, resolve);
 }
 
 // The thinnest water (m) the shore's foam band ends at (FOAM_MIN_DEPTH_M in water.rs).
@@ -481,7 +498,9 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
             let n0 = streaks(x0, dir, s, footprint, t);
             let n1 = streaks(x1, dir, s, footprint, t);
             let n = STREAK_CONTRAST * (weights.x * n0 + weights.y * n1);
-            white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, ww) * river_w;
+            let flicker = crest_flicker(xz, t);
+            white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, flicker, ww)
+                * river_w;
         }
     }
     let lake_tilt = (ripple - wave_slope) * (1.0 - river_w);
