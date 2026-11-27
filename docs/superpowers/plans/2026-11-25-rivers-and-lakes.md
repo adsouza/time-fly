@@ -1427,3 +1427,39 @@ Disk-guard bookkeeping is left out, as in M3.
 
 - **Review packages are generated with `GIT_CONFIG_GLOBAL=/dev/null`** from Task 11c's re-review on.
   - Why: `~/.gitconfig` sets `diff.external=difft`, so every earlier package was a difftastic display, not a unified diff, and earlier reviewers may have missed context; the final whole-branch review gets a clean package.
+
+#### Rulings since Task 12's first round (copied in Task 12's fix round 1)
+
+**Task 11c, rounds 2–6, and the order of work**
+
+- **Task 11c's fix round 2 runs after Task 12 rather than interrupting it.**
+  - Why: the fix changes rock placement only, not bench cost; Task 12's rapid renders are redone.
+  - Cost if wrong: one stale render set.
+- **The bug-shot button takes the window's top-right corner** at (`GUTTER_PX`, `GUTTER_PX`); the FPS readout (`ui/fps.rs`) moves left of it on the same row, vertically centred.
+  - Why: both stay visible without overlap.
+  - Cost if wrong: the owner wanted the FPS kept in the corner; a one-line move.
+- **Task 11c's fix round 2 (rocks inside the water, the button, the fmt fix) runs before the Chrome benches,** so Chrome measures the final code.
+  - Cost: Chrome waits one round.
+- **Task 12's fix round 1 waits until 11c's round 2 lands and the owner rules on hop memory,** so the doc fixes, the redone rapid renders and the gate wording land in one round.
+  - Why: it avoids two docs rounds and a git index race with the running code round.
+  - Cost: Task 12 stays open a little longer.
+- **A rock that fails the drawn-water test is first moved toward the drawn channel's centre and shrunk to fit** (with a radius floor), and dropped only if it still fails (round 3).
+  - Why: round 2 met "no rocks on the bank" by deleting the owner's "bigger rocks, sloshing over rocks"; fitting keeps the look.
+  - Cost if wrong: smaller rocks on narrow rivers than on wide ones.
+- **A CPU-only WESL + naga validation test over every shader** (`tests/shader_compile.rs`, proven RED with a parameter named `patch`, a WGSL reserved word the owner spotted), and `region_gpu -- --ignored` before reporting (round 4).
+  - Why: no default-gate test compiled the shaders (`wesl_water_matches_rust` is ignored and needs a GPU), so a broken shader passed every gate and failed only at runtime.
+  - Cost: a little test time.
+- **The white water's animation is texture flowing through stationary shapes plus bounded pulses, not travelling waves** (round 5).
+  - Why: a real rapid's standing waves stay put while the water rushes through them; surf moves because sea waves travel.
+  - Cost if wrong: the owner wanted visibly travelling, lapping waves; a later tweak.
+- **Rounds 4 and 5 get a scoped correctness re-review** (determinism, bindings, `sample_mask`, the removed core hold); further look tuning is owner-directed new work, not a sixth fix round. The owner then chose "Ship, tune later" (2026-11-27): the round-5 look ships, and lacier wakes (thinning the solid core into streaks, so neighbouring wakes stop merging into straight-sided sheets) join the post-milestone follow-ups.
+  - Cost: one more small task if the owner wants it.
+- **The 5-round cap is exceeded for a crash fix** (round 6): the collar material bound `Handle::default()` into its `texture_2d<u32>` water slots on every replace, wgpu rejected the bind group and the app quit on the first hop or snapshot change.
+  - Why: the cap stops review loops that don't converge, not crash fixes; a task that quits the app on a hop can't be parked.
+  - Cost: one more round. Task 12's journey bench and web build wait for it.
+
+**Task 12: the hop-memory baseline (owner, 2026-11-27: "Fix the hop-memory baseline")**
+
+- **The native gate keeps +64 MiB; its baseline becomes the flight before the hop**, not the sample at the hop's start, which lands in macOS's reclaim trough. What the gate means: a hop does not raise peak memory above flight.
+  - As built (Task 12's fix round 1, the implementer's call): the baseline is the **highest** footprint flown on the hop's leg (`FlightLeg`: since the region was entered or the last hop began), not a median or maximum over the last few seconds. The trace showed the trough arriving eight seconds before the first hop (1,296.9 → 1,231 → 1,028 MiB while cruising), so any window of the last few seconds sat wholly inside it. The maximum is "peak over flight"; the footprint is a slow, steady series within a leg, so a spike isn't a practical risk. The last flying frame's figure is still logged, labelled, and the web keeps M3's growth rule on it.
+  - Cost if wrong: a real hop growth hidden by a high flight footprint earlier on the same leg (just after a dive, with the pass's working set still resident).

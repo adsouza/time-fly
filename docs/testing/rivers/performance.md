@@ -30,13 +30,15 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory
 
 | Gate | Result |
 |---|---|
-| `--region-bench` run 2 (judged) | **PASS** (exit 0). Every region's R14 passes (uncapped p95 rule for seven, Pangaea and the Red Sea reported only); R11 41.45 ms; warm generation median 531, max 540 ms (≤ 3,000); memory cycles +0.7% (≤ +10%) |
+| `--region-bench` run 2 (judged) | **PASS** (exit 0). The seven gated regions' R14 flights pass (uncapped p95 rule). **Pangaea's and the Red Sea's flights FAIL, reported only** (not gated since M3): Pangaea display-paced 16.50 / 21.42 / 43.25 ms with 21 stalls, the Red Sea uncapped 11.06 / p95 18.58 / 37.80 ms with 13 stalls; R11 41.45 ms; warm generation median 531, max 540 ms (≤ 3,000); memory cycles +0.7% (≤ +10%) |
 | `--region-bench` run 1 (first launch) | FAIL (exit 3): R14 in Sundaland, Beringia, the Rockies (and its globe pan) and Panama, during the other session's build and a display change mid-run; everything else passes |
 | `--journey-bench` run 2 (judged) | **FAIL (exit 3) on hop memory alone: the first hop +78.1 MiB** against +64; every other hop +22.0 to +45.4 MiB; every other gate passes (holds, flight, swap worst frame 33.75 ms, route checks, journey memory +3.5%) |
 | `--journey-bench` run 1 | FAIL (exit 3) on hop memory alone: the first hop +72.0 MiB; the others +44.4 to +54.8 MiB (uncapped, which reads higher, as Task 7 found) |
+| Hop-memory baseline (owner, 2026-11-27: "Fix the hop-memory baseline") | **Changed in Task 12's fix round 1** (`bffa796`): the native gate judges a hop against the highest footprint of the flight before it, not the last flying frame. **The two journey runs under it are pending** (they wait for Task 11c's round 6, which fixes a crash on a hop); see "The baseline, fixed" below |
 | Hop-memory escalation (plan Step 3) | (1) `APRON_RIVER_MIN_DISCHARGE_M3S` 200 → 1,000, two runs: **still FAIL** (worst +71.0 and +64.5 MiB, again on hops whose baseline fell into a trough). (2) Dropping the CPU river array after upload: already in place since Task 7 (`free_rivers`). **The gate is the owner's call** (below) |
 | `--scrub-bench` (one run) | **PASS** (display-paced; older 16.70 / 18.47 / 32.12 ms, 0.08% missed; younger 16.68 / 18.41 / 22.52 ms) |
 | The continental pass, native (target ≤ 1,000 ms, reported) | 0 ka 1,033–1,449 ms wall; 21 ka 1,099–1,231 ms; deep eras 433–755 ms: **over the native target at 0 ka and 21 ka** (Task 10: 930–1,050 ms), under it deep |
+| `cargo fmt --check` | failed at `9814212` (`examples/region_tour.rs:1515`, from M3's merge); **fixed at `f30ba91`** |
 | White water's GPU cost (budget +1.0 ms) | **−0.01 ms** (bench pose) and **+0.04 ms** (rapid close-up) against `12ef525`, GPU timestamps, display-paced, window shown: within noise |
 | The reality check (`--hydro-check`) | outlets **22/22**, lakes **8/8**, Amazon box PASS (91.8%), ridged joins 0/4,714, arid PASS; **Indus box FAIL on "every link" (74/84)**, as since Task 11 (the owner's) |
 | Chrome WebGPU | **PENDING: the controller's run** (the build is ready, below) |
@@ -46,14 +48,14 @@ TIMEFLY_LOG_DIR="$(mktemp -d)" TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory
 | | Run 1 (first launch) | Run 2 (judged) | Task 10 run 2 | M3 (Task 11 run 2) |
 |---|---|---|---|---|
 | Pacing, resolution | display-paced 2560 × 1440 for six regions, then uncapped; the last three at 1920 × 951 | uncapped from the Red Sea on (Pangaea paced), 2560 × 1440, the last three 1920 × 951 | display-paced, 1920 × 951 | display-paced, 1920 × 951 |
-| R14 per region | FAIL in Sundaland (98 stalls), Beringia (36), the Rockies (uncapped p95 17.24 ms; its globe pan 49 ms worst), Panama (uncapped p95 16.80 ms); the rest PASS | all PASS | all PASS | all PASS |
+| R14 per region | FAIL in Sundaland (98 stalls), Beringia (36), the Rockies (uncapped p95 17.24 ms; its globe pan 49 ms worst), Panama (uncapped p95 16.80 ms); the rest PASS (Pangaea and the Red Sea reported only) | the seven gated regions PASS; **Pangaea's and the Red Sea's flights FAIL, reported only** (16.50 / 21.42 / 43.25 ms, 21 stalls; uncapped 11.06 / 18.58 / 37.80 ms, 13 stalls) | all PASS | all PASS |
 | R11 first-region worst frame (native: reported) | 32.52 ms | 41.45 ms | 32.07 ms | 42.60 ms |
 | Himalayas load-window worst frame | 34.72 ms | 33.10 ms | 34.48 ms | 23.90 ms |
 | Warm generation (10 Himalayas re-entries) | median 466, max 514 ms | median 531, max 540 ms | median 432, max 434 ms | median 316, max 332 ms |
 | Memory cycles (≤ +10%) | −9.5% | +0.7% | +0.0% | — |
 | First entries (the region's own generation; pass wait excluded) | Pangaea 366, Red Sea 468, Himalayas 464, Indus 466, Sundaland 433, Japan 2,067, Beringia 532, Rockies 714, Panama 417 ms | Pangaea 402, Red Sea 506, Himalayas 508, Indus 488, Sundaland 468, Japan 2,098, Beringia 502, Rockies 855, Panama 433 ms | 368, 467, 450, 466, 416, 1,911, 466, 649, 368 ms | 549, 482, 332, —, 332, 1,865, 382, 616, 332 ms |
 
-**Against M3 and Task 10.** Flight gates hold in the judged run. Region generation (pass wait
+**Against M3 and Task 10.** The gated flights hold in the judged run (the two ungated ones fail, reported only, as above). Region generation (pass wait
 excluded) is up on Task 10 by 5–30% in run 2 (Himalayas 508 vs 450 ms, warm 531 vs 432 ms) and
 on M3 by about 50% in the recent eras (Himalayas 508 vs 332). Task 10 explained M3 → Task 10 (the
 rivers' prep and the wider tile margin). Task 10 → now adds Task 11e's tributary corridor search
@@ -122,8 +124,10 @@ after the first dive"), and Task 10's run 1 failed the same way (+71.0).
 **The escalation list (plan Step 3), in order:**
 1. **Raise `APRON_RIVER_MIN_DISCHARGE_M3S`** (200 → 1,000 m³/s, a scratch build, not committed;
    two journey runs, display-paced with the window hidden throughout, 1920 × 951): **still FAIL.**
-   Run 1: worst **+71.0 MiB** (Mt Fuji hop 1), the first hop +53.0, the rest +20.1 to +63.1.
-   Run 2: worst **+64.5 MiB** (Andes hop 2), the first hop +50.7, the rest +17.4 to +29.0. In
+   Run 1: worst **+71.0 MiB** (Mt Fuji hop 1); every hop, from the summary line: +53.0, +63.1,
+   +20.1, +20.4, +26.4, +23.8, +71.0, +28.8, +20.6, +20.5.
+   Run 2: worst **+64.5 MiB** (Andes hop 2); every hop: +50.7, +64.5, +20.5, +20.7, +29.0, +23.8,
+   +28.8, +26.9, +24.5, +17.4. In
    run 2 the failing hop is the same trough: its baseline fell from 904.1 to 806.5 MiB as the
    hop began, and it peaked at 871.0, below hop 1's 924.5. Graphics memory read about 130 MiB
    lower in both (no main pass drawn while hidden), so these runs are not like-for-like with
@@ -132,11 +136,36 @@ after the first dive"), and Task 10's run 1 failed the same way (+71.0).
 2. **Drop the CPU river array after upload:** already done (Task 7, `free_rivers` in
    `terrain/mod.rs`), so nothing to try.
 
-**So the hop-memory gate is the owner's call**, with these facts: the swap itself stays within
+**So the hop-memory gate was the owner's call**, with these facts: the swap itself stays within
 +22–55 MiB; only the first hop after the first dive exceeds +64 MiB, by a baseline sampled in the
 trough after macOS returns the pass's working set; the gate was not loosened. Options the owner
 has seen before: take the baseline as the in-region footprint before the hop's lift (a
 measurement change), or keep the gate and count first hops as reported only.
+
+**The baseline, fixed (Task 12's fix round 1, `bffa796`).** The owner chose "Fix the hop-memory
+baseline" (2026-11-27): the gate keeps +64 MiB and now means "a hop does not raise peak memory
+above flight". The native baseline is the **highest** footprint flown on the hop's leg
+(`FlightLeg` in `bench/journey/mod.rs`: since the region was entered, or the last hop began),
+not the last flying frame. A median or maximum over the last few seconds would not do: the trace
+shows the trough arriving **eight seconds before** the first hop, while the fly cruised (one
+sample a second: 1,299 MiB, then 1,231 from 10 s before the hop, then 1,028 from 8 s before), so
+any short window sits wholly inside it. Within a leg the footprint moves in slow steps, not
+spikes, so the maximum is safe and is the gate's own meaning, peak over flight. The cost: a real
+hop growth could hide under a high footprint earlier on the same leg (just after a dive, with
+the pass's working set still resident). The summary prints each hop's rise over the new
+baseline and, in brackets, over the last flying frame (the old baseline, reported only). The
+web keeps M3's growth rule on the last flying frame, unchanged.
+
+Tests (`bench/journey/tests.rs`): `a_reclaim_trough_before_a_hop_is_not_counted_as_the_hops_growth`
+(the recorded series above: the old rule fails at +78.3 MiB, the new one passes at −192.9),
+`a_hop_that_grows_past_the_flights_level_still_fails` (+65 MiB over the flight's highest fails,
++64 passes) and `the_bench_judges_each_hop_against_its_own_legs_flight` (each leg separate, the
+web on the last flying frame). The old rule fails the first and the third.
+
+Under the new baseline, run 2's hops read: hop 1 1,106.3 − 1,299.2 = −192.9 MiB, hop 2 +45.3
+(its leg flew at 1,061.0), and every later hop at most what it read before (the new baseline is
+never below the last flying frame), so at most +45.4: by the trace, the run would pass. **The two native journey runs under the new code are pending** (Task 11c's round 6
+first: at `03d96b9` the app can quit on the first hop).
 
 **`MAX_BOULDERS` stays 16,384.** Task 11c's ruling let it rise to 32,768 only if this task's hop
 memory stayed under the gate; it did not.
@@ -201,9 +230,13 @@ GPU p95s were 13.5–14.8 ms and worsts 14.8–15.9 ms in every run, with no pat
 `--hydro-check` on HEAD `9814212` (release, native, the real bake; run beside the render batch,
 so its pass time is under load). Full method and history: `reality-check.md`. It exits 3 (FAIL)
 on the Indus box's "every link" bar alone, as since Task 11 (the owner's decision, open); every
-other bar passes. The summary lines:
+other bar passes. **The block below is condensed**: the `lakes:` and `outlets:` lines stand for 8
+and 22 lines of the output, the arid line's list is cut, and the missed links, the deepest
+burnt nodes, the pinned courses and the lake-map audit are left out. **Every summary line, as
+printed, is in [`hydro-check-summary.txt`](hydro-check-summary.txt)** in this folder.
 
 ```text
+# condensed; the full lines are in hydro-check-summary.txt
 pass at 0 ka: 1.01 s (0.18 s sampling), lattice n = 900, 120571 river nodes, 849 lakes, Beyer climate: true
 box indus: relaxed 82.7% within 10 km, 74/84 links matched, worst 81.3 km (needs 80% and every link); coarse graph 81.7% within 10 km, 73/84 links matched, worst 82.4 km - FAIL
 box amazon (reference below 300 m): relaxed 91.8% within 25 km, 457/482 links matched, worst 145.9 km (needs 80%); coarse graph 91.4% within 25 km, 454/482 links matched, worst 142.6 km - PASS
@@ -218,11 +251,11 @@ discharge table (informative): 1 of 18 gauges flagged (ratio outside 1/3 to 3): 
 hydro check FAIL
 ```
 
-The lake and outlet lines are condensed above from one line each in the output (the run's full
-output is in the Task 12 report). The Indus box's ten missed links are as in
+The Indus box's ten missed links are as in
 `reality-check.md` (the Shyok and the Arghandab are not in Natural Earth's 1:10m rivers).
 Every number above matches Task 11e's record digit for digit (Indus 82.7%, 74/84; Amazon 91.8%;
-849 lakes; 22/22), so Tasks 11c and M3's merge changed no hydrology.
+849 lakes; 22/22), so Task 11c's first rounds and M3's merge changed no hydrology. (Task 11c's rounds 2–5 after
+this run changed only rocks and the water's look, not the pass.)
 
 ### Chrome WebGPU (Task 12, Step 2): PENDING, the controller's run in the owner's Chrome
 

@@ -144,6 +144,11 @@ and white water (11c).
 - [ ] From afar a rapid reads pale, not white (`FOAM_MEAN` 0.28): is that right, or should
       distant rapids read whiter? ______
 
+**This shot predates Task 11c's rounds 2–5** (rocks held to the drawn water, the rock-driven,
+animated white water); a render at the final HEAD replaces it in Task 12's fix round 1, after
+Task 11c's round 6. At `9814212` some rocks sat on the bank beside the drawn water; that is
+fixed since round 2.
+
 Shot: `render-rapid-closeup.jpg` (a crop of a 3840 × 2160 frame at 150 m). Foam streaks and
 rock clusters with collars up close. Note for this check: farther up the reach the standing
 waves read as regular, evenly spaced stripes across the channel (a ladder pattern), and the
@@ -226,6 +231,11 @@ plain as one continuous line. Things to look at:
   rather than over a reach;
 - a **tiny orphan river fragment** (a short curved dash) lies on the slope south of the river,
   joined to nothing.
+
+**No tributary join is visible in these frames**: they show the Min alone, so this check's box
+needs a flight up the valley. Task 11e's own frames of a join are
+`joins-sichuan-before.jpg` and `joins-sichuan-after.jpg` in this folder (the biggest-gain join,
+29.38° N 101.10° E).
 
 ### 15. The big falls (a data-resolution limit, as ruled)
 
