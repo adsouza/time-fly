@@ -5,8 +5,9 @@
 # on tags, `release` otherwise; data; .deb);
 # `flatpak` needs both. Caches: Rust targets per job (rust-cache, saved on failure too, never
 # on tags: a tag's cache is visible only to that tag's runs), uv
-# downloads, the raw data (keyed on data/sources.json), the baked globe and the baked region
-# tiles (each keyed on its inputs; when both hit, nothing is fetched or baked).
+# downloads, the raw data (keyed on data/sources.json), the baked globe, the baked region
+# tiles and the baked past climate (each keyed on its inputs; when the globe and tiles hit,
+# nothing is fetched; the climate bake range-reads its own source).
 name: linux-package
 
 on:
@@ -145,8 +146,16 @@ jobs:
           path: crates/timefly/assets/data/tiles
           key: baked-tiles-${{ hashFiles('data/sources.json', 'tools/bake/**') }}
 
+      # Past climate (Beyer et al. 2020, 35 grids, about 2.5 MB); same keys as pages.yml.
+      - name: Cache baked climate
+        id: climate-cache
+        uses: actions/cache@v6
+        with:
+          path: crates/timefly/assets/data/climate
+          key: baked-climate-${{ hashFiles('data/sources.json', 'tools/bake/**') }}
+
       - uses: astral-sh/setup-uv@v10.3.3
-        if: steps.bake-cache.outputs.cache-hit != 'true' || steps.tiles-cache.outputs.cache-hit != 'true'
+        if: steps.bake-cache.outputs.cache-hit != 'true' || steps.tiles-cache.outputs.cache-hit != 'true' || steps.climate-cache.outputs.cache-hit != 'true'
         with:
           enable-cache: true
           cache-dependency-glob: tools/bake/uv.lock
@@ -200,6 +209,14 @@ jobs:
           uv run --locked timefly-bake tiles --raw ../../data/raw \
             --out ../../crates/timefly/assets/data/tiles 2>&1 | tee ../../ci-logs/bake-tiles.txt
 
+      # Range-reads about 40 MB from figshare; needs no raw data.
+      - name: Bake past climate
+        if: steps.climate-cache.outputs.cache-hit != 'true'
+        working-directory: tools/bake
+        run: |
+          uv run --locked timefly-bake climate --sources ../../data/sources.json \
+            --out ../../crates/timefly/assets/data/climate 2>&1 | tee ../../ci-logs/bake-climate.txt
+
       # Whether baked here or restored from the cache, the bakes must load in this build's
       # readers (window-less, no GPU): the globe, then the tiles beside it (the manifest, the
       # overview and the three largest tiles, size- and SHA-256-checked). Exits 1 with the
@@ -213,10 +230,13 @@ jobs:
         run: |
           echo "baked globe from cache: ${{ steps.bake-cache.outputs.cache-hit == 'true' }}"
           echo "baked tiles from cache: ${{ steps.tiles-cache.outputs.cache-hit == 'true' }}"
+          echo "baked climate from cache: ${{ steps.climate-cache.outputs.cache-hit == 'true' }}"
           packaging/linux/stage.sh target/$PROFILE/timefly crates/timefly/assets staged
           find staged -path '*/frames/f0*' -prune -o -path '*/tiles/r*' -prune -o -print | sort
           test ! -e staged/lib/time-fly/assets/data/globe/bake.log
           test ! -e staged/lib/time-fly/assets/data/tiles/bake.log
+          test ! -e staged/lib/time-fly/assets/data/climate/bake.log
+          test "$(find staged/lib/time-fly/assets/data/climate -name 'bio_*.tfgrid' | wc -l)" -eq 35
           du -sh staged staged/lib/time-fly/assets/data/*
 
       - name: Validate desktop entry and AppStream metadata
@@ -255,6 +275,7 @@ jobs:
             ci-logs/
             crates/timefly/assets/data/globe/bake.log
             crates/timefly/assets/data/tiles/bake.log
+            crates/timefly/assets/data/climate/bake.log
           if-no-files-found: warn
           retention-days: 14
 

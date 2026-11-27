@@ -4,6 +4,7 @@
 #   lib/time-fly/time-fly                    the game binary
 #   lib/time-fly/assets/data/globe/...       baked globe data (bake.log and other files left out)
 #   lib/time-fly/assets/data/tiles/...       baked region tiles: manifest, overview, listed tiles
+#   lib/time-fly/assets/data/climate/...     baked past climate: manifest and its 35 grids
 #   bin/time-fly                             wrapper: exec <dir>/time-fly "$@"
 #   share/applications/io.github.adsouza.TimeFly.desktop
 #   share/icons/hicolor/scalable/apps/io.github.adsouza.TimeFly.svg
@@ -30,10 +31,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 globe="$assets/data/globe"
 tiles="$assets/data/tiles"
+climate="$assets/data/climate"
 
 [ -f "$binary" ] && [ -x "$binary" ] || die "binary not found or not executable: $binary"
 [ -f "$globe/manifest.json" ] || die "no baked data: $globe/manifest.json (run timefly-bake)"
 [ -f "$tiles/manifest.json" ] || die "no baked tiles: $tiles/manifest.json (run timefly-bake tiles)"
+[ -f "$climate/manifest.json" ] || die "no baked climate: $climate/manifest.json (run timefly-bake climate)"
 [ -f "$assets/credits.txt" ] || die "missing $assets/credits.txt"
 if [ -e "$out" ] && [ -n "$(ls -A "$out")" ]; then die "output directory is not empty: $out"; fi
 
@@ -84,6 +87,11 @@ PYTHON
 # lists (`region/tiles.rs`), each checked against the manifest's size. bake.log is left out.
 n_tiles=$(python3 "$root/packaging/stage_tiles.py" "$tiles" "$lib/assets/data/tiles")
 
+# Past climate (`hydro/climate.rs`): the manifest and every grid it lists, size- and
+# SHA-256-checked, and all 35 of them; without them the game runs on the zonal climate.
+# bake.log is left out.
+n_climate=$(python3 "$root/packaging/stage_climate.py" "$climate" "$lib/assets/data/climate")
+
 cat >"$out/bin/time-fly" <<'WRAPPER'
 #!/bin/sh
 # Runs Time Fly from its install directory, where Bevy finds assets/ beside the binary.
@@ -110,8 +118,8 @@ GNU Affero General Public License as published by the Free Software Foundation, 
 version 3 of the License, or (at your option) any later version (full text at the end of
 this file).
 
-The baked globe data in assets/data/globe and the region tiles in assets/data/tiles are
-derived from the datasets credited below. Each is redistributed in baked form only, under the
+The baked globe data in assets/data/globe, the region tiles in assets/data/tiles and the past
+climate in assets/data/climate are derived from the datasets credited below. Each is redistributed in baked form only, under the
 terms stated with it; the original files are not included. Provenance, checksums and licence notes: data/README.md in the source.
 
 ================================================================================
@@ -154,4 +162,4 @@ Licences and data citations: copyright (this directory).
 README
 chmod 0644 "$doc/README"
 
-echo "stage.sh: staged $(basename "$binary") with $n_frames frames and $n_tiles tiles into $out"
+echo "stage.sh: staged $(basename "$binary") with $n_frames frames, $n_tiles tiles and $n_climate climate grids into $out"
