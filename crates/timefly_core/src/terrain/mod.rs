@@ -103,26 +103,8 @@ pub struct WaterSample {
 pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
     let s = blend_weight(grid, x_m, z_m);
     let read = |f: &Field| {
-        let level = field_level(f, x_m, z_m);
-        let decoded = |i: usize| decode_river(f.river_at(i));
-        let hw = sample_field(f, x_m, z_m, |i| {
-            let [ribbon, _, _, offset] = decoded(i);
-            ribbon + offset.abs()
-        });
-        let offset = sample_field(f, x_m, z_m, |i| decoded(i)[3]);
-        let east = sample_field(f, x_m, z_m, |i| decoded(i)[1]);
-        let north = sample_field(f, x_m, z_m, |i| decoded(i)[2]);
-        let (lo, hi) = taps(f, x_m, z_m)
-            .0
-            .iter()
-            .map(|&i| decoded(i)[3])
-            .fold((f32::MAX, f32::MIN), |(lo, hi), o| (lo.min(o), hi.max(o)));
-        let reach = CROSSING_REACH_TEXELS * f.spacing_m() as f32;
-        if lo < 0.0 && hi > 0.0 && hi - lo > reach {
-            let ribbon = sample_field(f, x_m, z_m, |i| decoded(i)[0]);
-            return [level, ribbon, 0.0, east, north];
-        }
-        [level, hw, offset, east, north]
+        let (t, fu, fv) = field_taps(f, x_m, z_m);
+        field_water(&t, fu, fv, f.spacing_m())
     };
     let (i, a) = (read(&grid.inner), read(&grid.apron));
     let mix = |k: usize| i[k] + (a[k] - i[k]) * s;
@@ -133,6 +115,90 @@ pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
         ribbon_m: mix(1) - mix(2).abs(),
         flow: [mix(3), mix(4)],
     }
+}
+
+/// One texel's drawn quantities, as [`blended_water`] reads them: its height, water level and
+/// river texel (decoded from its f16 bits once), and whether it is a river texel
+/// ([`Field::is_river`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TapTexel {
+    pub h_m: f32,
+    pub level_m: f32,
+    pub river: [f32; 4],
+    pub is_river: bool,
+}
+
+impl TapTexel {
+    /// A texel with its river bits ([`Field::is_river`]'s rule on them).
+    pub fn new(h_m: f32, level_m: f32, river: [u16; 4]) -> Self {
+        use crate::worldgen::generate::water::RIVER_NONE;
+        TapTexel {
+            h_m,
+            level_m,
+            river: decode_river(river),
+            is_river: river[0] != RIVER_NONE[0] || river[3] != RIVER_NONE[3],
+        }
+    }
+}
+
+/// A field's four taps at local `(x, z)` (in [`taps`]' order) and their weights.
+fn field_taps(f: &Field, x_m: f64, z_m: f64) -> ([TapTexel; 4], f32, f32) {
+    let (idx, fu, fv) = taps(f, x_m, z_m);
+    let t = idx.map(|i| TapTexel {
+        h_m: f.elevation_m[i],
+        level_m: f.water_level_m[i],
+        river: decode_river(f.river_at(i)),
+        is_river: f.is_river(i),
+    });
+    (t, fu, fv)
+}
+
+/// One field's drawn water from its four taps `t` (in [`taps`]' order) and bilinear weights
+/// `fu`, `fv`, texels `spacing_m` apart: `[level, hw, offset, flow east, flow north]` as
+/// [`blended_water`] mixes them (its crossing guard and standing-water rule included).
+fn field_water(t: &[TapTexel; 4], fu: f32, fv: f32, spacing_m: f64) -> [f32; 5] {
+    let level = taps_level(t, fu, fv);
+    let decoded = t.map(|x| x.river);
+    let hw = bilerp(
+        decoded.map(|[ribbon, _, _, offset]| ribbon + offset.abs()),
+        fu,
+        fv,
+    );
+    let offset = bilerp(decoded.map(|d| d[3]), fu, fv);
+    let east = bilerp(decoded.map(|d| d[1]), fu, fv);
+    let north = bilerp(decoded.map(|d| d[2]), fu, fv);
+    let (lo, hi) = decoded
+        .iter()
+        .map(|d| d[3])
+        .fold((f32::MAX, f32::MIN), |(lo, hi), o| (lo.min(o), hi.max(o)));
+    let reach = CROSSING_REACH_TEXELS * spacing_m as f32;
+    if lo < 0.0 && hi > 0.0 && hi - lo > reach {
+        let ribbon = bilerp(decoded.map(|d| d[0]), fu, fv);
+        return [level, ribbon, 0.0, east, north];
+    }
+    [level, hw, offset, east, north]
+}
+
+/// The water [`blended_water`] draws at a point of a single field (no apron blend) from the
+/// point's four taps `t` (in [`taps`]' order: `(r0, c0)`, `(r0, c0 + 1)`, `(r0 + 1, c0)`,
+/// `(r0 + 1, c0 + 1)`) and its bilinear weights, texels `spacing_m` apart: exactly what
+/// [`blended_water`] returns over a region whose inner and apron fields are that field. The
+/// generator's drawn-water emulation (Task 11c) reads it.
+pub fn water_from_taps(t: &[TapTexel; 4], fu: f32, fv: f32, spacing_m: f64) -> WaterSample {
+    let [level_m, hw, offset, east, north] = field_water(t, fu, fv, spacing_m);
+    WaterSample {
+        level_m,
+        thickness_m: level_m - bilerp(t.map(|x| x.h_m), fu, fv),
+        ribbon_m: hw - offset.abs(),
+        flow: [east, north],
+    }
+}
+
+/// [`sample_field`]'s bilinear blend of four tap values (in [`taps`]' order).
+fn bilerp(v: [f32; 4], fu: f32, fv: f32) -> f32 {
+    let top = v[0] + (v[1] - v[0]) * fu;
+    let bottom = v[2] + (v[3] - v[2]) * fu;
+    top + (bottom - top) * fv
 }
 
 /// The drawn surface at local `(x, z)` metres: the higher of the ground ([`blended_height_m`])
@@ -158,17 +224,19 @@ pub fn blended_surface_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
 ///
 /// With every tap wet, or none, the plain bilinear level.
 fn field_level(f: &Field, x_m: f64, z_m: f64) -> f32 {
-    let plain = sample_field(f, x_m, z_m, |i| f.water_level_m[i]);
-    let (taps, fu, fv) = taps(f, x_m, z_m);
-    let wet = |i: usize| f.water_level_m[i] - f.elevation_m[i] > DRY_BELOW_M;
-    let wet_taps = taps.iter().filter(|&&i| wet(i)).count();
-    if taps.iter().any(|&i| f.is_river(i)) || wet_taps == 0 || wet_taps == 4 {
+    let (t, fu, fv) = field_taps(f, x_m, z_m);
+    taps_level(&t, fu, fv)
+}
+
+/// [`field_level`] from a field's four taps and weights.
+fn taps_level(t: &[TapTexel; 4], fu: f32, fv: f32) -> f32 {
+    let plain = bilerp(t.map(|x| x.level_m), fu, fv);
+    let wet = |x: &TapTexel| x.level_m - x.h_m > DRY_BELOW_M;
+    let wet_taps = t.iter().filter(|x| wet(x)).count();
+    if t.iter().any(|x| x.is_river) || wet_taps == 0 || wet_taps == 4 {
         return plain;
     }
-    let mut levels = taps
-        .iter()
-        .filter(|&&i| wet(i))
-        .map(|&i| f.water_level_m[i]);
+    let mut levels = t.iter().filter(|x| wet(x)).map(|x| x.level_m);
     let first = levels.next().expect("a wet tap");
     if levels.all(|l| l == first) {
         return first;
@@ -180,8 +248,8 @@ fn field_level(f: &Field, x_m: f64, z_m: f64) -> f32 {
         fu * fv,
     ];
     let (mut n, mut d) = (0.0f32, 0.0f32);
-    for (k, &i) in taps.iter().enumerate().filter(|&(_, &i)| wet(i)) {
-        n += w[k] * f.water_level_m[i];
+    for (k, x) in t.iter().enumerate().filter(|(_, x)| wet(x)) {
+        n += w[k] * x.level_m;
         d += w[k];
     }
     if d > 0.0 { n / d } else { plain }

@@ -155,10 +155,22 @@ pub const RIBBON_NONE_M: f64 = 1_000.0;
 
 // Boulders.
 
-/// A sub-segment at `rapid` holds `floor(rapid × this + h0)` boulders (Task 11c: 24, was 6).
-pub const BOULDERS_PER_SUBPOINT_MAX: u32 = 24;
-/// A sub-segment's boulders fall in clusters of at most this many (Task 11c).
+/// At `rapid` = 1 a sub-segment holds one boulder cluster per this much channel (m², its length
+/// times its width): `floor(rapid × length × width / this + h0)` clusters, at most
+/// [`BOULDER_CLUSTERS_PER_SUBPOINT_MAX`] (Task 11c fix round 4, the owner's "rework the look":
+/// a cluster every 30–60 m along a 100–150 m river; was 24 boulders a sub-segment in clusters
+/// of 6, whatever its width).
+pub const BOULDER_CLUSTER_AREA_M2: f64 = 3_500.0;
+/// The most clusters one sub-segment holds.
+pub const BOULDER_CLUSTERS_PER_SUBPOINT_MAX: u32 = 16;
+/// A cluster at `rapid` = 1 holds a hashed count of boulders in this range (fewer at lesser
+/// rapids: the count times `rapid`, at least 1).
+pub const BOULDER_CLUSTER_MEMBERS: [u32; 2] = [2, 5];
+/// A cluster's boulders never number more than this.
 pub const BOULDER_CLUSTER_MAX: u32 = 6;
+/// A cluster's first `ceil(n × rapid × this)` members are breakers (fix round 4: was a third,
+/// so that after the drawn-water fitting at least a third of the shipped rocks still break).
+pub const BOULDER_BREAK_SHARE: f64 = 0.6;
 /// A cluster's members lie within this many cluster radii (its centre boulder's) of its centre.
 pub const BOULDER_CLUSTER_REACH: f64 = 3.0;
 /// A cluster member's radius before the rule that it breaks the surface, as a share of its
@@ -167,9 +179,10 @@ pub const BOULDER_MEMBER_SHARE: [f64; 2] = [0.4, 0.85];
 /// The hashed radius range of a cluster's centre boulder (fix round 1, the owner's "bigger
 /// rocks": about 1.7 times Task 6's `[0.4, 3.0]`).
 pub const BOULDER_RADIUS_M: [f64; 2] = [0.7, 5.0];
-/// A boulder that breaks the surface (a cluster's first `ceil(n × rapid / 3)` members, its
-/// centre first) has its top this far above the water (m) over the sub-segment's deepest point:
-/// its centre the most, the others hashed within the range.
+/// A boulder that breaks the surface (a cluster's first `ceil(n × rapid ×`
+/// [`BOULDER_BREAK_SHARE`]`)` members, its centre first) has its top this far above the water
+/// (m) over the cluster's deepest member bed: its centre the most, the others hashed within the
+/// range.
 pub const BOULDER_BREAK_M: [f64; 2] = [0.2, 0.8];
 /// No boulder's radius exceeds this (m), nor half the channel's half-width, so in a river
 /// deeper than about 15 m even the breakers stay under (fix round 1: was 5).
@@ -179,9 +192,8 @@ pub const BOULDER_MAX_RADIUS_M: f64 = 8.0;
 pub const FOAM_SITE_DEPTH_M: f32 = 0.5;
 /// Rapids keep a cluster of boulders only where a hash of its `(river, k, c)` falls under this
 /// share (Task 11c fix round 1): a function of direction, so overlapping regions keep the same
-/// clusters, whole. Chosen so no bench region holds more than 75% of [`MAX_BOULDERS`]. Fix round
-/// 2 keeps only the rocks the drawn water holds, about half of the rest, so it rose from 0.45:
-/// the Himalayas, the densest, hold about 7,200 (44%).
+/// clusters, whole. Chosen so no bench region holds more than 75% of [`MAX_BOULDERS`] (fix
+/// round 4's counts are in the Task 11c report).
 pub const BOULDER_KEEP_FRACTION: f64 = 0.6;
 /// A guard, never reached on the bench regions: past it a region keeps its first boulders in
 /// sub-segment order and the shell warns. Overlapping regions then disagree, so the keep

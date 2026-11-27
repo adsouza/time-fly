@@ -32,19 +32,20 @@
 //! sub-texel river as `ribbon = (ribbon_i + |offset_i|) − |offset|` interpolated
 //! ([`crate::terrain::blended_water`]).
 
-use bevy_math::DVec3;
+use bevy_math::{DVec2, DVec3};
 use half::f16;
 
-use super::rivers::{RegionRivers, RiverHit, across, chord_point, offset_point};
-use super::{Field, RegionGrid, RegionSpec};
+use super::rivers::{RegionRivers, RiverHit, SubPoint, across, chord_point, offset_point};
 use crate::geo::RenderDir;
 use crate::hydrology::params::{
-    BANK_FREEBOARD_M, BOULDER_BREAK_M, BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH,
-    BOULDER_KEEP_FRACTION, BOULDER_MAX_RADIUS_M, BOULDER_MEMBER_SHARE, BOULDER_RADIUS_M,
-    BOULDERS_PER_SUBPOINT_MAX, DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M,
+    BANK_FREEBOARD_M, BOULDER_BREAK_M, BOULDER_BREAK_SHARE, BOULDER_CLUSTER_AREA_M2,
+    BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_MEMBERS, BOULDER_CLUSTER_REACH,
+    BOULDER_CLUSTERS_PER_SUBPOINT_MAX, BOULDER_KEEP_FRACTION, BOULDER_MAX_RADIUS_M,
+    BOULDER_MEMBER_SHARE, BOULDER_RADIUS_M, DATA_LAKE_DEPTH_RAMP_NODES, DATA_LAKE_MAX_DEPTH_M,
     FOAM_SITE_DEPTH_M, NO_WATER_DROP_M, OCEAN_STRAIT_M, RIBBON_NONE_M,
 };
 use crate::hydrology::{EraHydrology, HydroGraph, LakeKind, LakeTap};
+use crate::terrain::{TapTexel, WaterSample, water_from_taps};
 use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
 use crate::worldgen::noise::hash3;
 
@@ -70,11 +71,15 @@ pub struct Boulder {
     /// The river's flow at `dir` (m/s), `[east, north]` in `dir`'s own frame, as the river
     /// texel stores it; zero where the water there is not a river.
     pub flow_mps: [f32; 2],
-    /// Whether its foam collar is drawn: a foam site whose collar's footprint the region's
-    /// drawn water holds (set when the grid is assembled,
-    /// [`place_boulders`](crate::terrain::drawn::place_boulders); false in the generator's own
-    /// list).
+    /// Whether its foam collar is drawn: a foam site whose collar's footprint every lattice the
+    /// generator checks draws wet ([`hold_in_drawn_water`]; the region then drops the rocks in
+    /// its own apron-blend band, [`region_boulders`](crate::terrain::drawn::region_boulders)).
     pub collar: bool,
+    /// Its collar's V wake (radii downstream): the full
+    /// [`collar_wake_radii`](crate::terrain::drawn::collar_wake_radii) of its flow, or the
+    /// longest share of it the drawn water holds; 0 without a collar, or for a boil (a rock under
+    /// the water, whose collar has no V).
+    pub wake_radii: f32,
 }
 
 impl Boulder {
@@ -315,6 +320,12 @@ impl BoulderCluster {
         }
     }
 
+    /// Its sub-segment's first sub-point: the origin of the lattices its rocks are checked
+    /// against ([`DrawnLattices`]), shared by the sub-segment's clusters.
+    pub fn origin(&self) -> DVec3 {
+        self.a
+    }
+
     /// Its centre (unit, era frame).
     pub fn centre(&self) -> DVec3 {
         self.at(self.t, self.x)
@@ -363,6 +374,7 @@ const BOULDER_SPREAD_SALT: u32 = 0xC2B2_AE35;
 const BOULDER_SHARE_SALT: u32 = 0x27D4_EB2F;
 const BOULDER_BREAK_SALT: u32 = 0x1656_67B1;
 const BOULDER_KEEP_SALT: u32 = 0xD3A2_646C;
+const BOULDER_MEMBERS_SALT: u32 = 0x2C1B_3C6D;
 
 /// Whether cluster `c` of the sub-segment from sub-point `(river, k)` is kept: its hash falls
 /// under [`BOULDER_KEEP_FRACTION`]. A function of the cluster alone, so every region that holds
@@ -388,21 +400,25 @@ fn lerp(range: [f64; 2], f: f64) -> f64 {
 
 /// The boulder clusters of every rapid sub-segment that could put a boulder inside the square
 /// `|x|, |z| ≤ half_m` of `basis` (the centre within the square widened by the cluster's
-/// reach), in sub-segment order.
+/// reach and the channel's half-width, as far as the drawn-water fitting can move a rock), in
+/// sub-segment order.
 ///
-/// A sub-segment from sub-point `a = (river, k)` with `rapid > 0` holds
-/// `n = floor(rapid × BOULDERS_PER_SUBPOINT_MAX + h0)` boulders, `h0` the hash fraction of
-/// `(river, k)`, in `ceil(n / BOULDER_CLUSTER_MAX)` clusters of [`BOULDER_CLUSTER_MAX`] (the
-/// last one the rest). Every value below is a hash of `(river, k, c)` for cluster `c` or of
-/// `(river, k, j)` for boulder `j`. With `hw` the sub-segment's half-width and `cap =
-/// min(hw / 2, BOULDER_MAX_RADIUS_M)`:
+/// A sub-segment from sub-point `a = (river, k)` with `rapid > 0`, `L` long and `w = 2 hw` wide,
+/// holds `floor(rapid × L × w / BOULDER_CLUSTER_AREA_M2 + h0)` clusters (at most
+/// [`BOULDER_CLUSTERS_PER_SUBPOINT_MAX`]), `h0` the hash fraction of `(river, k)` (Task 11c fix
+/// round 4: a cluster every 30–60 m along a 100–150 m full rapid, fewer on narrow ones). Every
+/// value below is a hash of `(river, k, c)` for cluster `c` or of `(river, k, 6c + m)` for its
+/// member `m`. With `cap = min(hw / 2, BOULDER_MAX_RADIUS_M)`:
 ///
+/// - **Its members**: `n = max(1, floor(rapid × lerp([2, 6), u)))` (2–5 at `rapid` 1,
+///   [`BOULDER_CLUSTER_MEMBERS`]).
 /// - **The centre** (member 0) sits at arc parameter `t = u` and `x = c × (hw − cap)` across
 ///   the arc (`c` in [−1, 1]), its hashed radius `H = min(lerp(BOULDER_RADIUS_M, r), cap)`.
 /// - **Member `m ≥ 1`**: hashed radius `lerp(BOULDER_MEMBER_SHARE, s) × H`, a bearing, and a
 ///   spread `lerp([1.1, BOULDER_CLUSTER_REACH], e)` (in spread radii, [`BoulderCluster::spread_m`]).
-/// - **The breakers**: the first `ceil(members × rapid / 3)` members, the centre first, rise
-///   [`BOULDER_BREAK_M`]`[1]` (the centre) or `lerp(BOULDER_BREAK_M, b)` above the water.
+/// - **The breakers**: the first `ceil(n × rapid × BOULDER_BREAK_SHARE)` members, the centre
+///   first, rise [`BOULDER_BREAK_M`]`[1]` (the centre) or `lerp(BOULDER_BREAK_M, b)` above the
+///   water.
 ///
 /// Only the clusters [`cluster_kept`] keeps are listed (Task 11c fix round 1), whole.
 pub(super) fn boulder_clusters(
@@ -416,18 +432,21 @@ pub(super) fn boulder_clusters(
             continue;
         }
         let (river, k) = (a.river as i32, a.k as i32);
-        let h0 = fraction(hash3([river, k, -1], BOULDER_COUNT_SALT));
-        let count = (f64::from(a.rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX) + h0).floor() as i32;
         let hw = f64::from(a.half_width_m);
+        let length_m = a.dir.angle_between(b.dir) * EARTH_RADIUS_M;
+        let rapid = f64::from(a.rapid);
+        let clusters = subsegment_clusters(a, b) as i32;
         let cap = (hw / 2.0).min(BOULDER_MAX_RADIUS_M);
         let size = BOULDER_CLUSTER_MAX as i32;
-        for cluster in 0..(count + size - 1) / size {
+        for cluster in 0..clusters {
             if !cluster_kept(a.river, a.k, cluster as u32) {
                 continue;
             }
-            let n = (count - cluster * size).min(size);
-            let breakers = (f64::from(n) * f64::from(a.rapid) / 3.0).ceil() as i32;
             let cell = [river, k, cluster];
+            let [lo, hi] = BOULDER_CLUSTER_MEMBERS.map(f64::from);
+            let hashed = lerp([lo, hi + 1.0], fraction(hash3(cell, BOULDER_MEMBERS_SALT)));
+            let n = ((rapid * hashed).floor() as i32).clamp(1, size);
+            let breakers = (f64::from(n) * rapid * BOULDER_BREAK_SHARE).ceil() as i32;
             let members = (0..n)
                 .map(|m| {
                     let cell = [river, k, cluster * size + m];
@@ -472,7 +491,7 @@ pub(super) fn boulder_clusters(
                 index: cluster as u32,
                 a: a.dir,
                 b: b.dir,
-                length_m: a.dir.angle_between(b.dir) * EARTH_RADIUS_M,
+                length_m,
                 t: fraction(hash3(cell, BOULDER_ALONG_SALT)),
                 x: (2.0 * fraction(hash3(cell, BOULDER_ACROSS_SALT)) - 1.0) * (hw - cap),
                 reach_m: hw - cap,
@@ -481,7 +500,9 @@ pub(super) fn boulder_clusters(
                     .min(cap),
                 members,
             };
-            let margin = BOULDER_CLUSTER_REACH * cap + 1.0;
+            // A member lies within the reach of the centre, and fitting moves it at most to the
+            // centreline.
+            let margin = BOULDER_CLUSTER_REACH * cap + hw + 1.0;
             let near = basis
                 .dir_to_local(RenderDir(c.centre()))
                 .is_some_and(|(x, z)| x.abs().max(z.abs()) <= half_m + margin);
@@ -491,6 +512,21 @@ pub(super) fn boulder_clusters(
         }
     }
     out
+}
+
+/// How many clusters (before thinning) the sub-segment from `a` to `b` holds:
+/// `floor(rapid × L × 2 hw / BOULDER_CLUSTER_AREA_M2 + h0)`, at most
+/// [`BOULDER_CLUSTERS_PER_SUBPOINT_MAX`] ([`boulder_clusters`]).
+pub(super) fn subsegment_clusters(a: &SubPoint, b: &SubPoint) -> u32 {
+    if a.rapid <= 0.0 {
+        return 0;
+    }
+    let h0 = fraction(hash3([a.river as i32, a.k as i32, -1], BOULDER_COUNT_SALT));
+    let length_m = a.dir.angle_between(b.dir) * EARTH_RADIUS_M;
+    let area = length_m * 2.0 * f64::from(a.half_width_m);
+    (f64::from(a.rapid) * area / BOULDER_CLUSTER_AREA_M2 + h0)
+        .floor()
+        .min(f64::from(BOULDER_CLUSTERS_PER_SUBPOINT_MAX)) as u32
 }
 
 /// What a boulder stands on: the bed's height, the water's level and its river texel there.
@@ -545,12 +581,14 @@ pub(super) fn size_cluster(
         .collect()
 }
 
-/// The texel lattices a cluster is checked against (Task 11c fix round 2): the drawn water is
-/// the region's own texels bilinearly blended, and no two regions share a lattice, so a rock is
-/// kept only where every one of these draws water over it. Each is a turn of the lattice
-/// (degrees; it repeats every 90°) and where the cluster's centre falls in its cell (fractions
-/// of a texel across and down), spread so a rock near a bank meets the cell's corners from
-/// several sides.
+/// The texel lattices a cluster's rocks are checked against (Task 11c fix round 2): the drawn
+/// water is the region's own texels bilinearly blended, and no two regions share a lattice, so
+/// a rock is kept only where every one of these draws water over it. Each is a turn of the
+/// lattice (degrees; it repeats every 90°) and its phase (fractions of a texel east and south),
+/// spread so a rock near a bank meets a cell's corners from several sides. Fix round 4: they
+/// are laid out about the sub-segment's first sub-point ([`DrawnLattices`]), not each
+/// cluster's centre, so a rock's phase in each is its own and the sub-segment's clusters share
+/// their texels.
 pub(super) const DRAWN_LATTICES: [(f64, f64, f64); 16] = [
     (0.0, 0.15, 0.35),
     (0.0, 0.4, 0.85),
@@ -570,69 +608,196 @@ pub(super) const DRAWN_LATTICES: [(f64, f64, f64); 16] = [
     (67.5, 0.65, 0.1),
 ];
 
-/// One of [`DRAWN_LATTICES`] about a cluster's centre: its cell's four texel corners (in field
-/// order: the first row, then the second, each west to east in the turned frame) and the map
-/// from the centre's tangent plane (metres east and south) to the cell's field coordinates.
-#[derive(Copy, Clone, Debug)]
-pub(super) struct DrawnCell {
-    pub corners: [DVec3; 4],
-    turn: f64,
-    centre_xz: (f64, f64),
+/// The texels [`DrawnLattices`] has read, by lattice, row and column, for one sub-segment
+/// (`key`): the generator keeps it from one cluster to the next of the same sub-segment, so
+/// each texel is read once. A cache of pure reads: what is in it never changes a result. Rows
+/// and columns within [`DRAWN_CACHE_REACH`] of the origin sit in a flat array, stamped with the
+/// sub-segment they were read for (hashing every lookup, or clearing the array for each
+/// sub-segment, cost more than the reads it saved), the rest in a map.
+#[derive(Debug)]
+pub(super) struct DrawnCache {
+    pub key: Option<(u32, u32)>,
+    /// Which sub-segment this is (the array's entries of any other are stale).
+    stamp: u32,
+    near: Vec<(u32, TapTexel)>,
+    far: std::collections::HashMap<(u8, i64, i64), TapTexel>,
 }
 
-impl DrawnCell {
-    /// The cell's field coordinates of a point `(east, south)` metres from the cluster's centre.
-    fn field_xz(&self, east: f64, south: f64) -> (f64, f64) {
-        let (s, c) = self.turn.sin_cos();
-        (
-            self.centre_xz.0 + east * c + south * s,
-            self.centre_xz.1 - east * s + south * c,
-        )
+/// [`DrawnCache`]'s array holds rows and columns `−this..this` about the origin.
+const DRAWN_CACHE_REACH: i64 = 8;
+const DRAWN_CACHE_SIDE: usize = 2 * DRAWN_CACHE_REACH as usize;
+
+impl Default for DrawnCache {
+    fn default() -> Self {
+        let empty = TapTexel::new(0.0, 0.0, RIVER_NONE);
+        DrawnCache {
+            key: None,
+            stamp: 0,
+            near: vec![(0, empty); DRAWN_LATTICES.len() * DRAWN_CACHE_SIDE * DRAWN_CACHE_SIDE],
+            far: Default::default(),
+        }
     }
 }
 
-/// The cells of [`DRAWN_LATTICES`] about `centre` for texels `texel_m` apart.
-pub(super) fn drawn_cells(centre: DVec3, texel_m: f64) -> Vec<DrawnCell> {
-    let (north, east) = RegionFrame {
-        center: RenderDir(centre),
-    }
-    .north_east();
-    let south = -north;
-    DRAWN_LATTICES
-        .iter()
-        .map(|&(deg, a, b)| {
-            let turn = deg.to_radians();
-            let (s, c) = turn.sin_cos();
-            let (x_axis, z_axis) = (east * c + south * s, -east * s + south * c);
-            let corner = |i: f64, j: f64| {
-                let v = x_axis * ((j - a) * texel_m) + z_axis * ((i - b) * texel_m);
-                let len = v.length();
-                if len > 0.0 {
-                    offset_point(centre, v / len, len)
-                } else {
-                    centre
-                }
-            };
-            DrawnCell {
-                corners: [
-                    corner(0.0, 0.0),
-                    corner(0.0, 1.0),
-                    corner(1.0, 0.0),
-                    corner(1.0, 1.0),
-                ],
-                turn,
-                centre_xz: ((a - 0.5) * texel_m, (b - 0.5) * texel_m),
+impl DrawnCache {
+    /// Starts on sub-segment `key`, dropping another's texels.
+    pub fn start(&mut self, key: (u32, u32)) {
+        if self.key != Some(key) {
+            self.key = Some(key);
+            self.stamp = self.stamp.wrapping_add(1);
+            if self.stamp == 0 {
+                // Wrapped: entries stamped long ago could pass for this one's.
+                self.near.iter_mut().for_each(|e| e.0 = u32::MAX);
+                self.stamp = 1;
             }
+            self.far.clear();
+        }
+    }
+
+    /// The array slot of lattice `k`'s texel `(i, j)`, if it is near the origin.
+    fn slot(k: usize, i: i64, j: i64) -> Option<usize> {
+        let r = DRAWN_CACHE_REACH;
+        ((-r..r).contains(&i) && (-r..r).contains(&j)).then(|| {
+            let side = DRAWN_CACHE_SIDE;
+            (k * side + (i + r) as usize) * side + (j + r) as usize
         })
-        .collect()
+    }
+
+    fn get(&self, k: usize, i: i64, j: i64) -> Option<TapTexel> {
+        match Self::slot(k, i, j) {
+            Some(n) => {
+                let (stamp, t) = self.near[n];
+                (stamp == self.stamp && self.key.is_some()).then_some(t)
+            }
+            None => self.far.get(&(k as u8, i, j)).copied(),
+        }
+    }
+
+    fn insert(&mut self, k: usize, i: i64, j: i64, t: TapTexel) {
+        match Self::slot(k, i, j) {
+            Some(n) => self.near[n] = (self.stamp, t),
+            None => {
+                self.far.insert((k as u8, i, j), t);
+            }
+        }
+    }
 }
 
-/// A texel's drawn quantities: its carved height, water level and river bits.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub(super) struct DrawnTexel {
-    pub h_m: f32,
-    pub level_m: f32,
-    pub river: [u16; 4],
+/// The [`DRAWN_LATTICES`] about a sub-segment's first sub-point `origin` (fix round 4), texels
+/// `texel_m` apart, each texel read through `bed` (the generator's own texel rule) when first
+/// needed. Points are metres east and south of `origin` in its tangent plane. Every lattice
+/// extends as far as it is read, so a point anywhere reads its own cell's four texels (round 2's
+/// emulation built one 2 × 2 cell about each cluster's centre and clamped points beyond it to
+/// the cell's edge, Important 1 of the rounds 2–3 re-review).
+pub(super) struct DrawnLattices<'a> {
+    origin: DVec3,
+    east: DVec3,
+    north: DVec3,
+    texel_m: f64,
+    bed: &'a dyn Fn(DVec3) -> BoulderBed,
+    cache: &'a mut DrawnCache,
+}
+
+impl<'a> DrawnLattices<'a> {
+    pub fn new(
+        origin: DVec3,
+        texel_m: f64,
+        bed: &'a dyn Fn(DVec3) -> BoulderBed,
+        cache: &'a mut DrawnCache,
+    ) -> Self {
+        let (north, east) = RegionFrame {
+            center: RenderDir(origin),
+        }
+        .north_east();
+        DrawnLattices {
+            origin,
+            east,
+            north,
+            texel_m,
+            bed,
+            cache,
+        }
+    }
+
+    /// The bed under `dir`.
+    pub fn bed(&self, dir: DVec3) -> BoulderBed {
+        (self.bed)(dir)
+    }
+
+    /// `dir` in metres east and south of the origin.
+    pub fn tangent(&self, dir: DVec3) -> DVec2 {
+        let v = (dir - self.origin) * EARTH_RADIUS_M;
+        DVec2::new(v.dot(self.east), -v.dot(self.north))
+    }
+
+    /// The direction `p` metres east and south of the origin.
+    pub fn dir_of(&self, p: DVec2) -> DVec3 {
+        (self.origin + (self.east * p.x - self.north * p.y) / EARTH_RADIUS_M).normalize()
+    }
+
+    /// Lattice `k`'s texel at row `i`, column `j`.
+    fn texel(&mut self, k: usize, i: i64, j: i64) -> TapTexel {
+        if let Some(t) = self.cache.get(k, i, j) {
+            return t;
+        }
+        let (deg, a, b) = DRAWN_LATTICES[k];
+        let (sn, c) = deg.to_radians().sin_cos();
+        let (x, z) = ((j as f64 + a) * self.texel_m, (i as f64 + b) * self.texel_m);
+        let dir = self.dir_of(DVec2::new(x * c - z * sn, x * sn + z * c));
+        let bed = (self.bed)(dir);
+        let t = TapTexel::new(bed.base_m, bed.level_m, bed.river);
+        self.cache.insert(k, i, j, t);
+        t
+    }
+
+    /// The water lattice `k` draws at `p` (m east and south of the origin): its cell's four
+    /// texels blended exactly as a region blends its own ([`water_from_taps`]).
+    pub fn sample(&mut self, k: usize, p: DVec2) -> WaterSample {
+        let (deg, a, b) = DRAWN_LATTICES[k];
+        let (sn, c) = deg.to_radians().sin_cos();
+        let (x, z) = (p.x * c + p.y * sn, -p.x * sn + p.y * c);
+        let (u, v) = (x / self.texel_m - a, z / self.texel_m - b);
+        let (c0, r0) = (u.floor(), v.floor());
+        let (fu, fv) = ((u - c0) as f32, (v - r0) as f32);
+        let (c0, r0) = (c0 as i64, r0 as i64);
+        let taps = [
+            self.texel(k, r0, c0),
+            self.texel(k, r0, c0 + 1),
+            self.texel(k, r0 + 1, c0),
+            self.texel(k, r0 + 1, c0 + 1),
+        ];
+        water_from_taps(&taps, fu, fv, self.texel_m)
+    }
+
+    /// Whether every lattice draws water at `p`: if so, the least ribbon less
+    /// [`DRAWN_SPREAD_FACTOR`](crate::terrain::drawn::DRAWN_SPREAD_FACTOR) times their
+    /// disagreement (where the lattices disagree, a region's own may draw the bank farther in).
+    /// It stops at the first dry lattice.
+    pub fn held(&mut self, p: DVec2) -> Option<f64> {
+        use crate::terrain::drawn::DRAWN_SPREAD_FACTOR;
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for k in 0..DRAWN_LATTICES.len() {
+            let w = self.sample(k, p);
+            if !(w.thickness_m > 0.0 && w.ribbon_m >= 0.0) {
+                return None;
+            }
+            lo = lo.min(f64::from(w.ribbon_m));
+            hi = hi.max(f64::from(w.ribbon_m));
+        }
+        Some(lo - DRAWN_SPREAD_FACTOR * (hi - lo))
+    }
+
+    /// Whether a rock of radius `r` fits at `p`: every lattice holds its centre with a ribbon
+    /// of `r` plus [`DRAWN_ROCK_MARGIN_M`](crate::terrain::drawn::DRAWN_ROCK_MARGIN_M), and
+    /// draws water a radius out on all four sides.
+    pub fn fits(&mut self, p: DVec2, r: f64) -> bool {
+        use crate::terrain::drawn::DRAWN_ROCK_MARGIN_M;
+        self.held(p)
+            .is_some_and(|ribbon| ribbon >= r + DRAWN_ROCK_MARGIN_M)
+            && [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
+                .iter()
+                .all(|&(de, ds)| self.held(p + DVec2::new(de, ds)).is_some())
+    }
 }
 
 /// A rock that the drawn water doesn't hold where it was sized is moved toward its channel's
@@ -645,133 +810,149 @@ pub(super) const FIT_SHRINKS: [f64; 6] = [1.0, 0.8, 0.65, 0.5, 0.35, 0.2];
 /// is dropped.
 pub(super) const FIT_MIN_RADIUS_M: f64 = 0.4;
 
-/// The boulders of `sized` (a cluster's) fitted to the water every lattice of
-/// [`DRAWN_LATTICES`] draws, each marked `collar` where it is a foam site whose collar's
-/// footprint they all draw wet. A rock fits where every lattice draws its centre wet with a
-/// ribbon of its radius plus [`DRAWN_ROCK_MARGIN_M`](crate::terrain::drawn::DRAWN_ROCK_MARGIN_M)
-/// and [`DRAWN_SPREAD_FACTOR`](crate::terrain::drawn::DRAWN_SPREAD_FACTOR) times the lattices'
-/// disagreement there, and wet a radius out on all four sides. One that doesn't fit where it was
-/// sized is tried at [`FIT_SHRINKS`] of its radius (the largest first, not below
-/// [`FIT_MIN_RADIUS_M`]), each at [`FIT_MOVES`] of the way across to its channel's centreline
-/// (the least first; across is square to its flow, its distance from the centreline its river
-/// texel's offset); the first that fits is kept, re-seated on the bed read by `bed` there, and
-/// the rock is dropped only if none does (fix round 3). Each cell (`cells`, with its corners'
-/// `texels`) is drawn exactly as a region draws its water, by
-/// [`blended_water`](crate::terrain::blended_water) over a 2 × 2 field of them. A pure function of
-/// the pass and the directions, so overlapping regions keep the same rocks.
+/// The boulders of `cluster`, as `sized` (its members' boulders and beds, in member order),
+/// fitted to the water every one of `lattices` draws, each marked `collar` where it is a foam
+/// site whose collar's footprint they all draw wet.
+///
+/// A rock fits where [`DrawnLattices::fits`] says so. One that doesn't fit where it was sized is
+/// tried at [`FIT_SHRINKS`] of its radius (the largest first, not below [`FIT_MIN_RADIUS_M`]),
+/// each at [`FIT_MOVES`] of the way across to its channel's centreline (the least first, so a
+/// move is always tried before a shrink; across is square to its flow, its distance from the
+/// centreline its river texel's offset); the rock is dropped only if none fits (fix round 3).
+/// Where it lands it is re-seated on the bed `lattices` reads there.
+///
+/// A breaker (a member with a rise, fix round 4, Important 2 of the rounds 2–3 re-review) must
+/// still break where it lands: a try whose re-seated top stands under the water is grown to
+/// break there (`(depth + rise) / 2`, within the cluster's cap) if that still fits, and passed
+/// over otherwise. Only if no try breaks is the first that fits kept, under the water.
+///
+/// A foam site's collar is drawn with the longest of [`COLLAR_WAKE_FITS`] of its full wake
+/// ([`collar_wake_radii`] of its flow) whose footprint ([`collar_footprint`]) every lattice
+/// holds with [`DRAWN_ROCK_MARGIN_M`] to spare, tested where the rock lands; none: no collar. A
+/// rock under the water (a boil) has no wake. A pure function of the pass and the directions,
+/// so overlapping regions keep the same rocks.
+///
+/// [`COLLAR_WAKE_FITS`]: crate::terrain::drawn::COLLAR_WAKE_FITS
+/// [`collar_wake_radii`]: crate::terrain::drawn::collar_wake_radii
+/// [`collar_footprint`]: crate::terrain::drawn::collar_footprint
+/// [`DRAWN_ROCK_MARGIN_M`]: crate::terrain::drawn::DRAWN_ROCK_MARGIN_M
 pub(super) fn hold_in_drawn_water(
-    spec: RegionSpec,
-    centre: DVec3,
-    texel_m: f64,
-    cells: &[DrawnCell],
-    texels: &[[DrawnTexel; 4]],
+    lattices: &mut DrawnLattices,
+    cluster: &BoulderCluster,
     sized: Vec<(Boulder, BoulderBed)>,
-    bed: &dyn Fn(DVec3) -> BoulderBed,
 ) -> Vec<Boulder> {
-    use crate::terrain::blended_water;
-    use crate::terrain::drawn::{DRAWN_ROCK_MARGIN_M, DRAWN_SPREAD_FACTOR, collar_footprint};
-    let (north, east) = RegionFrame {
-        center: RenderDir(centre),
-    }
-    .north_east();
-    let grids: Vec<RegionGrid> = texels
-        .iter()
-        .map(|t| {
-            let field = Field {
-                res: 2,
-                size_m: texel_m,
-                elevation_m: t.iter().map(|x| x.h_m).collect(),
-                surface: vec![[0; 4]; 4],
-                water_level_m: t.iter().map(|x| x.level_m).collect(),
-                river: t.iter().map(|x| x.river).collect(),
-                river_mask: Vec::new(),
-            };
-            RegionGrid {
-                spec,
-                inner: field.clone(),
-                apron: field,
-                boulders: Vec::new(),
-            }
-        })
-        .collect();
-    // Metres east and south of the centre, and back.
-    let tangent = |d: DVec3| {
-        let v = (d - centre) * EARTH_RADIUS_M;
-        (v.dot(east), -v.dot(north))
-    };
-    let wet = |g: &RegionGrid, cell: &DrawnCell, e: f64, s: f64| {
-        let (x, z) = cell.field_xz(e, s);
-        let w = blended_water(g, x, z);
-        (w.thickness_m > 0.0 && w.ribbon_m >= 0.0, w.ribbon_m)
-    };
-    // Every lattice wet at (e, s); the least ribbon less DRAWN_SPREAD_FACTOR times their
-    // disagreement (where the lattices disagree, a region's own may draw the bank farther in).
-    let held = |e: f64, s: f64| {
-        let (mut lo, mut hi, mut all_wet) = (f64::MAX, f64::MIN, true);
-        for (g, cell) in grids.iter().zip(cells) {
-            let (is_wet, ribbon) = wet(g, cell, e, s);
-            all_wet &= is_wet;
-            lo = lo.min(f64::from(ribbon));
-            hi = hi.max(f64::from(ribbon));
-        }
-        all_wet.then_some(lo - DRAWN_SPREAD_FACTOR * (hi - lo))
-    };
-    let fits = |e: f64, s: f64, r: f64| {
-        held(e, s).is_some_and(|ribbon| ribbon >= r + DRAWN_ROCK_MARGIN_M)
-            && [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
-                .iter()
-                .all(|&(de, ds)| held(e + de, s + ds).is_some())
-    };
+    assert_eq!(sized.len(), cluster.members.len());
     sized
         .into_iter()
-        .filter_map(|(b, b_bed)| {
-            let (e, s) = tangent(b.dir);
-            let r = f64::from(b.radius_m);
-            // Toward the centreline: square to the flow, the offset's sign saying which side
-            // (positive on the left of travel). No flow: it can only shrink.
-            let [_, fe, fnorth, offset] = decode_river(b_bed.river);
-            let flow = bevy_math::DVec2::new(f64::from(fe), -f64::from(fnorth)).try_normalize();
-            // Left of travel, in (east, south): the flow turned a quarter anticlockwise seen from
-            // above, which is (−south, east) in these axes.
-            let to_centre = flow.map(|f| bevy_math::DVec2::new(f.y, -f.x) * -f64::from(offset));
-            let (fit_e, fit_s, fit_r) = FIT_SHRINKS
-                .iter()
-                .map(|k| r * k)
-                .filter(|&rr| rr >= FIT_MIN_RADIUS_M.min(r))
-                .find_map(|rr| {
-                    FIT_MOVES
-                        .iter()
-                        .filter(|&&m| m == 0.0 || to_centre.is_some())
-                        .map(|&m| {
-                            let v = to_centre.unwrap_or_default() * m;
-                            (e + v.x, s + v.y, rr)
-                        })
-                        .find(|&(fe, fs, rr)| fits(fe, fs, rr))
-                })?;
-            let fitted = if (fit_e, fit_s, fit_r) == (e, s, r) {
-                b
-            } else {
-                let v = east * (fit_e - e) - north * (fit_s - s);
-                let len = v.length();
-                let dir = if len > 0.0 {
-                    offset_point(b.dir, v / len, len)
-                } else {
-                    b.dir
-                };
-                boulder(dir, fit_r as f32, b.seed, &bed(dir))
-            };
-            let down = bevy_math::DVec2::new(
-                f64::from(fitted.flow_mps[0]),
-                -f64::from(fitted.flow_mps[1]),
-            )
-            .try_normalize();
-            let collar = fitted.foam_site().is_some()
-                && collar_footprint(fit_e, fit_s, fitted.radius_m, down)
-                    .iter()
-                    .all(|p| held(p.x, p.y).is_some_and(|ribbon| ribbon >= DRAWN_ROCK_MARGIN_M));
-            Some(Boulder { collar, ..fitted })
-        })
+        .zip(&cluster.members)
+        .filter_map(|((b, b_bed), m)| fit_rock(lattices, cluster.cap_m, b, b_bed, m.rise_m))
         .collect()
+}
+
+/// One rock of [`hold_in_drawn_water`]: fitted, re-seated and given its collar, or `None`.
+pub(super) fn fit_rock(
+    lattices: &mut DrawnLattices,
+    cap_m: f64,
+    b: Boulder,
+    b_bed: BoulderBed,
+    rise_m: Option<f64>,
+) -> Option<Boulder> {
+    use crate::terrain::drawn::{
+        COLLAR_WAKE_FITS, DRAWN_ROCK_MARGIN_M, collar_footprint, collar_wake_radii,
+    };
+    let p0 = lattices.tangent(b.dir);
+    let r = f64::from(b.radius_m);
+    // Toward the centreline: square to the flow, the offset's sign saying which side (positive
+    // on the left of travel). No flow: it can only shrink.
+    let [_, fe, fnorth, offset] = decode_river(b_bed.river);
+    let flow = DVec2::new(f64::from(fe), -f64::from(fnorth)).try_normalize();
+    // Left of travel, in (east, south): the flow turned a quarter anticlockwise seen from above,
+    // which is (−south, east) in these axes.
+    let to_centre = flow.map(|f| DVec2::new(f.y, -f.x) * -f64::from(offset));
+    let breaks = |bed: &BoulderBed, radius: f64| bed.base_m + 2.0 * radius as f32 > bed.level_m;
+    let mut first_fit: Option<(DVec2, f64, BoulderBed)> = None;
+    let mut chosen = None;
+    'tries: for rr in FIT_SHRINKS
+        .iter()
+        .map(|k| r * k)
+        .filter(|&rr| rr >= FIT_MIN_RADIUS_M.min(r))
+    {
+        for &m in FIT_MOVES
+            .iter()
+            .filter(|&&m| m == 0.0 || to_centre.is_some())
+        {
+            let p = p0 + to_centre.unwrap_or_default() * m;
+            if !lattices.fits(p, rr) {
+                continue;
+            }
+            let landing = if p == p0 {
+                b_bed
+            } else {
+                lattices.bed(lattices.dir_of(p))
+            };
+            let Some(rise) = rise_m else {
+                chosen = Some((p, rr, landing));
+                break 'tries;
+            };
+            if breaks(&landing, rr) {
+                chosen = Some((p, rr, landing));
+                break 'tries;
+            }
+            let need = (landing.depth_m() + rise) / 2.0;
+            if need > rr && need <= cap_m && lattices.fits(p, need) && breaks(&landing, need) {
+                chosen = Some((p, need, landing));
+                break 'tries;
+            }
+            first_fit.get_or_insert((p, rr, landing));
+        }
+    }
+    let (p, rr, landing) = chosen.or(first_fit)?;
+    let fitted = if p == p0 && rr == r {
+        b
+    } else {
+        let dir = if p == p0 { b.dir } else { lattices.dir_of(p) };
+        boulder(dir, rr as f32, b.seed, &landing)
+    };
+    let mut out = Boulder {
+        collar: false,
+        wake_radii: 0.0,
+        ..fitted
+    };
+    if fitted.foam_site().is_some() {
+        let down = DVec2::new(
+            f64::from(fitted.flow_mps[0]),
+            -f64::from(fitted.flow_mps[1]),
+        )
+        .try_normalize();
+        let full = if fitted.top_m() > fitted.level_m && down.is_some() {
+            collar_wake_radii(fitted.flow_mps[0].hypot(fitted.flow_mps[1]))
+        } else {
+            0.0
+        };
+        let tries: &[f64] = if full > 0.0 {
+            &COLLAR_WAKE_FITS
+        } else {
+            &[0.0]
+        };
+        for &share in tries {
+            let wake = full * share;
+            // The wake's far end first, where a footprint most often leaves the water.
+            let holds = collar_footprint(p.x, p.y, fitted.radius_m, down, wake)
+                .iter()
+                .rev()
+                .all(|q| {
+                    lattices
+                        .held(*q)
+                        .is_some_and(|ribbon| ribbon >= DRAWN_ROCK_MARGIN_M)
+                });
+            if holds {
+                out.collar = true;
+                out.wake_radii = wake as f32;
+                break;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// A boulder at `dir` of radius `radius_m` on `bed`.
@@ -787,6 +968,7 @@ pub(super) fn boulder(dir: DVec3, radius_m: f32, seed: u32, bed: &BoulderBed) ->
         level_m: bed.level_m,
         flow_mps: [east, north],
         collar: false,
+        wake_radii: 0.0,
     }
 }
 
@@ -883,6 +1065,121 @@ mod tests {
             choose_water(1.0, false, None, Some(&hit(2.0, 1.0, 0.0))).level_m,
             1.0 - 64.0
         );
+    }
+
+    /// A hand-built river for the fitting's unit tests: flowing east at 5 m/s along the
+    /// origin's parallel, `2 hw` wide, its level 100 m over a bed `base + slope × |offset|` (m),
+    /// flat beyond the banks and below the level everywhere, so the ribbon alone bounds the
+    /// water.
+    /// Returns the origin and the bed under a direction.
+    fn hand_built_river(
+        hw: f32,
+        base: f32,
+        slope: f32,
+    ) -> (DVec3, impl Fn(DVec3) -> BoulderBed + Copy) {
+        let origin = crate::worldgen::testkit::dir(20.0, 30.0).0;
+        let (north, _) = RegionFrame {
+            center: RenderDir(origin),
+        }
+        .north_east();
+        let bed = move |d: DVec3| {
+            // The offset is positive on the left of travel: north.
+            let offset = ((d - origin) * EARTH_RADIUS_M).dot(north) as f32;
+            BoulderBed {
+                base_m: base + slope * offset.abs().min(hw),
+                level_m: 100.0,
+                river: encode_river(hw - offset.abs(), 5.0, 0.0, offset),
+            }
+        };
+        (origin, bed)
+    }
+
+    /// Fix round 4 (Important 3 of the rounds 2–3 re-review): `hold_in_drawn_water`'s fitting
+    /// on a hand-built cell. A 3 m rock 37 m off the centreline of an 80 m river has a ribbon of
+    /// 3 m, short of its radius plus the 1.5 m margin, so it is moved (by a quarter, to 27.75 m)
+    /// rather than shrunk; re-seated on the bed where it lands; and its collar is tested there,
+    /// where only the shortest wake fits (it would not at all where it was sized).
+    #[test]
+    fn fitting_moves_a_bank_rock_toward_the_centreline() {
+        use crate::terrain::drawn::{DRAWN_ROCK_MARGIN_M, collar_footprint, collar_wake_radii};
+        let (origin, bed) = hand_built_river(40.0, 96.0, 0.05);
+        let texel_m = 300_000.0 / 1024.0;
+        let mut cache = DrawnCache::default();
+        let mut lattices = DrawnLattices::new(origin, texel_m, &bed, &mut cache);
+        let at = |l: &DrawnLattices, e: f64, s: f64| l.dir_of(DVec2::new(e, s));
+        // 40 m east of the origin, 37 m north (south −37).
+        let dir0 = at(&lattices, 40.0, -37.0);
+        let bed0 = bed(dir0);
+        let rock = boulder(dir0, 3.0, 77, &bed0);
+        assert!(rock.foam_site().is_some() && rock.top_m() > rock.level_m);
+        let offset_of = |d: DVec3| decode_river(bed(d).river)[3];
+        assert!((offset_of(dir0) - 37.0).abs() < 1e-3);
+        assert!(
+            !lattices.fits(lattices.tangent(dir0), 3.0),
+            "it doesn't fit where sized"
+        );
+        let got = fit_rock(&mut lattices, 15.0, rock, bed0, None).expect("fitted, not dropped");
+        assert_eq!(got.radius_m, 3.0, "moved, not shrunk");
+        assert!(got.radius_m as f64 >= FIT_MIN_RADIUS_M);
+        let (o0, o1) = (offset_of(dir0), offset_of(got.dir));
+        assert!(
+            o1.abs() < o0.abs() && (o1 - 0.75 * o0).abs() < 1e-3,
+            "a quarter of the way in: {o0} to {o1}"
+        );
+        let landed = bed(got.dir);
+        assert_eq!(
+            (got.base_m, got.level_m, got.flow_mps),
+            (landed.base_m, landed.level_m, [5.0, 0.0]),
+            "re-seated on the bed where it lands"
+        );
+        assert_eq!(got.wet, boulder(got.dir, 3.0, 77, &landed).wet);
+        // The collar, tested where the rock landed: the shortest wake (9.5 radii at 5 m/s, a
+        // 0.35 share) fits; at the sized place not even its ring does.
+        let full = collar_wake_radii(5.0);
+        assert_eq!(full, 9.5);
+        assert!(got.collar);
+        assert!((f64::from(got.wake_radii) - 0.35 * full).abs() < 1e-6);
+        let p1 = lattices.tangent(got.dir);
+        let held = |l: &mut DrawnLattices, p: DVec2, wake: f64| {
+            collar_footprint(p.x, p.y, 3.0, Some(DVec2::X), wake)
+                .iter()
+                .all(|q| l.held(*q).is_some_and(|r| r >= DRAWN_ROCK_MARGIN_M))
+        };
+        assert!(!held(&mut lattices, p1, 0.6 * full));
+        let p0 = lattices.tangent(dir0);
+        assert!(!held(&mut lattices, p0, 0.0));
+    }
+
+    /// Fix round 4 (Important 2): a breaker that the fitting slides into deeper water is grown
+    /// to break there, within its cluster's cap; past the cap it ships under the water only if
+    /// no try breaks.
+    #[test]
+    fn a_fitted_breaker_still_breaks() {
+        // The bed falls 0.15 m a metre toward the centreline.
+        let (origin, bed) = hand_built_river(30.0, 94.0, 0.15);
+        let texel_m = 300_000.0 / 1024.0;
+        let mut cache = DrawnCache::default();
+        let mut lattices = DrawnLattices::new(origin, texel_m, &bed, &mut cache);
+        let dir0 = lattices.dir_of(DVec2::new(40.0, -28.0));
+        let bed0 = bed(dir0);
+        // 1.2 m, rising 0.6 m: top 100.6 at the bank (bed 98.2), where its 2 m ribbon is short.
+        let rock = boulder(dir0, 1.2, 5, &bed0);
+        assert!(rock.top_m() > rock.level_m);
+        assert!(!lattices.fits(lattices.tangent(dir0), 1.2));
+        // Without the breaker's rule it lands a quarter in, under the water (bed 97.15).
+        let plain = fit_rock(&mut lattices, 5.0, rock, bed0, None).unwrap();
+        assert_eq!(plain.radius_m, 1.2);
+        assert!(plain.top_m() <= plain.level_m, "slid under: {plain:?}");
+        // As a breaker it grows to (depth + rise) / 2 there, and breaks.
+        let got = fit_rock(&mut lattices, 5.0, rock, bed0, Some(0.5)).unwrap();
+        assert_eq!(got.dir, plain.dir, "the same move");
+        let need = (f64::from(got.level_m - got.base_m) + 0.5) / 2.0;
+        assert!((f64::from(got.radius_m) - need).abs() < 1e-5, "{got:?}");
+        assert!(got.top_m() > got.level_m);
+        // A cap too small to grow: it keeps looking for a try that breaks, and with none (every
+        // try lands deeper), ships the first that fitted, under the water.
+        let capped = fit_rock(&mut lattices, 1.3, rock, bed0, Some(0.5)).unwrap();
+        assert_eq!(capped, plain);
     }
 
     #[test]

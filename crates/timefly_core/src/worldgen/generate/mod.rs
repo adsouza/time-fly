@@ -382,6 +382,8 @@ pub struct RegionPrep<'a, F: CoarseField> {
     boulder_sites: Option<Vec<water::BoulderCluster>>,
     boulders: Vec<Boulder>,
     boulders_dropped: u32,
+    /// The drawn-water lattices' texels read for the current sub-segment's clusters.
+    drawn_cache: water::DrawnCache,
     /// The chamfer's input: 0 at sea, infinity on land, filled texel by texel.
     coast: Vec<f32>,
     units_done: u64,
@@ -464,6 +466,7 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
             boulder_sites: None,
             boulders: Vec::new(),
             boulders_dropped: 0,
+            drawn_cache: water::DrawnCache::default(),
             coast: Vec::with_capacity((spec.apron_res * spec.apron_res) as usize),
             units_done: 0,
         }
@@ -650,10 +653,13 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
 
     /// A cluster's boulders that the drawn water holds (all its members, in or out of the
     /// square): its centre's bed read first, its members spread by the water there, then sized
-    /// by the deepest; then kept, and given a collar, where the cells of
-    /// [`water::DRAWN_LATTICES`] all draw water over them ([`water::hold_in_drawn_water`], Task
-    /// 11c fix round 2).
-    fn cluster_boulders(&self, cluster: &water::BoulderCluster) -> Vec<Boulder> {
+    /// by the deepest; then fitted to the water every lattice of [`water::DRAWN_LATTICES`]
+    /// draws, and given a collar where they draw its footprint wet
+    /// ([`water::hold_in_drawn_water`], Task 11c fix rounds 2–4). The lattices' texels are kept
+    /// for the next cluster of the same sub-segment.
+    fn cluster_boulders(&mut self, cluster: &water::BoulderCluster) -> Vec<Boulder> {
+        let mut cache = std::mem::take(&mut self.drawn_cache);
+        cache.start((cluster.river, cluster.k));
         let bed = |dir: bevy_math::DVec3| {
             let (carved, water) = self.sampler().texel(FieldKind::Inner, RenderDir(dir));
             water::BoulderBed {
@@ -670,30 +676,14 @@ impl<'a, F: CoarseField> RegionPrep<'a, F> {
             .collect();
         let sized = water::size_cluster(cluster, spread, &dirs, &beds);
         let texel_m = self.layers[0].size_m / f64::from(self.layers[0].res - 1);
-        let cells = water::drawn_cells(cluster.centre(), texel_m);
-        let texels: Vec<[water::DrawnTexel; 4]> = cells
-            .iter()
-            .map(|c| {
-                c.corners.map(|d| {
-                    let b = bed(d);
-                    water::DrawnTexel {
-                        h_m: b.base_m,
-                        level_m: b.level_m,
-                        river: b.river,
-                    }
-                })
-            })
-            .collect();
-        let with_beds = sized.into_iter().zip(beds.iter().copied()).collect();
-        water::hold_in_drawn_water(
-            self.spec,
-            cluster.centre(),
-            texel_m,
-            &cells,
-            &texels,
-            with_beds,
-            &bed,
-        )
+        let held = {
+            let mut lattices =
+                water::DrawnLattices::new(cluster.origin(), texel_m, &bed, &mut cache);
+            let with_beds = sized.into_iter().zip(beds.iter().copied()).collect();
+            water::hold_in_drawn_water(&mut lattices, cluster, with_beds)
+        };
+        self.drawn_cache = cache;
+        held
     }
 
     /// Work units done so far (planning points, lattice nodes, river sub-points, boulders and

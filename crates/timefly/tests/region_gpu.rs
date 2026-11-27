@@ -2246,3 +2246,221 @@ fn the_gpu_frame_time_is_measured_on_this_gpu() {
         "back-to-back worst {worst} ms vs their median {mid} ms"
     );
 }
+
+const WATER: &str = include_str!("../assets/shaders/water.wesl");
+const SCATTER: &str = include_str!("../assets/shaders/scatter.wesl");
+
+/// The text of `fn name(...) { ... }` in `src`, up to its closing brace at the line start.
+fn wesl_fn(src: &str, name: &str) -> String {
+    let start = src
+        .find(&format!("\nfn {name}("))
+        .unwrap_or_else(|| panic!("fn {name}"))
+        + 1;
+    let end = start + src[start..].find("\n}\n").expect("the fn's end") + 3;
+    src[start..end].to_string()
+}
+
+/// The line `const NAME ...;` in `src`.
+fn wesl_const(src: &str, name: &str) -> String {
+    let start = src
+        .find(&format!("\nconst {name}:"))
+        .unwrap_or_else(|| panic!("const {name}"))
+        + 1;
+    let end = start + src[start..].find('\n').expect("the line's end");
+    src[start..end].to_string()
+}
+
+const WHITE_WATER_ENTRY: &str = r#"
+const TAU: f32 = 6.2831855;
+@group(0) @binding(0) var<storage, read> queries: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&out)) {
+        return;
+    }
+    // (x, z) region metres, made on the CPU (a fused multiply-add here would move them by an
+    // ulp of 151 km, 1.6 cm), then two unit values.
+    let q = queries[n];
+    let xz = q.xy;
+    let p = vec2<f32>(8.0 * q.z - 4.0, 10.0 * q.w - 2.0);
+    let dir = normalize(vec2<f32>(cos(q.z * 6.0), sin(q.z * 6.0)));
+    let lambda = 6.0 + 17.0 * q.w;
+    let crests = crest_patch(xz);
+    let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+    out[n] = vec4<f32>(
+        collar_shape(p, q.z, 8.0 * q.w),
+        white_water_foam(1.0, crest, crests, q.z - 0.5, q.w),
+        crest,
+        crests,
+    );
+}
+"#;
+
+/// Fix round 4: the white water's shape functions as the shipped shaders write them (cut from
+/// `scatter.wesl` and `water.wesl`, with `noise.wesl`) agree with their Rust mirrors on the GPU:
+/// the collars' pillow, V and boil, the crests' warped standing waves and patches, and the
+/// foam weight.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_white_water_matches_rust() {
+    use bevy::math::Vec2;
+    use timefly::boulders::collar_shape;
+    use timefly::water::{crest_patch, crest_warp, standing_waves, white_water_foam};
+    let mut src = String::from(NOISE);
+    for c in [
+        "STANDING_WAVE_CELL_M",
+        "FOAM_CREST_BAND",
+        "FOAM_LACE",
+        "FOAM_LACE_BAND",
+        "FOAM_MEAN",
+        "CREST_WARP",
+        "CREST_NOISE_M",
+        "CREST_PATCH_BAND",
+    ] {
+        src += &format!("{}\n", wesl_const(WATER, c));
+    }
+    for f in [
+        "brush",
+        "standing_waves",
+        "crest_warp",
+        "crest_patch",
+        "white_water_foam",
+    ] {
+        src += &format!("{}\n", wesl_fn(WATER, f));
+    }
+    src += &format!("{}\n{WHITE_WATER_ENTRY}", wesl_fn(SCATTER, "collar_shape"));
+    let mut rng = SplitMix(0xC011A5);
+    let queries: Vec<[f32; 4]> = (0..16_384)
+        .map(|_| {
+            [
+                151_234.0 + 60.0 * rng.unit(),
+                -87_321.0 + 60.0 * rng.unit(),
+                rng.unit(),
+                rng.unit(),
+            ]
+        })
+        .collect();
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("white water parity"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("white water parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let query_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("queries"),
+        contents: bytemuck::cast_slice(&queries),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bytes = (queries.len() * 16) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(queries.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<[f32; 4]> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    let (mut diffs, mut shaped, mut foamed) = ([(); 4].map(|_| Vec::new()), 0, 0);
+    for (q, g) in queries.iter().zip(&got) {
+        let xz = Vec2::new(q[0], q[1]);
+        let p = Vec2::new(8.0 * q[2] - 4.0, 10.0 * q[3] - 2.0);
+        let a = q[2] * 6.0;
+        let dir = Vec2::new(a.cos(), a.sin()).normalize();
+        let lambda = 6.0 + 17.0 * q[3];
+        let crests = crest_patch(xz);
+        let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+        let want = [
+            collar_shape(p, q[2], 8.0 * q[3]),
+            white_water_foam(1.0, crest, crests, q[2] - 0.5, q[3]),
+            crest,
+            crests,
+        ];
+        shaped += usize::from(want[0] > 0.5);
+        foamed += usize::from(want[1] > 0.5);
+        for (d, (got, want)) in diffs.iter_mut().zip(g.iter().zip(&want)) {
+            d.push((got - want).abs());
+        }
+    }
+    // The shape: a few ulps. The noise itself agrees to 1e-6 (`wesl_noise_matches_golden`), but
+    // `brush` divides region metres by its cell (16,800 cells out here), and WGSL's division may
+    // be 2.5 ulps off, which the patches' smoothstep over a 0.3 band steepens; the waves' phase
+    // runs through sin on hashed offsets; the foam's smoothsteps steepen both again. So the
+    // worst and the 99th percentile are bounded separately.
+    let mut worst = [0.0f32; 4];
+    for (k, (max, p99)) in [(1e-4f32, 1e-4f32), (0.1, 1e-2), (2e-2, 5e-3), (3e-2, 5e-3)]
+        .into_iter()
+        .enumerate()
+    {
+        let d = &mut diffs[k];
+        d.sort_by(f32::total_cmp);
+        worst[k] = d[d.len() - 1];
+        let q99 = d[d.len() * 99 / 100];
+        assert!(
+            worst[k] <= max && q99 <= p99,
+            "output {k}: worst {}, p99 {q99}",
+            worst[k]
+        );
+    }
+    println!("worst differences {worst:?}; {shaped} in a collar, {foamed} foamed");
+    assert!(
+        shaped > 600 && foamed > 100,
+        "{shaped} shaped, {foamed} foamed"
+    );
+}

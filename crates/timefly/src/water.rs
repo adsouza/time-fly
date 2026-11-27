@@ -24,7 +24,10 @@
 //! technique with two phases half a period apart ([`flow_phase_weights`], [`FLOW_PERIOD_S`]),
 //! so the water moves without pulsing; in rapids (`rapid_from_speed` of the flow's speed) the
 //! scroll is faster, the ripples rougher ([`RAPID_NORMAL_GAIN`]) and the water broken and white
-//! ([`WHITE_WATER`]).
+//! ([`WHITE_WATER`]). Task 11c fix round 4: the standing waves' crests are warped and broken
+//! into still patches ([`crest_warp`], [`crest_patch`]), so the rapid's own foam is short,
+//! irregular crests over dark water; most of its white is the rocks' foam collars
+//! (`crate::boulders`).
 //!
 //! Waves (art pass §5.4, `waves.wesl`):
 //! - **Swell:** three directional components around the region's wind ([`water_waves`]). Below
@@ -158,22 +161,98 @@ pub const FOAM_LACE: f32 = 0.5;
 /// ...over this band of the streak noise. A `water.wesl` constant.
 pub const FOAM_LACE_BAND: [f32; 2] = [0.35, 0.7];
 /// Where the crests and streaks can't be resolved, a full rapid's foam fades to this, the mean
-/// of its foam up close (`white_water_foams_on_crests_not_troughs` checks the two agree). A `water.wesl`
+/// of its foam up close: the crests' own plus [`FOAM_ROCK_SHARE`]
+/// (`background_crest_foam_stays_under_its_cap` checks they agree). Fix round 4: most of a
+/// rapid's white is its rocks' collars, which fade out with distance, so the far mean stands in
+/// for them too. A `water.wesl` constant.
+pub const FOAM_MEAN: f32 = 0.105;
+/// The share of a full rapid's water its rocks' collars whiten up close (fix round 4, measured
+/// on the wide-rapid renders; the Task 11c report).
+pub const FOAM_ROCK_SHARE: f32 = 0.05;
+/// Fix round 4 (the owner's "rework the look": the crests read as a regular ladder): the
+/// standing waves' phase is shifted by this many wavelengths at most, by still noise
+/// ([`crest_warp`])... A `water.wesl` constant.
+pub const CREST_WARP: f32 = 0.5;
+/// ...whose cells are twice this, while the waves' strength comes in still patches this big
+/// (m, [`crest_patch`]). A `water.wesl` constant.
+pub const CREST_NOISE_M: f32 = 9.0;
+/// A patch's strength is `smoothstep` of its noise over this band. A `water.wesl` constant.
+pub const CREST_PATCH_BAND: [f32; 2] = [0.0, 0.3];
+/// The standing waves' slope keeps this share where the patches are gone. A `water.wesl`
 /// constant.
-pub const FOAM_MEAN: f32 = 0.28;
+pub const CREST_WAVE_FLOOR: f32 = 0.4;
 
-/// White water's foam weight (fix round 1) at a rapid of `rapid`, a standing-wave `crest` (the
-/// height's sine, −1 in a trough, 1 on a crest), the `streak` noise (after
-/// [`STREAK_CONTRAST`]), and `resolve`, how far the pattern is resolved (1 up close, 0 where
-/// it shrinks below a couple of pixels). Mirrored in `water.wesl`.
-pub fn white_water_foam(rapid: f32, crest: f32, streak: f32, resolve: f32) -> f32 {
+/// `water.wesl`'s `brush`: gradient noise at a world-space scale.
+fn brush(xz: Vec2, scale_m: f32, z: f32, seed: u32) -> f32 {
+    let q = xz / scale_m;
+    let c = q.floor();
+    let zc = z.floor();
+    timefly_core::worldgen::noise::gradient_noise3(
+        [c.x as i32, c.y as i32, zc as i32],
+        [q.x - c.x, q.y - c.y, z - zc],
+        seed,
+    )
+}
+
+/// The standing waves at `xz` in water flowing along unit `dir`, wavelength `lambda` (m), their
+/// phase shifted by `warp` wavelengths: `(sin, cos)` of the height pattern's phase, blended over
+/// the four cells of a [`STANDING_WAVE_CELL_M`] lattice around `xz`, each its own train with its
+/// own hashed phase. Mirrored in `water.wesl`.
+pub fn standing_waves(xz: Vec2, dir: Vec2, lambda: f32, warp: f32) -> Vec2 {
+    let g = xz / STANDING_WAVE_CELL_M - 0.5;
+    let c = g.floor();
+    let t = g - c;
+    let f = t * t * (Vec2::splat(3.0) - 2.0 * t);
+    let (mut sum, mut norm) = (Vec2::ZERO, 0.0);
+    for j in 0..2 {
+        for i in 0..2 {
+            let cell = c + Vec2::new(i as f32, j as f32);
+            let point = (cell + 0.5) * STANDING_WAVE_CELL_M;
+            let h = timefly_core::worldgen::noise::hash3([cell.x as i32, cell.y as i32, 0], 229);
+            let offset = (h >> 8) as f32 / 16_777_216.0;
+            let phase = (xz - point).dot(dir) / lambda + offset + warp;
+            let a = std::f32::consts::TAU * (phase - phase.floor());
+            let w = if i == 1 { f.x } else { 1.0 - f.x } * if j == 1 { f.y } else { 1.0 - f.y };
+            sum += w * Vec2::new(a.sin(), a.cos());
+            norm += w * w;
+        }
+    }
+    sum / norm.max(1e-6).sqrt()
+}
+
+/// The standing waves' still phase shift at `xz` (wavelengths). Mirrored in `water.wesl`.
+pub fn crest_warp(xz: Vec2) -> f32 {
+    CREST_WARP * brush(xz, 2.0 * CREST_NOISE_M, 0.0, 233)
+}
+
+/// How strong the standing waves are at `xz`, 0 to 1, in still patches about
+/// [`CREST_NOISE_M`] across. Mirrored in `water.wesl`.
+pub fn crest_patch(xz: Vec2) -> f32 {
+    let n = brush(xz, CREST_NOISE_M, 0.0, 239);
+    let t =
+        ((n - CREST_PATCH_BAND[0]) / (CREST_PATCH_BAND[1] - CREST_PATCH_BAND[0])).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// White water's foam weight (fix rounds 1 and 4) at a rapid of `rapid`, a standing-wave
+/// `crest` (the height's sine, −1 in a trough, 1 on a crest), the crests' `patch` strength
+/// ([`crest_patch`]), the `streak` noise (after [`STREAK_CONTRAST`]), and `resolve`, how far the
+/// pattern is resolved (1 up close, 0 where it shrinks below a couple of pixels). Mirrored in
+/// `water.wesl`.
+pub fn white_water_foam(rapid: f32, crest: f32, patch: f32, streak: f32, resolve: f32) -> f32 {
     let step = |e0: f32, e1: f32, x: f32| {
         let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
-    let foam = step(FOAM_CREST_BAND[0], FOAM_CREST_BAND[1], crest + streak);
-    let lace =
-        FOAM_LACE * step(FOAM_LACE_BAND[0], FOAM_LACE_BAND[1], streak) * step(-0.5, 0.0, crest);
+    let foam = step(
+        FOAM_CREST_BAND[0],
+        FOAM_CREST_BAND[1],
+        crest * patch + streak * patch,
+    );
+    let lace = FOAM_LACE
+        * step(FOAM_LACE_BAND[0], FOAM_LACE_BAND[1], streak)
+        * step(-0.5, 0.0, crest)
+        * patch;
     rapid * (FOAM_MEAN + (foam.max(lace) - FOAM_MEAN) * resolve)
 }
 /// White water's streak noise is scaled by this before its threshold: up close the foam breaks
@@ -1185,6 +1264,9 @@ mod tests {
             ("STREAK_STRETCH", STREAK_STRETCH),
             ("STREAK_DIRECTIONS", STREAK_DIRECTIONS),
             ("STREAK_CONTRAST", STREAK_CONTRAST),
+            ("CREST_WARP", CREST_WARP),
+            ("CREST_NOISE_M", CREST_NOISE_M),
+            ("CREST_WAVE_FLOOR", CREST_WAVE_FLOOR),
         ] {
             assert_eq!(wesl_const_f32(WATER_WESL, name), value, "{name}");
         }
@@ -1202,89 +1284,384 @@ mod tests {
         let end = WATER_WESL.find("    let lake_tilt").unwrap();
         assert!(river < gate && gate < end);
         let block = &WATER_WESL[gate..end];
-        assert!(block.contains("let waves = standing_waves(xz, dir, lambda);"));
+        assert!(block.contains("let waves = standing_waves(xz, dir, lambda, crest_warp(xz));"));
+        assert!(block.contains("let crests = crest_patch(xz);"));
         assert!(block.contains("let n0 = streaks(x0, dir, s, footprint, t);"));
         assert!(block.contains("let n1 = streaks(x1, dir, s, footprint, t);"));
         assert!(block.contains("* river_w);"));
-        assert!(
-            block.contains(
-                "white = look.flow.z * white_water_foam(rapid, waves.x, n, ww) * river_w;"
-            )
-        );
+        assert!(block.contains(
+            "white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, ww) * river_w;"
+        ));
     }
 
-    /// Fix round 1 (the owner's "less white"): foam on the standing waves' crests, none in their
-    /// troughs whatever the streaks do, lace only off the troughs, and the mean where unresolved.
+    /// Fix rounds 1 and 4: foam on the standing waves' crests where their patches are strong,
+    /// none in their troughs whatever the streaks do nor where the patches are gone, lace only
+    /// off the troughs, and the mean where unresolved.
     #[test]
     fn white_water_foams_on_crests_not_troughs() {
         let streak_max = STREAK_CONTRAST * 0.88;
         for k in 0..=40 {
             let streak = -streak_max + 2.0 * streak_max * k as f32 / 40.0;
-            assert_eq!(
-                white_water_foam(1.0, -1.0, streak, 1.0),
-                0.0,
-                "a trough, streak {streak}"
-            );
+            for patch in [0.0, 0.5, 1.0] {
+                assert_eq!(
+                    white_water_foam(1.0, -1.0, patch, streak, 1.0),
+                    0.0,
+                    "a trough, streak {streak}"
+                );
+                assert_eq!(
+                    white_water_foam(1.0, 1.0, 0.0, streak, 1.0),
+                    0.0,
+                    "no patch, streak {streak}"
+                );
+            }
         }
-        assert!(white_water_foam(1.0, 1.0, 0.0, 1.0) > 0.9, "a crest");
+        assert!(white_water_foam(1.0, 1.0, 1.0, 0.0, 1.0) > 0.9, "a crest");
         assert!(
-            white_water_foam(1.0, 0.0, 0.0, 1.0) < 0.05,
+            white_water_foam(1.0, 0.0, 1.0, 0.0, 1.0) < 0.05,
             "between, a quiet streak"
         );
-        assert!(
-            white_water_foam(1.0, 0.0, streak_max, 1.0) > 0.2,
-            "between, a bright streak"
-        );
         assert_eq!(
-            white_water_foam(0.0, 1.0, 0.5, 1.0),
+            white_water_foam(0.0, 1.0, 1.0, 0.5, 1.0),
             0.0,
             "no rapid, no foam"
         );
         assert_eq!(
-            white_water_foam(1.0, -1.0, 0.0, 0.0),
+            white_water_foam(1.0, -1.0, 1.0, 0.0, 0.0),
             FOAM_MEAN,
             "unresolved: the mean"
         );
-        // The mean is the share a full rapid's near foam covers, well under half: crests and
-        // lace over a uniform crest phase and normally spread streaks (σ = 0.25 × contrast).
-        let mut sum = 0.0;
-        let n = 200;
-        for i in 0..n {
-            let crest = (std::f32::consts::TAU * (i as f32 + 0.5) / n as f32).sin();
-            for j in 0..n {
-                let u = (j as f32 + 0.5) / n as f32;
-                // A normal quantile by the logistic approximation.
-                let z = (u / (1.0 - u)).ln() / 1.702;
-                sum += white_water_foam(1.0, crest, 0.25 * STREAK_CONTRAST * z, 1.0);
-            }
-        }
-        let mean = sum / (n * n) as f32;
-        assert!(mean < 0.4, "near foam covers {mean}");
-        assert!(
-            (mean - FOAM_MEAN).abs() < 0.08,
-            "near {mean}, far {FOAM_MEAN}"
-        );
         // The shader's copy.
         for line in [
-            "fn white_water_foam(rapid: f32, crest: f32, streak: f32, resolve: f32) -> f32 {",
-            "    let foam = smoothstep(FOAM_CREST_BAND.x, FOAM_CREST_BAND.y, crest + streak);",
+            "fn white_water_foam(rapid: f32, crest: f32, crests: f32, streak: f32, resolve: f32) -> f32 {",
+            "    let foam = smoothstep(FOAM_CREST_BAND.x, FOAM_CREST_BAND.y, crest * crests + streak * crests);",
             "    let lace = FOAM_LACE * smoothstep(FOAM_LACE_BAND.x, FOAM_LACE_BAND.y, streak)",
-            "        * smoothstep(-0.5, 0.0, crest);",
+            "        * smoothstep(-0.5, 0.0, crest) * crests;",
             "    return rapid * mix(FOAM_MEAN, max(foam, lace), resolve);",
-            "white = look.flow.z * white_water_foam(rapid, waves.x, n, ww) * river_w;",
+            "white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, ww) * river_w;",
+            "fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32, warp: f32) -> vec2<f32> {",
+            "            let a = TAU * fract(dot(xz - point, dir) / lambda + offset + warp);",
+            "            let offset = f32(hash3(vec3<i32>(i32(cell.x), i32(cell.y), 0), 229u) >> 8u) / 16777216.0;",
+            "    return CREST_WARP * brush(xz, 2.0 * CREST_NOISE_M, 0.0, 233u);",
+            "    return smoothstep(CREST_PATCH_BAND.x, CREST_PATCH_BAND.y, brush(xz, CREST_NOISE_M, 0.0, 239u));",
+            "            let strength = CREST_WAVE_FLOOR + (1.0 - CREST_WAVE_FLOOR) * crests;",
         ] {
             assert!(WATER_WESL.contains(line), "{line}");
         }
         assert_eq!(wesl_const_f32(WATER_WESL, "FOAM_MEAN"), FOAM_MEAN);
         assert_eq!(wesl_const_f32(WATER_WESL, "FOAM_LACE"), FOAM_LACE);
-        assert!(WATER_WESL.contains(&format!(
-            "const FOAM_CREST_BAND: vec2<f32> = vec2<f32>({:?}, {:?});",
-            FOAM_CREST_BAND[0], FOAM_CREST_BAND[1]
-        )));
-        assert!(WATER_WESL.contains(&format!(
-            "const FOAM_LACE_BAND: vec2<f32> = vec2<f32>({:?}, {:?});",
-            FOAM_LACE_BAND[0], FOAM_LACE_BAND[1]
-        )));
+        for (name, band) in [
+            ("FOAM_CREST_BAND", FOAM_CREST_BAND),
+            ("FOAM_LACE_BAND", FOAM_LACE_BAND),
+            ("CREST_PATCH_BAND", CREST_PATCH_BAND),
+        ] {
+            assert!(WATER_WESL.contains(&format!(
+                "const {name}: vec2<f32> = vec2<f32>({:?}, {:?});",
+                band[0], band[1]
+            )));
+        }
+    }
+
+    /// The crests' foam over a stretch of a full rapid at `speed_mps` flowing along `dir`, sampled
+    /// every `step_m` over `n × n` points from `origin`, with normally spread streaks (σ = 0.25 ×
+    /// contrast, by the logistic quantile of a hash): the mean foam weight and the share of
+    /// points over half white.
+    fn crest_cover(origin: Vec2, dir: Vec2, speed_mps: f32, step_m: f32, n: u32) -> (f32, f32) {
+        let lambda = standing_wavelength_m(speed_mps);
+        let (mut sum, mut white) = (0.0, 0);
+        for i in 0..n {
+            for j in 0..n {
+                let xz = origin + Vec2::new(i as f32, j as f32) * step_m;
+                let h = timefly_core::worldgen::noise::hash3([i as i32, j as i32, 7], 31);
+                let u = ((h >> 8) as f32 + 0.5) / 16_777_216.0;
+                let streak = 0.25 * STREAK_CONTRAST * (u / (1.0 - u)).ln() / 1.702;
+                let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+                let f = white_water_foam(1.0, crest, crest_patch(xz), streak, 1.0);
+                sum += f;
+                white += usize::from(f > 0.5);
+            }
+        }
+        let count = (n * n) as f32;
+        (sum / count, white as f32 / count)
+    }
+
+    /// Fix round 4: away from the rocks the crests' foam covers well under a tenth of a full
+    /// rapid, and its mean is the unresolved mean (so a distant rapid isn't brighter or darker
+    /// than a near one), at the rapids' speeds and in two directions.
+    #[test]
+    fn background_crest_foam_stays_under_its_cap() {
+        let mut means = Vec::new();
+        for (speed, dir) in [(3.5, Vec2::X), (6.0, Vec2::new(0.6, -0.8))] {
+            let (mean, white) = crest_cover(Vec2::new(151_234.0, -87_321.0), dir, speed, 0.7, 500);
+            println!("{speed} m/s: mean foam {mean:.3}, {white:.3} over half white");
+            assert!(white < 0.07, "{speed} m/s: {white} white");
+            means.push(mean);
+        }
+        let mean = means.iter().sum::<f32>() / means.len() as f32;
+        assert!(
+            (mean + FOAM_ROCK_SHARE - FOAM_MEAN).abs() < 0.02,
+            "near {mean} and the rocks' {FOAM_ROCK_SHARE}, far {FOAM_MEAN}"
+        );
+    }
+
+    /// Fix round 4: the crests are not a ladder. The crests' strength (the waves' height times
+    /// their patch, which the foam thresholds) one wavelength along the flow is weakly
+    /// correlated with itself (a regular train correlates fully), and so is it a crest spacing
+    /// across the flow (a crest running straight across the river would correlate fully); the
+    /// waves without the warp and the patches are the ladder the owner saw.
+    #[test]
+    fn the_crests_are_not_a_ladder() {
+        let speed = 6.0;
+        let lambda = standing_wavelength_m(speed);
+        let dir = Vec2::X;
+        let step = lambda / 16.0;
+        let signal = |xz: Vec2, irregular: bool| {
+            let (warp, patch) = if irregular {
+                (crest_warp(xz), crest_patch(xz))
+            } else {
+                (0.0, 1.0)
+            };
+            standing_waves(xz, dir, lambda, warp).x * patch
+        };
+        // The correlation of the signal with itself `lag` samples on, along `axis`, over lines.
+        let correlation = |axis: Vec2, irregular: bool| {
+            let mut v: Vec<(f32, f32)> = Vec::new();
+            for line in 0..40 {
+                let start = Vec2::new(53_117.0, -20_011.0) + axis.perp() * (37.0 * line as f32);
+                for k in 0..400 {
+                    let a = start + axis * (step * k as f32);
+                    v.push((signal(a, irregular), signal(a + axis * lambda, irregular)));
+                }
+            }
+            let n = v.len() as f32;
+            let (ma, mb) = v
+                .iter()
+                .fold((0.0, 0.0), |(x, y), &(a, b)| (x + a / n, y + b / n));
+            let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
+            for &(a, b) in &v {
+                c += (a - ma) * (b - mb);
+                va += (a - ma) * (a - ma);
+                vb += (b - mb) * (b - mb);
+            }
+            c / (va * vb).sqrt()
+        };
+        let along = (correlation(dir, false), correlation(dir, true));
+        let across = (
+            correlation(dir.perp(), false),
+            correlation(dir.perp(), true),
+        );
+        println!("one wavelength on: along {along:?}, across {across:?} (ladder, now)");
+        // The ladder's own cells (32 m, each with its own phase) already decorrelate it to
+        // about 0.45; the warp and the patches take it under 0.1.
+        assert!(
+            along.0 > 0.4 && across.0 > 0.4,
+            "the ladder: {along:?} {across:?}"
+        );
+        assert!(along.1 < 0.15, "along the flow: {}", along.1);
+        assert!(across.1 < 0.15, "across the flow: {}", across.1);
+    }
+
+    /// No shader names a value with one of WGSL's reserved words (fix round 4: a parameter
+    /// called `patch` failed every water pipeline at run time, and no test compiles the shaders
+    /// with their imports). Checks every `let`, `var` and `const` and every function parameter
+    /// in `assets/shaders`.
+    #[test]
+    fn shaders_name_nothing_with_a_reserved_word() {
+        const RESERVED: &[&str] = &[
+            "NULL",
+            "Self",
+            "abstract",
+            "active",
+            "alignas",
+            "alignof",
+            "as",
+            "asm",
+            "asm_fragment",
+            "async",
+            "attribute",
+            "auto",
+            "await",
+            "become",
+            "binding_array",
+            "cast",
+            "catch",
+            "class",
+            "co_await",
+            "co_return",
+            "co_yield",
+            "coherent",
+            "column_major",
+            "common",
+            "compile",
+            "compile_fragment",
+            "concept",
+            "const_cast",
+            "consteval",
+            "constexpr",
+            "constinit",
+            "crate",
+            "debugger",
+            "decltype",
+            "delete",
+            "demote",
+            "demote_to_helper",
+            "do",
+            "dynamic_cast",
+            "enum",
+            "explicit",
+            "export",
+            "extends",
+            "extern",
+            "external",
+            "fallthrough",
+            "filter",
+            "final",
+            "finally",
+            "friend",
+            "from",
+            "fxgroup",
+            "get",
+            "goto",
+            "groupshared",
+            "highp",
+            "impl",
+            "implements",
+            "import",
+            "inline",
+            "instanceof",
+            "interface",
+            "layout",
+            "lowp",
+            "macro",
+            "macro_rules",
+            "match",
+            "mediump",
+            "meta",
+            "mod",
+            "module",
+            "move",
+            "mut",
+            "mutable",
+            "namespace",
+            "new",
+            "nil",
+            "noexcept",
+            "noinline",
+            "nointerpolation",
+            "noperspective",
+            "null",
+            "nullptr",
+            "of",
+            "operator",
+            "package",
+            "packoffset",
+            "partition",
+            "pass",
+            "patch",
+            "pixelfragment",
+            "precise",
+            "precision",
+            "premerge",
+            "priv",
+            "protected",
+            "pub",
+            "public",
+            "readonly",
+            "ref",
+            "regardless",
+            "register",
+            "reinterpret_cast",
+            "require",
+            "resource",
+            "restrict",
+            "self",
+            "set",
+            "shared",
+            "sizeof",
+            "smooth",
+            "snorm",
+            "static",
+            "static_assert",
+            "static_cast",
+            "std",
+            "subroutine",
+            "super",
+            "target",
+            "template",
+            "this",
+            "thread_local",
+            "throw",
+            "trait",
+            "try",
+            "type",
+            "typedef",
+            "typeid",
+            "typename",
+            "typeof",
+            "union",
+            "unless",
+            "unorm",
+            "unsafe",
+            "unsized",
+            "use",
+            "using",
+            "varying",
+            "virtual",
+            "volatile",
+            "wgsl",
+            "where",
+            "with",
+            "writeonly",
+            "yield",
+        ];
+        let ident = |t: &str| -> String {
+            t.trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect()
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/shaders");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "wesl") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let mut names = Vec::new();
+                for kw in ["let ", "var ", "const "] {
+                    for (i, _) in code.match_indices(kw) {
+                        let before = code[..i].chars().last();
+                        if before.is_none_or(|c| !(c.is_alphanumeric() || c == '_')) {
+                            let rest = &code[i + kw.len()..];
+                            // `var<uniform> name`: skip the address space.
+                            let rest = rest
+                                .split_once('>')
+                                .map_or(rest, |(a, b)| if a.starts_with('<') { b } else { rest });
+                            names.push(ident(rest));
+                        }
+                    }
+                }
+                if let Some(sig) = code.trim_start().strip_prefix("fn ")
+                    && let Some((_, params)) = sig.split_once('(')
+                {
+                    for p in params.split(',').filter(|p| p.contains(':')) {
+                        names.push(ident(p.split(':').next().unwrap()));
+                    }
+                }
+                for name in names.into_iter().filter(|n| !n.is_empty()) {
+                    checked += 1;
+                    assert!(
+                        !RESERVED.contains(&name.as_str()),
+                        "{}:{}: `{name}` is a WGSL reserved word",
+                        path.display(),
+                        n + 1
+                    );
+                }
+            }
+        }
+        assert!(checked > 500, "{checked} names");
     }
 
     /// The water is drawn after the opaque terrain (the alpha-mask phase, with a cutoff no

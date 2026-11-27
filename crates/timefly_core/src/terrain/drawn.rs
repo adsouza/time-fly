@@ -16,12 +16,24 @@ use crate::worldgen::frame::{EARTH_RADIUS_M, FrameBasis, RegionFrame};
 use crate::worldgen::generate::RegionGrid;
 use crate::worldgen::generate::water::Boulder;
 
-/// A foam collar's footprint, in its boulder's radii: a ring this far out all round...
-pub const COLLAR_RING_RADII: f64 = 1.8;
-/// ...and a tail this far downstream...
-pub const COLLAR_TAIL_RADII: f64 = 3.0;
-/// ...this wide either side of the flow line.
-pub const COLLAR_TAIL_HALF_RADII: f64 = 1.3;
+/// A foam collar's footprint, in its boulder's radii (Task 11c fix round 4): a ring this far
+/// out all round, which holds the pillow piled on its upstream face and the boil over a rock
+/// just under...
+pub const COLLAR_RING_RADII: f64 = 2.7;
+/// ...and a V wake downstream, as long as the collar's wake (radii), whose arms reach this far
+/// either side of the flow line at the rock...
+pub const COLLAR_WAKE_HALF_RADII: f64 = 1.6;
+/// ...widening by this much a radius downstream.
+pub const COLLAR_WAKE_SPREAD: f64 = 0.5;
+/// A collar's wake is `COLLAR_WAKE_BASE_RADII + COLLAR_WAKE_RADII_PER_MPS × speed` radii long
+/// (`collar_wake_radii`): longer in faster water...
+pub const COLLAR_WAKE_BASE_RADII: f64 = 2.0;
+pub const COLLAR_WAKE_RADII_PER_MPS: f64 = 1.5;
+/// ...up to this.
+pub const COLLAR_WAKE_MAX_RADII: f64 = 12.0;
+/// Where the drawn water doesn't hold a collar's full wake, these shares of it are tried, the
+/// longest first; a collar whose shortest doesn't fit isn't drawn.
+pub const COLLAR_WAKE_FITS: [f64; 4] = [1.0, 0.6, 0.35, 0.2];
 /// A rock is kept only where the drawn ribbon holds it with this much water (m) to spare, and a
 /// collar's footprint only where the drawn ribbon reaches this far past it: the slack for a
 /// region's own lattice drawing the bank differently from every one checked (on the test's
@@ -60,11 +72,24 @@ pub fn drawn_wet(grid: &RegionGrid, x_m: f64, z_m: f64) -> bool {
     w.thickness_m > 0.0 && w.ribbon_m >= 0.0
 }
 
-/// The points a collar's footprint is checked at, in local metres: its ring
-/// ([`COLLAR_RING_RADII`] out, every 30°) and its tail ([`COLLAR_TAIL_RADII`] downstream,
-/// [`COLLAR_TAIL_HALF_RADII`] either side) for a rock of radius `radius_m` at `(x, z)` whose
-/// flow runs along `down` (a ring alone without one).
-pub fn collar_footprint(x_m: f64, z_m: f64, radius_m: f32, down: Option<DVec2>) -> Vec<DVec2> {
+/// A collar's full wake (radii) in water flowing at `speed_mps`: it grows with the speed.
+pub fn collar_wake_radii(speed_mps: f32) -> f64 {
+    (COLLAR_WAKE_BASE_RADII + COLLAR_WAKE_RADII_PER_MPS * f64::from(speed_mps).max(0.0))
+        .min(COLLAR_WAKE_MAX_RADII)
+}
+
+/// The points a collar's footprint is checked at, in local metres, for a rock of radius
+/// `radius_m` at `(x, z)` whose flow runs along `down`: its ring ([`COLLAR_RING_RADII`] out,
+/// every 30°) and, given a flow and a wake, its V wake: `wake_radii` downstream in four steps,
+/// at each three points across its width: its flow line and `±(COLLAR_WAKE_HALF_RADII +
+/// COLLAR_WAKE_SPREAD × y)`.
+pub fn collar_footprint(
+    x_m: f64,
+    z_m: f64,
+    radius_m: f32,
+    down: Option<DVec2>,
+    wake_radii: f64,
+) -> Vec<DVec2> {
     let r = f64::from(radius_m);
     let c = DVec2::new(x_m, z_m);
     let mut points: Vec<DVec2> = (0..12)
@@ -73,12 +98,13 @@ pub fn collar_footprint(x_m: f64, z_m: f64, radius_m: f32, down: Option<DVec2>) 
             c + DVec2::new(a.cos(), a.sin()) * COLLAR_RING_RADII * r
         })
         .collect();
-    if let Some(d) = down {
+    if let Some(d) = down.filter(|_| wake_radii > 0.0) {
         let across = DVec2::new(-d.y, d.x);
         for k in 1..=4 {
-            let along = c + d * (COLLAR_TAIL_RADII * r * f64::from(k) / 4.0);
+            let y = wake_radii * f64::from(k) / 4.0;
+            let half = COLLAR_WAKE_HALF_RADII + COLLAR_WAKE_SPREAD * y;
             for s in [-1.0, 0.0, 1.0] {
-                points.push(along + across * (s * COLLAR_TAIL_HALF_RADII * r));
+                points.push(c + (d * y + across * (s * half)) * r);
             }
         }
     }

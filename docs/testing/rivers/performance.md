@@ -543,7 +543,62 @@ The cap guard stayed silent everywhere. The fitting re-reads one texel for each 
 its tries run on the emulated cells, not on new texels: the Himalayas' prep grew by about
 110 ms.
 
-## Tiles, the continental pass and boulders per bench region (native)
+### Fix round 4: rock-driven white water
+
+The owner chose "rework the look": rapids hold a rock cluster every 30–60 m along a wide channel
+(one per `BOULDER_CLUSTER_AREA_M2` = 3,500 m² of channel at `rapid` 1, 2–5 rocks each, at most
+16 a sub-segment), more of them break the surface, their collars carry a pillow and a V wake,
+and the standing waves' crests are broken into short, irregular ones. The drawn-water check now
+lays its 16 lattices about each sub-segment's start and reads every point's own cell (no
+clamped 2 × 2 cell), keeping the texels it reads for the sub-segment's other clusters.
+
+| Bench region | Boulders | Share of `MAX_BOULDERS` | Collars | Placement | Prep (region job) |
+|---|---|---|---|---|---|
+| Pangaea interior (250 Ma) | 0 | 0% | 0 | 0.13 ms | 105 ms |
+| Red Sea (0 ka) | 0 | 0% | 0 | 0.08 ms | 284 ms |
+| Himalayas (0 ka) | 10,840 | **66%** | 4,450 | 2.48 ms | 663 ms (655–661 ms alone; round 3's binary 653–654 ms today), see below |
+| Indus tributaries (0 ka) | 1,086 | 7% | 362 | 0.37 ms | 283 ms |
+| Sundaland (21 ka) | 0 | 0% | 0 | 0.13 ms | 191 ms |
+| Japan (1 Ma) | 17 | 0.1% | 11 | 0.11 ms | 1,777 ms |
+| Beringia (21 ka) | 0 | 0% | 0 | 0.12 ms | 219 ms |
+| Rockies ice margin (21 ka) | 911 | 6% | 286 | 0.34 ms | 479 ms |
+| Panama (3 Ma) | 0 | 0% | 0 | 0.04 ms | 108 ms |
+
+Prep is the region job's, not a frame's. The round-3 rule read 64 texels for every cluster; the
+lattices now share their texels across a sub-segment's clusters (a flat array, stamped per
+sub-segment, beside a map for the rare far texel), stop at the first dry lattice, and read
+each texel's river bits once. On the 125 m kinked test fixture that took a region's generation
+from 1,621 ms to 714 ms before the stamping; hashing every lookup had cost more than the reads.
+
+**GPU cost** (the budget: the whole white-water pass within +1.0 ms of `12ef525`). Method as in
+Task 12's re-measure above: `region_tour time --offscreen`, 2560 × 1440, the window raised and
+shown, Task 10's GPU frame timer; `12ef525` built from `git archive` (sources touched, proved by
+`grep -a -c 'fn white_water_foam'`: 0) against this round's build (1), alternating pose by pose
+over four passes, pass 0 the new binary's shader-cache warm-up and left out:
+
+**This session's runs gave no GPU-timer readings** ("no readings (timestamp-query)"), and
+passes 0–2 ran uncapped (the window raised but frames not display-paced), as in fix round 1;
+pass 3 came out display-paced (16.67 ms), so it is not like for like and is left out. The
+fallback is the uncapped frame-time medians (GPU-bound, so an upper bound on the GPU's share),
+passes 0–2:
+
+| Frame time, median (mean) ms | Pass 0 | Pass 1 | Pass 2 | Mean of means | Change |
+|---|---|---|---|---|---|
+| Indus bench pose (2,000 m), parent | 12.53 (12.56) | 12.56 (12.55) | 12.66 (12.68) | 12.60 | — |
+| Indus bench pose, fix round 4 | 12.41 (12.42) | 12.55 (12.55) | 12.64 (12.67) | 12.55 | **−0.05 ms** |
+| Rapid close-up (150 m), parent | 9.39 (9.42) | 9.47 (9.49) | 9.53 (9.54) | 9.48 | — |
+| Rapid close-up, fix round 4 | 9.54 (9.56) | 9.61 (9.64) | 9.67 (9.70) | 9.63 | **+0.15 ms** |
+| Wide rapid (`28.14479,87.34929,0`, 150 m), parent | 9.85 (9.89) | 9.99 (10.00) | 10.02 (10.05) | 9.98 | — |
+| Wide rapid, fix round 4 | 10.30 (10.39) | 10.44 (10.45) | 10.44 (10.45) | 10.43 | **+0.45 ms** |
+
+All within the +1.0 ms budget; the wide rapid, with the most collars in view (their quads grew
+to `[7.6, 2.7, 12.2]` radii), costs the most. A display-paced re-measure with the GPU timer is
+still worth doing in Task 12's next run.
+
+**Prep, like for like.** Round 3's own binary measures 653–654 ms on the Himalayas today (648 ms
+when it was committed); this round's, 655–663 ms over six runs. So the region job takes about
+6 ms (1%) more, for 20% more rocks and 48% more collars with footprints several times larger.
+
 
 `region_tour … shaded 3000` at each bench region's centre, 640 × 360, rivers on and with
 `--no-rivers`, one run each with a fresh `TIMEFLY_LOG_DIR`; the numbers are the session log's

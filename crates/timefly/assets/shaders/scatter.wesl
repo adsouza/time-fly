@@ -19,15 +19,17 @@
 //
 // Foam collars (look.texel.z == SCATTER_MODE_FOAM, Task 11c): a flat quad at the water level,
 // its local +z downstream, in boulder radii; the tag's top byte is the drawn rock's radius at the
-// waterline as a share of its radius (0 for a rock just under the water). The vertex stage pulls
-// every vertex by the water's pull plus look.pull.w, so the water at its level never hides it.
-// The fragment cuts it out (`discard`; the material is alpha-masked, so nothing is sorted): a
-// ring from just inside the rock's waterline, thicker on its upstream face (the water piling on
-// it), or a boil over a rock just under the surface, and a wake look.colour.w radii long that
-// widens downstream. Its edge is broken by noise that churns with time and by streaks stretched
-// 4:1 along the flow that run downstream; it thins out where a radius shrinks to a few pixels.
-// Its colour is the water's white water (look.colour.rgb), lit as the water's foam is (rough,
-// the water's reflectance), with the boulders' shade floor.
+// waterline as a share of its radius (0 for a rock just under the water), its next byte the V
+// wake's length as a share of look.colour.w radii, and its low 16 bits the seed. The vertex
+// stage pulls every vertex by the water's pull plus look.pull.w, so the water at its level never
+// hides it. The fragment cuts it out (`discard`; the material is alpha-masked, so nothing is
+// sorted) by `collar_shape` (fix round 4): round a rock through the surface, foam piled on its
+// upstream face (the pillow), a V of two arms trailing downstream as long as its wake, and churn
+// just behind it; over a rock just under the surface, a boil just downstream of it, dimmer
+// (look.light.y). Its edge is broken by noise that churns with time and by streaks stretched 4:1
+// along the flow that run downstream; it thins out where a radius shrinks to a few pixels. Its
+// colour is the water's white water (look.colour.rgb), lit as the water's foam is (rough, the
+// water's reflectance), with the boulders' shade floor.
 
 import bevy_pbr::render::mesh_functions::{get_world_from_local, get_tag, mesh_normal_local_to_world};
 import bevy_pbr::render::mesh_view_bindings::{view, globals};
@@ -43,12 +45,13 @@ struct ScatterLook {
     texel: vec4<u32>,
     // Solid: x: hue jitter (± radians); y: value jitter (± share); z: wet darkening (share); w:
     // the wet band above the waterline (share of the height). Foam: rgb: its colour (linear);
-    // w: the wake's length (radii).
+    // w: the longest wake (radii), which the tag's wake byte is a share of.
     colour: vec4<f32>,
     // x: the water's constant pull (m); y: its share of the view distance; z: Earth radius (m);
     // w: foam only, the extra pull (m) in front of the water.
     pull: vec4<f32>,
-    // x: the least light (exposure applied) a surface shows: the terrain ramp's shade floor.
+    // x: the least light (exposure applied) a surface shows: the terrain ramp's shade floor;
+    // y: foam only, a boil's shade.
     light: vec4<f32>,
 }
 
@@ -127,30 +130,39 @@ fn foam_noise(q: vec2<f32>, z: f32, seed: u32) -> f32 {
     return gradient_noise3(vec3<i32>(i32(c.x), i32(c.y), i32(zc)), vec3<f32>(q - c, z - zc), seed);
 }
 
-// `collar_shape` in boulders.rs: 1 in the ring round the rock (from just inside its waterline
-// `w`, in radii, to 0.45 radii out, 0.35 more upstream, where the water piles) and along a tail
-// `wake` radii long downstream, 0 elsewhere; a rock just under (w = 0) gets a small boil.
+// `collar_shape` in boulders.rs: 1 where a collar is white, 0 elsewhere, at `p` (radii, x across,
+// y downstream) round a rock whose waterline is `w` of its radius, its V wake `wake` radii long.
+// Through the surface: the pillow on its upstream face, the V's two arms spreading downstream at
+// about 19° until the wake's end, and churn just behind it. Just under (w = 0, or no wake): a
+// boil just downstream of it and a short trail.
 fn collar_shape(p: vec2<f32>, w: f32, wake: f32) -> f32 {
     let rho = length(p);
     let up = clamp(-p.y / max(rho, 1e-3), 0.0, 1.0);
-    let breaks = w > 0.0;
+    let breaks = w > 0.0 && wake > 0.0;
     let inner = 0.8 * w;
-    let edge = select(0.7, w + 0.45, breaks) + 0.35 * up;
-    let ring = (1.0 - smoothstep(edge - 0.15, edge, rho)) * smoothstep(inner - 0.1, inner, rho);
-    let half = select(0.45, 0.8 * w + 0.15, breaks) * (1.0 + 0.1 * max(p.y, 0.0));
-    let tail = select(0.6, wake, breaks);
-    let trail = (1.0 - smoothstep(0.6 * half, half, abs(p.x)))
-        * smoothstep(-0.2, 0.4, p.y)
-        * (1.0 - smoothstep(0.5 * tail, tail, p.y));
-    return max(ring, trail);
+    let edge = w + 0.5 + 1.1 * up;
+    let pillow = (1.0 - smoothstep(edge - 0.2, edge, rho)) * smoothstep(inner - 0.1, inner, rho);
+    let along = max(p.y, 0.0);
+    let arm = 0.8 * w + 0.3 + 0.35 * along;
+    let arm_half = 0.45 + 0.15 * along;
+    let reach = max(wake, 1e-3);
+    let fade = smoothstep(-0.3, 0.3, p.y) * (1.0 - smoothstep(0.5 * reach, reach, p.y));
+    let arms = (1.0 - smoothstep(0.3 * arm_half, arm_half, abs(abs(p.x) - arm))) * fade;
+    let core = w + 0.5 + 0.15 * along;
+    let churn = (1.0 - smoothstep(0.5 * core, core, abs(p.x))) * smoothstep(-0.2, 0.4, p.y)
+        * (1.0 - smoothstep(0.4 * reach, 0.8 * reach, p.y));
+    let boil = 1.0 - smoothstep(0.8, 1.2, length(p - vec2<f32>(0.0, 0.9)));
+    let trail = (1.0 - smoothstep(0.2, 0.4, abs(p.x))) * smoothstep(0.5, 1.0, p.y)
+        * (1.0 - smoothstep(1.6, 2.5, p.y));
+    return select(max(boil, trail), max(pillow, max(arms, churn)), breaks);
 }
 
 // A foam collar's coverage at a fragment (see the header): above 0 is foam. `p` is the mesh's
-// xz in radii (x across, y downstream), `r` the radius (m), `w` the waterline share, `seed` the
-// boulder's, `footprint` the pixel's size in radii, `t` the time (s). The shape holds a clear
-// ring and tail; the noise only breaks their edges (fix round 1: more visible collars).
-fn collar_cover(p: vec2<f32>, r: f32, w: f32, seed: u32, footprint: f32, t: f32) -> f32 {
-    let shape = collar_shape(p, w, look.colour.w) * (1.0 - smoothstep(0.3, 0.8, footprint));
+// xz in radii (x across, y downstream), `r` the radius (m), `w` the waterline share, `wake` the V
+// wake's length (radii), `seed` the boulder's, `footprint` the pixel's size in radii, `t` the
+// time (s). The shape holds a clear pillow and V; the noise only breaks their edges.
+fn collar_cover(p: vec2<f32>, r: f32, w: f32, wake: f32, seed: u32, footprint: f32, t: f32) -> f32 {
+    let shape = collar_shape(p, w, wake) * (1.0 - smoothstep(0.3, 0.8, footprint));
     // Churning clumps (about 0.7 m) and streaks 4:1 along the flow running downstream at 2 m/s,
     // each collar's own (offset by its seed).
     let m = p * r + vec2<f32>(f32(seed & 1023u), f32((seed >> 10u) & 1023u));
@@ -173,13 +185,16 @@ fn foam_fragment(in: ScatterVertexOutput, is_front: bool) -> FragmentOutput {
     let footprint = length(fwidth(in.world_position.xz)) / max(in.scale, 1e-3);
     let tag = get_tag(in.instance_index);
     let w = f32(tag >> 24u) / 255.0;
-    let seed = tag & 0xFFFFFFu;
-    let cover = collar_cover(in.local, in.scale, w, seed, footprint, globals.time);
+    let wake = f32((tag >> 16u) & 255u) / 255.0 * look.colour.w;
+    let seed = tag & 0xFFFFu;
+    let cover = collar_cover(in.local, in.scale, w, wake, seed, footprint, globals.time);
     if cover <= 0.0 {
         discard;
     }
-    // The dense core a shade brighter than the water's white water around it: foam piled up.
-    let albedo = look.colour.rgb * (1.0 + 0.08 * clamp(cover * 4.0, 0.0, 1.0));
+    // The dense core a shade brighter than the water's white water around it: foam piled up. A
+    // boil, over a rock just under the surface, is dimmer.
+    let shade = select(look.light.y, 1.0, w > 0.0 && wake > 0.0);
+    let albedo = look.colour.rgb * shade * (1.0 + 0.08 * clamp(cover * 4.0, 0.0, 1.0));
     var mesh: VertexOutput;
     mesh.position = in.position;
     mesh.world_position = in.world_position;

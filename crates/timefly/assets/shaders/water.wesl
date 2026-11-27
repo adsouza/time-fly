@@ -20,11 +20,14 @@
 // White water in rapids (Task 11c), only where `rapid` > 0:
 // - Standing waves: a normal-only pattern that holds still while the foam runs through it, its
 //   crests across the flow at the hydraulic wavelength 2π v² / g (`standing_waves`), its slope
-//   growing with the rapid.
-// - Foam on the standing waves' crests (`white_water_foam`), broken by noise stretched
-//   STREAK_STRETCH : 1 along the flow (`streaks`) and carried by the flow map, its coarse clumps
-//   breaking and re-forming with time; none in the troughs, which read as dark, fast, streaked
-//   water; faded to its mean where unresolved (fix round 1, the owner's "less white").
+//   growing with the rapid. Fix round 4: their phase is warped (`crest_warp`) and their strength
+//   broken into patches (`crest_patch`) by still noise, so the crests are short and irregular,
+//   not a ladder across the river.
+// - Foam on the standing waves' crests where the patches are strong (`white_water_foam`), broken
+//   by noise stretched STREAK_STRETCH : 1 along the flow (`streaks`) and carried by the flow
+//   map, its coarse clumps breaking and re-forming with time; none in the troughs, which read as
+//   dark, fast, streaked water; faded to its mean where unresolved. Most of a rapid's white is
+//   the rocks' own: their collars (scatter.wesl), which this shader cannot see.
 //
 // Waves (art pass §5.4, waves.wesl):
 // - Swell: below 1 km the vertex stage raises and lowers the surface by three directional
@@ -142,7 +145,13 @@ const STREAK_DIRECTIONS: f32 = 24.0;
 const FOAM_CREST_BAND: vec2<f32> = vec2<f32>(0.45, 0.75);
 const FOAM_LACE: f32 = 0.5;
 const FOAM_LACE_BAND: vec2<f32> = vec2<f32>(0.35, 0.7);
-const FOAM_MEAN: f32 = 0.28;
+const FOAM_MEAN: f32 = 0.105;
+// `CREST_WARP`, `CREST_NOISE_M`, `CREST_PATCH_BAND`, `CREST_WAVE_FLOOR` in water.rs: the
+// standing waves' still phase warp (wavelengths) and patches (`crest_warp`, `crest_patch`).
+const CREST_WARP: f32 = 0.5;
+const CREST_NOISE_M: f32 = 9.0;
+const CREST_PATCH_BAND: vec2<f32> = vec2<f32>(0.0, 0.3);
+const CREST_WAVE_FLOOR: f32 = 0.4;
 // `STREAK_CONTRAST` in water.rs: the streaks' noise is scaled by this before the foam's
 // threshold, so up close the foam breaks into streaks and clumps over dark water, while where
 // it is unresolved (the noise at its mean, 0) the rapid is as white as before.
@@ -264,14 +273,15 @@ fn brush(xz: vec2<f32>, scale_m: f32, z: f32, seed: u32) -> f32 {
     return gradient_noise3(vec3<i32>(i32(c.x), i32(c.y), i32(zc)), vec3<f32>(q - c, z - zc), seed);
 }
 
-// Standing waves at xz in water flowing along unit `dir`, wavelength `lambda` (m): the height
-// pattern's (sin, cos) of its phase, so the height is `sin` and its slope along `dir` is `cos`
-// (times 2π / λ and the amplitude). Its crests run across the flow and never move. A single
-// phase `dot(xz, dir) / λ` would sweep the crests round wherever the flow turns or λ changes
-// (xz is hundreds of kilometres from the origin), so each cell of a STANDING_WAVE_CELL_M lattice
-// holds its own train about its own point with its own phase, and the four around xz are
-// blended with smooth weights, normalised so the blend keeps the pattern's strength.
-fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32) -> vec2<f32> {
+// Standing waves at xz in water flowing along unit `dir`, wavelength `lambda` (m), their phase
+// shifted by `warp` wavelengths: the height pattern's (sin, cos) of its phase, so the height is
+// `sin` and its slope along `dir` is `cos` (times 2π / λ and the amplitude). Its crests run
+// across the flow and never move. A single phase `dot(xz, dir) / λ` would sweep the crests round
+// wherever the flow turns or λ changes (xz is hundreds of kilometres from the origin), so each
+// cell of a STANDING_WAVE_CELL_M lattice holds its own train about its own point with its own
+// phase, and the four around xz are blended with smooth weights, normalised so the blend keeps
+// the pattern's strength. `standing_waves` in water.rs.
+fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32, warp: f32) -> vec2<f32> {
     let g = xz / STANDING_WAVE_CELL_M - 0.5;
     let c = floor(g);
     let f = smoothstep(vec2<f32>(0.0), vec2<f32>(1.0), g - c);
@@ -282,13 +292,25 @@ fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32) -> vec2<f32> {
             let cell = c + vec2<f32>(f32(i), f32(j));
             let point = (cell + 0.5) * STANDING_WAVE_CELL_M;
             let offset = f32(hash3(vec3<i32>(i32(cell.x), i32(cell.y), 0), 229u) >> 8u) / 16777216.0;
-            let a = TAU * fract(dot(xz - point, dir) / lambda + offset);
+            let a = TAU * fract(dot(xz - point, dir) / lambda + offset + warp);
             let w = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
             sum += w * vec2<f32>(sin(a), cos(a));
             norm += w * w;
         }
     }
     return sum * inverseSqrt(max(norm, 1e-6));
+}
+
+// `crest_warp` in water.rs: the standing waves' still phase shift at xz (wavelengths), so their
+// crests wander instead of running straight across the river.
+fn crest_warp(xz: vec2<f32>) -> f32 {
+    return CREST_WARP * brush(xz, 2.0 * CREST_NOISE_M, 0.0, 233u);
+}
+
+// `crest_patch` in water.rs: how strong the standing waves are at xz, 0 to 1, in still patches
+// about CREST_NOISE_M across: the crests break into short, irregular ones.
+fn crest_patch(xz: vec2<f32>) -> f32 {
+    return smoothstep(CREST_PATCH_BAND.x, CREST_PATCH_BAND.y, brush(xz, CREST_NOISE_M, 0.0, 239u));
 }
 
 // White water's noise at xz, in frames turned to the unit flow `dir` and stretched
@@ -320,11 +342,12 @@ fn streaks(xz: vec2<f32>, dir: vec2<f32>, s: f32, footprint: f32, t: f32) -> f32
 }
 
 // `white_water_foam` in water.rs: the foam weight at a rapid, a standing-wave crest (−1 in a
-// trough, 1 on a crest), the streak noise and how far they are resolved: none in a trough.
-fn white_water_foam(rapid: f32, crest: f32, streak: f32, resolve: f32) -> f32 {
-    let foam = smoothstep(FOAM_CREST_BAND.x, FOAM_CREST_BAND.y, crest + streak);
+// trough, 1 on a crest), the crests' patch strength (`patch` is a WGSL reserved word), the
+// streak noise and how far they are resolved: none in a trough, none where the patch is gone.
+fn white_water_foam(rapid: f32, crest: f32, crests: f32, streak: f32, resolve: f32) -> f32 {
+    let foam = smoothstep(FOAM_CREST_BAND.x, FOAM_CREST_BAND.y, crest * crests + streak * crests);
     let lace = FOAM_LACE * smoothstep(FOAM_LACE_BAND.x, FOAM_LACE_BAND.y, streak)
-        * smoothstep(-0.5, 0.0, crest);
+        * smoothstep(-0.5, 0.0, crest) * crests;
     return rapid * mix(FOAM_MEAN, max(foam, lace), resolve);
 }
 
@@ -447,16 +470,18 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
             // Standing waves: still, so sampled at xz (not carried by the flow map); the normal
             // tilts by minus the height's slope.
             let lambda = TAU * speed * speed / GRAVITY_MPS2;
-            let waves = standing_waves(xz, dir, lambda);
+            let crests = crest_patch(xz);
+            let waves = standing_waves(xz, dir, lambda, crest_warp(xz));
             let ww = octave_weight(footprint, lambda);
-            flow_tilt -= dir * (STANDING_WAVE_SLOPE * rapid * ww * waves.y * river_w);
+            let strength = CREST_WAVE_FLOOR + (1.0 - CREST_WAVE_FLOOR) * crests;
+            flow_tilt -= dir * (STANDING_WAVE_SLOPE * rapid * ww * strength * waves.y * river_w);
             // White water: foam on the crests the flow carries it through, broken by streaks
             // along the flow that churn as they go, dark fast water in the troughs; where the
             // pattern can't be resolved it fades to its mean.
             let n0 = streaks(x0, dir, s, footprint, t);
             let n1 = streaks(x1, dir, s, footprint, t);
             let n = STREAK_CONTRAST * (weights.x * n0 + weights.y * n1);
-            white = look.flow.z * white_water_foam(rapid, waves.x, n, ww) * river_w;
+            white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, ww) * river_w;
         }
     }
     let lake_tilt = (ripple - wave_slope) * (1.0 - river_w);

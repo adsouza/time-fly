@@ -1692,7 +1692,8 @@ mod water {
     /// bit.
     #[test]
     fn thinned_rapids_agree_where_regions_overlap() {
-        use crate::hydrology::params::{BOULDERS_PER_SUBPOINT_MAX, MAX_BOULDERS};
+        use crate::hydrology::params::MAX_BOULDERS;
+        use crate::worldgen::generate::water::subsegment_clusters;
         let frame = RegionFrame {
             center: dir(20.0, 30.0),
         };
@@ -1700,7 +1701,7 @@ mod water {
             CubeLattice { n: 900 },
             frame,
             &[-15_000.0, 15_000.0],
-            150.0,
+            60.0,
             0.03,
         );
         let field = FnField {
@@ -1718,13 +1719,14 @@ mod water {
                 .dir_to_local(RenderDir(d))
                 .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
         };
-        // The hazard: before thinning the first region's rapids hold more than the cap.
+        // The hazard: before thinning the first region's rapids hold more than the cap (a
+        // full rapid's clusters hold 4 boulders on average).
         let unthinned: f64 = ga
             .rivers(FieldKind::Inner)
             .unwrap()
             .sub_segments()
             .filter(|(s, e)| s.rapid > 0.0 && in_square(&ga, s.dir) && in_square(&ga, e.dir))
-            .map(|(s, _)| (f64::from(s.rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX)).floor())
+            .map(|(s, e)| 4.0 * f64::from(subsegment_clusters(s, e)))
             .sum();
         assert!(
             unthinned > f64::from(MAX_BOULDERS),
@@ -1812,27 +1814,30 @@ mod water {
     /// cluster is kept exactly when its hash falls under `BOULDER_KEEP_FRACTION`.
     #[test]
     fn thinning_keeps_whole_clusters() {
-        use crate::hydrology::params::{BOULDER_CLUSTER_MAX, BOULDER_KEEP_FRACTION};
+        use crate::hydrology::params::BOULDER_KEEP_FRACTION;
         use crate::worldgen::generate::water::cluster_kept;
         let g = rapids(150.0, true);
         let clusters = clusters_of(&g);
         let full = rapid_subsegments(&g, 0.999..=1.0);
+        let counts = subsegment_counts(&g);
         let mut kept = std::collections::BTreeSet::new();
-        for (c, boulders) in &clusters {
+        for (c, boulders, _) in &clusters {
             assert!(
                 cluster_kept(c.river, c.k, c.index),
                 "only kept clusters are listed"
             );
             kept.insert((c.river, c.k, c.index));
             if full.contains_key(&(c.river, c.k)) {
-                // 24 boulders: four clusters of six, each whole.
-                assert_eq!(c.members.len(), BOULDER_CLUSTER_MAX as usize);
-                assert_eq!(boulders.len(), c.members.len(), "the whole cluster is held");
+                assert_eq!(
+                    boulders.len(),
+                    c.members.len(),
+                    "the whole cluster is sized"
+                );
             }
         }
         let mut listed = 0;
         for &(river, k) in full.keys() {
-            for index in 0..4 {
+            for index in 0..counts[&(river, k)].0 {
                 listed += 1;
                 assert_eq!(
                     kept.contains(&(river, k, index)),
@@ -1843,9 +1848,14 @@ mod water {
         }
         let share = full
             .keys()
-            .map(|&(r, k)| (0..4).filter(|&c| kept.contains(&(r, k, c))).count())
+            .map(|&(r, k)| {
+                (0..counts[&(r, k)].0)
+                    .filter(|&c| kept.contains(&(r, k, c)))
+                    .count()
+            })
             .sum::<usize>() as f64
             / f64::from(listed);
+        assert!(listed > 200, "{listed} clusters");
         assert!(
             (share - BOULDER_KEEP_FRACTION).abs() < 0.05,
             "kept {share} of the clusters, the fraction {BOULDER_KEEP_FRACTION}"
@@ -1870,8 +1880,10 @@ mod water {
     /// Fix round 2: the region keeps a boulder only where the drawn water (the water shader's
     /// own quantities, `blended_water` over the region's texels) holds it, and draws its collar
     /// only where the drawn water holds the collar's footprint. Real widths: a narrow steep river
-    /// (Q 20 m³/s, 22 m) and a 61 m one (Q 150), each on a 3% bed along a line oblique to the
-    /// lattice, so the course kinks at every node; and the straight equator rapid. Non-vacuous:
+    /// (Q 20 m³/s, 22 m), a 61 m one (Q 150) and a 200 m one (Q 1,600, fix round 4: clusters
+    /// spread across it and fitting slides reach far from each cluster's centre), each on a 3%
+    /// bed along a line oblique to the lattice, so the course kinks at every node; and the
+    /// straight equator rapid. Non-vacuous:
     /// the generator's rocks near the banks stand outside the drawn water in each fixture.
     #[test]
     fn placed_boulders_and_collars_lie_in_the_drawn_water() {
@@ -1898,7 +1910,10 @@ mod water {
             // its texels from the inner field's edge.
             let g: RegionGenerator<'static, _> =
                 RegionGenerator::new(spec_at(c, 0.0, 1025, 513), &*field, Some(&*hydro));
-            let unplaced: Vec<Boulder> = clusters_of(&g).into_iter().flat_map(|(_, b)| b).collect();
+            let unplaced: Vec<Boulder> = clusters_of(&g)
+                .into_iter()
+                .flat_map(|(_, b, _)| b)
+                .collect();
             (unplaced, g.finish())
         };
         let straight = || {
@@ -1913,12 +1928,16 @@ mod water {
                 &field,
                 Some(&hydro),
             );
-            let unplaced: Vec<Boulder> = clusters_of(&g).into_iter().flat_map(|(_, b)| b).collect();
+            let unplaced: Vec<Boulder> = clusters_of(&g)
+                .into_iter()
+                .flat_map(|(_, b, _)| b)
+                .collect();
             (unplaced, g.finish())
         };
         for (name, (unplaced, grid), kinked) in [
             ("narrow, kinked", oblique(20.0), true),
             ("61 m, kinked", oblique(150.0), true),
+            ("200 m, kinked", oblique(1600.0), true),
             ("61 m, straight", straight(), false),
         ] {
             let basis = grid.spec.frame().basis();
@@ -1975,7 +1994,7 @@ mod water {
                     collars += 1;
                     assert!(b.foam_site().is_some());
                     let down = flow_local(&basis, b.dir, b.flow_mps);
-                    for p in collar_footprint(x, z, b.radius_m, down) {
+                    for p in collar_footprint(x, z, b.radius_m, down, f64::from(b.wake_radii)) {
                         let w = blended_water(&grid, p.x, p.y);
                         assert!(
                             w.thickness_m > 0.0 && w.ribbon_m >= 0.0,
@@ -1988,14 +2007,140 @@ mod water {
         }
     }
 
+    /// Fix round 4 (Important 1 of the rounds 2–3 re-review): each emulated lattice draws the
+    /// water at a point from that point's own cell, however far it lies from the cluster. Round
+    /// 2 built one 2 × 2 cell about each cluster's centre, so a point more than about 29 m away
+    /// (a member's spread, a collar's wake, a fitting slide) read the cell's clamped edge. On a
+    /// 200 m (Q 1,600) kinked rapid, points out to 300 m from each cluster's centre are checked
+    /// against `blended_water` over a region built from the four texels around the point, laid
+    /// out as `DRAWN_LATTICES` lays them, read from the generator.
+    #[test]
+    fn drawn_lattices_read_each_points_own_cell() {
+        use crate::terrain::blended_water;
+        use crate::worldgen::generate::water::{DRAWN_LATTICES, DrawnCache, DrawnLattices};
+        let frame = RegionFrame {
+            center: dir(20.0, 30.0),
+        };
+        let (hydro, floor) = rivers_along(
+            CubeLattice { n: 900 },
+            frame,
+            &[-15_000.0, 37_000.0],
+            1_600.0,
+            0.03,
+        );
+        let field = FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        };
+        let g = RegionGenerator::new(
+            spec_at(frame.local_to_dir(20_000.0, 0.0), 0.0, 1025, 33),
+            &field,
+            Some(&hydro),
+        );
+        let t = REGION_SIZE_M / 1024.0;
+        let texel = |d: DVec3| g.sample_texel_in(FieldKind::Inner, RenderDir(d));
+        let bed = |d: DVec3| {
+            let x = texel(d);
+            crate::worldgen::generate::water::BoulderBed {
+                base_m: x.h,
+                level_m: x.water_level_m,
+                river: x.river,
+            }
+        };
+        // The reference: lattice k's cell around p (m east and south of `origin`), its corners
+        // read from the generator, drawn by `blended_water` over a 2 × 2 region of them.
+        let reference = |origin: DVec3, k: usize, p: bevy_math::DVec2| {
+            let (north, east) = RegionFrame {
+                center: RenderDir(origin),
+            }
+            .north_east();
+            let (deg, a, b) = DRAWN_LATTICES[k];
+            let (sn, c) = deg.to_radians().sin_cos();
+            let (x, z) = (p.x * c + p.y * sn, -p.x * sn + p.y * c);
+            let (u, v) = (x / t - a, z / t - b);
+            let (j0, i0) = (u.floor(), v.floor());
+            let corner = |i: f64, j: f64| {
+                let (cx, cz) = ((j + a) * t, (i + b) * t);
+                let (e, s) = (cx * c - cz * sn, cx * sn + cz * c);
+                texel((origin + (east * e - north * s) / EARTH_RADIUS_M).normalize())
+            };
+            let corners = [
+                corner(i0, j0),
+                corner(i0, j0 + 1.0),
+                corner(i0 + 1.0, j0),
+                corner(i0 + 1.0, j0 + 1.0),
+            ];
+            let field = Field {
+                res: 2,
+                size_m: t,
+                elevation_m: corners.iter().map(|x| x.h).collect(),
+                surface: vec![[0; 4]; 4],
+                water_level_m: corners.iter().map(|x| x.water_level_m).collect(),
+                river: corners.iter().map(|x| x.river).collect(),
+                river_mask: Vec::new(),
+            };
+            let grid = RegionGrid {
+                spec: *g.spec(),
+                inner: field.clone(),
+                apron: field,
+                boulders: Vec::new(),
+            };
+            blended_water(&grid, (u - j0 - 0.5) * t, (v - i0 - 0.5) * t)
+        };
+        let mut cache = DrawnCache::default();
+        let (mut checked, mut far, mut wet) = (0, 0, 0);
+        let clusters = g
+            .rivers(FieldKind::Inner)
+            .map(|r| {
+                crate::worldgen::generate::water::boulder_clusters(
+                    r,
+                    &g.spec().frame().basis(),
+                    REGION_SIZE_M / 2.0,
+                )
+            })
+            .unwrap();
+        for c in clusters.iter().step_by(37).take(40) {
+            cache.start((c.river, c.k));
+            let mut lattices = DrawnLattices::new(c.origin(), t, &bed, &mut cache);
+            let centre = lattices.tangent(c.centre());
+            for step in 0..12 {
+                let a = std::f64::consts::TAU * f64::from(step) / 12.0 + 0.3;
+                let reach = 12.0 + 26.0 * f64::from(step);
+                let p = centre + bevy_math::DVec2::new(a.cos(), a.sin()) * reach;
+                for k in 0..DRAWN_LATTICES.len() {
+                    let got = lattices.sample(k, p);
+                    let want = reference(c.origin(), k, p);
+                    checked += 1;
+                    far += usize::from(reach > 0.15 * t);
+                    wet += usize::from(want.thickness_m > 0.0 && want.ribbon_m >= 0.0);
+                    for (name, x, y) in [
+                        ("level", got.level_m, want.level_m),
+                        ("thickness", got.thickness_m, want.thickness_m),
+                        ("ribbon", got.ribbon_m, want.ribbon_m),
+                    ] {
+                        assert!(
+                            (x - y).abs() < 2e-3,
+                            "lattice {k}, {reach} m out: {name} {x} vs {y}"
+                        );
+                    }
+                }
+            }
+        }
+        println!("{checked} samples, {far} more than 44 m out, {wet} drawn wet");
+        assert!(checked > 5_000 && far > 3_000 && wet > 1_000);
+    }
+
     /// Fix round 3: a rock the drawn water doesn't hold is moved toward the channel's centre and
-    /// shrunk until it fits, not dropped. A narrow (22 m, Q 20) steep river on a course that
-    /// kinks at every node keeps most of its clusters away from the apron-blend band: at least
-    /// 74% of those sized there keep most of their rocks. Round 2's drop-only rule kept 68%; with
-    /// the fitting, 77% (11,825 of 15,362 rocks). The rest sit by kinks, where the lattices
-    /// disagree by more than the channel holds, even at its centreline.
+    /// shrunk until it fits, not dropped. On a narrow (22 m, Q 20) steep river whose course kinks
+    /// at every node, away from the apron-blend band: the fitting first tries each rock where it
+    /// was sized, so every rock the drop-only rule (round 2) keeps still ships, and every one of
+    /// them that is no breaker ships unchanged; and the fitting keeps more. (Fix round 4: this
+    /// replaces round 3's fitted 74% bar; `fitting_moves_a_bank_rock_toward_the_centreline` tests
+    /// the fitting itself.)
     #[test]
     fn narrow_kinked_rapids_keep_their_clusters() {
+        use crate::worldgen::generate::water::{DrawnCache, DrawnLattices};
         let frame = RegionFrame {
             center: dir(20.0, 30.0),
         };
@@ -2020,29 +2165,56 @@ mod water {
                 .dir_to_local(RenderDir(d))
                 .is_some_and(|(x, z)| x.abs().max(z.abs()) < band - 100.0)
         };
-        let kept: std::collections::BTreeSet<u32> = g.boulders().iter().map(|b| b.seed).collect();
-        // A cluster is kept when most of its members are: its rocks stay together.
-        let (mut sized, mut holding, mut rocks, mut rocks_kept) = (0, 0, 0, 0);
-        for (c, members) in clusters_of(&g) {
-            if !interior(c.centre()) || members.is_empty() {
+        let texel_m = REGION_SIZE_M / 1024.0;
+        let bed = |d: DVec3| {
+            let t = g.sample_texel_in(FieldKind::Inner, RenderDir(d));
+            crate::worldgen::generate::water::BoulderBed {
+                base_m: t.h,
+                level_m: t.water_level_m,
+                river: t.river,
+            }
+        };
+        let mut cache = DrawnCache::default();
+        let (mut rocks, mut drop_only, mut fitted, mut unchanged) = (0, 0, 0, 0);
+        for (c, sized, held) in clusters_of(&g) {
+            if !interior(c.centre()) {
                 continue;
             }
-            let n = members.iter().filter(|m| kept.contains(&m.seed)).count();
-            sized += 1;
-            holding += usize::from(2 * n > members.len());
-            rocks += members.len();
-            rocks_kept += n;
+            cache.start((c.river, c.k));
+            let mut lattices = DrawnLattices::new(c.origin(), texel_m, &bed, &mut cache);
+            for (b, m) in sized.iter().zip(&c.members) {
+                rocks += 1;
+                let shipped = held.iter().find(|h| h.seed == b.seed);
+                fitted += usize::from(shipped.is_some());
+                let p = lattices.tangent(b.dir);
+                if !lattices.fits(p, f64::from(b.radius_m)) {
+                    continue;
+                }
+                drop_only += 1;
+                let shipped = shipped.expect("a rock the drop-only rule keeps ships");
+                if m.rise_m.is_none() {
+                    assert_eq!(
+                        Boulder {
+                            collar: false,
+                            wake_radii: 0.0,
+                            ..*shipped
+                        },
+                        *b,
+                        "kept where it was sized"
+                    );
+                    unchanged += 1;
+                }
+            }
         }
-        let share = holding as f64 / sized as f64;
         println!(
-            "{holding} of {sized} clusters keep most of their rocks ({share:.2}); \
-             {rocks_kept} of {rocks} rocks"
+            "{rocks} rocks sized: the drop-only rule keeps {drop_only}, the fitting {fitted} \
+             ({unchanged} non-breakers unchanged)"
         );
-        assert!(sized > 500, "{sized} clusters");
         assert!(
-            share >= 0.74,
-            "only {holding} of {sized} clusters keep most of their rocks"
+            rocks > 2_000 && unchanged > 500,
+            "{rocks} rocks, {unchanged}"
         );
+        assert!(fitted > drop_only, "the fitting keeps more");
     }
 
     /// The continent's pass and a dense region at `inner`/`apron` resolution.
@@ -2782,17 +2954,44 @@ mod water {
         RegionGenerator::new(spec_at(LAT.dir(eq(405)), 0.0, 1025, 33), field, Some(hydro))
     }
 
+    /// Two full rapids (3% beds) of discharge `q` 52 km apart on lines oblique to the lattice, so
+    /// their courses kink at every node.
+    fn kinked_rapids(
+        q: f32,
+    ) -> RegionGenerator<'static, FnField<impl Fn(RenderDir) -> f64 + Sync + Copy>> {
+        let frame = RegionFrame {
+            center: dir(20.0, 30.0),
+        };
+        let (hydro, floor) = rivers_along(
+            CubeLattice { n: 900 },
+            frame,
+            &[-15_000.0, 37_000.0],
+            q,
+            0.03,
+        );
+        let field = Box::leak(Box::new(FnField {
+            f: floor,
+            spacing_m: 1852.0,
+            koppen: Some(26),
+        }));
+        let hydro = Box::leak(Box::new(hydro));
+        let c = frame.local_to_dir(20_000.0, 0.0);
+        RegionGenerator::new(spec_at(c, 0.0, 1025, 33), field, Some(hydro))
+    }
+
     /// The generator's boulder clusters, each with its boulders inside the region as sized
-    /// (before the drawn-water hold), rebuilt as the generator builds them (its centre's bed
-    /// first); the held ones, in cluster order, are checked to be the generator's boulders.
+    /// (before the drawn-water hold) and as held, rebuilt as the generator builds them (its
+    /// centre's bed first); the held ones, in cluster order, are checked to be the generator's
+    /// boulders.
     fn clusters_of<F: CoarseField>(
         g: &RegionGenerator<F>,
     ) -> Vec<(
         crate::worldgen::generate::water::BoulderCluster,
         Vec<Boulder>,
+        Vec<Boulder>,
     )> {
         use crate::worldgen::generate::water::{
-            BoulderBed, DrawnTexel, boulder_clusters, drawn_cells, hold_in_drawn_water,
+            BoulderBed, DrawnCache, DrawnLattices, boulder_clusters, hold_in_drawn_water,
             size_cluster,
         };
         let rivers = g.rivers(FieldKind::Inner).unwrap();
@@ -2813,6 +3012,7 @@ mod water {
                 .is_some_and(|(x, z)| x.abs() <= half && z.abs() <= half)
         };
         let mut held_all = Vec::new();
+        let mut cache = DrawnCache::default();
         let out: Vec<_> = boulder_clusters(rivers, &frame.basis(), half)
             .into_iter()
             .map(|c| {
@@ -2822,39 +3022,46 @@ mod water {
                 let beds: Vec<BoulderBed> = dirs.iter().map(|&d| bed(d)).collect();
                 assert_eq!(beds[0], centre);
                 let sized = size_cluster(&c, spread, &dirs, &beds);
-                let cells = drawn_cells(c.centre(), texel_m);
-                let texels: Vec<[DrawnTexel; 4]> = cells
-                    .iter()
-                    .map(|cell| {
-                        cell.corners.map(|d| {
-                            let b = bed(d);
-                            DrawnTexel {
-                                h_m: b.base_m,
-                                level_m: b.level_m,
-                                river: b.river,
-                            }
-                        })
-                    })
-                    .collect();
+                cache.start((c.river, c.k));
+                let mut lattices = DrawnLattices::new(c.origin(), texel_m, &bed, &mut cache);
                 let held = hold_in_drawn_water(
-                    *g.spec(),
-                    c.centre(),
-                    texel_m,
-                    &cells,
-                    &texels,
+                    &mut lattices,
+                    &c,
                     sized.iter().copied().zip(beds.iter().copied()).collect(),
-                    &bed,
                 );
-                held_all.extend(held.into_iter().filter(inside));
-                (c, sized.into_iter().filter(inside).collect())
+                let held: Vec<Boulder> = held.into_iter().filter(inside).collect();
+                held_all.extend(held.iter().copied());
+                (c, sized.into_iter().filter(inside).collect(), held)
             })
             .collect();
+        // The fixtures' rapids run the whole square, so the cap may cut them.
         assert_eq!(
-            &held_all[..],
+            held_all.len(),
+            g.boulders().len() + g.boulders_dropped() as usize
+        );
+        assert_eq!(
+            &held_all[..g.boulders().len()],
             g.boulders(),
             "the generator's boulders, in cluster order"
         );
         out
+    }
+
+    /// Every sub-segment's cluster count before thinning and its length (m), by `(river, k)`.
+    fn subsegment_counts<F: CoarseField>(
+        g: &RegionGenerator<F>,
+    ) -> std::collections::BTreeMap<(u32, u32), (u32, f64)> {
+        use crate::worldgen::generate::water::subsegment_clusters;
+        g.rivers(FieldKind::Inner)
+            .unwrap()
+            .sub_segments()
+            .map(|(a, b)| {
+                (
+                    (a.river, a.k),
+                    (subsegment_clusters(a, b), metres(a.dir, b.dir)),
+                )
+            })
+            .collect()
     }
 
     /// The sub-segments whose rapid lies in `range` and whose boulders all fall in the square
@@ -2881,49 +3088,47 @@ mod water {
         a.angle_between(b) * EARTH_RADIUS_M
     }
 
+    /// Fix round 4: at `rapid` = 1 a 125 m river (Q 625) holds a cluster every 30–60 m along
+    /// its channel, and each sub-segment the clusters its area calls for; a cluster holds 2–5
+    /// boulders at `rapid` 1 (1–2 at 0.5) around its largest, within 3 cluster radii.
     #[test]
     fn rapids_hold_clustered_boulders() {
-        use crate::hydrology::params::{
-            BOULDER_CLUSTER_MAX, BOULDER_CLUSTER_REACH, BOULDERS_PER_SUBPOINT_MAX,
-        };
+        use crate::hydrology::params::BOULDER_CLUSTER_REACH;
         use crate::worldgen::generate::water::cluster_kept;
         use std::collections::BTreeMap;
-        for (full, range, counts) in [(true, 0.999..=1.0, 24..=24), (false, 0.4..=0.6, 9..=15)] {
-            let g = rapids(150.0, full);
+        for (full, range, members) in [(true, 0.999..=1.0, 2..=5), (false, 0.4..=0.6, 1..=2)] {
+            let g = rapids(625.0, full);
             let subs = rapid_subsegments(&g, range.clone());
             assert!(subs.len() > 50, "full {full}: {} sub-segments", subs.len());
+            let counts = subsegment_counts(&g);
             let mut by_sub: BTreeMap<(u32, u32), Vec<_>> = BTreeMap::new();
-            for (c, boulders) in clusters_of(&g) {
+            for (c, boulders, _) in clusters_of(&g) {
                 by_sub
                     .entry((c.river, c.k))
                     .or_default()
                     .push((c, boulders));
             }
-            for (&(river, k), &rapid) in &subs {
+            let (mut along_m, mut listed, mut several, mut spread) = (0.0, 0, 0, 0);
+            let mut sizes = std::collections::BTreeSet::new();
+            for &(river, k) in subs.keys() {
                 let clusters = by_sub.get(&(river, k)).map(Vec::as_slice).unwrap_or(&[]);
-                let h0 = f64::from(crate::worldgen::noise::hash3(
-                    [river as i32, k as i32, -1],
-                    0x5BD1_E995,
-                )) / 4_294_967_296.0;
-                let n = (f64::from(rapid) * f64::from(BOULDERS_PER_SUBPOINT_MAX) + h0).floor();
-                let n = n as usize;
-                assert!(counts.contains(&n), "({river}, {k}): {n}");
-                // Clusters of at most six, ceil(n / 6) of them before thinning, each around its
-                // largest boulder; the thinning keeps whole ones (fix round 1).
-                let max = BOULDER_CLUSTER_MAX as usize;
-                let kept: Vec<usize> = (0..n.div_ceil(max))
-                    .filter(|&c| cluster_kept(river, k, c as u32))
-                    .map(|c| (n - c * max).min(max))
-                    .collect();
-                let held: usize = clusters.iter().map(|(_, b)| b.len()).sum();
+                let (n, length_m) = counts[&(river, k)];
+                let kept: Vec<u32> = (0..n).filter(|&c| cluster_kept(river, k, c)).collect();
+                let indices: Vec<u32> = clusters.iter().map(|(c, _)| c.index).collect();
                 assert_eq!(
-                    held,
-                    kept.iter().sum::<usize>(),
-                    "({river}, {k}) at rapid {rapid}"
+                    indices, kept,
+                    "({river}, {k}): {n} clusters before thinning"
                 );
-                assert_eq!(clusters.len(), kept.len(), "({river}, {k})");
+                along_m += length_m;
+                listed += kept.len();
                 for (c, boulders) in clusters {
-                    assert!(boulders.len() <= max && boulders.len() == c.members.len());
+                    assert_eq!(boulders.len(), c.members.len());
+                    assert!(
+                        members.contains(&boulders.len()),
+                        "{} members",
+                        boulders.len()
+                    );
+                    sizes.insert(boulders.len());
                     let centre = boulders[0];
                     assert_eq!(centre.dir, c.centre(), "the centre comes first");
                     let big = f64::from(centre.radius_m);
@@ -2936,35 +3141,52 @@ mod water {
                         );
                     }
                     if boulders.len() > 1 {
-                        assert!(
+                        several += 1;
+                        spread += usize::from(
                             boulders[1..]
                                 .iter()
                                 .any(|b| metres(b.dir, centre.dir) > big),
-                            "members spread around the centre"
                         );
                     }
                 }
             }
+            // Members spread around the centre (a two-rock cluster's one member may be clamped
+            // to the channel or lie within a centre grown to break the deepest water).
+            assert!(spread * 10 >= several * 8, "{spread} of {several} spread");
+            let spacing = along_m / listed as f64;
+            println!("full {full}: a cluster every {spacing:.1} m, sizes {sizes:?}");
+            assert_eq!(sizes.len(), members.count(), "every size occurs");
+            if full {
+                assert!(
+                    (30.0..=60.0).contains(&spacing),
+                    "a cluster every {spacing} m"
+                );
+            }
         }
     }
 
-    /// At `rapid` = 1 a third of each cluster's rocks stand above the water, wherever the cap
-    /// lets them (water up to `2 × cap − BOULDER_BREAK_M[1]` deep over the cluster's beds).
+    /// At `rapid` = 1 at least a third of the rocks that ship break the surface (fix round 4,
+    /// Important 2 of the rounds 2–3 re-review: judged after the drawn-water fitting, which can
+    /// slide a breaker into deeper water or shrink it), wherever the cap lets them (water up to
+    /// `2 × cap − BOULDER_BREAK_M[1]` deep over the cluster's beds); and few breakers ship under
+    /// the water.
     #[test]
     fn a_third_of_a_full_rapids_rocks_break_the_surface() {
         use crate::hydrology::params::BOULDER_BREAK_M;
-        // A mid river and a deep one. The detail noise under the channel makes the water at
-        // the beds deeper than the channel's own depth (1.9 and 5.1 m), up to tens of metres.
-        for q in [150.0, 2_000.0] {
-            let g = rapids(q, true);
+        // A 125 m river and a 200 m one, each on a course that kinks at every node, where the
+        // fitting moves rocks most. The detail noise under the channel makes the water at the
+        // beds deeper than the channel's own depth, up to tens of metres.
+        for q in [625.0, 1_600.0] {
+            let g = kinked_rapids(q);
             let full = rapid_subsegments(&g, 0.999..=1.0);
             assert!(full.len() > 50, "q {q}: {} full sub-segments", full.len());
-            let (mut checked, mut too_deep) = (0, 0);
-            for (c, boulders) in clusters_of(&g) {
-                if !full.contains_key(&(c.river, c.k)) {
+            let (mut checked, mut too_deep, mut shipped, mut breaking) = (0, 0, 0, 0);
+            let (mut breakers, mut sunk) = (0, 0);
+            for (c, sized, held) in clusters_of(&g) {
+                if !full.contains_key(&(c.river, c.k)) || sized.len() != c.members.len() {
                     continue;
                 }
-                let deepest = boulders
+                let deepest = sized
                     .iter()
                     .map(|b| f64::from(b.level_m - b.base_m))
                     .fold(0.0, f64::max);
@@ -2973,23 +3195,33 @@ mod water {
                     continue;
                 }
                 checked += 1;
-                let breaking = boulders
-                    .iter()
-                    .filter(|b| {
-                        let t = g.sample_texel_in(FieldKind::Inner, RenderDir(b.dir));
-                        assert_eq!(b.level_m.to_bits(), t.water_level_m.to_bits());
-                        b.top_m() > b.level_m
-                    })
-                    .count();
-                assert!(
-                    3 * breaking >= boulders.len(),
-                    "q {q}: {breaking} of {} break the surface",
-                    boulders.len()
-                );
+                for b in &held {
+                    let t = g.sample_texel_in(FieldKind::Inner, RenderDir(b.dir));
+                    assert_eq!(b.level_m.to_bits(), t.water_level_m.to_bits());
+                    assert_eq!(b.base_m.to_bits(), t.h.to_bits(), "re-seated on its bed");
+                    shipped += 1;
+                    breaking += usize::from(b.top_m() > b.level_m);
+                    let m = c.members.iter().zip(&sized).find(|(_, s)| s.seed == b.seed);
+                    if m.is_some_and(|(m, _)| m.rise_m.is_some()) {
+                        breakers += 1;
+                        sunk += usize::from(b.top_m() <= b.level_m);
+                    }
+                }
             }
-            println!("q {q}: {checked} clusters checked, {too_deep} in water too deep");
-            assert!(checked > 100, "{checked} clusters");
+            println!(
+                "q {q}: {checked} clusters checked, {too_deep} in water too deep; {breaking} of \
+                 {shipped} shipped rocks break; {sunk} of {breakers} breakers ship under"
+            );
+            assert!(
+                checked > 100 && shipped > 300,
+                "{checked} clusters, {shipped} rocks"
+            );
             assert!(too_deep * 10 < checked, "{too_deep} too deep of {checked}");
+            assert!(
+                3 * breaking >= shipped,
+                "q {q}: {breaking} of {shipped} break the surface"
+            );
+            assert!(sunk * 100 < breakers, "{sunk} of {breakers} breakers sunk");
         }
     }
 

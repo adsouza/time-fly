@@ -87,3 +87,6 @@ ruzstd = "0.9"
 half = "2"
 # The fly camera's clearance property test (already a timefly_core dev-dependency).
 proptest = "1.12"
+# Validates the composed WESL shaders on the CPU (`tests/shader_compile.rs`): the same naga as
+# Bevy's wgpu (one copy in the lock file), with its WGSL front end, which wgpu enables already.
+naga = { version = "30.0.2", features = ["wgsl-in"] }
