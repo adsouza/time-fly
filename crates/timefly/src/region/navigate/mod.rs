@@ -455,6 +455,7 @@ struct NavWriters<'w> {
 /// What navigation reads of the region and the globe.
 #[derive(SystemParam)]
 struct NavWorld<'w> {
+    held_camera: Option<Res<'w, crate::ui::bug_shot::HeldCamera>>,
     region_state: Res<'w, State<RegionState>>,
     keys: Option<Res<'w, ButtonInput<KeyCode>>>,
     globe: Option<Res<'w, GlobeData>>,
@@ -607,7 +608,13 @@ fn navigate(
 
     // Decide.
     let before = nav.phase;
-    let (phase, actions) = step_nav(before, &inputs);
+    // Restored shots can be inside an automatic dive or climb threshold.
+    // Keep drawing that world (including its altitude-dependent cloud) until input resumes.
+    let (phase, actions) = if world.held_camera.is_some() {
+        (before, Vec::new())
+    } else {
+        step_nav(before, &inputs)
+    };
 
     // Apply.
     let ease = Ease {

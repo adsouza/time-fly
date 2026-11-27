@@ -8,7 +8,8 @@
 //!   `timefly_20261126-143005_22.870N_71.420E_8101m_h047_p15_0y_region.png`: the era frame's
 //!   latitude and longitude to 3 decimals with their hemispheres, the altitude above sea level
 //!   in whole metres, the true compass heading and the chase camera's look below the horizontal
-//!   in whole degrees, and the era in whole years. [`parse_shot_name`] reads it back.
+//!   in whole degrees, and the era in whole years. Captures append a unique ID before `.png`
+//!   so consecutive shots of the same place keep distinct pairs. [`parse_shot_name`] reads both forms.
 //! - **The folder** ([`shot_folder`]): the pictures folder's `Time Fly`, or without one the
 //!   data folder's `shots`. On the web both files are browser downloads of the same names.
 //! - **Timing.** A Bevy screenshot captures a frame a few frames after its request, so the name
@@ -136,10 +137,16 @@ pub fn sidecar_name(png: &str) -> String {
     format!("{}.json", png.strip_suffix(".png").unwrap_or(png))
 }
 
-/// Reads a shot's name back (rounded as written); `None` for anything [`shot_name`] does not
-/// write.
+/// Reads the rounded pose from a capture filename, including legacy names without a capture ID.
 pub fn parse_shot_name(file: &str) -> Option<ShotName> {
     let stem = file.strip_prefix("timefly_")?.strip_suffix(".png")?;
+    let stem = match stem.rsplit_once('+') {
+        Some((base, id)) => {
+            bevy::asset::uuid::Uuid::parse_str(id).ok()?;
+            base
+        }
+        None => stem,
+    };
     let parts: Vec<&str> = stem.split('_').collect();
     let [stamp, lat, lon, alt, heading, pitch, era, world] = parts[..] else {
         return None;
@@ -348,9 +355,12 @@ pub fn shot_pose(inputs: ShotInputs) -> ShotPose {
         (ShotWorld::Region, Some((_, fly))) => fly.pos_m.as_dvec3(),
         _ => inputs.globe.position_km(),
     };
+    let base = shot_name(&ShotName::of(&place, inputs.utc));
+    let stem = base.strip_suffix(".png").unwrap();
+    let id = bevy::asset::uuid::Uuid::new_v4();
     ShotPose {
         version: SIDECAR_VERSION,
-        file: shot_name(&ShotName::of(&place, inputs.utc)),
+        file: format!("{stem}+{id}.png"),
         utc: inputs.utc.rfc3339(),
         world: place.world,
         lat_deg: place.lat_deg,
@@ -795,9 +805,12 @@ fn write_sidecar(png: &Path, json: &str) -> Result<(), String> {
     let name = sidecar_name(&png.file_name().unwrap_or_default().to_string_lossy());
     #[cfg(not(target_arch = "wasm32"))]
     {
+        use std::io::Write;
         let dir = png.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        std::fs::write(dir.join(name), json).map_err(|e| e.to_string())
+        std::fs::File::create_new(dir.join(name))
+            .and_then(|mut file| file.write_all(json.as_bytes()))
+            .map_err(|e| e.to_string())
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1189,6 +1202,16 @@ mod tests {
     }
 
     #[test]
+    fn shots_at_the_same_place_and_instant_get_distinct_file_pairs() {
+        let first = region_pose();
+        let second = region_pose();
+        assert_ne!(first.file, second.file);
+        assert_ne!(sidecar_name(&first.file), sidecar_name(&second.file));
+        let name = parse_shot_name(&first.file).unwrap();
+        assert_eq!(parse_shot_name(&second.file), Some(name));
+    }
+
+    #[test]
     fn the_sidecar_round_trips() {
         let pose = region_pose();
         let json = serde_json::to_string_pretty(&pose).unwrap();
@@ -1452,6 +1475,40 @@ mod tests {
             app.update();
             assert_eq!(screenshots(&mut app), 1);
             std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_globe_shot_below_the_dive_threshold_waits_for_input() {
+            use crate::region::{RegionPlugin, navigate::RegionNavigationPlugin};
+            use bevy::{asset::AssetPlugin, state::app::StatesPlugin};
+
+            let (mut app, _) = globe_app(false);
+            let mut pose = region_pose();
+            pose.world = ShotWorld::Globe;
+            pose.region = None;
+            pose.globe.altitude_km = timefly_core::flight::altitudes::DIVE_ALTITUDE_KM - 1.0;
+            app.add_plugins((
+                StatesPlugin,
+                AssetPlugin::default(),
+                RegionPlugin,
+                crate::time::TimePlugin,
+                RegionNavigationPlugin,
+            ))
+            .insert_resource(GlobeRenderStatus::Interactive { first_frame: 1 })
+            .insert_resource(ShotRestore::new(pose));
+            for _ in 0..10 {
+                app.update();
+                assert!(app.world().resource::<ShotRestore>().placed());
+                assert_eq!(app.world().resource::<Navigation>().phase, NavPhase::Globe);
+            }
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::KeyW);
+            app.update();
+            assert!(matches!(
+                app.world().resource::<Navigation>().phase,
+                NavPhase::Diving { .. }
+            ));
         }
 
         #[test]

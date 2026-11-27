@@ -97,7 +97,7 @@
 //! A fifth argument `bugshot` checks the bug shot (M3 Task 12): after the settle (the fly at
 //! `AGL_M` over the centre, turned to face [`BUG_HEADING_DEG`] so the rose turns), it presses
 //! `F12`, the game's own key, with the shot's folder set to `<out_dir>` and its capture to the
-//! offscreen image, so the game writes `timefly_<…>_region.png` and its `.json` sidecar there.
+//! offscreen image, so the game writes `timefly_<…>_region+<id>.png` and its `.json` sidecar there.
 //! `globebug` does the same over the globe: the game starts on the globe, the fly is put over
 //! `LAT,LON` at `AGE_YEARS`, `AGL_M` metres up (default [`GLOBE_BUG_ALTITUDE_KM`]), facing
 //! [`BUG_HEADING_DEG`].

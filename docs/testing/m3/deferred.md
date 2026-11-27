@@ -55,7 +55,7 @@ owner has to judge are also in `manual-checks.md`.
 
 ## Task 7 (the dive and the climb)
 - A launch or bench `--region` entry pops from clear to opaque with no gather (`phase.rs:420`; manual check 12).
-- Moving the slider back to the held time doesn't unqueue the change (`phase.rs:651`).
+- Fixed after merge: explicitly reselecting the held time clears the pending slider change.
 - A slider move on the `Backspace` frame becomes the held time (`mod.rs:540`, undocumented).
 - `tests.rs` is 2,304 lines: split out the headless worlds.
 - The task's gate log lacked exit codes.
