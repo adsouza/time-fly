@@ -61,8 +61,46 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # The `ci-test` profile (Cargo.toml): dependencies unoptimized, so Bevy compiles fast.
+      # The headless bench tests write each run's summary (holds, memory cycles) to
+      # TIMEFLY_BENCH_SUMMARY_DIR, one file per test, kept below for later inspection.
       - name: Tests
+        env:
+          TIMEFLY_BENCH_SUMMARY_DIR: ${{ runner.temp }}/bench-summaries
         run: cargo test --locked --profile ci-test --workspace
+
+      # Pass or fail: the journey tests' hold lines (dives, hops, climbs, with cycle and route)
+      # and memory-cycle lines on the run page.
+      - name: Bench summaries on the run page
+        if: always()
+        env:
+          DIR: ${{ runner.temp }}/bench-summaries
+        run: |
+          if ! compgen -G "$DIR/*.txt" >/dev/null; then
+            echo "No headless bench summaries were written." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Headless bench summaries (ci-test profile, fixed-step time)"
+            for f in "$DIR"/*.txt; do
+              lines=$(grep -E '^(hold: |journey memory cycles)' "$f" || true)
+              [ -n "$lines" ] || continue
+              echo
+              echo "**$(basename "$f" .txt)**"
+              echo
+              echo '```text'
+              echo "$lines"
+              echo '```'
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload bench summaries
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-summaries
+          path: ${{ runner.temp }}/bench-summaries/
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: wasm32 build check
         run: cargo check --locked -p timefly --target wasm32-unknown-unknown
