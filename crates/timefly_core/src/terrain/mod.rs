@@ -12,7 +12,7 @@ pub mod drawn;
 
 pub use cdlod::{LodSettings, Patch, morph_factor, morph_vertex, select_patches};
 
-use crate::hydrology::params::NO_WATER_DROP_M;
+use crate::hydrology::params::{NO_WATER_DROP_M, RIBBON_NONE_M};
 use crate::worldgen::frame::EARTH_RADIUS_M;
 use crate::worldgen::generate::water::decode_river;
 use crate::worldgen::generate::{Field, RegionGrid};
@@ -158,7 +158,7 @@ fn field_taps(f: &Field, x_m: f64, z_m: f64) -> ([TapTexel; 4], f32, f32) {
 /// [`blended_water`] mixes them (its crossing guard and standing-water rule included).
 fn field_water(t: &[TapTexel; 4], fu: f32, fv: f32, spacing_m: f64) -> [f32; 5] {
     let level = taps_level(t, fu, fv);
-    let decoded = t.map(|x| x.river);
+    let decoded = river_taps(t);
     let hw = bilerp(
         decoded.map(|[ribbon, _, _, offset]| ribbon + offset.abs()),
         fu,
@@ -177,6 +177,26 @@ fn field_water(t: &[TapTexel; 4], fu: f32, fv: f32, spacing_m: f64) -> [f32; 5] 
         return [level, ribbon, 0.0, east, north];
     }
     [level, hw, offset, east, north]
+}
+
+/// The decoded river texels of a field's four taps as [`field_water`] interpolates them. Where
+/// some tap is a river, a dry tap that is no river (`level − h ≤ `[`DRY_BELOW_M`]) stands
+/// outside the water: ribbon `−RIBBON_NONE_M`, offset 0, no flow. Its stored
+/// [`RIVER_NONE`](crate::worldgen::generate::water::RIVER_NONE) ribbon, `+RIBBON_NONE_M`, means
+/// "over standing water" and would rebuild a ribbon between a river's footprint and the dry
+/// ground beyond it; where the footprint's level stands over its ground (a perched river), that
+/// drew a strip of water along the footprint's edge, parallel to the river. Standing water (a
+/// wet tap that is no river) keeps `+RIBBON_NONE_M`, and so does every tap of a cell with no
+/// river.
+fn river_taps(t: &[TapTexel; 4]) -> [[f32; 4]; 4] {
+    let any_river = t.iter().any(|x| x.is_river);
+    t.map(|x| {
+        if any_river && !x.is_river && x.level_m - x.h_m <= DRY_BELOW_M {
+            [-(RIBBON_NONE_M as f32), 0.0, 0.0, 0.0]
+        } else {
+            x.river
+        }
+    })
 }
 
 /// The water [`blended_water`] draws at a point of a single field (no apron blend) from the

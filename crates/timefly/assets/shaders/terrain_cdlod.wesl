@@ -158,9 +158,23 @@ fn standing(w: vec4<u32>) -> f32 {
     return select(0.0, 1.0, w.z == RIVER_NONE_WORD && bitcast<f32>(w.y) > DRY_BELOW_M);
 }
 
+// `RIBBON_NONE_M` in timefly_core::hydrology::params.
+const TAP_RIBBON_NONE_M: f32 = 1000.0;
+
+// `river_taps` in timefly_core::terrain: in a cell with a river tap, a dry tap that is no river
+// stands outside the water (ribbon -RIBBON_NONE_M, offset 0), not over standing water.
+fn dry_outside(w: vec4<u32>, any_river: bool) -> bool {
+    return any_river && w.z == RIVER_NONE_WORD && bitcast<f32>(w.y) <= DRY_BELOW_M;
+}
+
+// A tap's (ribbon, offset), as `river_taps` reads it.
+fn tap_river(w: vec4<u32>, any_river: bool) -> vec2<f32> {
+    return select(unpack2x16float(w.z), vec2<f32>(-TAP_RIBBON_NONE_M, 0.0), dry_outside(w, any_river));
+}
+
 // A water texel (`water_image`): (level, level - h, ribbon + |offset|, offset).
-fn water_texel(w: vec4<u32>) -> vec4<f32> {
-    let river = unpack2x16float(w.z);
+fn water_texel(w: vec4<u32>, any_river: bool) -> vec4<f32> {
+    let river = tap_river(w, any_river);
     return vec4<f32>(bitcast<f32>(w.x), bitcast<f32>(w.y), river.x + abs(river.y), river.y);
 }
 
@@ -179,10 +193,12 @@ fn field_water(tex: texture_2d<u32>, field: vec4<f32>, xz: vec2<f32>) -> FieldWa
     let w10 = textureLoad(tex, i + vec2<i32>(1, 0), 0);
     let w01 = textureLoad(tex, i + vec2<i32>(0, 1), 0);
     let w11 = textureLoad(tex, i + vec2<i32>(1, 1), 0);
-    let a00 = water_texel(w00);
-    let a10 = water_texel(w10);
-    let a01 = water_texel(w01);
-    let a11 = water_texel(w11);
+    let any_river = w00.z != RIVER_NONE_WORD || w10.z != RIVER_NONE_WORD
+        || w01.z != RIVER_NONE_WORD || w11.z != RIVER_NONE_WORD;
+    let a00 = water_texel(w00, any_river);
+    let a10 = water_texel(w10, any_river);
+    let a01 = water_texel(w01, any_river);
+    let a11 = water_texel(w11, any_river);
     let top = a00 + (a10 - a00) * f.x;
     let bottom = a01 + (a11 - a01) * f.x;
     var a = top + (bottom - top) * f.y;
@@ -193,8 +209,6 @@ fn field_water(tex: texture_2d<u32>, field: vec4<f32>, xz: vec2<f32>) -> FieldWa
     let flow_top = q00 + (q10 - q00) * f.x;
     let flow_bottom = q01 + (q11 - q01) * f.x;
     let flow = flow_top + (flow_bottom - flow_top) * f.y;
-    let any_river = w00.z != RIVER_NONE_WORD || w10.z != RIVER_NONE_WORD
-        || w01.z != RIVER_NONE_WORD || w11.z != RIVER_NONE_WORD;
     let m00 = standing(w00);
     let m10 = standing(w10);
     let m01 = standing(w01);
@@ -226,10 +240,10 @@ fn field_water(tex: texture_2d<u32>, field: vec4<f32>, xz: vec2<f32>) -> FieldWa
     let lo = min(min(a00.w, a10.w), min(a01.w, a11.w));
     let hi = max(max(a00.w, a10.w), max(a01.w, a11.w));
     if lo < 0.0 && hi > 0.0 && hi - lo > CROSSING_REACH_TEXELS * field.y {
-        let r00 = unpack2x16float(w00.z).x;
-        let r10 = unpack2x16float(w10.z).x;
-        let r01 = unpack2x16float(w01.z).x;
-        let r11 = unpack2x16float(w11.z).x;
+        let r00 = tap_river(w00, any_river).x;
+        let r10 = tap_river(w10, any_river).x;
+        let r01 = tap_river(w01, any_river).x;
+        let r11 = tap_river(w11, any_river).x;
         let r_top = r00 + (r10 - r00) * f.x;
         let r_bottom = r01 + (r11 - r01) * f.x;
         a = vec4<f32>(a.x, a.y, r_top + (r_bottom - r_top) * f.y, 0.0);
