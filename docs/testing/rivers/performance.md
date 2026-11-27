@@ -1,7 +1,258 @@
 # Rivers and lakes: performance
 
-Task 10 (benches) of the rivers and lakes milestone. Native numbers were measured on 2026-11-26
-by the Task 10 implementer; the Chrome (WebGPU) numbers are the owner's run and are pending.
+Task 10 (benches) and Task 12 (verification) of the rivers and lakes milestone. **Task 12's
+final numbers at HEAD come first**; Task 10's and Task 11c's records follow unchanged. The
+Chrome (WebGPU) numbers are the controller's run in the owner's Chrome and are pending.
+
+## Task 12: final verification at HEAD (2026-11-26/27)
+
+Every native number in this section is HEAD `9814212` (Task 11c's fix round, the last code
+commit), the `release` profile, copied out of the shared target dir. The binary's label reads
+`9814212`, and `grep -a -c 'fn white_water_foam'` (Task 11c's fix round; the shaders are
+embedded) finds 1 in it. The sections after this one are Task 10's and Task 11c's records, kept
+as they were.
+
+| | |
+|---|---|
+| Machine, adapter | Apple M4, 16 GB, macOS 27.2.1 (26B131); Apple M4 (Metal), wgpu 30.0.2 through Bevy 0.20.1 |
+| Display | **changed during the runs.** Until about 03:50 UTC the main display was a 3840 × 2160 monitor at 1× (the 2560 × 1440 window rendered in full); from then on a 1920 × 1080 display (the window rendered **1920 × 951**, as in M3 and Task 10). Each bench line below says which |
+| Pacing | mixed: a window the compositor showed ran **uncapped** on the 4K monitor (`AutoNoVsync` honoured), and display-paced while hidden. The benches judge each run by its own pacing (R14's two rules); like-for-like comparisons are noted where pacing differs |
+| Other load | another session built and ran tests (`ci-test` profile) in the shared target dir from about 03:2x to 03:38 UTC, during region bench run 1 (logged from 03:35:47; the disk fell 2.4 GB from 03:22 to 03:33). Run 1's late regions are not clean measurements |
+| Runs | `--keep-going` everywhere, so every gate reports. Each run a fresh `TIMEFLY_LOG_DIR`, `TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory=trace`, `BEVY_ASSET_ROOT` the `rivers-root` scratch root. Region bench run 1 and 2 launched directly; the journey and scrub benches through a scratch `.app` wrapper and `open -n -W` so the window came to the front (raising a bare binary with System Events failed: no Accessibility grant). Run 2 of each bench is the one judged |
+
+```sh
+TIMEFLY_LOG_DIR="$(mktemp -d)" TIMEFLY_LOG=warn,timefly=info,timefly::hop_memory=trace \
+  BEVY_ASSET_ROOT=<root> <scratch>/timefly --region-bench --keep-going --target-fps 60 --window 2560x1440
+# the same with --journey-bench and --scrub-bench
+```
+
+### Summary
+
+| Gate | Result |
+|---|---|
+| `--region-bench` run 2 (judged) | **PASS** (exit 0). Every region's R14 passes (uncapped p95 rule for seven, Pangaea and the Red Sea reported only); R11 41.45 ms; warm generation median 531, max 540 ms (≤ 3,000); memory cycles +0.7% (≤ +10%) |
+| `--region-bench` run 1 (first launch) | FAIL (exit 3): R14 in Sundaland, Beringia, the Rockies (and its globe pan) and Panama, during the other session's build and a display change mid-run; everything else passes |
+| `--journey-bench` run 2 (judged) | **FAIL (exit 3) on hop memory alone: the first hop +78.1 MiB** against +64; every other hop +22.0 to +45.4 MiB; every other gate passes (holds, flight, swap worst frame 33.75 ms, route checks, journey memory +3.5%) |
+| `--journey-bench` run 1 | FAIL (exit 3) on hop memory alone: the first hop +72.0 MiB; the others +44.4 to +54.8 MiB (uncapped, which reads higher, as Task 7 found) |
+| Hop-memory escalation (plan Step 3) | (1) `APRON_RIVER_MIN_DISCHARGE_M3S` 200 → 1,000, two runs: **still FAIL** (worst +71.0 and +64.5 MiB, again on hops whose baseline fell into a trough). (2) Dropping the CPU river array after upload: already in place since Task 7 (`free_rivers`). **The gate is the owner's call** (below) |
+| `--scrub-bench` (one run) | **PASS** (display-paced; older 16.70 / 18.47 / 32.12 ms, 0.08% missed; younger 16.68 / 18.41 / 22.52 ms) |
+| The continental pass, native (target ≤ 1,000 ms, reported) | 0 ka 1,033–1,449 ms wall; 21 ka 1,099–1,231 ms; deep eras 433–755 ms: **over the native target at 0 ka and 21 ka** (Task 10: 930–1,050 ms), under it deep |
+| White water's GPU cost (budget +1.0 ms) | **−0.01 ms** (bench pose) and **+0.04 ms** (rapid close-up) against `12ef525`, GPU timestamps, display-paced, window shown: within noise |
+| The reality check (`--hydro-check`) | outlets **22/22**, lakes **8/8**, Amazon box PASS (91.8%), ridged joins 0/4,714, arid PASS; **Indus box FAIL on "every link" (74/84)**, as since Task 11 (the owner's) |
+| Chrome WebGPU | **PENDING: the controller's run** (the build is ready, below) |
+
+### Region bench
+
+| | Run 1 (first launch) | Run 2 (judged) | Task 10 run 2 | M3 (Task 11 run 2) |
+|---|---|---|---|---|
+| Pacing, resolution | display-paced 2560 × 1440 for six regions, then uncapped; the last three at 1920 × 951 | uncapped from the Red Sea on (Pangaea paced), 2560 × 1440, the last three 1920 × 951 | display-paced, 1920 × 951 | display-paced, 1920 × 951 |
+| R14 per region | FAIL in Sundaland (98 stalls), Beringia (36), the Rockies (uncapped p95 17.24 ms; its globe pan 49 ms worst), Panama (uncapped p95 16.80 ms); the rest PASS | all PASS | all PASS | all PASS |
+| R11 first-region worst frame (native: reported) | 32.52 ms | 41.45 ms | 32.07 ms | 42.60 ms |
+| Himalayas load-window worst frame | 34.72 ms | 33.10 ms | 34.48 ms | 23.90 ms |
+| Warm generation (10 Himalayas re-entries) | median 466, max 514 ms | median 531, max 540 ms | median 432, max 434 ms | median 316, max 332 ms |
+| Memory cycles (≤ +10%) | −9.5% | +0.7% | +0.0% | — |
+| First entries (the region's own generation; pass wait excluded) | Pangaea 366, Red Sea 468, Himalayas 464, Indus 466, Sundaland 433, Japan 2,067, Beringia 532, Rockies 714, Panama 417 ms | Pangaea 402, Red Sea 506, Himalayas 508, Indus 488, Sundaland 468, Japan 2,098, Beringia 502, Rockies 855, Panama 433 ms | 368, 467, 450, 466, 416, 1,911, 466, 649, 368 ms | 549, 482, 332, —, 332, 1,865, 382, 616, 332 ms |
+
+**Against M3 and Task 10.** Flight gates hold in the judged run. Region generation (pass wait
+excluded) is up on Task 10 by 5–30% in run 2 (Himalayas 508 vs 450 ms, warm 531 vs 432 ms) and
+on M3 by about 50% in the recent eras (Himalayas 508 vs 332). Task 10 explained M3 → Task 10 (the
+rivers' prep and the wider tile margin). Task 10 → now adds Task 11e's tributary corridor search
+(its own measure: +5–7 ms a region) and the wider reach (tile margin 120 → 133 km), the bigger
+rocks of 11c, and the merged M3 work; and run 2 here ran uncapped, so the render thread competed
+with generation for the CPU, where Task 10's ran paced. The 3,000 ms warm-generation gate keeps a
+wide margin. Run 1's first entries (paced for most regions) sit within 3–10% of Task 10's.
+
+**The continental passes** (wall / CPU ms, native release; the cache keeps two eras, so the last
+0 ka pass is the Himalayas' recomputed after the deep eras):
+
+| Era | Run 1 | Run 2 | Journey run 1 | Journey run 2 | Task 10 |
+|---|---|---|---|---|---|
+| 250 Ma | 616 / 597 | 658 / 649 | 755 / 750 | 633 / 600 | 618 / 599 |
+| 0 ka | 1,033 / 1,004, then 1,154 / 1,144 | 1,144 / 1,133, then 1,364 / 1,361 | 1,449 / 1,441 | 1,393 / 1,387 | 933 / 905 |
+| 21 ka | 1,099 / 1,072 | 1,231 / 1,222 | — | — | 999 / 970 |
+| 1 Ma | 433 / 423 | 447 / 440 | — | — | 415 / 402 |
+| 3 Ma | 462 / 460 | 511 / 511 | — | — | 432 / 430 |
+| 5 Ma | 486 / 473 | 479 / 469 | — | — | 466 / 435 |
+
+The recent passes rose from about 0.93 s (Task 10) to 1.03–1.45 s: Tasks 11b–11g added the
+burnt courses, their order, the lake overlay and the ridged steps (11d measured 1.33–1.45 s in
+the dev profile; `--hydro-check` read 1.01 s here, beside a render batch). The 1 s native target
+is reported, not gated; the journey runs' 1.39–1.45 s were under the uncapped window's load.
+
+**`EraHydrology` sizes** (the `continental pass done` line, region bench run 2):
+
+| Era | `result_bytes` (`EraHydrology::bytes()`) | `working_bytes()` | Nodes | River nodes | Lakes | Longest step (native task) |
+|---|---|---|---|---|---|---|
+| 0 ka | 6,964,996 B (6.6 MiB) | 180,411,688 B (172 MiB) | 4,860,000 | 120,571 | 849 | 40.0 ms (`route`) |
+| 21 ka | 7,749,996 B (7.4 MiB) | 108,253,732 B (103 MiB) | 4,860,000 | 138,671 | 1,368 | 39.4 ms (`route`) |
+| 250 Ma | 1,075,708 B (1.0 MiB) | 4,743,344 B (4.5 MiB) | 194,400 | 24,211 | 349 | 7.3 ms (`route`) |
+
+(The native task's steps are 2¹⁸ units on a background thread and never hold a frame; the
+web's time-boxed steps are the Chrome run's `longest_step_ms`.)
+
+### Journey bench and hop memory
+
+| | Run 1 | Run 2 (judged) | Task 10 run 2 |
+|---|---|---|---|
+| Pacing, resolution | uncapped (median 8.28 ms), window shown, 1920 × 951 | display-paced (16.23 ms); the window was shown for the Andes, then hidden (GPU 1.5 ms a frame), 1920 × 951 | display-paced, 1920 × 951 |
+| Holds (≤ 3,000 ms) | dives 430–769 ms, hops 29–46 ms, climbs 24–36 ms: PASS | dives 446–731 ms, hops 39–72 ms, climbs 33–35 ms: PASS | PASS |
+| Flight per route | PASS (uncapped rule) | PASS (display-paced rule) | PASS |
+| Swap worst frame (≤ 100 ms) | 19.03 ms | 33.75 ms | 31.35 ms |
+| **Hop memory (≤ +64 MiB)** | **FAIL: first hop +72.0**; then +48.1, +44.7, +44.4, +54.8, +49.0, +54.5, +52.0, +44.6, +45.2 | **FAIL: first hop +78.1**; then +45.4, +22.4, +22.0, +24.7, +27.4, +29.2, +28.5, +22.3, +22.3 | PASS, worst +31.4 (run 1: first hop +71.0, FAIL) |
+| Route checks; journey memory cycles | PASS; Andes +4.7% | PASS; Andes +3.5% | PASS |
+
+**The first hop: a baseline trough, not more memory.** From the hop-memory trace
+(`timefly::hop_memory=trace`, cycle 1, MiB):
+
+| Run 2, cycle 1 | Footprint at the hop's start (the baseline) | Peak (after the swap) | Rise | Internal | Graphics | malloc in use |
+|---|---|---|---|---|---|---|
+| Flying in the first region, before the hop | 1,296.9 | | | 610.8 | 668.5 | 275.9 |
+| Hop 1 | **1,028.0** | **1,106.3** | **+78.3** | 364.9 → 392.2 | 666.6 → 711.5 | 305.2 → 282.1 |
+| Hop 2 | 1,060.8 | **1,106.3** | +45.5 | 369.0 → 392.6 | 666.2 → 710.6 | 305.2 → 282.9 |
+
+Both hops peak at the same footprint, 1,106.3 MiB. Hop 1's baseline is 33 MiB lower because
+macOS returned about 270 MiB of internal memory (the 0 ka pass's 172 MiB working set among it, freed but
+resident) just as the hop began: the baseline is sampled in that trough,
+and the regrowth to the steady level counts as the hop's rise. Run 1 shows the same (hop 1
+1,051.3 → 1,123.5, +72.2; hop 2 1,078.8 → 1,127.1, +48.3). The swap's own cost is the later
+hops' +22 to +45 MiB: graphics +45 MiB (the new region's textures and staging under the held
+cloud) and internal +23 to +27. Task 7 recorded the same trough ("hop 1's baseline is a trough
+after the first dive"), and Task 10's run 1 failed the same way (+71.0).
+
+**The escalation list (plan Step 3), in order:**
+1. **Raise `APRON_RIVER_MIN_DISCHARGE_M3S`** (200 → 1,000 m³/s, a scratch build, not committed;
+   two journey runs, display-paced with the window hidden throughout, 1920 × 951): **still FAIL.**
+   Run 1: worst **+71.0 MiB** (Mt Fuji hop 1), the first hop +53.0, the rest +20.1 to +63.1.
+   Run 2: worst **+64.5 MiB** (Andes hop 2), the first hop +50.7, the rest +17.4 to +29.0. In
+   run 2 the failing hop is the same trough: its baseline fell from 904.1 to 806.5 MiB as the
+   hop began, and it peaked at 871.0, below hop 1's 924.5. Graphics memory read about 130 MiB
+   lower in both (no main pass drawn while hidden), so these runs are not like-for-like with
+   HEAD's run 2; the change does not remove the failure either way. The scratch build was not
+   committed (`params.rs` restored and checked with `git diff`).
+2. **Drop the CPU river array after upload:** already done (Task 7, `free_rivers` in
+   `terrain/mod.rs`), so nothing to try.
+
+**So the hop-memory gate is the owner's call**, with these facts: the swap itself stays within
++22–55 MiB; only the first hop after the first dive exceeds +64 MiB, by a baseline sampled in the
+trough after macOS returns the pass's working set; the gate was not loosened. Options the owner
+has seen before: take the baseline as the in-region footprint before the hop's lift (a
+measurement change), or keep the gate and count first hops as reported only.
+
+**`MAX_BOULDERS` stays 16,384.** Task 11c's ruling let it rise to 32,768 only if this task's hop
+memory stayed under the gate; it did not.
+
+### Scrub bench (once, as the plan asks)
+
+`--scrub-bench`, display-paced, 1920 × 951: **PASS**. Cold load 0.57 s; data 137 frames, 136
+images, decoded textures 61.1 MiB; bridge targets 13.9 MiB persistent + 139.3 MiB while
+bridging; footprint at first frame 857.3 MiB, scrub peak outside the bridge 1,377.2 MiB, in the
+bridge 1,255.2 MiB. Older (present → 540 Ma): 1,200 frames, median 16.70, p95 18.47, worst
+32.12 ms, 1 missed (0.08%). Younger: 1,201 frames, 16.68 / 18.41 / 22.52 ms, 0 missed. The
+bridge: 22 frames, worst 18.59 ms. The overview now decodes on the globe (Task 4's ruling) and
+the scrub's frame gates still pass.
+
+### The climate bake (Task 1)
+
+The Beyer et al. 2020 grids were fetched by HTTP range requests: 39.6 MB in 66 requests for the
+bake itself (plus a 1.35 MB probe and a 39.6 MB verification re-run: 80.6 MB in all, under the
+owner's 100 MB pre-approval), from the 1,333,236,636-byte `LateQuaternary_Environment.nc`, never
+held whole. The output: 35 grids (BIO1 and BIO12, 1°, F16), 2.49 MB, in the main checkout's
+`crates/timefly/assets/data/climate` (git-ignored; packaging is a follow-up, ledgered in Task 1).
+
+### White water's GPU cost, re-measured with GPU timestamps (Task 12)
+
+**Result: no measurable cost.** Against the parent of Task 11c (`12ef525`, no white water),
+the shipped white water (`9814212`, Task 11c with its fix round) changes the GPU frame time by
+**−0.01 ms** at the Indus bench pose and **+0.04 ms** at the rapid close-up (means of the
+per-run means; by medians −0.20 and +0.02 ms). The budget is +1.0 ms. Both are inside the
+run-to-run spread (up to 0.5 ms between passes of one build), so neither budget cut is needed.
+This replaces Task 11c fix round 1's uncapped frame-median fallback (+0.09 and +0.24 ms), recorded below.
+
+**Method.** As Task 11c round 0: `region_tour time --offscreen`, 2560 × 1440, 6 s settle then
+30 s timed, Task 10's GPU frame timer (pass timestamps). The parent binary is Task 11c's copy
+(`region_tour_before`, built at `12ef525`: `grep -a -c 'fn white_water_foam'` finds 0), HEAD's
+is this task's release build (finds 1). Builds alternated pose by pose over four passes, each run
+a fresh `TIMEFLY_LOG_DIR`; pass 0 is the warm-up of the new binary (Metal's shader cache) and is
+left out of the means.
+
+```sh
+TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=$R $T --offscreen <out> 2560x1440 32.5,74.5,0 bench-<build> time 2000
+TIMEFLY_LOG_DIR="$(mktemp -d)" BEVY_ASSET_ROOT=$R $T --offscreen <out> 2560x1440 32.5735,75.8714,0 rapid-<build> time 150
+```
+
+**Pacing and readings.** Every run was display-paced (frame medians 16.66–16.68 ms on the 60 Hz
+4K display, 1,800–1,801 frames) and every run's GPU timer read all 1,800–1,801 frames: the
+window was on screen this time (the bench display is now a 3840 × 2160 monitor at 1×, so the
+2560 × 1440 window fits). The script's attempt to raise the window with System Events had no
+effect (no Accessibility grant); the readings show the main pass was drawn (12–13 ms, not the
+1.5–1.8 ms of an occluded window).
+
+| GPU frame time, median (mean) ms | Pass 0 (warm-up) | Pass 1 | Pass 2 | Pass 3 | Mean of means, passes 1–3 | Change |
+|---|---|---|---|---|---|---|
+| Indus bench pose, parent `12ef525` | 12.53 (12.88) | 13.19 (13.03) | 13.26 (13.09) | 13.35 (13.21) | 13.11 | — |
+| Indus bench pose, HEAD `9814212` | 12.94 (12.97) | 13.37 (13.36) | 12.53 (12.83) | 13.29 (13.12) | 13.10 | **−0.01 ms** |
+| Rapid close-up, parent | 12.44 (12.29) | 12.40 (12.24) | 12.25 (12.27) | 11.92 (12.07) | 12.19 | — |
+| Rapid close-up, HEAD | 12.42 (12.25) | 12.23 (12.28) | 12.15 (12.12) | 12.24 (12.29) | 12.23 | **+0.04 ms** |
+
+GPU p95s were 13.5–14.8 ms and worsts 14.8–15.9 ms in every run, with no pattern by build.
+
+### The reality check at HEAD (the record for the PR)
+
+`--hydro-check` on HEAD `9814212` (release, native, the real bake; run beside the render batch,
+so its pass time is under load). Full method and history: `reality-check.md`. It exits 3 (FAIL)
+on the Indus box's "every link" bar alone, as since Task 11 (the owner's decision, open); every
+other bar passes. The summary lines:
+
+```text
+pass at 0 ka: 1.01 s (0.18 s sampling), lattice n = 900, 120571 river nodes, 849 lakes, Beyer climate: true
+box indus: relaxed 82.7% within 10 km, 74/84 links matched, worst 81.3 km (needs 80% and every link); coarse graph 81.7% within 10 km, 73/84 links matched, worst 82.4 km - FAIL
+box amazon (reference below 300 m): relaxed 91.8% within 25 km, 457/482 links matched, worst 145.9 km (needs 80%); coarse graph 91.4% within 25 km, 454/482 links matched, worst 142.6 km - PASS
+lakes: 8 of 8 PASS, each off by 0.0 m (5 m allowed): Caspian -28.0 (table), Dead Sea -427.0, Titicaca 3808.5, Great Salt Lake 1278.0, Victoria 1133.0 (the map's fine surface), Michigan 176.0, Huron 176.0, Erie 173.0 (table)
+outlets: 22 of 22 PASS (Danube, Jhelum, Indus, Amazon 152 km of 160, Ganges, Brahmaputra, Yangtze, Yellow River, Pearl, Mekong, Nile, Congo, Niger, Mississippi, Hudson, Yenisei, Ob, Orinoco, Paraná, Lena, Volga, Mackenzie)
+endorheic lakes' surplus (informative, not routed): 1 [lake 5 (Terminal, -28.0 m, 374667 km2) at (42.02, 50.52): surplus 3478 m3/s of 12882 in]
+arid basins (< 250 mm/yr): game 0 of 3 large lakes in the boxes [...], reference 0 of 2 - PASS
+ridged joins: 0 of 4714 joining steps climb more than 100 m over the 60″ tiles (0 joins are no lattice step) - PASS
+today's courses (informative): 31985 burnt nodes, terrain above the bed max 1362 m, p99 439 m; 4611 over 50 m
+today's courses' order (informative): 31633 interior nodes [Follows 28628, SharedNode 92, Ocean 5, InLake 73, NoRiver 2738, BasinRoute 94, Other 3]
+discharge table (informative): 1 of 18 gauges flagged (ratio outside 1/3 to 3): the Nile at Aswan, game 14089 m3/s against 2757 (x5.11; channel losses are a follow-up)
+hydro check FAIL
+```
+
+The lake and outlet lines are condensed above from one line each in the output (the run's full
+output is in the Task 12 report). The Indus box's ten missed links are as in
+`reality-check.md` (the Shyok and the Arghandab are not in Natural Earth's 1:10m rivers).
+Every number above matches Task 11e's record digit for digit (Indus 82.7%, 74/84; Amazon 91.8%;
+849 lakes; 22/22), so Tasks 11c and M3's merge changed no hydrology.
+
+### Chrome WebGPU (Task 12, Step 2): PENDING, the controller's run in the owner's Chrome
+
+**The build** (Task 12): `web-release` (wasm32, no features) of HEAD `9814212`, built 2026-11-26:
+
+- `timefly-task12.wasm`, 73,887,711 bytes, sha256
+  `1f352c216bf85569ba76941417b6286bb206462a905d9ae1542b6708c430f943`;
+- `grep -a -c 'fn white_water_foam'` finds 1 (Task 11c's fix round, the last code commit; the
+  shaders are embedded), and `grep -a -c 'Indus tributaries'` finds 1.
+
+Serve it as in Task 10's Chrome section below (`cd <root with assets/>; wasm-server-runner <wasm>`, then
+`http://127.0.0.1:1334/?region-bench` and `?journey-bench` in an Incognito window, in front,
+hands off; add `&keep-going` to get every verdict).
+
+| What | Web result | Rule |
+|---|---|---|
+| Chrome version, WebGPU adapter, "WebGPU Developer Features" on or off | **PENDING (controller)** | recorded |
+| `?region-bench` summary lines, every gate | **PENDING (controller)** | M3's gates |
+| `?journey-bench` summary lines, every gate | **PENDING (controller)** | M3's gates; holds reported against 8 s |
+| The continental pass per era: wall and CPU (`continental pass (<age>): …`) | **PENDING (controller)**: 250 Ma ___, 0 ka ___, 21 ka ___, 1 Ma ___, 3 Ma ___, 5 Ma ___ | ≤ 5,000 ms, reported |
+| The pass's longest step and slice (`continental pass done … longest_step_ms=… longest_slice_ms=…`) | **PENDING (controller)** | each step within 6 ms |
+| Boulder placement on the swap frame (`region boulders placed`), Himalayas and Indus | **PENDING (controller)** | reported |
+| GPU frame time per region (`gpu frame time (<name>)`) | **PENDING (controller)** | reported |
+| Task 8's renders in Chrome (Manaus, the Indus gorge, Titicaca, the Caspian, Qattara) | **PENDING (controller)** | by eye, against the Metal shots in `manual-checks.md` |
+
+If the pass misses 5 s, the plan's escalation, in order, each ledgered: sample the ICE-6G terms on
+a coarser sub-lattice; raise `WEB_HYDRO_BUDGET_MS` to 8 if the globe's frame gate still passes;
+lower `HYDRO_RECENT_N` to 768.
+
+## Task 10's record (2026-11-26, `f846c1a`)
 
 | | |
 |---|---|
@@ -10,7 +261,7 @@ by the Task 10 implementer; the Chrome (WebGPU) numbers are the owner's run and 
 | Build | `f846c1a` for every native run, the `release` profile (no LTO). The binaries' labels read a stale SHA (worktree), so `grep -a -c 'gpu time: pass timestamps'` and `grep -a -c 'Indus tributaries'` (both new in this task) finding 1 in each binary is the proof |
 | Assets | the `rivers-root` scratch root (the main checkout's `assets/data`, this branch's shaders) |
 
-## Summary
+### Summary
 
 | What | Result |
 |---|---|

@@ -1149,7 +1149,7 @@ Each ruling is *what*; *why*; *cost if wrong*.
 
 ### Rulings made while building (copied from the SDD ledger)
 
-- **A hop's swap holds the cloud one frame longer (owner, 2026-11-25: "One more frame in cloud").**
+- **A hop's swap holds the cloud one frame longer (owner, 2026-11-25: "One more frame in cloud").** *(Extended by the fourth stage below: `REPLACE_EXTRA_HELD_FRAMES` is now 2.)*
   - What: a replaced region uploads in three frames. On the swap frame the old water textures are removed and nothing binds water. The next frame makes the new water, once the render world has freed the old. The third frame replaces the heights and surface codes. Navigation holds the cloud at density exactly 1 for the swap frame and `REPLACE_EXTRA_HELD_FRAMES` (1) more, for both hops and snapshot changes. The active grid also frees its river texels after the upload.
   - Why: with rivers, M3's native hop-memory gate (+64 MiB) failed at +81 MiB. The old and new field data, their staging and both water texture sets peaked together.
   - Cost if wrong: one more white frame (about 17 ms) per hop and per snapshot change. Task 8's water material must draw nothing while `TerrainScene::inner_water` is not loaded.
@@ -1202,3 +1202,228 @@ Each ruling is *what*; *why*; *cost if wrong*.
   - Why: with the mesh at the ground, pulled toward the camera, every land pixel ran `blended_water` before discarding. That measured +0.8–1.8 ms per frame at 4K over the Alps (old 20.33–21.37 ms, HEAD 22.06–22.18 ms medians, interleaved). There is no depth prepass and opaque bins are ordered by pipeline id, so nothing guaranteed the terrain's depth was there first. The mask phase guarantees it, and the sunk, unpulled mesh is then rejected by the depth test before it shades: 20.26–20.30 ms. The sink can't hide water: where the ground is less than 4 m above the level the vertex stays at the level, and a higher bank's vertex sits above it. The first version's `cull_mode: None` was meant to fix distant dashes, but debug builds later showed those were occlusion; turning culling off never changed them.
   - Cost if wrong: where the terrain's coarse far LOD stands more than 4 m above the water mesh's interpolation, water fragments over land still run and discard (no worse than before). A river narrower than the terrain's far LOD can hide under it, where the old mesh at the ground, pulled, won. The far renders show rivers as continuous lines.
 - **Task 8 renders (controller's rulings 3 and 4).** Step 5 adds Qattara (`29.5,27.0,0`, AGL 3,000), which must show dry ground. Rapids are judged by white water where `rapid_from_speed` is high, until Task 9's boulders. The brief's Manaus and Indus poses showed no river (see the report), so supplementary shots were added: south of Manaus, and an Andes river with rapids east of Titicaca.
+
+#### Rulings from the rest of the ledger (copied in Task 12)
+
+The rulings above were copied as they were made. These are the ledger's other `Ruling:` lines, in
+ledger order, grouped by task. A ruling later superseded says so; the one that replaced it follows.
+Disk-guard bookkeeping is left out, as in M3.
+
+**Planning and Task 1**
+
+- **Task 11's bars run on the relaxed centrelines.**
+  - What: the bars use the relaxed (valley-searched, pre-meander) centrelines from Task 5's relaxation over the boxes, not only the continental graph; the coarse graph's numbers are reported alongside.
+  - Why: spec §7 bars "the game's centreline", and the relaxation is what puts rivers in real valleys. Meanders are excluded because they are deterministic noise of at most 1.5 widths.
+  - Cost if wrong: a little more work in Task 11 (a `floor_at` over the boxes from the inner-level field).
+- **`MAX_FETCH_BYTES` = 100,000,000, not 300 MB.**
+  - Why: the owner pre-approved downloads under 100 MB (2026-11-25); the measured need is about 40 MB.
+  - Cost if wrong: a fetch that legitimately needs more fails loudly and comes back to the owner.
+- **Task 1's real network fetch (about 40 MB) runs inside Task 1, by its implementer,** not as a separate controller step.
+  - Why: the owner pre-approved downloads under 100 MB; the implementer reports the bytes fetched.
+  - Cost if wrong: none beyond the 40 MB.
+- **"Downloads need the owner's go-ahead" reads as "over 100 MB, or anything left large on disk"** (owner, 2026-11-25).
+- **Cargo builds and benches hold while the owner runs the Chrome benches.**
+  - Why: CPU-heavy builds would skew the web timings.
+  - Cost if wrong: an idle hour on rivers.
+
+**Task 2**
+
+- **The interface grows:** `RECEIVER_EXIT` = 9 for basin nodes redirected to a distant exit, `Routed::basin_of` to resolve it, and `HydroGraph::mean_spacing_m()` for the strait reach.
+  - Why: the brief's "redirect to exit" can't be a neighbour index. Carried into Tasks 3, 4 and 11.
+  - Cost if wrong: an interface rename later.
+- **Cube-corner duplicate neighbours resolve cardinal-first** (E, N, W, S, then the diagonals; later duplicates dropped). Task 11's Python mirrors it.
+  - Cost if wrong: a reference/game mismatch at 24 corner texels only.
+- **The neighbour-distance test normalises by step length (0.62–1.37),** not the brief's [0.5, 1.6] × mean spacing.
+  - Why: that bound is impossible for diagonals (1.93 at a face centre); a plan defect.
+  - Cost if wrong: none.
+
+**Task 3**
+
+- **The data-lake rule gets an upper bound:** Q_in ≤ `DATA_LAKE_MAX_BALANCE` × capacity(F), with `DATA_LAKE_MAX_BALANCE` = 10.
+  - Why: without it any flat-bottomed pit outranks the water balance (a 0.3 m dip ended rivers; a steppe bowl became a 79 m/yr evaporator). The Caspian sits near 3, pits near 1,000.
+  - Cost if wrong: a real data lake with a large inflow ratio falls back to the water balance.
+- **Data lakes also come from large flats, not only depressions.** A connected set of at least `DATA_LAKE_FLAT_MIN_NODES` (20) non-ice land nodes within `DATA_LAKE_FLAT_TOL_M` of one level, passing the same balance veto, becomes an Open data lake at that level, its water passing through to its outlet.
+  - Why: ETOPO's surface holds draining lakes (Victoria, the Great Lakes) as flats at the outlet level; spec §4.2 says a lake the data holds keeps its level, and §7's reality check names Victoria.
+  - Cost if wrong: a flat that isn't a lake (a playa that passes the veto) reads as water.
+- **`MIN_LAKE_DEPTH_M` = 0.5 is accepted:** shallower open basins pass through; shallower terminal basins are dry playas unless Q_in ≥ 20 m³/s. Task 11 mirrors it with the terminal-sink and footprint rules.
+- **A flat counts as a data lake only if its downhill boundary is small:** at most `DATA_LAKE_FLAT_MAX_OUTLETS` (3) boundary nodes have a strictly lower outside neighbour.
+  - Why: F16 quantisation stairs on plateaus and sloping deltas must not become lakes; real lake surfaces drain through one or two outlets.
+  - Cost if wrong: a real lake with many low points on its rim (a delta lake) is missed, and the balance decides.
+- **Table lake levels stay at the present level in recent eras** (`NodeSource` exposes no elevation change); accepted for this milestone.
+  - Why: at 21 ka the Great Lakes are under ice and Baikal barely moved; the Caspian's past levels differ, but no data for them is here.
+  - Cost if wrong: a Caspian at today's level in ice-age snapshots.
+- **A table lake is Open whenever Q_in exceeds evaporation over its footprint,** passing Q_in − evaporation out through the basin exit, whatever its level against the spill; Terminal otherwise (the Caspian).
+  - Why: the water surplus decides drainage physically, and the table's datum can't be trusted to the spill within a 10 km lattice.
+  - Cost if wrong: a table lake that really is endorheic but humid would drain (none of the seven are). *(Narrowed in Task 11d: a cited `endorheic` flag makes the Caspian terminal; see below.)*
+
+**Task 5**
+
+- **`river_tile_margin_m` is about 116 km at n = 900** (was 49.5 km), and `MAX_CHANNEL_DISCHARGE_M3S` = 300,000 bounds the reach (the Amazon's mean is about 209,000).
+  - Why: the old formula missed the gather reach and far incision segments; the tile test proves reads past it.
+  - Cost if wrong: more tile loads per region (6 against 2 in the test) and more fallbacks near data gaps. Task 10 measured generation.
+
+**Task 6**
+
+- **The relaxation moves a line only to an interior local minimum of its corridor samples** (lower than both neighbours, strictly inside the corridor), and a node only to an interior local minimum of its 7 × 7 grid; with none, the offset is 0. The uphill bound off bends is restored. *(A Task 5 defect found in Task 6.)*
+  - Why: on tilted plains the corridor minimum sits at its edge, so segments left and re-entered their pinned nodes sideways (1,064 of 12,437 sub-segments over 1 km at n = 900, legs up to 6.6 km) and the bilinear level rose up to 38 mm. Real valleys (gorges) are interior minima.
+  - Cost if wrong: a river on a sloping plain beside a shallow real valley stays on the coarse line.
+- **The node rule as built is accepted:** off the border and strictly lower than both neighbours along its row or its column, instead of "lower than all 8".
+  - Why: a valley floor falls downstream, so the all-8 rule pins every node (Task 5's valley test failed).
+  - Cost if wrong: a node on a saddle-like spot moves along one axis.
+- **Raw cross-chord offsets taper to 0 over 3 sub-points next to an end whose node did not move** (reviewer's minor 3, folded into fix round 2).
+  - Why: a valley pulling sub-points beside a pinned node should bend in gradually, not make a sideways leg; the remaining 336 legs over 1 km were a visible zigzag risk.
+  - Cost if wrong: a river near a pinned node sits slightly off a side valley's floor.
+- **No further relaxation rule in Task 6** (a "nearest interior minimum to the previous offset" continuity rule is deferred).
+  - Why: the remaining legs come from a synthetic 40 m ripple fixture; real terrain is judged by Task 11's maps and the owner's flights before adding sequential rules.
+  - Cost if wrong: visible short zigzags on rippled plains, fixable later in `rivers.rs` alone.
+
+**Task 7 (hop memory)**
+
+- **Native hop memory is measured (journey bench, release, twice) right after Task 7's review, before Task 8.**
+  - Why: the computed swap growth put the +64 MiB gate at risk, and a texture-layout or upload change is cheaper before the shader binds it.
+  - Cost if wrong: one extra bench run.
+- **Mitigate before asking the owner to move the gate:** (1) drop the active grid's CPU `river` array (and any field only the GPU needs) after upload; (2) stagger the swap's uploads so old and new CPU image data and staging don't peak in one frame, with the cloud at full cover (extending the hop's hold by a few frames if needed); re-measure twice. If still over +64, bring the owner the numbers and options.
+  - Cost if wrong: a few frames' longer hold and one more bench cycle.
+- **The re-measure must be display-paced like every earlier run;** find why pacing dropped before judging.
+  - Why: the owner's gate compares like with like.
+  - Cost if wrong: a pass or fail that reflects pacing rather than memory. *(The uncapped runs traced to a bench window hidden behind others on an unlocked session.)*
+
+**Task 8 and Task 8b**
+
+- **"Today's data" means a present-day lake map** (Natural Earth 10m lakes, public domain, baked to a small committed mask pinned in `data/sources.json`), not ETOPO flats alone. Applied where terrain is today's (recent eras): an Open water-balance lake that overlaps no mapped lake is breached; Terminal (arid) lakes stay by water balance, so past lakes in closed basins (Mega-Chad, Bonneville) survive; a data flat becomes a lake only where the map holds one; table lakes are unchanged; deep-time eras skip the check. (Owner, 2026-11-25: "Check against today".)
+  - Why: the flats are what made the Amazon at Manaus a lake and missed Titicaca, so a map fixes the artefact lakes, Manaus and Titicaca with one source.
+  - Cost if wrong: a real Open lake missing from the map is drained (none of the reality-check lakes), and palaeolakes that overflowed in basins with no lake today are lost in past eras.
+- **The data fix is its own task, Task 8b, before Task 9,** so Task 10's benches measure the final hydrology. It also fixes the water walls at lattice-cell lines (no wet texel at level L beside a dry texel whose ground is below L − tolerance).
+  - Cost if wrong: one more task cycle.
+- **Overlap with the map is not enough:** a mapped Open lake whose level exceeds its mapped surface (the median elevation of its mapped nodes) by more than `OPEN_LAKE_MAP_TOL_M` = 10 m becomes a data lake at the mapped surface; reservoirs are dropped from the map.
+  - Why: Natural Earth may map Wular Lake inside the Kashmir valley, which would keep the 2,140 m artefact.
+  - Cost if wrong: a past Open palaeolake that overflowed above today's surface (possibly Mega-Chad at 6–9 ka) drops to today's level.
+- **The Dead Sea gets a low oblique shore render in Task 8b; Victoria Falls (−17.925, 25.857) and Iguazu Falls (−25.695, −54.437) become a big-river rapids check in Task 8b and renders in Task 12.**
+  - Why: the owner asked about them as tests. They show as churning white water on a steep reach, not a falling curtain: waterfalls are a spec non-goal, and the drop sits inside a gorge narrower than the terrain data.
+  - Cost if wrong: two renders. *(The rapids check was dropped later in Task 8b; see below.)*
+- **The uncapped hop-memory PASS of Task 8's fix round is accepted;** the paced confirmation comes from Task 10's benches and the final-merge re-bench.
+  - Why: uncapped runs read higher hop growth than paced (Task 7: +42–50 against +22–36 MiB), so +48.7 uncapped is consistent with the paced gate.
+  - Cost if wrong: a paced overrun found in Task 10, after Tasks 8b and 9 had built on the swap code.
+- **The shore scallops go to Task 8b with the walls:** standing water interpolates its level over wet taps only (core `blended_water`, the WESL mirror and the parity test), so the shoreline is the terrain's own h = L contour.
+  - Cost if wrong: a sampler change late in the milestone, re-checked by the parity test.
+- **A mapped lake's surface comes from the fine data, not the lattice:** Task 8b bakes a per-lake surface level from the finest ETOPO data inside each mapped polygon (the median), ships it with the map, and uses it as the mapped surface; Task 11's lake check compares against it.
+  - Why: the Dead Sea read about −276 m (the 10 km overview mixes the rift walls) against about −430 m.
+  - Cost if wrong: a baked level from a different ETOPO epoch than the region terrain (the Dead Sea falls about 1 m a year), off by metres.
+- **At the present-day snapshot (age 0) the map decides every lake.** Each mapped lake stands at its baked surface (the table level for table lakes), its footprint its own mapped nodes only, so several lakes can share a basin (Titicaca beside Uyuni), a lake needs no lattice node below its level (the Dead Sea), and the balance veto doesn't apply (the Great Salt Lake). An unmapped basin holds no lake and its rivers end at its sink. Past eras keep the water balance with Task 8b's rules, and a mapped lake capped at its surface takes its mapped nodes as its footprint (never "basin nodes below S", which flooded the Hungarian plain).
+  - Why: "check against today" is exact for today; the balance's calibration error (the Great Salt Lake +40 m) and the 10 km lattice can't reproduce today's lakes, and the past has no map.
+  - Cost if wrong: lakes can jump at the first past snapshot (the Great Salt Lake up about 40 m, an Altiplano lake appears).
+- **The Black Sea is sea at 0 m, not part of a Caspian lake,** fixed in Task 8b with a real-data check (no lake and the ocean flag at 43.0, 34.0; the Caspian stays at −28 m within its own nodes).
+  - Cost if wrong: one more rule in the pass's ocean flags.
+- **Both falls are dropped from Task 8b's rapids check;** "no rapids near Manaus" stays. The falls stay as Task 12 renders and go to the owner as a data-resolution limit.
+  - Why: the 10 km lattice spreads Iguazu's 82 m and Victoria's 108 m drops below the rapid threshold and puts the Iguazu 5 km off.
+  - Cost if wrong: weak white water at big falls ships unflagged by a test.
+- **Parallel rivers in breached valleys** (Task 3's BFS routing in pass-through basins) are deferred to Task 11's maps unless they show on the Indus or Amazon flights.
+  - Cost if wrong: visible doubled rivers in some Andes valleys.
+- **Rivers keep their blend:** the wet-taps-only blend is restricted to standing water, with a river-bank test (supersedes a deferred minor that every wet tap, rivers included, was treated as standing water).
+  - Why: the brief says rivers keep their blend.
+  - Cost if wrong: none beyond the round.
+- **The Pannonian basin spilling through the Moravian Gate is fixed in Task 11, not Task 8b.** Task 11 checks the outlets of a short list of major rivers against reality (the Danube through the Iron Gate to the Black Sea; the Jhelum out of Kashmir at Baramulla; the Indus and the Amazon to their seas) and fixes misroutes with gorge entries in the strait table (generalised to passes).
+  - Why: the reality check is where routing is judged, and the same artefact may sit on the owner's Indus flights.
+  - Cost if wrong: a famous river misrouted until Task 11.
+
+**Task 9**
+
+- **Hop memory with the grow-only boulder pool, the swap-frame placement cost on wasm at 16,384, and a WebGPU run all go to Task 10:** its hop bench includes a hop from a boulder-free region into a rapids region, and it times placement on wasm. The LOD-0-within-6-km assumption is checked in Task 9's fix round.
+  - Cost if wrong: a pool trim or time-slicing added in Task 10.
+
+**Task 10**
+
+- **Task 10 starts before the owner answers the white-water question;** its bench plumbing and GPU timing don't depend on the look, and if a white-water pass follows, only the water GPU numbers are re-measured.
+  - Cost if wrong: one re-run of the water measurements.
+- **Run 1's +71.0 MiB first hop does not fail the task:** the brief judges run 2 (+31.4), and the owner allowed +64 headroom; the paced hop bench re-runs on the final merge.
+  - Cost if wrong: a first-launch hop over the gate goes unaddressed until the merge re-run.
+- *(Superseded by the next ruling.)* The continental pass's 28–31 ms native longest step can't fit `WEB_HYDRO_BUDGET_MS` = 6.0 on the web; it is a budget defect from Task 4's slicing; a Task 10b would name the step and split it to at most 2 ms natively, with a bench test.
+- **Windowed GPU lines from occluded windows are not scene costs;** the offscreen numbers are the record.
+  - Cost if wrong: none (reported only).
+- **Naming and splitting the pass's longest step is Task 10's own carried "time-slice whatever overruns",** in its fix loop, not a new task. Target: the time-boxed run's longest step at most 2 ms natively (about 3× the wasm margin under 6 ms), pinned by a test.
+  - Why: the controller's measurement found an indivisible step of about 23 ms even with adaptive units, so the web overrun was real.
+  - Cost if wrong: a larger fix round on a bench task.
+
+**Task 11**
+
+- **The failing Indus bar goes to the owner unchanged** (brief Step 6); the task review proceeds on the code meanwhile.
+  - Cost if wrong: none (the bar's outcome doesn't change the code under review).
+- **The outlet tolerances are ratified** (start 30 km, via 15 km, sea 150 km).
+  - Why: the misroutes this bar exists to catch end in the wrong sea, 1,000+ km off (the Baltic, the Bay of Bengal), so 150 km separates them; the Amazon's estuary is about 300 km wide; the Indus ending 144 km east by Kori Creek is the same Sindh-plain route error the box bar already fails on, and goes to the owner with it. The fix is disclosure: `reality-check.md` says which thresholds and inputs the task chose.
+  - Cost if wrong: an outlet bar a touch loose.
+
+**Task 11b (today's courses burnt in)**
+
+- **Task 11b burns Natural Earth `River` features of scalerank ≤ 7 only** (no lake centrelines).
+  - Why: rank ≤ 7 takes in the Jhelum, a check miss; today's lakes are the map's.
+  - Cost if wrong: minor rivers (ranks 8–10) keep lattice routes; a river through an unmapped lake has a gap. *(Task 11d later burns the lake centrelines no mapped lake covers.)*
+- **The Python 1′ reference does not burn Natural Earth courses;** it stays a DEM reference independent of Natural Earth, so the check compares two independent sources.
+  - Cost if wrong: none for honesty; the box shares are not comparable with an NE-burnt reference.
+- **The Natural Earth table (≤ 1 MB, committed, compiled in) is new shipped data** beyond the Global Constraints' climate grids; the owner chose the burn.
+  - Cost if wrong: about +0.3 MB gzipped in the web build.
+- **The burn runs in every era with today's terrain** (`data_lakes`), skipping ice nodes, routing-only (the river bed is the running-minimum level).
+  - Why: today's course beats the lattice's on plains for the last 26 kyr; a 10 m trench in every burnt river would show.
+  - Cost if wrong: ice-age rivers on fans follow today's course.
+- *(Superseded by the next ruling.)* The Amazon outlet's mouth point moves from (−0.5, −49.5) to the estuary's North Channel at a cited coordinate; `OUTLET_SEA_KM` stays 150 (owner, 2026-11-26: "Move the mouth point").
+- **Every outlet target in `CheckSpec::standard` gets a cited source** (paper, gazetteer, atlas) beside it in `hydro_check.rs` and in `reality-check.md`; the Amazon's goes to its North Channel mouth; a point with no findable source keeps its value and says "unsourced"; `OUTLET_SEA_KM` and `OUTLET_VIA_KM` stay, and the re-run reports each margin (owner, 2026-11-26: "Let's relocate all mouth points based on cited sources where we have them").
+  - Cost if wrong: a gazetteer point may sit off the main channel, so a bar can fail on the point, not the river; that goes to the owner.
+- **The plan-mandated running-minimum bed stays for routing and for the bed, but is measured:** max and p99 of (e − bed) over burnt nodes at 0 ka on the real bake, with the worst five nodes; over 50 m, the worst is rendered and brought to the owner before the rule changes.
+  - Why: the spec's aim is no trench; a measured number decides.
+  - Cost if wrong: one more fix round.
+- **The Amazon outlet gets its own sea tolerance of 160 km** (`OUTLET_SEA_KM` stays 150 for the others), documented beside the entry (owner, 2026-11-26: "Raise the Amazon's allowance to 160 km").
+  - Cost if wrong: none beyond the Amazon bar's 10 km slack.
+- **The burn stays (it fixes a real misroute), and the region side is fixed:** (1) the pass records, per burnt node, its anchor (the nearest point on its course polyline), and region refinement relaxes burnt nodes from that anchor, not the coarse-floor search; (2) held running-minimum stretches get beds interpolated by path length (never rising, no flat holds); (3) the Hells Canyon ridge capture is re-judged by re-render after (1) and (2).
+  - Why: tributaries really do join the Snake, so the capture is not wrong in kind, only in where it crosses.
+  - Cost if wrong: a round of region work; regions with burnt courses change their golden hashes (determinism holds: anchors are pass data).
+
+**Task 11d (the world's major rivers)**
+
+- **Task 11d is outlet plus discharge, not centreline agreement.**
+  - Why: the NE burn makes a centreline test against NE circular, and a 1′ reference per river is out of budget.
+  - Cost if wrong: a river that reaches its mouth by a wrong mid-course route between via points passes.
+- *(Superseded by the `endorheic` flag below.)* A lake whose level comes from the map or the level table and stands below its basin's spill is terminal, outflow 0 whatever its balance. Implemented test-first, then reverted: it cut Baikal, Superior, Ontario and 313 mapped lakes, because the lattice spill stands above narrow real outlets.
+- **A cited `endorheic: true` flag per level-table lake** (the Caspian) makes that lake terminal (outflow 0, surplus reported); where its table level applies, its nodes at or below the level seed the priority flood like the sea at that level, so its basin's land drains by descent to it instead of filling to the basin's spill. The Python mirror follows.
+  - Why: the flag is observed fact, not a lattice inference; filling a terminal basin to its spill flattened the Caspian lowland and erased the Volga's course.
+  - Cost if wrong: an unflagged endorheic lake can still spill (the Aral, Balkhash: the check reports any it finds).
+- **Burnt courses keep their order:** on a stretch clamped at 0 m each course node still drains to the next (a small descent toward the course's end), and a course node other than the course's last never drains into an ocean neighbour.
+  - Why: the burn exists to say where the river runs; the clamp kept the land but lost the direction (the Mississippi at LaPlace, the Yangtze via the Hudi).
+  - Cost if wrong: a course with a real second mouth (a distributary to the sea) loses it unless it is its own course.
+- **Lake-centreline parts are oriented by their connections to oriented river courses first, ETOPO second;** parts still ambiguous are reported.
+  - Why: course order now steers routing.
+  - Cost if wrong: a reversed reservoir drives a river uphill.
+- **The next Task 11d round (after the sea-start diagnosis) takes in** the parent-fallback hole with the Mississippi and the sea-start fix, the beside-the-ocean junction hole with a fixture, and river-part orientation by connection; the other minors stay deferred.
+  - Why: they decide the remaining outlet failures and course order's correctness.
+- **The surest-first orientation rule is accepted over the literal "connections first".**
+  - Why: the literal rule ran 25 parts more than 50 m uphill on real data; the ruling's aim was the correct direction.
+  - Cost if wrong: flat-delta parts still follow ETOPO noise (3 known).
+- **The Nile's mouth moves to its Damietta branch mouth (Ras El Bar), cited;** the allowance stays 150 km.
+  - Why: as the owner's Orinoco decision, cite where the river meets the sea, not the delta head.
+  - Cost if wrong: none; the bar then tests the branch the burn carries.
+- **Interior course nodes drain to their course successor,** proved by a property test over the real table (ties at shared nodes by a deterministic rule), with flood and basin consistency kept (filled levels never rise along receivers; no lake or basin made of course nodes). The 0 m clamp may be dropped for interior corridor nodes, since they can no longer be ocean.
+  - Why: ruling B's intent; the ε chain lost to marsh at sea level.
+  - Cost if wrong: a course with a real side outlet loses it.
+- **A course's level never reads a lake bed:** a course node within one lattice spacing of a mapped lake's footprint (or a node whose 5′ sample mixes a lake bed, as at Baikal) reads its height as max(sample, that lake's surface); every course pinned at 0 m after a below-sea node is reported before and after.
+  - Why: the Angara at Irkutsk must follow its own valley.
+  - Cost if wrong: a real river leaving a lake below its surface (none expected).
+- **Round 5 (the last):** (1) trace the Aral's lost inflow and fix or explain; (2) audit the lake map with an informative check line listing every lake-map lake whose baked surface stands more than 20 m below its shoreline ring, Baikal-type errors named, with no re-bake of shipped data in that round; (3) reorient or drop the Ganges delta's misoriented parts 1099 and 1101 and the ring 1100, with evidence.
+  - Cost if wrong: deep-lake surfaces stay wrong until the bake fix. *(The owner then chose cited table entries, Task 11f, and a re-bake of the lake map after the milestone.)*
+
+**Task 11g (no drainage into a burnt course across a ridge)**
+
+- **Before shipping new data, an option needing none is measured:** a non-course node may take a burnt course node as its receiver only if that node's unburnt elevation stands no higher than its own (plus a small tolerance). Options 5 and 1 are compared on all 4,645 joining steps with a probe; 5 is chosen if comparable, else 1.
+  - Why: no new shipped data, cheap, deterministic.
+  - Cost if wrong: one probe round. *(Option 5 failed the probe.)*
+- **Task 11g implements option 1 with `JOIN_RIDGE_M` = 100 m:** a committed, cited data file of blocked (feeder, burnt node) steps at the recent lattice (about 16,000 pairs, at most 256 KB), produced deterministically from ETOPO 60″ by a hidden tool command (`--bake-ridged-steps`), stamped with the course table's hash and the lattice n; a test fails if the stamp doesn't match the shipped course table; the pass forbids those steps in the flood; the time-boxed pass equals `run_parallel`; the full reality check and lake dump re-run.
+  - Why: 76 of 81 deep joins stopped at 0.9% false blocks with every outlet intact; 300 m left 53 deep.
+  - Cost if wrong: 36 shallow joins rerouted their own way; a stale file if courses change (the stamp test catches it).
+
+**Task 11c (white water)**
+
+- **Boulder thinning is a function of direction only:** a cluster is kept iff a hash of (river, k, c) is below a global keep fraction (`BOULDER_KEEP_FRACTION`, a `pub const`), chosen so no bench region exceeds 75% of `MAX_BOULDERS`; the cap stays as a guard that logs a `warn!` when it fires (it should never on the bench regions); a test checks that a thinned region and its overlapping neighbour agree; raising `MAX_BOULDERS` to 32,768 waits on Task 12's hop-memory run.
+  - Why: determinism is a binding constraint, and a region-dependent prefix breaks it.
+  - Cost if wrong: fewer rocks everywhere by the keep fraction. *(Fix round 1 chose 0.45: the Himalayas hold 68% of the cap. `MAX_BOULDERS` stays 16,384.)*
+
+**Reviews**
+
+- **Review packages are generated with `GIT_CONFIG_GLOBAL=/dev/null`** from Task 11c's re-review on.
+  - Why: `~/.gitconfig` sets `diff.external=difft`, so every earlier package was a difftastic display, not a unified diff, and earlier reviewers may have missed context; the final whole-branch review gets a clean package.
