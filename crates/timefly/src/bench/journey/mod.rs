@@ -919,7 +919,7 @@ pub struct HopRecord {
     pub from_agl_m: Option<f32>,
     /// The fly's highest height above sea level during the hop.
     pub peak_height_m: Option<f32>,
-    /// The neighbour's centre (era frame), from the hop's phase.
+    /// The promoted region’s centre (era frame), sampled after landing.
     pub centre: Option<RenderDir>,
     /// The share of the region's inner field above sea level once the hop is done (the
     /// neighbour's, after a swap).
@@ -939,6 +939,8 @@ pub struct JourneyBench {
     stage: Stage,
     /// Navigation's phase in the last frame measured.
     prev_phase: NavPhase,
+    /// Journey that drew the preceding frame, if it was clear.
+    previous_clear_cycle: Option<u32>,
     /// Frames drawn with no cloud (density 0) during the script.
     flight_ms: Vec<f32>,
     /// The journey of each of `flight_ms`.
@@ -964,6 +966,7 @@ impl JourneyBench {
             config,
             stage: Stage::WaitingForGlobe,
             prev_phase: NavPhase::Globe,
+            previous_clear_cycle: None,
             flight_ms: Vec::new(),
             flight_cycle: Vec::new(),
             holds: Vec::new(),
@@ -1158,22 +1161,7 @@ fn measure_journey(
             swapped,
             height_m: game.fly.as_ref().map_or(0.0, |f| f.pos_m.y),
         };
-        record_frame(bench, cycle, frame);
-        // A hop just done: read the region it left the fly in.
-        let route = *bench.config.route(cycle);
-        if phase == NavPhase::Flying
-            && let Some(hop) = bench.hops.last_mut()
-            && hop.cycle == cycle
-            && !hop.open
-            && hop.land_share.is_none()
-            && let Some(region) = game.region.as_deref()
-        {
-            hop.land_share = Some(land_share(&region.grid));
-            hop.site = route
-                .site
-                .filter(|site| site.hop == hop.hop)
-                .and_then(|site| read_site(&site, &region.grid, &region.frame));
-        }
+        record_frame(bench, cycle, frame, game.region.as_deref());
         if !bench.config.keep_going
             && let Some(gate) = failed_journey_gate(bench, cfg!(target_arch = "wasm32"))
         {
@@ -1359,7 +1347,7 @@ struct Frame {
 }
 
 /// One frame of the script: its flight time, holds, swaps, hops and memory.
-fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
+fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame, region: Option<&ActiveRegion>) {
     let Frame {
         before,
         phase,
@@ -1369,10 +1357,11 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
         swapped,
         height_m,
     } = frame;
-    if density == 0.0 {
+    if let Some(previous) = bench.previous_clear_cycle {
         bench.flight_ms.push(frame_ms);
-        bench.flight_cycle.push(cycle);
+        bench.flight_cycle.push(previous);
     }
+    bench.previous_clear_cycle = (density == 0.0).then_some(cycle);
     // Transitions start on the phase change into them.
     let hops_done = match bench.stage {
         Stage::Region { hops, .. } => hops,
@@ -1385,7 +1374,7 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
     let entered = std::mem::discriminant(&phase) != std::mem::discriminant(&before);
     match phase {
         NavPhase::Diving { .. } if entered => bench.start_hold(Transition::Dive, cycle),
-        NavPhase::Hopping { centre, .. } if entered => {
+        NavPhase::Hopping { .. } if entered => {
             let hop = hops_done + 1;
             bench.start_hold(Transition::Hop(hop), cycle);
             match bench.hops.last_mut() {
@@ -1395,7 +1384,6 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
                 _ => bench.hops.push(HopRecord {
                     cycle,
                     hop,
-                    centre: Some(centre),
                     baseline: bench.in_region,
                     peak: memory,
                     open: true,
@@ -1427,6 +1415,18 @@ fn record_frame(bench: &mut JourneyBench, cycle: u32, frame: Frame) {
         NavPhase::Flying => {
             bench.in_region = memory;
             if let Some(hop) = bench.hops.last_mut().filter(|h| h.open) {
+                if matches!(before, NavPhase::Hopping { swapped: true, .. })
+                    && let Some(destination) = region
+                {
+                    hop.centre = Some(destination.frame.center);
+                    hop.land_share = Some(land_share(&destination.grid));
+                    hop.site = bench
+                        .config
+                        .route(cycle)
+                        .site
+                        .filter(|site| site.hop == hop.hop)
+                        .and_then(|site| read_site(&site, &destination.grid, &destination.frame));
+                }
                 hop.end = memory;
                 hop.open = false;
             }

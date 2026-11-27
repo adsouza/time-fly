@@ -136,9 +136,10 @@ RUN
                     (a benchmark stops at its first failed gate; add --keep-going to run on)
   Crash probe:      time-fly --diagnostics-probe=panic   (then launch normally)
 
-  Controls: drag to orbit, scroll to zoom, [ and ] to step older or younger, Esc for credits.
-  Regions:  double-click the globe to enter; W A S D move, drag to look, Space / E climb,
-            Ctrl / Q descend, Shift boosts; Backspace returns to the globe.
+  Flight: W A S D move, drag to look, Space / E climb, Ctrl / Q descend, Shift boosts.
+  On the globe, fly over a place and descend below 1,200 km to enter its region. Scrolling
+  up descends and scrolling down climbs. In a region, Backspace returns to the globe.
+  Time: [ steps older and ] steps younger. Esc opens the credits.
 
 LOGS
   Each run writes a session directory with its log:

@@ -466,7 +466,7 @@ fn web_memory_cycles_compare_a_repeat_with_the_memory_before_it() {
 }
 
 #[test]
-fn a_hop_started_again_keeps_one_record_and_records_its_lift() {
+fn a_retried_hop_scores_only_the_promoted_destination() {
     let mut bench = JourneyBench::new(JourneyBenchConfig::new(60, false));
     bench.stage = Stage::Region {
         cycle: 0,
@@ -496,6 +496,12 @@ fn a_hop_started_again_keeps_one_record_and_records_its_lift() {
         (hop(1.0, true), 0.6, 30_000.0),
         (NavPhase::Flying, 0.0, 19_900.0),
     ];
+    let (grid, frame) = shaped_grid(|_, _| 100.0);
+    let destination = ActiveRegion {
+        grid: grid.into(),
+        frame,
+    };
+    assert_ne!(destination.frame.center, RenderDir(DVec3::X));
     let mut before = NavPhase::Flying;
     for (i, (phase, density, height_m)) in frames.into_iter().enumerate() {
         let frame = Frame {
@@ -507,12 +513,18 @@ fn a_hop_started_again_keeps_one_record_and_records_its_lift() {
             swapped: is_swap(&before, &phase),
             height_m,
         };
-        record_frame(&mut bench, 0, frame);
+        record_frame(&mut bench, 0, frame, Some(&destination));
+        if i == 2 {
+            assert_eq!(bench.hops()[0].land_share, None);
+            assert_eq!(bench.hops()[0].centre, None);
+        }
         before = phase;
     }
     // One hop, numbered as its hold is, with the lift it made.
     let hops = bench.hops();
     assert_eq!(hops.len(), 1, "{hops:?}");
+    assert_eq!(hops[0].centre, Some(destination.frame.center));
+    assert_eq!(hops[0].land_share, Some(1.0));
     assert_eq!((hops[0].cycle, hops[0].hop), (0, 1));
     assert_eq!(hops[0].from_agl_m, Some(19_800.0));
     assert_eq!(hops[0].peak_height_m, Some(60_000.0));
@@ -937,4 +949,32 @@ fn the_gates_a_journey_decides_stop_the_run_once_failed() {
         Some(gate),
         "gated on the web too"
     );
+}
+
+#[test]
+fn flight_intervals_belong_to_the_previous_clear_frame_and_route() {
+    let mut bench = JourneyBench::new(JourneyBenchConfig::new(60, false));
+    for (cycle, density, frame_ms) in [
+        (0, 0.0, 1.0),
+        (1, 1.0, 31.0),
+        (1, 0.0, 90.0),
+        (1, 0.0, 12.0),
+    ] {
+        record_frame(
+            &mut bench,
+            cycle,
+            Frame {
+                before: NavPhase::Flying,
+                phase: NavPhase::Flying,
+                density,
+                frame_ms,
+                now: 0.0,
+                swapped: false,
+                height_m: 1000.0,
+            },
+            None,
+        );
+    }
+    assert_eq!(bench.flight_ms, [31.0, 12.0]);
+    assert_eq!(bench.flight_cycle, [0, 1]);
 }

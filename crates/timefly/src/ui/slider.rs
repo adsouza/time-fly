@@ -25,6 +25,7 @@ use timefly_core::deep_time::{YearsBp, format_years_bp, slider_to_years, years_t
 use super::credits::CreditsOpen;
 use super::{BlocksCamera, GUTTER_PX, PANEL_COLOR, TEXT_COLOR};
 use crate::region::RegionState;
+use crate::region::navigate::{Navigation, NavigationSystems};
 use crate::time::{GlobeTime, TimeChangeCause, TimeChanged, nearest_snapshot};
 
 /// Opacity of the idle UI.
@@ -111,7 +112,11 @@ impl Plugin for SliderUiPlugin {
                 (
                     track_idle,
                     hide_under_credits,
-                    (log_slider_drags, apply_snapped_slider).chain(),
+                    (
+                        log_slider_drags,
+                        apply_snapped_slider.before(NavigationSystems),
+                    )
+                        .chain(),
                 ),
             )
             .add_systems(
@@ -300,6 +305,17 @@ fn log_slider_drags(
     }
 }
 
+/// A selection during a transition replaces the pending choice, even if the player
+/// selects the displayed era. Idle frames never call this.
+fn queue_selection(nav: Option<ResMut<Navigation>>, to: YearsBp) -> bool {
+    let Some(mut nav) = nav else { return false };
+    let Some(held) = nav.slider.held else {
+        return false;
+    };
+    nav.slider.queued = (to != held).then_some(to);
+    true
+}
+
 /// Dragging (or clicking) the slider sets the globe time; while it snaps, it only previews.
 #[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
 fn on_slider_change(
@@ -311,6 +327,7 @@ fn on_slider_change(
     mut commands: Commands,
     mut time: ResMut<GlobeTime>,
     mut changes: MessageWriter<TimeChanged>,
+    nav: Option<ResMut<Navigation>>,
 ) {
     let Ok(state) = sliders.get(change.source) else {
         return;
@@ -328,7 +345,17 @@ fn on_slider_change(
         return;
     }
     let from = time.years;
-    let to = years_for(f64::from(value));
+    // The widget stores f32 positions. Returning to the held thumb position must
+    // recover the exact held age, even when the inverse mapping loses precision.
+    let to = if value == widget_value_for(from) as f32 {
+        from
+    } else {
+        years_for(f64::from(value))
+    };
+    if queue_selection(nav, to) {
+        time.set_changed(); // Restore the held thumb and label in PostUpdate.
+        return;
+    }
     if to != from {
         // A click on the track or a key on the focused slider is one change: `info`. (A
         // drag's final value arrives after the widget clears `dragging`, while the drag is
@@ -358,6 +385,7 @@ fn apply_snapped_slider(
     mut commands: Commands,
     mut time: ResMut<GlobeTime>,
     mut changes: MessageWriter<TimeChanged>,
+    nav: Option<ResMut<Navigation>>,
 ) {
     let Some(value) = drag.pending else {
         return;
@@ -374,6 +402,10 @@ fn apply_snapped_slider(
     drag.pending = None;
     let from = time.years;
     let to = nearest_snapshot(years_for(f64::from(value)));
+    if queue_selection(nav, to) {
+        time.set_changed();
+        return;
+    }
     if to != from {
         info!(from_years = from.0, to_years = to.0, "slider snapped");
         time.years = to;
@@ -700,6 +732,25 @@ mod tests {
         app.update();
         drag_to(&mut app, 0.5);
         assert!((years(&app) - 164_266.77).abs() < 0.01, "{}", years(&app));
+    }
+
+    #[test]
+    fn explicitly_reselecting_the_held_era_cancels_the_queue() {
+        for state in [RegionState::Globe, RegionState::InRegion] {
+            let mut app = app();
+            let held = YearsBp(21_000.0);
+            app.insert_resource(State::new(state));
+            app.world_mut().resource_mut::<GlobeTime>().years = held;
+            let mut nav = Navigation::default();
+            nav.slider.held = Some(held);
+            app.insert_resource(nav);
+            drag_to(&mut app, widget_value_for(YearsBp(66e6)) as f32);
+            app.update();
+            assert!(app.world().resource::<Navigation>().queued_time().is_some());
+            drag_to(&mut app, widget_value_for(held) as f32);
+            assert_eq!(app.world().resource::<Navigation>().queued_time(), None);
+            assert_eq!(app.world().resource::<GlobeTime>().years, held);
+        }
     }
 
     #[test]
