@@ -2,6 +2,11 @@
 //! globe flight and the fly camera, with the keyboard's own input plugin, and no window or
 //! renderer. Time advances by a fixed step per update; one cycle (dive, two hops, climb).
 //!
+//! Holds are judged at [`HOLD_LIMIT_HEADLESS_MS`], not the native 3 s
+//! ([`JourneyBenchConfig::headless`]): at a fixed step a hold counts updates while the region
+//! job and the continental pass run in wall time, so its length here follows the machine's load,
+//! not the game. The real bench (`--journey-bench`) keeps the native gate.
+//!
 //! The Alps sit outside the fixture tiles, so every region falls back to the overview (a `warn`
 //! each).
 
@@ -17,8 +22,8 @@ use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::bench::bench_exit;
 use timefly::bench::journey::{
-    ALPS_ROUTE, CRUISE_AGL_M, Crossing, JourneyBench, JourneyBenchConfig, JourneyBenchPlugin,
-    JourneyRoute, WEST_YAW,
+    ALPS_ROUTE, CRUISE_AGL_M, Crossing, HOLD_LIMIT_HEADLESS_MS, JourneyBench, JourneyBenchConfig,
+    JourneyBenchPlugin, JourneyRoute, WEST_YAW,
 };
 use timefly::bench::region::BenchRegion;
 use timefly::data::{GlobeDataPlugin, GlobeLoadState};
@@ -61,13 +66,18 @@ fn exits(app: &mut App) -> Vec<AppExit> {
 /// One journey app at a time. A hold is timed in fixed steps while the region job and the
 /// continental pass run on threads in wall time, so concurrent apps lengthen each other's holds:
 /// with the pass on, a dive's hold here is about 2.3 s alone but passed the 3 s native gate (an
-/// early stop since M3 Task 15) with this binary's six tests in parallel.
+/// early stop since M3 Task 15) with this binary's six tests in parallel, and read 3.0-3.1 s
+/// serially at load averages of 10-16. Serializing keeps the apps from slowing each other; the
+/// headless hold limit ([`journey_app`]) covers load from outside the binary.
 static ONE_APP_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// Held by a journey app for its life (one app per test), so the next test's app waits for it.
 struct OneAppAtATime(#[allow(dead_code)] MutexGuard<'static, ()>);
 
+/// A headless journey app over `config`, judged as a headless run
+/// ([`JourneyBenchConfig::headless`]: holds at [`HOLD_LIMIT_HEADLESS_MS`]).
 fn journey_app(config: JourneyBenchConfig) -> App {
+    let config = config.headless();
     // A failed test poisons the lock; the next one runs regardless.
     let turn = ONE_APP_AT_A_TIME
         .lock()
@@ -148,7 +158,7 @@ fn a_journey_run_reaches_the_summary() {
     for line in [
         "bake: manifest v2, sha256 ",
         "region: Alps (46.5, 10 at 0 years), 1 cycle of a dive, 2 hops and a climb",
-        "hold (from the first frame drawn at cloud density exactly 1 to the first frame after it drawn below 1)",
+        "hold (from the first frame drawn at cloud density exactly 1 to the first frame after it drawn below 1): headless gate <= 60000 ms each (fixed-step test; the native gate is 3000 ms)\n",
         "\nhold: dive ",
         "\nhold: hop 1 ",
         "\nhold: hop 2 ",
@@ -168,7 +178,9 @@ fn a_journey_run_reaches_the_summary() {
         .filter(|l| l.starts_with("hold: "))
         .collect();
     assert_eq!(holds.len(), 4, "{summary}");
-    // At a fixed step, every gate passes: a FAIL here is a bench or game fault.
+    // At a fixed step, every gate passes: a FAIL here is a bench or game fault. Holds are judged
+    // at the headless limit, which the machine's load cannot reach.
+    assert_eq!(HOLD_LIMIT_HEADLESS_MS, 60_000.0);
     for (line, name) in holds.iter().zip(["dive", "hop 1", "hop 2", "climb"]) {
         assert!(line.starts_with(&format!("hold: {name} ")), "{line}");
         assert!(line.ends_with(" ms (cycle 1) -> PASS"), "{line}");

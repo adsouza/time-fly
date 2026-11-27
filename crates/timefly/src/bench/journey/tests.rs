@@ -90,28 +90,52 @@ fn a_journey_names_its_four_transitions() {
 
     // Native gates each hold at 3 s; the web reports against 8 s.
     assert_eq!(
-        hold_line(Transition::Dive, 1_234.4, "cycle 1", false),
+        hold_line(
+            Transition::Dive,
+            1_234.4,
+            "cycle 1",
+            false,
+            HOLD_LIMIT_NATIVE_MS
+        ),
         (
             "hold: dive 1234 ms (cycle 1) -> PASS".to_string(),
             Some(true)
         )
     );
     assert_eq!(
-        hold_line(Transition::Hop(1), 3_000.0, "cycle 2, Japan", false),
+        hold_line(
+            Transition::Hop(1),
+            3_000.0,
+            "cycle 2, Japan",
+            false,
+            HOLD_LIMIT_NATIVE_MS
+        ),
         (
             "hold: hop 1 3000 ms (cycle 2, Japan) -> PASS".to_string(),
             Some(true)
         )
     );
     assert_eq!(
-        hold_line(Transition::Hop(2), 3_000.4, "cycle 1", false),
+        hold_line(
+            Transition::Hop(2),
+            3_000.4,
+            "cycle 1",
+            false,
+            HOLD_LIMIT_NATIVE_MS
+        ),
         (
             "hold: hop 2 3000 ms (cycle 1) -> FAIL".to_string(),
             Some(false)
         )
     );
     assert_eq!(
-        hold_line(Transition::Climb, 9_000.0, "cycle 3", true),
+        hold_line(
+            Transition::Climb,
+            9_000.0,
+            "cycle 3",
+            true,
+            HOLD_LIMIT_NATIVE_MS
+        ),
         (
             "hold: climb 9000 ms (cycle 3) -> reported only (web target <= 8000 ms)".to_string(),
             None
@@ -1095,5 +1119,88 @@ fn the_gates_a_journey_decides_stop_the_run_once_failed() {
         failed_journey_gate(&b, true),
         Some(gate),
         "gated on the web too"
+    );
+}
+
+#[test]
+fn headless_runs_judge_holds_by_their_own_limit_and_the_bench_keeps_3_s() {
+    // Every bench configuration the game builds judges holds at the native 3 s.
+    assert_eq!(HOLD_LIMIT_NATIVE_MS, 3_000.0);
+    assert_eq!(
+        JourneyBenchConfig::new(60, true).hold_limit_ms,
+        HOLD_LIMIT_NATIVE_MS
+    );
+    let bench_config = JourneyBenchConfig::single(60, true, ALPS_ROUTE);
+    assert_eq!(bench_config.hold_limit_ms, HOLD_LIMIT_NATIVE_MS);
+    // The headless tests' limit is far above it, and still below a stage's timeout, so a hold
+    // that never ends fails as a hold.
+    let headless = bench_config.clone().headless();
+    assert_eq!(headless.hold_limit_ms, HOLD_LIMIT_HEADLESS_MS);
+    const {
+        assert!(HOLD_LIMIT_HEADLESS_MS >= 10.0 * HOLD_LIMIT_NATIVE_MS);
+        assert!(HOLD_LIMIT_HEADLESS_MS < STAGE_TIMEOUT_SECS * 1_000.0);
+    }
+    assert_eq!(
+        JourneyBenchConfig {
+            hold_limit_ms: HOLD_LIMIT_NATIVE_MS,
+            ..headless.clone()
+        },
+        bench_config,
+        "headless() changes the hold limit only"
+    );
+
+    // A dive held 9 s in fixed steps while a slow region job ran in wall time.
+    let held = |config: JourneyBenchConfig, secs: f64| {
+        let mut b = JourneyBench::new(config);
+        b.start_hold(Transition::Dive, 0);
+        b.holds[0].clock.observe(10.0, 1.0);
+        b.holds[0].clock.observe(10.0 + secs, 0.5);
+        b
+    };
+    assert_eq!(
+        failed_journey_gate(&held(bench_config.clone(), 9.0), false).as_deref(),
+        Some("hold: dive 9000 ms (cycle 1) -> FAIL"),
+        "the real bench stops at 3 s"
+    );
+    assert_eq!(
+        failed_journey_gate(&held(bench_config, 3.5), false).as_deref(),
+        Some("hold: dive 3500 ms (cycle 1) -> FAIL")
+    );
+    assert!(
+        failed_journey_gate(&held(headless.clone(), 9.0), false).is_none(),
+        "a slow job does not trip the headless gate"
+    );
+    let over = HOLD_LIMIT_HEADLESS_MS / 1_000.0 + 1.0;
+    assert!(
+        failed_journey_gate(&held(headless, over), false).is_some(),
+        "the headless gate still holds"
+    );
+
+    // The summary line judges by the limit it is given.
+    assert_eq!(
+        hold_line(
+            Transition::Dive,
+            9_000.0,
+            "cycle 1",
+            false,
+            HOLD_LIMIT_HEADLESS_MS
+        ),
+        (
+            "hold: dive 9000 ms (cycle 1) -> PASS".to_string(),
+            Some(true)
+        )
+    );
+    assert_eq!(
+        hold_line(
+            Transition::Dive,
+            9_000.0,
+            "cycle 1",
+            false,
+            HOLD_LIMIT_NATIVE_MS
+        ),
+        (
+            "hold: dive 9000 ms (cycle 1) -> FAIL".to_string(),
+            Some(false)
+        )
     );
 }

@@ -36,7 +36,8 @@
 //!   dive, hop 1, hop 2 and the climb). The hold is the white-out the player sits through: from
 //!   the first frame drawn at cloud density exactly 1 to the first frame after it drawn below 1,
 //!   in real time between those frames ([`HoldClock`]). Natively each is gated at
-//!   [`HOLD_LIMIT_NATIVE_MS`]; the web reports against [`HOLD_TARGET_WEB_MS`] (design §8).
+//!   [`HOLD_LIMIT_NATIVE_MS`]; the web reports against [`HOLD_TARGET_WEB_MS`] (design §8). The
+//!   headless tests judge by [`HOLD_LIMIT_HEADLESS_MS`] ([`JourneyBenchConfig::headless`]).
 //! - **Flight**: every frame drawn with no cloud at all (density 0), a preload's included, under
 //!   M2's region rule (R14, [`super::passes`]).
 //! - **Swap worst frame**: the longest of each swap's frame and the [`SWAP_WINDOW_FRAMES`] − 1
@@ -305,6 +306,15 @@ pub const JOURNEY_CYCLES: u32 = 3;
 pub const HOPS_PER_CYCLE: u32 = 2;
 /// The longest hold natively, per transition (design §11, gated).
 pub const HOLD_LIMIT_NATIVE_MS: f64 = 3_000.0;
+/// The longest hold in the headless tests ([`JourneyBenchConfig::headless`]), per transition.
+/// They step time by a fixed 16.67 ms per update while the region job and the continental pass
+/// run on threads in wall time, so a hold there counts updates, not the job's time: the faster
+/// the update loop or the slower the job (other tests or builds on the machine, unoptimized
+/// dependencies under CI's `ci-test` profile), the longer it reads. A dive's hold there is about
+/// 2.3 s alone and read over 3 s under load, so the native gate made the tests fail by load.
+/// The tests check the script (stops, routes, summaries), not the hold's length; a hold that
+/// never ends still fails here, before a stage's [`STAGE_TIMEOUT_SECS`].
+pub const HOLD_LIMIT_HEADLESS_MS: f64 = 60_000.0;
 /// The web's hold target, per transition (design §8, reported only).
 pub const HOLD_TARGET_WEB_MS: f64 = 8_000.0;
 /// The longest swap frame natively (design §11, gated).
@@ -411,9 +421,16 @@ pub fn is_swap(before: &NavPhase, after: &NavPhase) -> bool {
 }
 
 /// A hold's summary line, `hold: <transition> <ms> ms (<tag>) -> <verdict>` (the tag names the
-/// journey, [`JourneyBenchConfig::tag`]), and its gate: natively at most
-/// [`HOLD_LIMIT_NATIVE_MS`]; on the web reported against [`HOLD_TARGET_WEB_MS`] (`None`).
-pub fn hold_line(t: Transition, ms: f64, tag: &str, web: bool) -> (String, Option<bool>) {
+/// journey, [`JourneyBenchConfig::tag`]), and its gate: natively at most `limit_ms`
+/// ([`JourneyBenchConfig::hold_limit_ms`]); on the web reported against [`HOLD_TARGET_WEB_MS`]
+/// (`None`).
+pub fn hold_line(
+    t: Transition,
+    ms: f64,
+    tag: &str,
+    web: bool,
+    limit_ms: f64,
+) -> (String, Option<bool>) {
     let head = format!("hold: {} {ms:.0} ms ({tag}) -> ", t.label());
     if web {
         (
@@ -421,7 +438,7 @@ pub fn hold_line(t: Transition, ms: f64, tag: &str, web: bool) -> (String, Optio
             None,
         )
     } else {
-        let ok = ms <= HOLD_LIMIT_NATIVE_MS;
+        let ok = ms <= limit_ms;
         (format!("{head}{}", gate_word(ok)), Some(ok))
     }
 }
@@ -595,6 +612,9 @@ pub struct JourneyBenchConfig {
     pub exit_when_done: bool,
     /// `--keep-going`: fly every journey even after a gate has failed.
     pub keep_going: bool,
+    /// Each hold's native gate: [`HOLD_LIMIT_NATIVE_MS`] for the game's bench,
+    /// [`HOLD_LIMIT_HEADLESS_MS`] for the headless tests ([`Self::headless`]).
+    pub hold_limit_ms: f64,
 }
 
 impl JourneyBenchConfig {
@@ -606,6 +626,7 @@ impl JourneyBenchConfig {
             target_fps,
             exit_when_done,
             keep_going: false,
+            hold_limit_ms: HOLD_LIMIT_NATIVE_MS,
         }
     }
 
@@ -617,6 +638,16 @@ impl JourneyBenchConfig {
             target_fps,
             exit_when_done,
             keep_going: false,
+            hold_limit_ms: HOLD_LIMIT_NATIVE_MS,
+        }
+    }
+
+    /// The same run judged as the headless tests run it: holds at [`HOLD_LIMIT_HEADLESS_MS`],
+    /// every other gate as the bench's.
+    pub fn headless(self) -> Self {
+        JourneyBenchConfig {
+            hold_limit_ms: HOLD_LIMIT_HEADLESS_MS,
+            ..self
         }
     }
 
@@ -1560,9 +1591,10 @@ fn failed_journey_gate(bench: &JourneyBench, web: bool) -> Option<String> {
     if !web {
         for hold in &bench.holds {
             if let Some(ms) = hold.clock.hold_ms()
-                && ms > HOLD_LIMIT_NATIVE_MS
+                && ms > config.hold_limit_ms
             {
-                return Some(hold_line(hold.transition, ms, &config.tag(hold.cycle), web).0);
+                let tag = config.tag(hold.cycle);
+                return Some(hold_line(hold.transition, ms, &tag, web, config.hold_limit_ms).0);
             }
         }
         for s in &bench.swaps {
@@ -1679,14 +1711,20 @@ fn finish(
         "hold (from the first frame drawn at cloud density exactly 1 to the first frame after it drawn below 1): {}",
         if web {
             format!("web reported only, target <= {HOLD_TARGET_WEB_MS:.0} ms each")
-        } else {
+        } else if config.hold_limit_ms == HOLD_LIMIT_NATIVE_MS {
             format!("native gate <= {HOLD_LIMIT_NATIVE_MS:.0} ms each")
+        } else {
+            format!(
+                "headless gate <= {:.0} ms each (fixed-step test; the native gate is {HOLD_LIMIT_NATIVE_MS:.0} ms)",
+                config.hold_limit_ms
+            )
         }
     ));
     for hold in &bench.holds {
         match hold.clock.hold_ms() {
             Some(ms) => {
-                let (line, gate) = hold_line(hold.transition, ms, &config.tag(hold.cycle), web);
+                let tag = config.tag(hold.cycle);
+                let (line, gate) = hold_line(hold.transition, ms, &tag, web, config.hold_limit_ms);
                 pass &= gate.unwrap_or(true);
                 out.push(line);
             }
