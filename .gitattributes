@@ -1,0 +1,13 @@
+# Files whose exact bytes are compiled in and stamped, or checked against a pinned SHA-256, must
+# reach every checkout unchanged: a CRLF conversion (core.autocrlf=true, as on Windows) would
+# break the stamps. data/hydrology/rivers_today.json is hashed (FNV-1a over its bytes) into the
+# stamp of ridged_steps.bin, which a test checks (timefly_core hydrology/ridged.rs); the other
+# tables there are compiled in beside it.
+data/hydrology/* -text
+
+# Baked formats: binary. The test bakes' manifests pin each file's size and SHA-256.
+*.tfgrid binary
+*.tfrot binary
+*.tfplates binary
+*.bin binary
+crates/timefly/tests/assets/** -text
