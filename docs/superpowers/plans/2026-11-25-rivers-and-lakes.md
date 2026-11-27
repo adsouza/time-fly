@@ -1472,3 +1472,6 @@ Disk-guard bookkeeping is left out, as in M3.
 - **The headless journey tests judge holds by their own limit** (`HOLD_LIMIT_HEADLESS_MS`, 60 s, through `JourneyBenchConfig::headless`); `--journey-bench` keeps the native 3 s gate.
   - Why: at a fixed step a hold counts updates while the jobs run in wall time, so its length follows the machine's load; the tests check the script, not the hold.
   - Cost if wrong: a hold regression under 60 s goes unnoticed by the tests; the real bench still gates it.
+- **The headless journey memory cycles pass within the larger of 10% and 8 MiB** (`HEADLESS_MEMORY_CYCLE_FLOOR_MIB`, through `headless()`); the game's bench keeps 10% alone. The headless tests write their summaries to `TIMEFLY_BENCH_SUMMARY_DIR`, which CI sets and uploads, with the hold lines on the run page (owner: "Fix it. Also record the dive times in CI so we can inspect them later.").
+  - Why: headless the process holds about 30 MiB, so 10% is about 3 MiB, inside what earlier tests in the same process leave behind (+3.4 MiB failed one full-suite run).
+  - Cost if wrong: a headless per-visit growth under 8 MiB goes unnoticed by the tests; the real bench still gates at 10%.

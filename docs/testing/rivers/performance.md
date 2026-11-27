@@ -243,6 +243,26 @@ bench's configuration and passes the headless one; a hold past 60 s fails both).
 (load average 6.9) the headless dives read 2,483–2,617 ms, all PASS. A hold's length in these
 tests still follows the machine's load; it is no longer a verdict.
 
+**The memory cycles, the same way (`700706d`).** A full-suite run then failed the route-set
+test on its journey memory cycles: the Alps' second visit read +11.6% of its first (29.4 →
+32.8 MiB) against the 10% limit, and the test passed 3 of 3 alone. Headless, with no renderer,
+the process holds about 30 MiB, so 10% is about 3 MiB, and what the allocator keeps from earlier
+tests in the same process moves it that much (CI's Linux footprint may move the same way).
+`JourneyBenchConfig::memory_cycle_floor_bytes` is 0 in the game's configurations (10% exactly as
+before) and `HEADLESS_MEMORY_CYCLE_FLOOR_MIB` (8 MiB, over twice that swing) through
+`headless()`: a headless visit passes within the larger of 10% and 8 MiB, on the native and the
+web rule alike, and the summary says `(limit +10% or +8 MiB, the larger (headless floor))`. Unit
+test: `headless_memory_cycles_allow_an_absolute_floor_and_the_bench_keeps_10_percent` (+3.4 MiB
+on 29.4 passes headless and fails the bench's configuration; +8.6 MiB, +29%, fails both).
+
+**Recorded in CI (`2808c55`).** With `TIMEFLY_BENCH_SUMMARY_DIR` set, the headless journey and
+region bench tests write each run's full summary to `<dir>/<test name>.txt`
+(`bench::record_summary`; unset, nothing is written). CI's `Tests` step sets it; afterwards,
+pass or fail, the hold lines (dives, hops and climbs, with cycle and route) and the journey
+memory-cycle lines go to the run page's step summary, and the folder is uploaded as the
+`bench-summaries` artifact, kept 30 days. So the dives' holds under the `ci-test` profile can be
+read from any run.
+
 ### Scrub bench (once, as the plan asks; `9814212`)
 
 `--scrub-bench`, display-paced, 1920 × 951: **PASS**. Cold load 0.57 s; data 137 frames, 136
