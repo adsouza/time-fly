@@ -275,3 +275,6 @@ continuously up the valley. **Two things look wrong:**
   Task 8b), not real streams.
 Both show identically in a render from the `12ef525` build (before Task 11c), so white water
 did not cause them; neither was investigated further in this task.
+
+`render-defects.md` (branch `river-render-defects`): the slivers were water strips at the edge of a
+perched river's footprint, fixed there; the terraces are still open.
