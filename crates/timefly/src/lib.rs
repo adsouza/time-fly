@@ -16,6 +16,7 @@ pub mod clusters;
 pub mod creature;
 pub mod data;
 pub mod diagnostics;
+mod flight_input;
 pub mod fly_camera;
 pub mod globe;
 pub mod globe_flight;

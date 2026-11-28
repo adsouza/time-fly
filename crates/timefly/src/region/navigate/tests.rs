@@ -2652,6 +2652,44 @@ fn dive(app: &mut App) -> usize {
 }
 
 #[test]
+fn flight_input_touch_can_dive_into_and_climb_out_of_a_region() {
+    use bevy::input::touch::TouchPhase::{Ended, Moved, Started};
+
+    use crate::flight_input::tests::{send, spawn_touch_window};
+
+    let mut app = worlds_app();
+    let window = spawn_touch_window(&mut app);
+    app.world_mut().resource_mut::<GlobeFlightState>().0 = GlobeFlight {
+        dir: ON_PLATE,
+        heading: DVec3::Y,
+        altitude_km: DIVE_ALTITUDE_KM + 5.0,
+    };
+    app.update();
+    let a = Vec2::new(120.0, 300.0);
+    let b = Vec2::new(280.0, 300.0);
+    let drag = |app: &mut App, dy: f32| {
+        let offset = Vec2::Y * dy;
+        send(app, window, &[(0, Started, a), (1, Started, b)]);
+        send(
+            app,
+            window,
+            &[(0, Moved, a + offset), (1, Moved, b + offset)],
+        );
+        send(
+            app,
+            window,
+            &[(0, Ended, a + offset), (1, Ended, b + offset)],
+        );
+    };
+
+    drag(&mut app, 100.0);
+    run_until(&mut app, 60, |a| phase(a) == NavPhase::Flying);
+    app.world_mut().resource_mut::<FlyState>().pos_m.y = CLIMB_OUT_M - 100.0;
+    drag(&mut app, -100.0);
+    run_until(&mut app, 60, |a| phase(a) == NavPhase::Globe);
+}
+
+#[test]
 fn the_dive_swaps_worlds_under_the_cloud() {
     let mut app = worlds_app();
     let swap = dive(&mut app);

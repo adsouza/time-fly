@@ -5,7 +5,7 @@
 //!   heading and an altitude, f64 in the render frame), so the fly crosses the poles with no
 //!   special case. [`GlobeLook`] holds the view drag's offset.
 //! - **Input** ([`GlobeFlightSystems::Step`]), on the globe and while a dive waits in the cloud
-//!   (the player can climb back out to cancel it): the region's keys ([`keys_to_input`]), the
+//!   (the player can climb back out to cancel it): the region's keys ([`crate::fly_camera::keys_to_input`]), the
 //!   drag and the scroll wheel (up descends, down climbs, M1's zoom habit), mapped by
 //!   [`globe_input`] and stepped by `globe_fly_step`. Below the dive altitude a descent eases
 //!   into the floor inside the cloud ([`descent_ease`]).
@@ -33,7 +33,6 @@
 //!   farthest eye.
 //! - The diagnostics context's camera distance and direction are written every frame.
 
-use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::math::{DMat3, DQuat, DVec3};
 use bevy::prelude::*;
 use timefly_core::flight::altitudes::{DIVE_ALTITUDE_KM, GLOBE_MAX_CAMERA_DISTANCE_KM};
@@ -48,9 +47,10 @@ use timefly_core::flight::globe::{
 
 use crate::creature::FlyPose;
 use crate::diagnostics::DiagnosticsContext;
+use crate::flight_input::{FlightIntent, add_flight_input};
 use crate::fly_camera::{
     ChaseGlide, FlyFlourish, FlyTurn, KeyInput, LOOK_RADIANS_PER_PX, MAX_STEP_S, TURN_DEG_PER_S,
-    fly_speed, keys_to_input,
+    fly_speed,
 };
 use crate::globe::{
     EARTH_RADIUS_KM, GlobeCamera, GlobeCameraSync, GlobeExaggeration, GlobeExaggerationSync,
@@ -58,7 +58,6 @@ use crate::globe::{
 use crate::region::RegionState;
 use crate::region::navigate::{NavPhase, Navigation};
 use crate::terrain::RegionViewSystems;
-use crate::ui::PointerOverUi;
 use crate::ui::altitude::{Altitude, FlyAltitude};
 
 /// Seconds of full climb (or descent) one scroll line asks for: at the keys' 0.8 × altitude a
@@ -100,10 +99,6 @@ pub enum GlobeFlightSystems {
     Apply,
 }
 
-/// Whether the current left-button drag began on the globe (not on the UI).
-#[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct GlobeDrag(bool);
-
 /// The chase camera's glide and the fly's visual state between frames.
 #[derive(Resource, Clone, Debug, Default)]
 pub(crate) struct GlobeChase {
@@ -125,9 +120,9 @@ pub struct GlobeFlightPlugin;
 
 impl Plugin for GlobeFlightPlugin {
     fn build(&self, app: &mut App) {
+        add_flight_input(app);
         app.init_resource::<GlobeFlightState>()
             .init_resource::<GlobeLook>()
-            .init_resource::<GlobeDrag>()
             .init_resource::<GlobeChase>()
             .init_resource::<FlyPose>()
             .init_resource::<FlyAltitude>()
@@ -235,42 +230,19 @@ pub fn dive_horizontal_scale(altitude_km: f64, boost: bool) -> f64 {
     if full > drift { drift / full } else { 1.0 }
 }
 
-/// Gathers the keys and the drag and steps [`GlobeFlightState`].
-#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
+/// Applies flight intent while navigation gives the globe fly control.
 fn step_globe_flight(
-    time: Res<Time>,
-    keys: Option<Res<ButtonInput<KeyCode>>>,
-    mouse: Option<Res<ButtonInput<MouseButton>>>,
-    motion: Option<Res<AccumulatedMouseMotion>>,
-    scroll: Option<Res<AccumulatedMouseScroll>>,
-    over_ui: Option<Res<PointerOverUi>>,
-    mut drag: ResMut<GlobeDrag>,
+    intent: Res<FlightIntent>,
     mut flight: ResMut<GlobeFlightState>,
     mut look: ResMut<GlobeLook>,
     nav: Option<Res<Navigation>>,
 ) {
-    if let Some(mouse) = &mouse {
-        if mouse.just_pressed(MouseButton::Left) {
-            drag.0 = !over_ui.as_ref().is_some_and(|o| o.0);
-        } else if !mouse.pressed(MouseButton::Left) {
-            drag.0 = false;
-        }
-    }
-    let held = keys.as_deref().map(keys_to_input).unwrap_or_default();
-    let look_delta = match (&motion, drag.0) {
-        (Some(m), true) => m.delta,
-        _ => Vec2::ZERO,
-    };
-    let over_ui = over_ui.is_some_and(|o| o.0);
-    let scroll_lines = match &scroll {
-        Some(s) if !over_ui => match s.unit {
-            MouseScrollUnit::Line => f64::from(s.delta.y),
-            MouseScrollUnit::Pixel => f64::from(s.delta.y / PIXELS_PER_LINE),
-        },
-        _ => 0.0,
-    };
-    let (mut input, look_change) =
-        globe_input(held, look_delta, scroll_lines, time.delta_secs_f64());
+    let (mut input, look_change) = globe_input(
+        intent.movement,
+        intent.look_delta,
+        intent.scroll_lines,
+        intent.dt_s,
+    );
     if input.climb < 0.0 {
         input.climb *= descent_ease(flight.0.altitude_km);
     }
@@ -460,6 +432,10 @@ mod tests {
         GLOBE_CHASE_MAX_ELEVATION_DEG, globe_chase_elevation_deg, globe_fly_below_centre_deg,
         globe_look_pitch_deg,
     };
+
+    use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
+
+    use crate::ui::PointerOverUi;
 
     use super::*;
 

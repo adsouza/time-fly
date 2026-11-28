@@ -64,9 +64,10 @@ use super::{
 use crate::clock::LoadClock;
 use crate::cloud::{CloudDensity, add_cloud_density};
 use crate::data::GlobeData;
+use crate::flight_input::{FlightIntent, add_flight_input};
 use crate::fly_camera::{
     BOOST, CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyChase, FlyState, FlySystems, MAX_SPEED_MPS,
-    fly_speed, keys_to_input,
+    fly_speed,
 };
 use crate::globe_flight::{GlobeChase, GlobeFlightState, GlobeFlightSystems, GlobeLook};
 use crate::terrain::{TerrainScene, TerrainSceneSystems, TerrainSettings};
@@ -226,6 +227,7 @@ pub struct RegionNavigationPlugin;
 
 impl Plugin for RegionNavigationPlugin {
     fn build(&self, app: &mut App) {
+        add_flight_input(app);
         crate::clock::add_load_clock(app);
         add_cloud_density(app);
         app.init_resource::<Navigation>()
@@ -457,7 +459,7 @@ struct NavWriters<'w> {
 struct NavWorld<'w> {
     held_camera: Option<Res<'w, crate::ui::bug_shot::HeldCamera>>,
     region_state: Res<'w, State<RegionState>>,
-    keys: Option<Res<'w, ButtonInput<KeyCode>>>,
+    intent: Res<'w, FlightIntent>,
     globe: Option<Res<'w, GlobeData>>,
     region: Option<Res<'w, ActiveRegion>>,
     frames: Option<Res<'w, FrameCache>>,
@@ -541,9 +543,7 @@ fn navigate(
     // Held at the field's edge (`FlyControls::confined`), the fly does not move out of it: what
     // the player asks for counts there on that axis, so pressing out of the edge, straight or at
     // an angle (sliding along it), still starts a hop.
-    let wish = world.keys.as_deref().map_or(Vec2::ZERO, |k| {
-        wish_mps(&keys_to_input(k), flies.fly.yaw, p.y - ground_m)
-    });
+    let wish = wish_mps(&world.intent.movement, flies.fly.yaw, p.y - ground_m);
     let velocity = velocity_at_edges(xz, measured, wish);
     let inputs = NavInputs {
         now_s,
@@ -551,10 +551,7 @@ fn navigate(
         dt_s,
         region_state: state,
         time: time.years,
-        climb_key: world
-            .keys
-            .as_ref()
-            .is_some_and(|k| k.just_pressed(LEAVE_KEY)),
+        climb_key: world.intent.leave,
         entered,
         generated: generated.map(|g| (g.spec.center, g.spec.snapshot)),
         region_centre: region.map(|r| r.frame.center),
@@ -577,10 +574,7 @@ fn navigate(
         region_vel_mps: velocity,
         neighbour: pending.map(|r| (r.frame.center, r.grid.spec.snapshot)),
         preload_failed: events.3.read().count() > 0,
-        vertical_held: world
-            .keys
-            .as_deref()
-            .is_some_and(|k| keys_to_input(k).move_local.y != 0.0),
+        vertical_held: world.intent.movement.move_local.y != 0.0,
         time_queued: nav.slider.queued.is_some(),
         fields_settling: world
             .scene
@@ -879,7 +873,7 @@ fn apply_action(
     }
 }
 
-/// The horizontal velocity (m/s, `(x, z)`) the held keys ask of the region's fly heading `yaw`,
+/// The horizontal velocity (m/s, `(x, z)`) the player asks of the region's fly heading `yaw`,
 /// `agl_m` above the ground: as [`crate::fly_camera::fly_step`] would move it, unheld.
 fn wish_mps(keys: &crate::fly_camera::KeyInput, yaw: f32, agl_m: f32) -> Vec2 {
     let m = keys.move_local;

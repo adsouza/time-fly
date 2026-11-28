@@ -31,7 +31,7 @@
 //!
 //! **The chase camera** is the terrain scene's own `RegionCamera` entity (a root entity, so its
 //! `Transform` is its world transform, which the patch planner reads). [`FlyState`] is a
-//! resource: the step system ([`FlySystems::Step`]) writes it from the keyboard and mouse while
+//! resource: the step system ([`FlySystems::Step`]) writes it from flight intent while
 //! the player is flying, and [`FlySystems::Apply`] places the camera every frame:
 //! [`region_chase_pose`] puts the eye behind the fly's heading and above it (Task 1's
 //! `chase_pose`, looking [`chase_look_pitch_deg`] below the horizontal, so the view pitch tilts
@@ -43,7 +43,6 @@
 //! hold its size on screen, banked and bobbing) and the overlay's `FlyAltitude`. A scripted
 //! driver (Task 10's bench) writes [`FlyState`] between the two sets.
 
-use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::math::{DQuat, DVec3};
 use bevy::prelude::*;
 use timefly_core::terrain::blended_surface_m;
@@ -57,11 +56,14 @@ pub use timefly_core::flight::chase::CHASE_START_LOOK_DEG;
 use timefly_core::flight::chase::{ChasePose, chase_pose, fly_scale, lift_above_ground};
 
 use crate::creature::{FlyPose, HOVER_EASE_S, bank_step, hover_offset, pitch_step};
+pub use crate::flight_input::{
+    FlightAxes as KeyInput, descend_modifiers, is_mac_platform, keys_to_input, platform_is_mac,
+};
+use crate::flight_input::{FlightIntent, add_flight_input};
 use crate::region::navigate::{Navigation, NavigationSystems};
 use crate::region::{ActiveRegion, CAMERA_START_ALTITUDE_M};
 use crate::terrain::view::REGION_FOV_DEG;
 use crate::terrain::{RegionViewSystems, TerrainScene, TerrainSceneSystems};
-use crate::ui::PointerOverUi;
 use crate::ui::altitude::{Altitude, FlyAltitude};
 
 /// The least height above the drawn surface ([`blended_surface_m`]: the ground or the water over
@@ -312,16 +314,12 @@ pub enum FlySystems {
     Apply,
 }
 
-/// Whether the current left-button drag began off the UI (and so looks around).
-#[derive(Resource, Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct LookDrag(bool);
-
 pub struct FlyCameraPlugin;
 
 impl Plugin for FlyCameraPlugin {
     fn build(&self, app: &mut App) {
+        add_flight_input(app);
         app.init_resource::<FlyState>()
-            .init_resource::<LookDrag>()
             .init_resource::<FlyChase>()
             .init_resource::<FlyPose>()
             .init_resource::<FlyAltitude>()
@@ -339,129 +337,29 @@ impl Plugin for FlyCameraPlugin {
     }
 }
 
-/// What the held keys ask for this frame.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct KeyInput {
-    /// See [`FlyInput::move_local`].
-    pub move_local: Vec3,
-    /// See [`FlyInput::turn`].
-    pub turn: f32,
-    pub boost: bool,
-}
-
-/// Whether `navigator.platform` names a Mac (`"MacIntel"` in every current Mac browser).
-pub fn is_mac_platform(platform: &str) -> bool {
-    platform.starts_with("Mac")
-}
-
-/// Whether the game runs on a Mac: natively by the target, on the web by `navigator.platform`
-/// (read once). A Mac browser has the native app's clash (Mission Control is the system's, so a
-/// page cannot take the keys back), and elsewhere a browser's `Alt` with the arrows is Back and
-/// Forward, so the web follows the machine, not the build.
-pub fn platform_is_mac() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        static MAC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *MAC.get_or_init(|| {
-            web_sys::window()
-                .and_then(|w| w.navigator().platform().ok())
-                .is_some_and(|p| is_mac_platform(&p))
-        })
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        cfg!(target_os = "macos")
-    }
-}
-
-/// The modifier keys that descend (with `Q`, everywhere): `Option` on a Mac, where `Ctrl+↑`
-/// opens Mission Control and `Ctrl+←` / `→` switch Spaces; `Ctrl` elsewhere. Not `Cmd`: `⌘Q`
-/// quits, and `Q` is the other descend key.
-pub fn descend_modifiers(mac: bool) -> [KeyCode; 2] {
-    if mac {
-        [KeyCode::AltLeft, KeyCode::AltRight]
-    } else {
-        [KeyCode::ControlLeft, KeyCode::ControlRight]
-    }
-}
-
-/// The held keys as flight input:
-/// - `W` / `↑` forward, `S` / `↓` back, `A` / `D` sideways;
-/// - `Space` / `E` up, `Q` or the descend modifier ([`descend_modifiers`]: `Option` on a Mac,
-///   `Ctrl` elsewhere) down;
-/// - `←` / `→` turn, or fly sideways while `Shift` is held;
-/// - `Shift` with forward boosts. It boosts nothing else, since with the arrows it means
-///   "sideways".
-pub fn keys_to_input(keys: &ButtonInput<KeyCode>) -> KeyInput {
-    let held = |codes: &[KeyCode]| keys.any_pressed(codes.iter().copied());
-    let axis = |plus: bool, minus: bool| f32::from(u8::from(plus)) - f32::from(u8::from(minus));
-    let shift = held(&[KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let left = held(&[KeyCode::ArrowLeft]);
-    let right = held(&[KeyCode::ArrowRight]);
-    let (strafe_left, strafe_right) = if shift { (left, right) } else { (false, false) };
-    let move_local = Vec3::new(
-        axis(
-            held(&[KeyCode::KeyD]) || strafe_right,
-            held(&[KeyCode::KeyA]) || strafe_left,
-        ),
-        axis(
-            held(&[KeyCode::Space, KeyCode::KeyE]),
-            held(&descend_modifiers(platform_is_mac())) || held(&[KeyCode::KeyQ]),
-        ),
-        axis(
-            held(&[KeyCode::KeyS, KeyCode::ArrowDown]),
-            held(&[KeyCode::KeyW, KeyCode::ArrowUp]),
-        ),
-    );
-    KeyInput {
-        move_local,
-        turn: if shift { 0.0 } else { axis(right, left) },
-        boost: shift && move_local.z < 0.0,
-    }
-}
-
-/// Gathers the keys and the look drag, steps [`FlyState`] over the region's ground.
-#[expect(clippy::too_many_arguments, reason = "a Bevy system's parameters")]
+/// Applies flight intent while navigation gives the region fly control.
 fn step_fly(
     nav: Option<Res<Navigation>>,
     region: Option<Res<ActiveRegion>>,
-    time: Res<Time>,
-    keys: Option<Res<ButtonInput<KeyCode>>>,
-    mouse: Option<Res<ButtonInput<MouseButton>>>,
-    motion: Option<Res<AccumulatedMouseMotion>>,
-    over_ui: Option<Res<PointerOverUi>>,
-    mut drag: ResMut<LookDrag>,
+    intent: Res<FlightIntent>,
     mut fly: ResMut<FlyState>,
 ) {
-    // Flying, or around a hop's lift, whose height is the lift's (and which slows the fly to a
-    // drift while it holds in the cloud).
+    // Around a hop's lift, navigation owns height and slows the fly in the cloud.
     let controls = nav.and_then(|n| n.phase.fly_controls());
     let (Some(controls), Some(region)) = (controls, region) else {
-        drag.0 = false;
         return;
     };
-    if let Some(mouse) = &mouse {
-        if mouse.just_pressed(MouseButton::Left) {
-            drag.0 = !over_ui.is_some_and(|o| o.0);
-        } else if !mouse.pressed(MouseButton::Left) {
-            drag.0 = false;
-        }
-    }
-    let held = keys.as_deref().map(keys_to_input).unwrap_or_default();
-    let m = held.move_local;
+    let m = intent.movement.move_local;
     let input = FlyInput {
         move_local: Vec3::new(
             m.x * controls.horizontal,
             if controls.vertical { m.y } else { 0.0 },
             m.z * controls.horizontal,
         ),
-        look_delta: match (&motion, drag.0) {
-            (Some(m), true) => m.delta,
-            _ => Vec2::ZERO,
-        },
-        turn: held.turn,
-        boost: held.boost,
-        dt_s: time.delta_secs(),
+        look_delta: intent.look_delta,
+        turn: intent.movement.turn,
+        boost: intent.movement.boost,
+        dt_s: intent.dt_s as f32,
         confined: controls.confined,
     };
     let grid = &region.grid;
@@ -1385,6 +1283,96 @@ mod tests {
                 .atan2(to.dot(forward))
                 .to_degrees();
             (below, to.dot(cam.right().as_vec3()))
+        }
+
+        #[test]
+        fn flight_input_touch_moves_the_region_fly() {
+            use bevy::input::touch::TouchPhase::{Ended, Moved, Started};
+
+            use crate::flight_input::tests::{send, spawn_touch_window};
+            use crate::region::navigate::NavPhase;
+
+            let grid = grid(|_, _| 0.0);
+            let start = FlyState::start(&grid);
+            let mut app = app(&grid, start);
+            app.init_resource::<Navigation>();
+            app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Flying;
+            let window = spawn_touch_window(&mut app);
+            app.update();
+            let a = Vec2::new(120.0, 300.0);
+            let b = Vec2::new(280.0, 300.0);
+
+            send(&mut app, window, &[(0, Started, a), (1, Started, b)]);
+            let pan = Vec2::new(40.0, -80.0);
+            send(
+                &mut app,
+                window,
+                &[(0, Moved, a + pan), (1, Moved, b + pan)],
+            );
+            let fly = *app.world().resource::<FlyState>();
+            assert!(fly.pos_m.x > start.pos_m.x);
+            assert!(fly.pos_m.y > start.pos_m.y);
+            assert_eq!(fly.pos_m.z, start.pos_m.z);
+
+            send(
+                &mut app,
+                window,
+                &[(0, Ended, a + pan), (1, Ended, b + pan)],
+            );
+            let drag = Vec2::new(60.0, 30.0);
+            send(&mut app, window, &[(2, Started, a), (2, Moved, a + drag)]);
+            let turned = *app.world().resource::<FlyState>();
+            assert!(turned.yaw < fly.yaw);
+            assert!(turned.pitch < fly.pitch);
+            assert_eq!(turned.pos_m, fly.pos_m);
+        }
+
+        #[test]
+        fn flight_input_double_tap_turns_and_flies_to_region_terrain() {
+            use bevy::input::touch::TouchPhase::{Ended, Started};
+
+            use crate::flight_input::tests::{SIZE, prepare_camera, send, spawn_touch_window};
+            use crate::region::navigate::NavPhase;
+
+            let grid = grid(|_, _| 500.0);
+            let start = FlyState::start(&grid);
+            let mut app = app(&grid, start);
+            app.init_resource::<Navigation>();
+            app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Flying;
+            let window = spawn_touch_window(&mut app);
+            app.update();
+
+            let target = Vec3::new(4_000.0, 500.0, -6_000.0);
+            let pose = Transform::from_xyz(0.0, 10_000.0, 1_000.0).looking_at(target, Vec3::Y);
+            let world = app.world_mut();
+            let (mut camera, projection, mut transform) = world
+                .query_filtered::<(&mut Camera, &Projection, &mut GlobalTransform), With<RegionCamera>>()
+                .single_mut(world)
+                .unwrap();
+            prepare_camera(&mut camera, projection);
+            *transform = GlobalTransform::from(pose);
+
+            let center = SIZE.as_vec2() * 0.5;
+            for id in [0, 1] {
+                send(
+                    &mut app,
+                    window,
+                    &[(id, Started, center), (id, Ended, center)],
+                );
+            }
+            let turning = *app.world().resource::<FlyState>();
+            assert!(turning.yaw < 0.0);
+            assert_eq!(turning.pos_m, start.pos_m);
+            for _ in 0..50 {
+                app.update();
+            }
+            let arrived = *app.world().resource::<FlyState>();
+            assert!(
+                Vec2::new(arrived.pos_m.x - target.x, arrived.pos_m.z - target.z).length() <= 2.0
+            );
+            assert_eq!(arrived.pos_m.y, start.pos_m.y);
+            app.update();
+            assert_eq!(*app.world().resource::<FlyState>(), arrived);
         }
 
         #[test]

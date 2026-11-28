@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::AccumulatedMouseScroll;
+use bevy::input::touch::Touches;
 use bevy::math::{DQuat, DVec3};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
@@ -1070,6 +1071,7 @@ fn release_held_camera(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     scroll: Option<Res<AccumulatedMouseScroll>>,
+    touches: Option<Res<Touches>>,
     mut commands: Commands,
 ) {
     if held.is_none() {
@@ -1078,7 +1080,8 @@ fn release_held_camera(
     let key = keys.is_some_and(|k| k.get_just_pressed().any(|&code| code != SHOT_KEY));
     let button = mouse.is_some_and(|m| m.get_just_pressed().next().is_some());
     let scrolled = scroll.is_some_and(|s| s.delta != Vec2::ZERO);
-    if key || button || scrolled {
+    let touched = touches.is_some_and(|t| t.iter_just_pressed().next().is_some());
+    if key || button || scrolled || touched {
         info!("from shot: the camera is released");
         commands.remove_resource::<HeldCamera>();
     }
