@@ -1,8 +1,9 @@
 # River and globe render defects: the owner's bug shots of 2026-11-27
 
-Branch `river-render-defects`, cut from `rivers-and-lakes` at `009d2d0` (PR #16). This note
-diagnoses the three bug shots in `~/Pictures/Time Fly/` and the related issues from Task 12's
-renders (`manual-checks.md`), groups them by cause and says which fixes are ready to ship.
+Branch `river-render-defects`, cut from `rivers-and-lakes` at `009d2d0` (PR #16) and rebased onto
+`main` after #16 merged. This note diagnoses the three bug shots in `~/Pictures/Time Fly/` and
+the related issues from Task 12's renders (`manual-checks.md`), groups them by cause and says
+which fixes are ready to ship.
 
 **How the evidence was made.** `region_tour --from-shot <sidecar>` replays each shot offscreen at
 2560 × 1440; all three replays show the same view and the same defects as the owner's PNGs. For the region
