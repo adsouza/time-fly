@@ -42,7 +42,7 @@ use timefly_core::flight::position::{
 use timefly_core::geo::RenderDir;
 use timefly_core::worldgen::generate::RegionSpec;
 
-use super::position::{FlyPlace, Place, ShotWorld, spawn_position, update_fly_place};
+use super::position::{FlyPlace, Place, ShotWorld, update_fly_place};
 use super::{BlocksCamera, PANEL_COLOR, TEXT_COLOR};
 use crate::clock::{LoadClock, add_load_clock};
 use crate::diagnostics::SessionInfo;
@@ -491,7 +491,7 @@ impl Plugin for BugShotPlugin {
             .init_resource::<ShotToast>()
             .init_resource::<ShotPending>()
             .add_message::<ShotRequested>()
-            .add_systems(Startup, (spawn_button.after(spawn_position), spawn_toast))
+            .add_systems(Startup, (spawn_button, spawn_toast))
             .add_systems(Update, take_shot.after(update_fly_place))
             .add_systems(PostUpdate, show_toast);
     }
@@ -535,23 +535,28 @@ impl Plugin for ShotRestorePlugin {
 }
 
 /// A small camera drawn from boxes (the UI font has no camera glyph): a body, a lens and the
-/// viewfinder's bump.
-fn spawn_button(mut commands: Commands, column: Single<Entity, With<super::altitude::HudColumn>>) {
-    let button = commands
+/// viewfinder's bump. In the window's top-right corner (Task 11c fix round 2, the owner's
+/// request), the frame-rate readout just left of it.
+fn spawn_button(mut commands: Commands) {
+    commands
         .spawn((
             Name::new("Bug shot button"),
             ShotButton,
             BlocksCamera,
             Node {
-                width: px(26),
-                height: px(20),
-                margin: UiRect::top(px(2)),
+                position_type: PositionType::Absolute,
+                top: px(super::GUTTER_PX),
+                right: px(super::GUTTER_PX),
+                width: px(super::CORNER_BUTTON_PX.x),
+                height: px(super::CORNER_BUTTON_PX.y),
                 justify_content: JustifyContent::Center,
                 align_items: AlignItems::Center,
                 border_radius: BorderRadius::all(px(4)),
                 ..default()
             },
             BackgroundColor(PANEL_COLOR),
+            // Above the scene's UI, as the readout beside it.
+            GlobalZIndex(10),
         ))
         .with_children(|b| {
             b.spawn((
@@ -598,9 +603,7 @@ fn spawn_button(mut commands: Commands, column: Single<Entity, With<super::altit
             |_: On<PointerClick>, mut requests: MessageWriter<ShotRequested>| {
                 requests.write(ShotRequested);
             },
-        )
-        .id();
-    commands.entity(*column).add_child(button);
+        );
 }
 
 fn spawn_toast(mut commands: Commands) {
@@ -1399,6 +1402,33 @@ mod tests {
             *app.world().get::<Transform>(entity).unwrap()
         }
 
+        /// The button takes the window's top-right corner (fix round 2, the owner's request),
+        /// above the scene's input, and keeps its click observer.
+        #[test]
+        fn the_shot_button_sits_in_the_top_right_corner() {
+            use crate::ui::{CORNER_BUTTON_PX, GUTTER_PX};
+            let (mut app, _) = globe_app(true);
+            app.update();
+            let world = app.world_mut();
+            let mut q = world.query_filtered::<(Entity, &Node, Has<BlocksCamera>, Option<&ChildOf>), With<ShotButton>>();
+            let (button, node, blocks, parent) = q.single(world).unwrap();
+            assert_eq!(node.position_type, PositionType::Absolute);
+            assert_eq!((node.top, node.right), (px(GUTTER_PX), px(GUTTER_PX)));
+            assert_eq!(
+                (node.width, node.height),
+                (px(CORNER_BUTTON_PX.x), px(CORNER_BUTTON_PX.y))
+            );
+            assert!(blocks, "the button keeps the pointer from the camera");
+            assert!(parent.is_none(), "a root node, not in the HUD's column");
+            // Its click observer (it writes ShotRequested) comes with it.
+            assert!(
+                app.world()
+                    .get::<bevy::ecs::observer::ObservedBy>(button)
+                    .is_some_and(|o| !o.get().is_empty()),
+                "the click observer"
+            );
+        }
+
         #[test]
         fn f12_fixes_the_name_and_the_sidecar_at_the_press() {
             let dir = std::env::temp_dir().join(format!("timefly-f12-{}", std::process::id()));
@@ -1609,17 +1639,13 @@ mod tests {
                     snapshot: request.snapshot,
                     ..saved.spec()
                 };
-                let field = |size_m| Field {
-                    res: 2,
-                    size_m,
-                    elevation_m: vec![0.0; 4],
-                    surface: vec![[0; 4]; 4],
-                };
+                let field = |size_m| Field::dry(2, size_m, vec![0.0; 4], vec![[0; 4]; 4]);
                 commands.insert_resource(ActiveRegion {
                     grid: Arc::new(RegionGrid {
                         spec,
                         inner: field(REGION_SIZE_M),
                         apron: field(APRON_SIZE_M),
+                        boulders: Vec::new(),
                     }),
                     frame: spec.frame(),
                 });

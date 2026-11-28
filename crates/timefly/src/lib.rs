@@ -6,6 +6,7 @@ use bevy::window::{PresentMode, WindowResolution};
 pub mod args;
 pub mod art;
 pub mod bench;
+pub mod boulders;
 pub mod build_features;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod check_data;
@@ -19,7 +20,13 @@ pub mod fly_camera;
 pub mod globe;
 pub mod globe_flight;
 pub mod gpu;
+pub mod hydro;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hydro_check;
 pub mod region;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ridged_bake;
+pub mod scatter;
 pub mod sky;
 pub mod terrain;
 pub mod time;
@@ -38,6 +45,7 @@ use diagnostics::{DiagnosticsPlugin, Session};
 use fly_camera::FlyCameraPlugin;
 use globe::GlobePlugin;
 use globe_flight::GlobeFlightPlugin;
+use hydro::HydroPlugin;
 use region::RegionPlugin;
 use region::launch::LaunchRegion;
 use region::navigate::RegionNavigationPlugin;
@@ -178,25 +186,34 @@ pub fn app(session: &Session) -> App {
     // Bevy's web panic handler replaces the panic hook; ours chains console_error_panic_hook.
     #[cfg(target_arch = "wasm32")]
     let plugins = plugins.disable::<bevy::app::PanicHandlerPlugin>();
-    app.add_plugins(plugins)
-        .add_plugins((
+    app.add_plugins(plugins).add_plugins((
+        (
+            // GPU frame time from pass timestamps, where the device has them (the benches
+            // report it).
+            diagnostics::gpu_time::GpuTimePlugin,
             clusters::NoClusteringPlugin,
-            time::TimePlugin,
-            GlobeDataPlugin::default(),
-            GlobePlugin,
-            RegionPlugin,
-            TerrainCdlodPlugin,
-            sky::SkyPlugin,
+        ),
+        time::TimePlugin,
+        GlobeDataPlugin::default(),
+        GlobePlugin,
+        // The pass shares the region plugin's tile index and frame cache.
+        (RegionPlugin, HydroPlugin),
+        TerrainCdlodPlugin,
+        sky::SkyPlugin,
+        (
             water::WaterPlugin,
-            terrain::warmup::RegionWarmupPlugin,
-            GlobeFlightPlugin,
-            RegionNavigationPlugin,
-            FlyCameraPlugin,
-            CreaturePlugin,
-            cloud::CloudPlugin,
-            GameUiPlugins,
-        ))
-        .add_plugins(ShotRestorePlugin);
+            scatter::ScatterPlugin,
+            boulders::BoulderPlugin,
+        ),
+        terrain::warmup::RegionWarmupPlugin,
+        GlobeFlightPlugin,
+        RegionNavigationPlugin,
+        FlyCameraPlugin,
+        CreaturePlugin,
+        cloud::CloudPlugin,
+        GameUiPlugins,
+    ));
+    app.add_plugins(ShotRestorePlugin);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = remembered {
         app.add_plugins(window_memory::WindowMemoryPlugin { path });

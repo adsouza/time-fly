@@ -19,8 +19,12 @@ use timefly_core::worldgen::frame::RegionFrame;
 use timefly_core::worldgen::generate::{RegionGenerator, RegionSpec};
 use timefly_core::worldgen::tiles::TileSet;
 
+/// The real bake: `TIMEFLY_REAL_DATA` (a worktree has none; point it at the main checkout's
+/// `crates/timefly/assets/data`), else this checkout's.
 fn data() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../timefly/assets/data")
+    std::env::var_os("TIMEFLY_REAL_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../timefly/assets/data"))
 }
 
 fn tile_dir() -> PathBuf {
@@ -128,7 +132,7 @@ fn ten_ma_channels() {
         seed: 0x7F1E_0002,
         ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
     };
-    let grid = RegionGenerator::new(spec, &field).finish();
+    let grid = RegionGenerator::new(spec, &field, None).finish();
     // The globe's reference at the same directions, with the same frames.
     let deep = match b.timeline.select_frames(age) {
         FrameSelection::Deep(d) => d,
@@ -388,7 +392,7 @@ fn modern_path_at(b: &Bake, globe: &Path, age: f64) -> usize {
             ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
         };
         let t0 = std::time::Instant::now();
-        let grid = RegionGenerator::new(spec, &field).finish();
+        let grid = RegionGenerator::new(spec, &field, None).finish();
         let secs = t0.elapsed().as_secs_f64();
         let sample = |e: usize, d: RenderDir| {
             let mut s = cube_rg(grids[sampling.endpoints[e].frame].as_ref().unwrap(), d);
@@ -578,7 +582,7 @@ fn candidate_stats(
             ..RegionSpec::new(centre, YearsBp(years), 0)
         };
         let t0 = std::time::Instant::now();
-        let grid = RegionGenerator::new(spec, &field).finish();
+        let grid = RegionGenerator::new(spec, &field, None).finish();
         s.gen_secs = Some(t0.elapsed().as_secs_f64());
         s.grid_max_m = grid.inner.elevation_m.iter().copied().reduce(f32::max);
         let mut counts = std::collections::BTreeMap::new();
@@ -703,7 +707,7 @@ fn dry_snowline_on_the_real_bake() {
             seed: 0x7F1E_0002,
             ..RegionSpec::new(centre, YearsBp(0.0), 0)
         };
-        (RegionGenerator::new(spec, &field).finish(), frame)
+        (RegionGenerator::new(spec, &field, None).finish(), frame)
     };
     let snowy = |s: &[u8; 4]| {
         s[2] >= 128 || s[0] == BiomeClass::IceCap as u8 || s[0] == BiomeClass::Alpine as u8
@@ -843,7 +847,7 @@ fn inner_field_at(lat: f64, lon: f64) -> timefly_core::worldgen::generate::Field
         seed: 0x7F1E_0002,
         ..RegionSpec::new(centre, YearsBp::from_myr(age), 0)
     };
-    RegionGenerator::new(spec, &field).finish().inner
+    RegionGenerator::new(spec, &field, None).finish().inner
 }
 
 /// The shader's band ramp on dry bare ground (`terrain.wesl`: smoothstep from `BAND_MIN_SLOPE`
@@ -992,4 +996,283 @@ fn grand_canyon_map() {
         }
         r0 += cell;
     }
+}
+
+/// The shipped climate table (`data/hydrology/climate_table.json`), parsed as the shell does.
+fn climate_table() -> timefly_core::hydrology::climate::ClimateTable {
+    use timefly_core::hydrology::climate::{BIOME_ORDER, Climate, ClimateTable};
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("../../../data/hydrology/climate_table.json")).unwrap();
+    let points = |key: &str| -> Vec<(f32, f32)> {
+        v[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p[0].as_f64().unwrap() as f32, p[1].as_f64().unwrap() as f32))
+            .collect()
+    };
+    ClimateTable {
+        pet_mm: points("pet_mm"),
+        lake_evaporation_mm: points("lake_evaporation_mm"),
+        turc_pike_n: v["turc_pike_n"].as_f64().unwrap() as f32,
+        ice_melt_runoff_mm: v["ice_melt_runoff_mm"].as_f64().unwrap() as f32,
+        biome_climate: BIOME_ORDER.map(|b| {
+            let row = &v["biome_climate"][format!("{b:?}")];
+            Climate {
+                precip_mm: row[0].as_f64().unwrap() as f32,
+                temp_c: row[1].as_f64().unwrap() as f32,
+            }
+        }),
+    }
+}
+
+/// Rivers and lakes Task 8b's real-data check: the present day's continental pass on the real
+/// overview and the Beyer 0 ka climate, as the game runs it (n = 900, recent mode), then the
+/// region refinement at Victoria Falls, Iguazu Falls and Manaus for the rapids. Prints every
+/// check, then asserts them. Uses only interfaces older than Task 8b, so the same test measures
+/// the commit before it.
+/// `TIMEFLY_REAL_DATA=<main checkout>/crates/timefly/assets/data cargo test -p timefly_core
+/// --test real_bake_region -- --ignored --nocapture todays_lakes`.
+#[test]
+#[ignore = "reads the real bake and climate"]
+fn todays_lakes_on_the_real_overview() {
+    use timefly_core::hydrology::climate::{BeyerClimate, ZonalClimate};
+    use timefly_core::hydrology::{
+        HydroPrep, LakeKind, LatticeSizes, SnapshotSource, hydro_lattice_for, river_tile_margin_m,
+    };
+    use timefly_core::worldgen::generate::FieldKind;
+    let globe = data().join("globe");
+    let b = bake(&globe);
+    let age = 0.0;
+    let mut grids: Vec<Option<Grid>> = vec![None; b.files.len()];
+    for i in frames_needed(&b.timeline, age) {
+        grids[i] = Some(read_tfgrid(&fs::read(globe.join(&b.files[i])).unwrap()).unwrap());
+    }
+    let overview = read_tfgrid(&fs::read(tile_dir().join("overview.tfgrid")).unwrap()).unwrap();
+    let mut tiles = TileSet::new();
+    tiles.set_overview(overview.clone()).unwrap();
+    let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+        grids[i].as_ref().unwrap()
+    })
+    .unwrap();
+    let (lattice, mode) = hydro_lattice_for(&b.timeline, age, LatticeSizes::default());
+    let source = SnapshotSource::new(&field, &tiles, &b.timeline, age, mode);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(data().join("climate/manifest.json")).unwrap()).unwrap();
+    let file = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["age_ka"].as_f64() == Some(0.0))
+        .unwrap()["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bio = read_tfgrid(&fs::read(data().join("climate").join(file)).unwrap()).unwrap();
+    let table = climate_table();
+    let zonal = ZonalClimate {
+        table: &table,
+        sea_level_anomaly_m: 0.0,
+    };
+    let climate = BeyerClimate::new([&bio, &bio], 0.0, zonal);
+    let t = std::time::Instant::now();
+    let mut prep = HydroPrep::new(lattice, YearsBp(0.0));
+    while !prep.step(&source, &climate, &table, 1 << 22) {}
+    let h = prep.finish();
+    println!("pass: {:?}, mode {mode:?}, n = {}", t.elapsed(), lattice.n);
+
+    let count = |k: LakeKind| h.lakes.iter().filter(|l| l.kind == k).count();
+    let area: f64 = h.lakes.iter().map(|l| l.area_km2).sum();
+    println!(
+        "lakes: {} (open {}, terminal {}, data {}), total area {:.0} km2, unplaced table points {:?}",
+        h.lakes.len(),
+        count(LakeKind::Open),
+        count(LakeKind::Terminal),
+        count(LakeKind::Data),
+        area,
+        h.unplaced_lake_levels
+    );
+    let mut big: Vec<&timefly_core::hydrology::Lake> = h.lakes.iter().collect();
+    big.sort_by(|a, b| b.area_km2.total_cmp(&a.area_km2));
+    for l in big.iter().take(12) {
+        let (la, lo) = geo_to_latlon(render_to_geo(h.lattice.dir(l.exit)));
+        println!(
+            "  {:?} {:8.1} m (spill {:8.1}) {:9.0} km2 at ({la:.2}, {lo:.2})",
+            l.kind, l.level_m, l.spill_m, l.area_km2
+        );
+    }
+    let dir_of = |lat: f64, lon: f64| geo_to_render(latlon_to_geo(lat, lon));
+    let lake_at = |lat: f64, lon: f64| h.lake_tap(dir_of(lat, lon));
+    let overview_at = |lat: f64, lon: f64| tiles.sample_overview(lat, lon).unwrap().0;
+    let mut failures = Vec::new();
+    println!("| check | point | lake (kind, level m) | reference m | result |");
+    println!("|---|---|---|---|---|");
+    // Round 2: mapped lakes against their baked fine surface (the shipped map's level there),
+    // the Caspian against the table.
+    let baked = |lat: f64, lon: f64| {
+        timefly_core::hydrology::lakemap::shipped_lake_map()
+            .level_at(lat, lon)
+            .unwrap_or(f32::NAN)
+    };
+    for (name, lat, lon, reference) in [
+        ("Titicaca", -15.8, -69.4, None),
+        ("Victoria", -1.0, 33.0, None),
+        ("Dead Sea", 31.5, 35.5, None),
+        ("Great Salt Lake", 41.1, -112.5, None),
+        ("Caspian (table)", 42.0, 51.0, Some(-28.0f32)),
+    ] {
+        let want = reference.unwrap_or_else(|| baked(lat, lon));
+        println!("    {name}: overview {:.1} m", overview_at(lat, lon));
+        let got = lake_at(lat, lon);
+        let ok = got.is_some_and(|t| (t.level_m - want).abs() <= 5.0);
+        println!(
+            "| {name} within 5 m | ({lat}, {lon}) | {} | {want:.1} | {} |",
+            got.map_or("none".into(), |t| format!("{:?} {:.1}", t.kind, t.level_m)),
+            if ok { "pass" } else { "FAIL" }
+        );
+        if !ok {
+            failures.push(name);
+        }
+    }
+    for (name, lat, lon) in [("Manaus", -3.1, -60.0), ("Skardu", 35.3, 75.6)] {
+        let got = lake_at(lat, lon);
+        println!(
+            "| no lake at {name} | ({lat}, {lon}) | {} | - | {} |",
+            got.map_or("none".into(), |t| format!("{:?} {:.1}", t.kind, t.level_m)),
+            if got.is_none() { "pass" } else { "FAIL" }
+        );
+        if got.is_some() {
+            failures.push(name);
+        }
+    }
+    // The Kashmir valley floor: no lake above 1,600 m within 15 km of (34.1, 74.8).
+    let mut kashmir: Option<f32> = None;
+    for a in -3..=3 {
+        for k in -3..=3 {
+            let d = RegionFrame {
+                center: dir_of(34.1, 74.8),
+            }
+            .local_to_dir(f64::from(a) * 5_000.0, f64::from(k) * 5_000.0);
+            if let Some(t) = h.lake_tap(d) {
+                kashmir = Some(kashmir.map_or(t.level_m, |m| m.max(t.level_m)));
+            }
+        }
+    }
+    let ok = kashmir.is_none_or(|l| l <= 1_600.0);
+    println!(
+        "| no lake above 1,600 m on the Kashmir floor | (34.1, 74.8) ± 15 km | {} | 1600 | {} |",
+        kashmir.map_or("none".into(), |l| format!("highest {l:.1}")),
+        if ok { "pass" } else { "FAIL" }
+    );
+    if !ok {
+        failures.push("Kashmir");
+    }
+
+    // The Black Sea is sea, not part of a Caspian lake through the Manych.
+    let black = h.lattice.nearest(dir_of(43.0, 34.0));
+    let ok = h.is_ocean(black) && lake_at(43.0, 34.0).is_none();
+    println!(
+        "| Black Sea is ocean, no lake | (43.0, 34.0) | {} | - | {} |",
+        lake_at(43.0, 34.0).map_or("none".into(), |t| format!("{:?} {:.1}", t.kind, t.level_m)),
+        if ok { "pass" } else { "FAIL" }
+    );
+    if !ok {
+        failures.push("Black Sea");
+    }
+    if let Some(t) = lake_at(42.0, 51.0) {
+        let l = &h.lakes[t.lake as usize];
+        let (la, lo) = geo_to_latlon(render_to_geo(h.lattice.dir(l.exit)));
+        println!(
+            "    Caspian: {:?} {:.1} m over {:.0} km2, exit ({la:.2}, {lo:.2})",
+            l.kind, l.level_m, l.area_km2
+        );
+        if l.area_km2 > 500_000.0 {
+            failures.push("Caspian footprint");
+        }
+    }
+
+    // Rapids: the refinement's sub-points within `r_km` of a point, and how many are rapids.
+    let margin = river_tile_margin_m(&h.lattice);
+    let rapids_near = |lat: f64, lon: f64, r_km: f64| -> (usize, usize, f32, String) {
+        let centre = dir_of(lat, lon);
+        let frame = RegionFrame { center: centre };
+        let mut tiles = TileSet::new();
+        tiles.set_overview(overview.clone()).unwrap();
+        let needed = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+            grids[i].as_ref().unwrap()
+        })
+        .unwrap()
+        .tiles_needed_with_margin(&frame, margin);
+        for (r, c) in needed {
+            let path = tile_dir().join(format!("r{r:02}c{c:02}.tfgrid"));
+            tiles
+                .insert(r, c, read_tfgrid(&fs::read(path).unwrap()).unwrap())
+                .unwrap();
+        }
+        let field = snapshot_field(&b.timeline, &b.crust, &tiles, false, age, |i| {
+            grids[i].as_ref().unwrap()
+        })
+        .unwrap();
+        let g = RegionGenerator::new(RegionSpec::new(centre, YearsBp(0.0), 7), &field, Some(&h));
+        let rivers = g.rivers(FieldKind::Inner).expect("a pass");
+        let reach = r_km * 1000.0 / 6_371_000.0;
+        let (mut near, mut rapid, mut most) = (0, 0, 0.0f32);
+        // The nearest sub-point, and the strongest rapid within 30 km.
+        let (mut nearest, mut wide) = ((f64::MAX, 0.0f32, 0.0f32), (0.0f32, 0.0f64));
+        for (a, _) in rivers.sub_segments() {
+            let d_km = a.dir.angle_between(centre.0) * 6_371.0;
+            if d_km < nearest.0 {
+                nearest = (d_km, a.half_width_m * 2.0, a.speed_mps);
+            }
+            if d_km <= 30.0 && a.rapid > wide.0 {
+                wide = (a.rapid, d_km);
+            }
+            if a.dir.angle_between(centre.0) <= reach {
+                near += 1;
+                if a.rapid > 0.0 {
+                    rapid += 1;
+                }
+                most = most.max(a.rapid);
+            }
+        }
+        let note = format!(
+            "nearest {:.1} km ({:.0} m wide, {:.2} m/s); strongest rapid within 30 km {:.2} at {:.1} km",
+            nearest.0, nearest.1, nearest.2, wide.0, wide.1
+        );
+        (near, rapid, most, note)
+    };
+    for (name, lat, lon, r_km, want_rapids) in [
+        ("Victoria Falls", -17.925, 25.857, 5.0, true),
+        ("Iguazu Falls", -25.695, -54.437, 5.0, true),
+        ("Manaus", -3.1, -60.0, 50.0, false),
+    ] {
+        let (near, rapid, most, note) = rapids_near(lat, lon, r_km);
+        println!("    {name}: {note}");
+        // Round 2: the falls are recorded, not checked (their drops are below the data's
+        // resolution; they stay as Task 12 renders).
+        let ok = if want_rapids {
+            true
+        } else {
+            near > 0 && rapid == 0
+        };
+        println!(
+            "| {} within {r_km} km of {name} | ({lat}, {lon}) | {near} sub-points, {rapid} rapid, most {most:.2} | - | {} |",
+            if want_rapids {
+                "rapids (recorded)"
+            } else {
+                "no rapids"
+            },
+            if want_rapids {
+                "-"
+            } else if ok {
+                "pass"
+            } else {
+                "FAIL"
+            }
+        );
+        if !ok {
+            failures.push(name);
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
 }

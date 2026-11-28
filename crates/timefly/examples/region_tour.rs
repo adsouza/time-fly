@@ -33,7 +33,9 @@
 //!
 //! A fifth argument `high` checks a region from high up (M3 Task 6; give a large `AGL_M`): after
 //! the start shot (looking north at the start pitch) it sets the steepest view pitch
-//! ([`MIN_PITCH_DEG`], the chase camera looking 45° down) and saves `<prefix>-down.png`.
+//! ([`MIN_PITCH_DEG`], the chase camera looking 45° down) and saves `<prefix>-down.png`. Given
+//! a `LATER_S`, it then saves [`DOWN_BURST`] more down shots `LATER_S` seconds apart,
+//! `<prefix>-down-1.png` …, for a clip of the animated water (Task 11c fix round 5).
 //!
 //! A fifth argument `cruise` checks the chase camera in sustained flight (M3 Task 3): after the
 //! start shot it holds `W` for [`FLIGHT_SHOT_SECS`] and saves `<prefix>-cruise.png` while still
@@ -123,7 +125,14 @@
 //! (as in the benches), the camera is held `AGL_M` above the centre, and after the settle it
 //! records [`TIME_SECS`] of frame deltas and logs one `region tour frame times` line (mean,
 //! median, p95 and worst), then exits. Run the same pose over two scenes to read a cost as a
-//! difference.
+//! difference. Where the device has timestamp queries it also logs a `region tour gpu frame
+//! times` line from the game's pass timestamps (rivers and lakes Task 10), the frames' GPU time,
+//! which reads a cost even when the display paces the frames.
+//!
+//! Scene switches for those differences (rivers and lakes Task 10), anywhere among the
+//! arguments: `--no-rivers` turns the continental pass off, so the region has no rivers or lakes
+//! (the water still draws its sea and discards over dry land); `--no-water` hides the water
+//! entirely.
 
 use std::path::PathBuf;
 
@@ -135,14 +144,17 @@ use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{PresentMode, PrimaryWindow};
 use timefly::args::{LaunchArgs, parse_region, parse_window_size};
 use timefly::bench::frame_time_stats;
+use timefly::bench::gpu_frame_line;
 use timefly::cloud::CloudDensity;
 use timefly::creature::{FlyPose, dragonfly_wings_mesh};
 use timefly::diagnostics;
+use timefly::diagnostics::gpu_time::{GpuFrameMeasured, GpuFrameTime};
 use timefly::fly_camera::{
     CAMERA_CEILING_M, CAMERA_CLEARANCE_M, FlyState, FlySystems, MIN_PITCH_DEG,
 };
 use timefly::globe::{GlobeCamera, GlobeRenderStatus};
 use timefly::globe_flight::{GlobeFlightState, GlobeLook};
+use timefly::hydro::HydroSettings;
 use timefly::region::launch::launch_request;
 use timefly::region::navigate::{LEAVE_KEY, World};
 use timefly::region::navigate::{NavPhase, Navigation, NavigationSystems, same_region};
@@ -155,6 +167,7 @@ use timefly::time::{GlobeTime, OLDER_KEY, YOUNGER_KEY};
 use timefly::ui::bug_shot::{
     HeldCamera, LastShot, SHOT_KEY, ShotFolder, ShotRestore, ShotTarget, load_shot,
 };
+use timefly::water::RegionWater;
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::{CLOUD_TOP_KM, GLOBE_MAX_ALTITUDE_KM};
 use timefly_core::flight::globe::GlobeFlight;
@@ -165,6 +178,8 @@ use timefly_core::worldgen::frame::RegionFrame;
 const SETTLE_SECS: f32 = 6.0;
 /// Frames between a shot and the next change, and between toggling the wireframe and its shot.
 const WIRE_FRAMES: u32 = 20;
+/// `high` mode with a `LATER_S`: this many more down shots, `LATER_S` seconds apart.
+const DOWN_BURST: u32 = 6;
 /// Frames after the last shot before exiting.
 const DONE_FRAMES: u32 = 240;
 /// Seconds to wait for the region.
@@ -304,8 +319,11 @@ struct Tour {
     requested: RegionRequested,
     /// Camera height above `max(ground, 0)` at the centre.
     agl_m: f32,
-    /// Seconds after the shaded shot to save the `later` one (`shaded` mode only).
+    /// Seconds after the shaded shot to save the `later` one (`shaded` mode), or between the
+    /// down burst's shots (`high` mode).
     later_s: Option<f32>,
+    /// The down burst's shots taken so far (`high` mode).
+    burst: u32,
     /// When the shaded shot was requested.
     shot_at: f32,
     step: Step,
@@ -318,6 +336,8 @@ struct Tour {
     left_generating: bool,
     /// Frame deltas recorded in `time` mode, milliseconds.
     frame_ms: Vec<f32>,
+    /// GPU frame times read while timing (`time` mode), milliseconds.
+    gpu_ms: Vec<f32>,
     /// The density the cloud is held at, if any (`cloud`, `cloudtime`).
     pin: Option<f32>,
     /// `time` renders into the offscreen image too (`--offscreen`).
@@ -459,6 +479,7 @@ fn tour(
     last_shot: Res<LastShot>,
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
+    gpu: Option<Res<GpuFrameTime>>,
 ) {
     let (nav, mut fly, region, time) = flight;
     let now = real.elapsed_secs();
@@ -485,7 +506,7 @@ fn tour(
             return;
         }
         if let Some(r) = region.as_ref() {
-            let surface = timefly_core::terrain::blended_height_m(&r.grid, 0.0, 0.0).max(0.0);
+            let surface = timefly_core::terrain::blended_surface_m(&r.grid, 0.0, 0.0);
             if !(CAMERA_CLEARANCE_M..=CAMERA_CEILING_M - surface).contains(&tour.agl_m) {
                 error!(
                     requested_agl_m = tour.agl_m,
@@ -611,6 +632,16 @@ fn tour(
         Step::Down => {
             if tour.frames == 2 * WIRE_FRAMES {
                 shoot(&mut commands, &tour, "down");
+                tour.shot_at = now;
+            } else if let Some(dt) = tour.later_s.filter(|_| tour.burst < DOWN_BURST) {
+                if tour.frames > 2 * WIRE_FRAMES && now - tour.shot_at >= dt {
+                    tour.burst += 1;
+                    let name = format!("down-{}", tour.burst);
+                    shoot(&mut commands, &tour, &name);
+                    tour.shot_at = now;
+                    // Let the last shot resolve before the tour ends.
+                    tour.frames = 2 * WIRE_FRAMES + 1;
+                }
             } else if tour.frames > 3 * WIRE_FRAMES {
                 tour.step = Step::Done;
                 tour.frames = 0;
@@ -838,6 +869,17 @@ fn tour(
                      ms, p95 {:.2} ms, worst {:.2} ms",
                     tour.prefix, tour.agl_m, s.frames, mean, s.median_ms, s.p95_ms, s.worst_ms
                 );
+                let gpu_line = gpu_frame_line(
+                    &tour.prefix,
+                    &tour.gpu_ms,
+                    gpu.as_deref().is_some_and(|g| g.available),
+                );
+                let gpu_mean = tour.gpu_ms.iter().sum::<f32>() / tour.gpu_ms.len().max(1) as f32;
+                info!(
+                    gpu_mean_ms = gpu_mean,
+                    "region tour gpu frame times: {gpu_line}"
+                );
+                println!("region tour gpu frame times: {gpu_line}, mean {gpu_mean:.2} ms");
                 exit.write(AppExit::Success);
             }
         }
@@ -934,7 +976,7 @@ fn hop_tour(
     let n = hop.hop + 1;
     let region = region.as_deref();
     let ground = |r: &ActiveRegion, x: f32, z: f32| {
-        timefly_core::terrain::blended_height_m(&r.grid, f64::from(x), f64::from(z)).max(0.0)
+        timefly_core::terrain::blended_surface_m(&r.grid, f64::from(x), f64::from(z))
     };
     if hop.frames > HOP_GIVE_UP_FRAMES {
         error!(step = ?hop.step, phase = ?nav.phase, "region tour: the hop never finished");
@@ -1436,6 +1478,26 @@ fn pin_cloud(tour: Res<Tour>, mut density: ResMut<CloudDensity>) {
     }
 }
 
+/// `time` mode: the GPU frame times read while timing.
+fn record_gpu_frames(mut tour: ResMut<Tour>, mut frames: MessageReader<GpuFrameMeasured>) {
+    let timing = tour.step == Step::Timing;
+    for frame in frames.read() {
+        if timing {
+            tour.gpu_ms.push(frame.ms);
+        }
+    }
+}
+
+/// `--no-water`: keeps the region's water hidden, so a scene without it can be timed.
+fn hide_water(water: Option<Res<RegionWater>>, mut visibility: Query<&mut Visibility>) {
+    if let Some(drawn) = water.as_ref().and_then(|w| w.drawn.as_ref())
+        && let Ok(mut v) = visibility.get_mut(drawn.entity)
+        && *v != Visibility::Hidden
+    {
+        *v = Visibility::Hidden;
+    }
+}
+
 /// `time` mode: vsync off, as `--region-bench` sets it, so frame times show the real cost.
 fn uncap_frames(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
     for mut window in &mut windows {
@@ -1444,8 +1506,8 @@ fn uncap_frames(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
 }
 
 fn main() -> AppExit {
-    // `--no-dunes`, `--offscreen` and `--from-shot <json>` may come anywhere; the rest are
-    // positional.
+    // The flags and `--from-shot <json>` may come anywhere; the rest are positional.
+    const FLAGS: [&str; 4] = ["--no-dunes", "--offscreen", "--no-rivers", "--no-water"];
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     let mut from_shot = None;
     if let Some(i) = argv.iter().position(|a| a.starts_with("--from-shot")) {
@@ -1470,14 +1532,15 @@ fn main() -> AppExit {
         }
         None => None,
     };
-    let (flags, args): (Vec<String>, Vec<String>) = argv
-        .into_iter()
-        .partition(|a| a == "--no-dunes" || a == "--offscreen");
+    let (flags, args): (Vec<String>, Vec<String>) =
+        argv.into_iter().partition(|a| FLAGS.contains(&a.as_str()));
     let no_dunes = flags.iter().any(|f| f == "--no-dunes");
     let offscreen = flags.iter().any(|f| f == "--offscreen");
+    let no_rivers = flags.iter().any(|f| f == "--no-rivers");
+    let no_water = flags.iter().any(|f| f == "--no-water");
     let Some(out) = args.first().map(PathBuf::from) else {
         eprintln!(
-            "usage: region_tour [--no-dunes] [--offscreen] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
+            "usage: region_tour [--no-dunes] [--offscreen] [--no-rivers] [--no-water] <out_dir> [WxH] [LAT,LON,AGE_YEARS] [prefix] \
              [shaded|high|fly|cruise|cloud|descent|time|cloudtime|cloudtime1|dive|divekey|lowclimb|hop|hop1|bugshot|globebug|globedescent] [AGL_M] [LATER_S] \
              [--from-shot <json>]"
         );
@@ -1568,6 +1631,18 @@ fn main() -> AppExit {
         ..default()
     });
     let mut app = timefly::app(&session);
+    if no_rivers {
+        app.insert_resource(HydroSettings {
+            enabled: false,
+            ..default()
+        });
+    }
+    if no_water {
+        app.add_systems(
+            PostUpdate,
+            hide_water.before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+        );
+    }
     if mode == Mode::Time {
         app.add_systems(Startup, uncap_frames).add_systems(
             Update,
@@ -1629,6 +1704,7 @@ fn main() -> AppExit {
         requested: launch_request(&region),
         agl_m,
         later_s,
+        burst: 0,
         shot_at: 0.0,
         step: Step::WaitRegion,
         changing: false,
@@ -1637,10 +1713,11 @@ fn main() -> AppExit {
         frames: 0,
         left_generating: false,
         frame_ms: Vec::new(),
+        gpu_ms: Vec::new(),
         pin: timed_cloud,
         offscreen,
     })
-    .add_systems(Update, render_offscreen)
+    .add_systems(Update, (render_offscreen, record_gpu_frames))
     .add_systems(Update, pin_cloud.after(NavigationSystems));
     let exit = app.run();
     session.finish(&exit);
@@ -1655,12 +1732,11 @@ mod tests {
     fn timing_app(agl_m: f32, ground: f32) -> App {
         let request = launch_request(&parse_region("0,0,0").unwrap());
         let spec = RegionSpec::new(request.era_dir, request.snapshot, 0);
-        let field = Field {
-            res: 2,
-            size_m: 1000.0,
-            elevation_m: vec![ground; 4],
-            surface: vec![[0; 4]; 4],
-        };
+        let mut field = Field::dry(2, 1000.0, vec![ground; 4], vec![[0; 4]; 4]);
+        if ground < 0.0 {
+            // Below sea level, the sea: its texels' water stands at 0, as generated.
+            field.water_level_m.fill(0.0);
+        }
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_message::<RegionEntered>()
@@ -1680,6 +1756,7 @@ mod tests {
                     spec,
                     inner: field.clone(),
                     apron: field,
+                    boulders: Vec::new(),
                 }
                 .into(),
             })
@@ -1692,6 +1769,7 @@ mod tests {
                 requested: request,
                 agl_m,
                 later_s: None,
+                burst: 0,
                 shot_at: 0.0,
                 step: Step::Timing,
                 changing: false,
@@ -1700,6 +1778,7 @@ mod tests {
                 frames: 0,
                 left_generating: false,
                 frame_ms: Vec::new(),
+                gpu_ms: Vec::new(),
                 pin: None,
                 offscreen: false,
             })

@@ -4,8 +4,8 @@
 // (tests/region_gpu.rs) compiles it on its own with a compute entry point.
 //
 // It mirrors timefly_core::terrain operation for operation: `cdlod_morph` is `morph_vertex`,
-// `blended_height` is `blended_height_m`, the drop in `cdlod_vertex` is `curvature_drop_m` and
-// `terrain_normal` is `surface_normal`.
+// `blended_height` is `blended_height_m`, the drop in `cdlod_vertex` is `curvature_drop_m`,
+// `terrain_normal` is `surface_normal` and `blended_water` is `blended_water`.
 // Heights are R32Float, which baseline WebGPU cannot filter, so they are read with textureLoad
 // and interpolated by hand, as the Rust reference does.
 //
@@ -120,6 +120,146 @@ fn blended_height(
     }
     let hi = field_height(inner, params.inner, xz);
     return hi + (ha - hi) * s;
+}
+
+// `WaterSample` in timefly_core::terrain: the water at a point, as drawn.
+struct WaterSample {
+    // The water surface (m).
+    level: f32,
+    // The water's thickness over the ground (m): positive where it stands over the ground.
+    thickness: f32,
+    // Positive inside a river's channel: w/2 minus the distance to its centreline. About
+    // RIBBON_NONE_M (1,000 m) or more over standing water.
+    ribbon: f32,
+    // The river's flow (m/s), (east, -north) in each texel's own frame, read as region (+x, +z)
+    // (`water_image`).
+    flow: vec2<f32>,
+}
+
+// One field's water before the fields are mixed: (level, thickness, half-width, offset) and the
+// flow.
+struct FieldWater {
+    a: vec4<f32>,
+    flow: vec2<f32>,
+}
+
+// `CROSSING_REACH_TEXELS` in timefly_core::terrain: taps whose centreline offsets differ in sign
+// by more than this many texels belong to different rivers.
+const CROSSING_REACH_TEXELS: f32 = 1.5;
+// `DRY_BELOW_M` in timefly_core::terrain: a texel whose level - h is at or below this is dry
+// (dry texels store h - NO_WATER_DROP_M, 64 m under the ground).
+const DRY_BELOW_M: f32 = -32.0;
+// Word 2 of a water texel that is no river: `RIVER_NONE`'s ribbon (RIBBON_NONE_M = 1,000 m as
+// f16, 0x63D0) and offset (0).
+const RIVER_NONE_WORD: u32 = 0x63D0u;
+
+// 1 where a water texel stands (no river, its level above DRY_BELOW_M under its ground), else 0.
+fn standing(w: vec4<u32>) -> f32 {
+    return select(0.0, 1.0, w.z == RIVER_NONE_WORD && bitcast<f32>(w.y) > DRY_BELOW_M);
+}
+
+// A water texel (`water_image`): (level, level - h, ribbon + |offset|, offset).
+fn water_texel(w: vec4<u32>) -> vec4<f32> {
+    let river = unpack2x16float(w.z);
+    return vec4<f32>(bitcast<f32>(w.x), bitcast<f32>(w.y), river.x + abs(river.y), river.y);
+}
+
+// One field's water at xz, read as `field_height` reads heights, with `blended_water`'s
+// crossing guard: offsets of both signs further apart than CROSSING_REACH_TEXELS texels are two
+// rivers, so the field gives its interpolated ribbons (as the half-width, offset 0) instead.
+// Standing water (`field_level`): where no tap is a river and some tap is wet, the level is
+// interpolated over the wet taps alone (n / d), and the thickness moves with it.
+fn field_water(tex: texture_2d<u32>, field: vec4<f32>, xz: vec2<f32>) -> FieldWater {
+    let last = field.z - 1.0;
+    let uv = clamp((xz + vec2<f32>(field.x * 0.5)) / field.y, vec2<f32>(0.0), vec2<f32>(last));
+    let c0 = min(floor(uv), vec2<f32>(last - 1.0));
+    let f = uv - c0;
+    let i = vec2<i32>(c0);
+    let w00 = textureLoad(tex, i, 0);
+    let w10 = textureLoad(tex, i + vec2<i32>(1, 0), 0);
+    let w01 = textureLoad(tex, i + vec2<i32>(0, 1), 0);
+    let w11 = textureLoad(tex, i + vec2<i32>(1, 1), 0);
+    let a00 = water_texel(w00);
+    let a10 = water_texel(w10);
+    let a01 = water_texel(w01);
+    let a11 = water_texel(w11);
+    let top = a00 + (a10 - a00) * f.x;
+    let bottom = a01 + (a11 - a01) * f.x;
+    var a = top + (bottom - top) * f.y;
+    let q00 = unpack2x16float(w00.w);
+    let q10 = unpack2x16float(w10.w);
+    let q01 = unpack2x16float(w01.w);
+    let q11 = unpack2x16float(w11.w);
+    let flow_top = q00 + (q10 - q00) * f.x;
+    let flow_bottom = q01 + (q11 - q01) * f.x;
+    let flow = flow_top + (flow_bottom - flow_top) * f.y;
+    let any_river = w00.z != RIVER_NONE_WORD || w10.z != RIVER_NONE_WORD
+        || w01.z != RIVER_NONE_WORD || w11.z != RIVER_NONE_WORD;
+    let m00 = standing(w00);
+    let m10 = standing(w10);
+    let m01 = standing(w01);
+    let m11 = standing(w11);
+    let wet = m00 + m10 + m01 + m11;
+    // The wet taps' levels, dry taps standing in with the first wet level: all equal when the
+    // wet taps share one level.
+    let first = select(select(select(a11.x, a01.x, m01 > 0.0), a10.x, m10 > 0.0), a00.x, m00 > 0.0);
+    let l00 = select(first, a00.x, m00 > 0.0);
+    let l10 = select(first, a10.x, m10 > 0.0);
+    let l01 = select(first, a01.x, m01 > 0.0);
+    let l11 = select(first, a11.x, m11 > 0.0);
+    let flat = l00 == first && l10 == first && l01 == first && l11 == first;
+    if !any_river && wet > 0.0 && wet < 4.0 && flat {
+        a = vec4<f32>(first, a.y + (first - a.x), a.z, a.w);
+    } else if !any_river && wet > 0.0 && wet < 4.0 {
+        // Positive weights only, so a small wet share loses no precision.
+        let k00 = m00 * ((1.0 - f.x) * (1.0 - f.y));
+        let k10 = m10 * (f.x * (1.0 - f.y));
+        let k01 = m01 * ((1.0 - f.x) * f.y);
+        let k11 = m11 * (f.x * f.y);
+        let n = k00 * a00.x + k10 * a10.x + k01 * a01.x + k11 * a11.x;
+        let d = k00 + k10 + k01 + k11;
+        if d > 0.0 {
+            let level = n / d;
+            a = vec4<f32>(level, a.y + (level - a.x), a.z, a.w);
+        }
+    }
+    let lo = min(min(a00.w, a10.w), min(a01.w, a11.w));
+    let hi = max(max(a00.w, a10.w), max(a01.w, a11.w));
+    if lo < 0.0 && hi > 0.0 && hi - lo > CROSSING_REACH_TEXELS * field.y {
+        let r00 = unpack2x16float(w00.z).x;
+        let r10 = unpack2x16float(w10.z).x;
+        let r01 = unpack2x16float(w01.z).x;
+        let r11 = unpack2x16float(w11.z).x;
+        let r_top = r00 + (r10 - r00) * f.x;
+        let r_bottom = r01 + (r11 - r01) * f.x;
+        a = vec4<f32>(a.x, a.y, r_top + (r_bottom - r_top) * f.y, 0.0);
+    }
+    return FieldWater(a, flow);
+}
+
+// `blended_water`: each field's water, mixed quantity by quantity with `blended_height`'s
+// weight (each side skipped where its weight is zero); then ribbon = half-width - |offset|.
+// The thickness is the blend of each texel's `level - h` (word 1), the level minus the blended
+// height to rounding, so the water needs no height texture.
+fn blended_water(
+    inner: texture_2d<u32>,
+    apron: texture_2d<u32>,
+    params: TerrainParams,
+    xz: vec2<f32>,
+) -> WaterSample {
+    let a = max(abs(xz.x), abs(xz.y));
+    let s = smoothstep(params.inner.w, params.apron.w, a);
+    var w: FieldWater;
+    if s <= 0.0 {
+        w = field_water(inner, params.inner, xz);
+    } else if s >= 1.0 {
+        w = field_water(apron, params.apron, xz);
+    } else {
+        let wi = field_water(inner, params.inner, xz);
+        let wa = field_water(apron, params.apron, xz);
+        w = FieldWater(wi.a + (wa.a - wi.a) * s, wi.flow + (wa.flow - wi.flow) * s);
+    }
+    return WaterSample(w.a.x, w.a.y, w.a.z - abs(w.a.w), w.flow);
 }
 
 // One texel of the field that dominates at xz: the inner field's inside the blend's end, the

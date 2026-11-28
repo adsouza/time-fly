@@ -34,6 +34,14 @@
 //!   (one `dragonfly_mesh`, drawn with the body's opaque material and the wings' blended one)
 //!   warms both of its pipelines; in Chrome they would otherwise compile through Tint on the
 //!   first region frame (the final review).
+//! - **The boulders.** The region camera draws the boulders (`crate::boulders`, Task 9), so a
+//!   stand-in boulder warms their pipeline: one of `boulder_meshes` (positions and normals),
+//!   the boulders' material from `scatter_material` over the warm-up's own palette (held by
+//!   the material until the warm-up retires) and a `MeshTag`, as every pooled boulder has.
+//!   It carries no `VisibilityRange`: the boulders' range is abrupt, which adds nothing to the
+//!   key, while a range could cull the stand-in from this camera. A stand-in foam collar
+//!   (Task 11c: `foam_collar_mesh`, `foam_collar_material`, alpha-masked, so its own key) warms
+//!   the collars' pipeline the same way.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -54,14 +62,17 @@ use timefly_core::worldgen::{APRON_SIZE_M, REGION_SIZE_M};
 use super::material::{TerrainMaterial, TerrainParams, palette_image, patch_instances};
 use super::view::{REGION_SKY, region_camera_parts, region_sun, region_sun_parts};
 use super::{TerrainOptions, grid_mesh, look_for, patch_buffer, terrain_material, upload_fields};
+use crate::boulders::{boulder_look, boulder_meshes, foam_collar_material, foam_collar_mesh};
 use crate::cloud::{CloudMaterial, CloudParams};
 use crate::creature::{DragonflyMaterial, body_material, dragonfly_mesh, wing_material};
 use crate::globe::{GlobeRenderStatus, RenderProbe};
+use crate::scatter::{ScatterMaterial, scatter_material};
 use crate::sky::{SkyMaterial, distance_fog, region_look, sky_params};
 use crate::water::{WaterMaterial, water_look, water_material};
 use tracing::instrument;
 
-/// The warm-up's render layer: its camera, sun, patch, sea, sky, cloud and dragonfly only.
+/// The warm-up's render layer: its camera, sun, patch, sea, sky, cloud, dragonfly and boulder
+/// only.
 pub const WARMUP_LAYER: usize = 5;
 /// Its camera's order: below every other camera (no other camera shares it).
 pub const WARMUP_CAMERA_ORDER: isize = -10;
@@ -164,13 +175,15 @@ impl Plugin for RegionWarmupPlugin {
 
 /// A stand-in region: a 3 × 3 field rising from sea to land, so its look is an ordinary one.
 pub fn warmup_grid() -> RegionGrid {
-    let field = |size_m: f64| Field {
-        res: 3,
-        size_m,
-        elevation_m: vec![
-            -200.0, -50.0, 100.0, -50.0, 100.0, 400.0, 100.0, 400.0, 900.0,
-        ],
-        surface: vec![[0, 0, 0, 0]; 9],
+    let field = |size_m: f64| {
+        Field::dry(
+            3,
+            size_m,
+            vec![
+                -200.0, -50.0, 100.0, -50.0, 100.0, 400.0, 100.0, 400.0, 900.0,
+            ],
+            vec![[0, 0, 0, 0]; 9],
+        )
     };
     RegionGrid {
         spec: RegionSpec {
@@ -180,6 +193,7 @@ pub fn warmup_grid() -> RegionGrid {
         },
         inner: field(REGION_SIZE_M),
         apron: field(APRON_SIZE_M),
+        boulders: Vec::new(),
     }
 }
 
@@ -194,6 +208,7 @@ struct WarmupAssets<'w> {
     sky: ResMut<'w, Assets<SkyMaterial>>,
     cloud: ResMut<'w, Assets<CloudMaterial>>,
     fly: ResMut<'w, Assets<DragonflyMaterial>>,
+    scatter: ResMut<'w, Assets<ScatterMaterial>>,
 }
 
 /// Gathers the globe's status and the render probe, decides with [`warmup_action`], and
@@ -265,6 +280,7 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         sky: sky_m,
         cloud: cloud_m,
         fly: fly_m,
+        scatter: scatter_m,
     } = assets;
     let grid = warmup_grid();
     let settings = LodSettings::region();
@@ -285,10 +301,12 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         // A uniform value doesn't change a pipeline, so the default options warm every one.
         look_for(&grid, TerrainOptions::default()),
     ));
+    // The sea binds the stand-in's water textures (`Field::dry`: no water, no river), as the
+    // region's water binds its own.
     let water = water_m.add(water_material(
         &buffer,
-        &fields.inner_height,
-        &fields.apron_height,
+        &fields.inner_water,
+        &fields.apron_water,
         water_look(&grid),
     ));
     let mut target = Image::new_target_texture(1, 1, WARMUP_TARGET_FORMAT, None);
@@ -329,6 +347,35 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
             layer.clone(),
         )
     };
+    // The boulders' vertex layout (positions and normals) and material, binding the stand-in's
+    // water as the real ones bind the region's.
+    let scatter_water =
+        crate::scatter::ScatterWater::of(&buffer, &fields.inner_water, &fields.apron_water);
+    let [boulder_mesh, ..] = boulder_meshes();
+    let boulder = (
+        Name::new("Warm-up boulder"),
+        Mesh3d(meshes.add(boulder_mesh)),
+        MeshMaterial3d(scatter_m.add(scatter_material(
+            &palette,
+            boulder_look(&grid),
+            &scatter_water,
+        ))),
+        MeshTag::new(0),
+        Transform::IDENTITY,
+        NoFrustumCulling,
+        NotShadowCaster,
+        layer.clone(),
+    );
+    let collar = (
+        Name::new("Warm-up foam collar"),
+        Mesh3d(meshes.add(foam_collar_mesh())),
+        MeshMaterial3d(scatter_m.add(foam_collar_material(&palette, &scatter_water))),
+        MeshTag::new(0),
+        Transform::IDENTITY,
+        NoFrustumCulling,
+        NotShadowCaster,
+        layer.clone(),
+    );
     let camera = commands
         .spawn((
             Name::new("Warm-up camera"),
@@ -375,6 +422,8 @@ fn spawn_warmup(commands: &mut Commands, assets: &mut WarmupAssets) -> RegionWar
         commands
             .spawn(fly("Warm-up dragonfly wings", fly_m.add(wing_material())))
             .id(),
+        commands.spawn(boulder).id(),
+        commands.spawn(collar).id(),
         camera,
         sun,
     ];
@@ -478,12 +527,13 @@ mod tests {
             .init_asset::<SkyMaterial>()
             .init_asset::<CloudMaterial>()
             .init_asset::<DragonflyMaterial>()
+            .init_asset::<ScatterMaterial>()
             .insert_resource(GlobeRenderStatus::LoadingData)
             .add_plugins(RegionWarmupPlugin);
         app
     }
 
-    fn asset_counts(app: &App) -> [usize; 8] {
+    fn asset_counts(app: &App) -> [usize; 9] {
         let w = app.world();
         [
             w.resource::<Assets<Image>>().len(),
@@ -494,6 +544,7 @@ mod tests {
             w.resource::<Assets<SkyMaterial>>().len(),
             w.resource::<Assets<CloudMaterial>>().len(),
             w.resource::<Assets<DragonflyMaterial>>().len(),
+            w.resource::<Assets<ScatterMaterial>>().len(),
         ]
     }
 
@@ -503,18 +554,20 @@ mod tests {
         let mut app = warmup_app();
         app.update();
         assert!(app.world().get_resource::<RegionWarmup>().is_none());
-        assert_eq!(asset_counts(&app), [0; 8]);
+        assert_eq!(asset_counts(&app), [0; 9]);
 
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();
         let entities = app.world().resource::<RegionWarmup>().entities.clone();
-        assert_eq!(entities.len(), 8);
+        assert_eq!(entities.len(), 10);
         // Its camera has no clusters (ruling R28), without the app-wide observer.
         crate::clusters::assert_no_clusters(app.world_mut());
-        // Six textures (four fields, the palette, the 1 x 1 target), two meshes (the quad and
-        // the dragonfly), one buffer, one of each material, the transition cloud's included (M3
-        // Task 5), and the dragonfly's body and wing materials (final review).
-        assert_eq!(asset_counts(&app), [6, 2, 1, 1, 1, 1, 1, 2]);
+        // Eight textures (four height and surface fields and the two water fields the sea
+        // binds, the palette, the 1 x 1 target), four meshes (the quad, the dragonfly, a
+        // boulder and a foam collar), one buffer, one of each material, the transition cloud's
+        // included (M3 Task 5), the dragonfly's body and wing materials (final review), and the
+        // boulders' and the collars' (Tasks 9 and 11c), over the same palette.
+        assert_eq!(asset_counts(&app), [8, 4, 1, 1, 1, 1, 1, 2, 2]);
         {
             let world = app.world_mut();
             // Everything on its own layer, none of it the region's camera or sun.
@@ -578,7 +631,7 @@ mod tests {
         for e in entities {
             assert!(app.world().get_entity(e).is_err());
         }
-        assert_eq!(asset_counts(&app), [0; 8]);
+        assert_eq!(asset_counts(&app), [0; 9]);
         // Never again.
         *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
         app.update();
@@ -617,6 +670,122 @@ mod tests {
                 RenderLayers::layer(WARMUP_LAYER)
             );
         }
+    }
+
+    /// The warm-up's sea binds both water textures (Task 8), built from the stand-in grid's
+    /// dry fields like the real region's: a pipeline's key doesn't depend on the data.
+    #[test]
+    fn the_warm_up_draws_the_new_water() {
+        use bevy::render::render_resource::TextureFormat;
+        let mut app = warmup_app();
+        *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
+        app.update();
+        let entities = app.world().resource::<RegionWarmup>().entities.clone();
+        let world = app.world_mut();
+        let mut seas = world.query::<(Entity, &MeshMaterial3d<WaterMaterial>)>();
+        let seas: Vec<_> = seas.iter(world).map(|(e, m)| (e, m.0.clone())).collect();
+        assert_eq!(seas.len(), 1);
+        assert!(entities.contains(&seas[0].0));
+        let material = world
+            .resource::<Assets<WaterMaterial>>()
+            .get(&seas[0].1)
+            .unwrap()
+            .clone();
+        let images = world.resource::<Assets<Image>>();
+        let grid = warmup_grid();
+        for (handle, field) in [
+            (&material.extension.inner_water, &grid.inner),
+            (&material.extension.apron_water, &grid.apron),
+        ] {
+            let image = images
+                .get(handle)
+                .expect("a water texture held by the warm-up sea");
+            assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba32Uint);
+            assert_eq!(image.size(), UVec2::splat(field.res));
+        }
+        assert_ne!(
+            material.extension.inner_water,
+            material.extension.apron_water
+        );
+    }
+
+    /// The region camera draws the boulders (Task 9): a stand-in boulder warms their pipeline
+    /// with the real key: a boulder mesh (positions and normals), the boulders' material from
+    /// the same constructor over a live palette, a `MeshTag`, and no dithered visibility range.
+    #[test]
+    fn the_warm_up_draws_the_boulders() {
+        use crate::boulders::{boulder_look, boulder_meshes};
+        use crate::scatter::scatter_material;
+        use bevy::camera::visibility::VisibilityRange;
+        let mut app = warmup_app();
+        *app.world_mut().resource_mut::<GlobeRenderStatus>() = GlobeRenderStatus::PreparingGpu;
+        app.update();
+        let entities = app.world().resource::<RegionWarmup>().entities.clone();
+        let world = app.world_mut();
+        let mut rocks = world.query::<(
+            Entity,
+            &Mesh3d,
+            &MeshMaterial3d<ScatterMaterial>,
+            Has<MeshTag>,
+            Option<&VisibilityRange>,
+        )>();
+        let rocks: Vec<_> = rocks
+            .iter(world)
+            .map(|(e, m, mat, tag, range)| (e, m.0.clone(), mat.0.clone(), tag, range.cloned()))
+            .collect();
+        assert_eq!(rocks.len(), 2, "one stand-in boulder and one foam collar");
+        // The collar: the real collar mesh and material, alpha-masked, tagged.
+        let materials = world.resource::<Assets<ScatterMaterial>>();
+        let (collar, boulder): (Vec<_>, Vec<_>) = rocks
+            .iter()
+            .cloned()
+            .partition(|r| materials.get(&r.2).unwrap().base.alpha_mode != AlphaMode::Opaque);
+        let (ce, cmesh, cmat, ctag, crange) = collar[0].clone();
+        assert!(entities.contains(&ce) && ctag && crange.is_none());
+        let want = crate::boulders::foam_collar_material(
+            &Handle::default(),
+            &crate::scatter::ScatterWater::default(),
+        );
+        let got = materials.get(&cmat).unwrap();
+        assert_eq!(got.base.alpha_mode, want.base.alpha_mode);
+        assert_eq!(got.extension.look, want.extension.look);
+        let cmesh = world.resource::<Assets<Mesh>>().get(&cmesh).unwrap();
+        let real = crate::boulders::foam_collar_mesh();
+        let ids = |m: &Mesh| m.attributes().map(|(a, _)| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(cmesh), ids(&real));
+        let (e, mesh, material, tagged, range) = boulder[0].clone();
+        assert!(entities.contains(&e));
+        assert!(tagged, "a MeshTag, as every pooled boulder has");
+        assert!(range.is_none_or(|r| r.is_abrupt()), "no dithered pipeline");
+        assert_eq!(
+            *world.get::<RenderLayers>(e).unwrap(),
+            RenderLayers::layer(WARMUP_LAYER)
+        );
+        // The real boulders' vertex layout and topology.
+        let real = &boulder_meshes()[0];
+        let mesh = world.resource::<Assets<Mesh>>().get(&mesh).unwrap();
+        let ids = |m: &Mesh| m.attributes().map(|(a, _)| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(mesh), ids(real));
+        assert_eq!(mesh.primitive_topology(), real.primitive_topology());
+        assert_eq!(mesh.indices().is_some(), real.indices().is_some());
+        // The real material's constructor, over a palette the warm-up holds.
+        let material = world
+            .resource::<Assets<ScatterMaterial>>()
+            .get(&material)
+            .unwrap()
+            .clone();
+        let want = scatter_material(
+            &material.extension.palette,
+            boulder_look(&warmup_grid()),
+            &crate::scatter::ScatterWater::default(),
+        );
+        assert_eq!(material.base.alpha_mode, want.base.alpha_mode);
+        assert_eq!(material.extension.look, want.extension.look);
+        let palette = world
+            .resource::<Assets<Image>>()
+            .get(&material.extension.palette)
+            .expect("a palette held by the warm-up boulder");
+        assert_eq!(palette.data, palette_image().data);
     }
 
     /// The warm-up cloud's depth is positive, so its plane never projects to an infinite clip

@@ -260,20 +260,21 @@ mod tests {
 
     #[test]
     fn stops_count_the_pan() {
-        assert_eq!(stop_count(&BENCH_REGIONS), 9);
+        assert_eq!(stop_count(&BENCH_REGIONS), 10);
         let numbers: Vec<_> = (0..BENCH_REGIONS.len())
             .map(|r| stop_number(r, &BENCH_REGIONS))
             .collect();
-        // Pangaea, Red Sea, Himalayas, Sundaland, Japan, Beringia, (pan = 7), Rockies, Panama.
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 8, 9]);
+        // Pangaea, Red Sea, Himalayas, Indus tributaries, Sundaland, Japan, Beringia, (pan = 8),
+        // Rockies, Panama.
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 9, 10]);
     }
 
     #[test]
     fn the_banner_names_each_stop() {
         assert_eq!(
-            banner_lines(BannerKey::In(3, None), &BENCH_REGIONS),
+            banner_lines(BannerKey::In(4, None), &BENCH_REGIONS),
             (
-                "Sundaland · 21 thousand years ago · 4 of 9".to_string(),
+                "Sundaland · 21 thousand years ago · 5 of 10".to_string(),
                 None
             )
         );
@@ -283,13 +284,13 @@ mod tests {
         );
         assert_eq!(
             banner_lines(BannerKey::Next(2), &BENCH_REGIONS).0,
-            "Next: Himalayas · Present · 3 of 9"
+            "Next: Himalayas · Present · 3 of 10"
         );
         assert_eq!(
-            banner_lines(BannerKey::Pan(6), &BENCH_REGIONS),
+            banner_lines(BannerKey::Pan(7), &BENCH_REGIONS),
             (
                 "Globe · Beringia → Rockies ice margin".to_string(),
-                Some("7 of 9".to_string())
+                Some("8 of 10".to_string())
             )
         );
         assert_eq!(

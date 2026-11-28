@@ -15,10 +15,16 @@
 //!   `timefly_core::worldgen::biome::snowline_with_raise_m`.
 //! - `wesl_planet_position_matches_rust` runs `planet.wesl`'s `planet_position_m` against
 //!   `EARTH_RADIUS_M * FrameBasis::local_to_dir`.
+//! - `wesl_water_matches_rust` runs `terrain_cdlod.wesl`'s `blended_water` (the water shader's
+//!   sampler, with its crossing guard) against `timefly_core::terrain::blended_water`, over
+//!   random water fields with rivers read through the shell's own `water_image` textures.
 //! - `the_cloud_veils_geometry_nearer_than_its_plane` draws `cloud.wesl` (its Bevy and package
 //!   imports stood in for) over an opaque quad nearer than 1.2 × the eye-to-fly distance, with
 //!   the game's blend and reverse-Z depth test, and checks the quad comes out veiled exactly as
 //!   far ground does (M3 Task 7's near-plane depth rule).
+//! - `the_gpu_frame_time_is_measured_on_this_gpu` times frames of 0, 1, 4 and 16 busy full-screen
+//!   passes with the game's `GpuTimer` (pass timestamps): positive, close to linear in the
+//!   passes, and not inflated when frames run back to back (rivers and lakes Task 10).
 
 use bevy::math::{DVec3, Vec3};
 use bevy::tasks::block_on;
@@ -257,12 +263,7 @@ fn rough_field(res: u32, size_m: f64, seed: u64) -> Field {
             elevation_m.push(h);
         }
     }
-    Field {
-        res,
-        size_m,
-        surface: vec![[0; 4]; (res * res) as usize],
-        elevation_m,
-    }
+    Field::dry(res, size_m, elevation_m, vec![[0; 4]; (res * res) as usize])
 }
 
 fn r32_texture(device: &wgpu::Device, queue: &wgpu::Queue, field: &Field) -> wgpu::TextureView {
@@ -315,6 +316,7 @@ fn wesl_morph_matches_rust() {
         spec: RegionSpec::new(center, YearsBp(0.0), 1),
         inner: rough_field(REGION_RES, REGION_SIZE_M, 1),
         apron: rough_field(APRON_RES, APRON_SIZE_M, 2),
+        boulders: Vec::new(),
     };
     let settings = LodSettings::region();
 
@@ -542,6 +544,7 @@ fn wesl_normal_matches_rust() {
         spec: RegionSpec::new(center, YearsBp(0.0), 1),
         inner: rough_field(REGION_RES, REGION_SIZE_M, 3),
         apron: rough_field(APRON_RES, APRON_SIZE_M, 4),
+        boulders: Vec::new(),
     };
     let settings = LodSettings::region();
     let camera = Vec3::new(-20_000.0, 3_000.0, 35_000.0);
@@ -1365,4 +1368,1119 @@ fn the_cloud_veils_geometry_nearer_than_its_plane() {
             near.len()
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The water texture (Task 7), as the water shader (Task 8) reads it
+
+const WATER_ENTRY: &str = r#"
+@group(0) @binding(0) var water: texture_2d<u32>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>; // two per texel
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(water);
+    if (id.x >= size.x || id.y >= size.y) {
+        return;
+    }
+    let w = textureLoad(water, vec2<i32>(id.xy), 0);
+    let river = unpack2x16float(w.z); // (ribbon, offset)
+    let flow = unpack2x16float(w.w);  // (+x, +z)
+    let n = (id.y * size.x + id.x) * 2u;
+    out[n] = vec4<f32>(bitcast<f32>(w.x), bitcast<f32>(w.y), river.x, river.y);
+    out[n + 1u] = vec4<f32>(flow.x, flow.y, 0.0, 0.0);
+}
+"#;
+
+/// `water_image`'s `Rgba32Uint` texels decode on the GPU, with `bitcast` and
+/// `unpack2x16float`, to the grid's level, `level − height`, ribbon, offset and flow `(east,
+/// −north)` in each texel's own frame: the layout the water shader reads.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn the_water_texture_decodes_on_the_gpu() {
+    use timefly::terrain::material::water_image;
+    use timefly_core::worldgen::generate::RIVER_NONE;
+    use timefly_core::worldgen::generate::water::{decode_river, encode_river};
+    let res = 37;
+    let mut field = rough_field(res, REGION_SIZE_M, 11);
+    let mut rng = SplitMix(5);
+    for i in 0..(res * res) as usize {
+        let h = field.elevation_m[i];
+        // A third dry, a third standing water, a third rivers.
+        match i % 3 {
+            0 => field.water_level_m[i] = h - 64.0,
+            1 => field.water_level_m[i] = h + 300.0 * rng.unit(),
+            _ => {
+                field.water_level_m[i] = h + 4.0 * rng.unit();
+                field.river[i] = encode_river(
+                    200.0 * (rng.unit() - 0.5),
+                    6.0 * (rng.unit() - 0.5),
+                    6.0 * (rng.unit() - 0.5),
+                    300.0 * (rng.unit() - 0.5),
+                );
+            }
+        }
+    }
+    assert!(field.river.contains(&RIVER_NONE));
+    let image = water_image(&field);
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let texture = device.create_texture_with_data(
+        &queue,
+        &wgpu::TextureDescriptor {
+            label: Some("water"),
+            size: wgpu::Extent3d {
+                width: res,
+                height: res,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        image.data.as_ref().expect("image data"),
+    );
+    let view = texture.create_view(&Default::default());
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("water decode"),
+        source: wgpu::ShaderSource::Wgsl(WATER_ENTRY.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("water decode"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bytes = u64::from(res * res) * 32;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(res.div_ceil(8), res.div_ceil(8), 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<f32> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    for i in 0..(res * res) as usize {
+        let g = &got[i * 8..i * 8 + 8];
+        let level = field.water_level_m[i];
+        let [ribbon, east, north, offset] = decode_river(field.river[i]);
+        assert_eq!(g[0].to_bits(), level.to_bits(), "texel {i} level");
+        assert_eq!(g[1], level - field.elevation_m[i], "texel {i} thickness");
+        assert_eq!(
+            [g[2], g[3]],
+            [ribbon, offset],
+            "texel {i} ribbon and offset"
+        );
+        assert_eq!([g[4], g[5]], [east, -north], "texel {i} flow");
+    }
+    println!("{} water texels decode on the GPU", res * res);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The water shader's sampler (Task 8)
+
+const WATER_PARITY_ENTRY: &str = r#"
+@group(0) @binding(0) var<storage, read> terrain: TerrainBuffer;
+@group(0) @binding(1) var inner_water: texture_2d<u32>;
+@group(0) @binding(2) var apron_water: texture_2d<u32>;
+@group(0) @binding(3) var<storage, read> queries: array<vec4<f32>>;   // (x, z, 0, 0)
+@group(0) @binding(4) var<storage, read_write> out: array<vec4<f32>>; // two per query
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&queries)) {
+        return;
+    }
+    let w = blended_water(inner_water, apron_water, terrain.params, queries[n].xy);
+    out[2u * n] = vec4<f32>(w.level, w.thickness, w.ribbon, 0.0);
+    out[2u * n + 1u] = vec4<f32>(w.flow, 0.0, 0.0);
+}
+"#;
+
+/// Points checked per case.
+const WATER_POINTS: usize = 4_096;
+
+/// A field's water texture on the GPU, as the shell uploads it.
+fn water_texture(device: &wgpu::Device, queue: &wgpu::Queue, field: &Field) -> wgpu::TextureView {
+    let image = timefly::terrain::material::water_image(field);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("water"),
+            size: wgpu::Extent3d {
+                width: field.res,
+                height: field.res,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        image.data.as_ref().expect("image data"),
+    );
+    texture.create_view(&Default::default())
+}
+
+/// Random water over `rough_field` terrain: inside `calm_m` (max(|x|, |z|)) a mix of dry
+/// texels, standing water and two rivers 1.5 km apart converging side by side (opposite offset
+/// signs across the divide, the crossing guard's case), plus scattered river texels with random
+/// offsets; from `calm_m` to `still_m` one uniform lake, so the blend between the fields mixes
+/// equal values and only the blend's arithmetic is compared there; beyond `still_m` random
+/// again. (A field's rivers meander nowhere: only the sampler is under test.)
+fn wet_rough_field(res: u32, size_m: f64, seed: u64, calm_m: f64, still_m: f64) -> Field {
+    use timefly_core::worldgen::generate::water::encode_river;
+    let mut field = rough_field(res, size_m, seed);
+    let mut rng = SplitMix(seed ^ 0xAB);
+    let (west, east) = (1_234.5, 2_734.5);
+    for row in 0..res {
+        for col in 0..res {
+            let i = (row * res + col) as usize;
+            let (x, z) = field.local_of(row, col);
+            let a = x.abs().max(z.abs());
+            let h = field.elevation_m[i];
+            if (calm_m..still_m).contains(&a) {
+                field.elevation_m[i] = 30.0;
+                field.water_level_m[i] = 40.0;
+                continue;
+            }
+            let near = (x - west).abs().min((x - east).abs());
+            if near < 1_500.0 {
+                let o = if x < (west + east) / 2.0 {
+                    x - west
+                } else {
+                    x - east
+                } as f32;
+                let half = 4.0 + 30.0 * rng.unit();
+                field.water_level_m[i] = h + 4.0 * rng.unit() - 1.0;
+                let speed = 6.0 * rng.unit();
+                field.river[i] = encode_river(half - o.abs(), speed, -0.5 * speed, o);
+                continue;
+            }
+            match rng.below(4) {
+                0 => field.water_level_m[i] = h - 64.0,
+                1 => field.water_level_m[i] = h + 30.0 * rng.unit(),
+                2 => {
+                    field.water_level_m[i] = h + 4.0 * rng.unit() - 1.0;
+                    let o = 4.0 * size_m as f32 / res as f32 * (rng.unit() - 0.5);
+                    field.river[i] = encode_river(
+                        40.0 * rng.unit() - o.abs(),
+                        6.0 * (rng.unit() - 0.5),
+                        6.0 * (rng.unit() - 0.5),
+                        o,
+                    );
+                }
+                _ => field.water_level_m[i] = h - 64.0 + 70.0 * rng.unit(),
+            }
+        }
+    }
+    field
+}
+
+/// `sample_clamped`'s four texel indices at `(x, z)` (the test's own copy).
+fn tap_indices(field: &Field, x: f64, z: f64) -> [usize; 4] {
+    let last = f64::from(field.res - 1);
+    let spacing = field.spacing_m();
+    let u = ((x + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let v = ((z + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let (c0, r0) = (u.floor().min(last - 1.0), v.floor().min(last - 1.0));
+    let n = field.res as usize;
+    let i = r0 as usize * n + c0 as usize;
+    [i, i + 1, i + n, i + n + 1]
+}
+
+/// Whether a field's level at `(x, z)` comes from its standing water alone
+/// (`timefly_core::terrain::blended_water`'s rule: no tap is a river texel, some tap is wet),
+/// and if so the wet taps' share `d` of the bilinear weight (0 when none has weight), and
+/// whether some tap is dry (a shore cell).
+fn standing_share(field: &Field, x: f64, z: f64) -> Option<(f32, bool)> {
+    use timefly_core::terrain::DRY_BELOW_M;
+    use timefly_core::worldgen::generate::water::RIVER_NONE;
+    let taps = tap_indices(field, x, z);
+    let river = |i: usize| field.river[i][0] != RIVER_NONE[0] || field.river[i][3] != 0;
+    let wet = |i: usize| field.water_level_m[i] - field.elevation_m[i] > DRY_BELOW_M;
+    if taps.iter().any(|&i| river(i)) || !taps.iter().any(|&i| wet(i)) {
+        return None;
+    }
+    let last = f64::from(field.res - 1);
+    let spacing = field.spacing_m();
+    let u = ((x + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let v = ((z + field.size_m / 2.0) / spacing).clamp(0.0, last);
+    let (fu, fv) = (u - u.floor().min(last - 1.0), v - v.floor().min(last - 1.0));
+    let w = [
+        (1.0 - fu) * (1.0 - fv),
+        fu * (1.0 - fv),
+        (1.0 - fu) * fv,
+        fu * fv,
+    ];
+    let d: f64 = (0..4).filter(|&k| wet(taps[k])).map(|k| w[k]).sum();
+    Some((d as f32, taps.iter().any(|&i| !wet(i))))
+}
+
+/// The largest magnitude and the spread (max − min) of `value` over both fields' taps at
+/// `(x, z)`.
+fn tap_range(
+    grid: &RegionGrid,
+    x: f64,
+    z: f64,
+    value: impl Fn(&Field, usize) -> f32,
+) -> (f32, f32) {
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for f in [&grid.inner, &grid.apron] {
+        for i in tap_indices(f, x, z) {
+            let v = value(f, i);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    (lo.abs().max(hi.abs()), hi - lo)
+}
+
+/// Runs `blended_water` on the GPU at `points` over `grid`'s water textures: per point
+/// `[level, thickness, ribbon, flow.x, flow.y]`.
+fn gpu_blended_water(grid: &RegionGrid, points: &[[f32; 4]]) -> Vec<[f32; 5]> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("water parity"),
+        source: wgpu::ShaderSource::Wgsl(format!("{CDLOD}\n{WATER_PARITY_ENTRY}").into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("water parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let inner = water_texture(&device, &queue, &grid.inner);
+    let apron = water_texture(&device, &queue, &grid.apron);
+    let settings = LodSettings::region();
+    let params = TerrainParams::new(grid, &settings);
+    let buffer_bytes = terrain_buffer_bytes(&params, &[], 1);
+    let storage = |label, data: &[u8]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: data,
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let terrain_buf = storage("terrain", &buffer_bytes);
+    let query_buf = storage("queries", bytemuck::cast_slice(points));
+    let bytes = (points.len() * 32) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: terrain_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&inner),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&apron),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(points.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<[f32; 8]> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+    got.iter().map(|g| [g[0], g[1], g[2], g[4], g[5]]).collect()
+}
+
+/// Worst differences of one case: (level in ulps of its taps, thickness, ribbon, flow in m or
+/// m/s), and how many points went through the crossing guard, the blend, rivers.
+#[derive(Debug, Default)]
+struct WaterParity {
+    level_ulps: f32,
+    thickness: f32,
+    ribbon: f32,
+    flow: f32,
+    guarded: usize,
+    blended: usize,
+    in_river: usize,
+    /// Points whose level came from a shore cell's wet taps alone (some taps dry).
+    shore: usize,
+}
+
+/// Compares the GPU's `blended_water` with the Rust reference at `points`. `weight_error` bounds
+/// how far the GPU's f32 bilinear weights may sit from the reference's (0 where the field sizes
+/// make them exact); each quantity's tolerance is `ulps` ulps of its taps' largest magnitude,
+/// plus the weight error and the blend weight's f32 rounding (1e-6) times its taps' spread.
+fn check_water_parity(grid: &RegionGrid, points: &[[f32; 4]], weight_error: f32) -> WaterParity {
+    use timefly_core::terrain::{CROSSING_REACH_TEXELS, blended_water};
+    use timefly_core::worldgen::generate::water::decode_river;
+    let got = gpu_blended_water(grid, points);
+    let mut parity = WaterParity::default();
+    let river = |f: &Field, i: usize| decode_river(f.river[i]);
+    let e1 = grid.inner.size_m / 2.0;
+    let e0 = e1 - 4.0 * grid.apron.spacing_m();
+    for (q, g) in points.iter().zip(&got) {
+        let (x, z) = (f64::from(q[0]), f64::from(q[1]));
+        let r = blended_water(grid, x, z);
+        let slack = weight_error + 1e-6;
+        let tol = |ulps: f32, (scale, spread): (f32, f32)| ulps * ulp(scale) + slack * spread;
+        let level = tap_range(grid, x, z, |f, i| f.water_level_m[i]);
+        let heights = tap_range(grid, x, z, |f, i| f.elevation_m[i]);
+        let half = tap_range(grid, x, z, |f, i| river(f, i)[0] + river(f, i)[3].abs());
+        let offset = tap_range(grid, x, z, |f, i| river(f, i)[3]);
+        let ribbon = tap_range(grid, x, z, |f, i| river(f, i)[0]);
+        let east = tap_range(grid, x, z, |f, i| river(f, i)[1]);
+        let north = tap_range(grid, x, z, |f, i| river(f, i)[2]);
+
+        // Standing water's level is `n / d` over the wet taps: two more ulps for the division,
+        // and the weight error divided by the wet taps' share `d`.
+        let shares: Vec<(f32, bool)> = [&grid.inner, &grid.apron]
+            .iter()
+            .filter_map(|f| standing_share(f, x, z))
+            .collect();
+        let standing = shares
+            .iter()
+            .map(|&(d, _)| 2.0 * ulp(level.0) + slack * level.1 / d.max(1e-6))
+            .fold(0.0f32, f32::max);
+        let d = (g[0] - r.level_m).abs();
+        assert!(
+            d <= tol(2.0, level) + standing,
+            "level at ({x}, {z}): gpu {} vs rust {} ({} ulps)",
+            g[0],
+            r.level_m,
+            d / ulp(level.0)
+        );
+        parity.level_ulps = parity.level_ulps.max(d / ulp(level.0));
+        // The GPU interpolates each texel's `level − h`; the reference subtracts the blended
+        // height from the blended level: a few ulps of either apart.
+        let both = (level.0.max(heights.0), level.1 + heights.1);
+        let d = (g[1] - r.thickness_m).abs();
+        assert!(
+            d <= tol(4.0, both) + 2.0 * standing,
+            "thickness at ({x}, {z}): gpu {} vs rust {}",
+            g[1],
+            r.thickness_m
+        );
+        parity.thickness = parity.thickness.max(d);
+        let parts = (
+            half.0.max(offset.0).max(ribbon.0),
+            half.1 + offset.1 + ribbon.1,
+        );
+        let d = (g[2] - r.ribbon_m).abs();
+        assert!(
+            d <= tol(4.0, parts),
+            "ribbon at ({x}, {z}): gpu {} vs rust {}",
+            g[2],
+            r.ribbon_m
+        );
+        parity.ribbon = parity.ribbon.max(d);
+        // The GPU's flow is (east, −north).
+        for (gpu, rust, range) in [(g[3], r.flow[0], east), (g[4], -r.flow[1], north)] {
+            let d = (gpu - rust).abs();
+            assert!(
+                d <= tol(2.0, range),
+                "flow at ({x}, {z}): gpu {gpu} vs rust {rust}"
+            );
+            parity.flow = parity.flow.max(d);
+        }
+        // Coverage.
+        let guarded = [&grid.inner, &grid.apron].iter().any(|f| {
+            let o = tap_indices(f, x, z).map(|i| river(f, i)[3]);
+            let (lo, hi) = o
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+            lo < 0.0 && hi > 0.0 && hi - lo > CROSSING_REACH_TEXELS * f.spacing_m() as f32
+        });
+        parity.guarded += usize::from(guarded);
+        let a = x.abs().max(z.abs());
+        parity.blended += usize::from(a > e0 && a < e1);
+        parity.in_river += usize::from(r.ribbon_m > 0.0 && r.ribbon_m < 100.0);
+        parity.shore += usize::from(shares.iter().any(|&(d, dry)| dry && d > 0.0));
+    }
+    parity
+}
+
+/// Query points: a third in the inner field (half of them within 60 m of a river or the divide
+/// between them), a sixth in
+/// the blend, the rest over the apron and beyond its edge; each coordinate a multiple of
+/// `step_m`.
+fn water_points(grid: &RegionGrid, seed: u64, step_m: f64) -> Vec<[f32; 4]> {
+    let mut rng = SplitMix(seed);
+    let e1 = grid.inner.size_m / 2.0;
+    let e0 = e1 - 4.0 * grid.apron.spacing_m();
+    let snap = |v: f64| ((v / step_m).round() * step_m) as f32;
+    let mut span = |lo: f64, hi: f64| lo + (hi - lo) * f64::from(rng.unit());
+    (0..WATER_POINTS)
+        .map(|k| {
+            let (x, z) = match k % 6 {
+                // Across the two rivers (wet_rough_field's), and the divide between them.
+                0 => {
+                    let centre = [1_234.5, 2_734.5, 1_984.5][k / 6 % 3];
+                    (centre + span(-60.0, 60.0), span(-e0, e0))
+                }
+                1 => (span(-e0, e0), span(-e0, e0)),
+                2 => {
+                    let a = span(e0, e1);
+                    let b = span(-e1, e1);
+                    if k % 12 == 2 { (a, b) } else { (b, -a) }
+                }
+                _ => {
+                    let edge = grid.apron.size_m / 2.0 + 20_000.0;
+                    (span(-edge, edge), span(-edge, edge))
+                }
+            };
+            [snap(x), snap(z), 0.0, 0.0]
+        })
+        .collect()
+}
+
+/// The water shader's sampler mirrors `blended_water`, crossing guard included. First over
+/// fields whose sizes make the bilinear weights exact in f32 (spacings of 256 m and 2,048 m,
+/// points on a 1/8 m grid): the level within 2 ulps of its taps, the rest within a few. Then
+/// over the region's own sizes, whose f32 weights sit a few ulps of the texel coordinate from
+/// the reference's (WGSL's division may be 2.5 ulps off): within that times each quantity's
+/// local spread.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_water_matches_rust() {
+    let center = geo_to_render(latlon_to_geo(34.2, 74.3));
+    let dyadic = RegionGrid {
+        spec: RegionSpec::new(center, YearsBp(0.0), 1),
+        inner: wet_rough_field(1025, 262_144.0, 3, 118_000.0, 1.0e9),
+        apron: wet_rough_field(1025, 2_097_152.0, 4, 0.0, 137_000.0),
+        boulders: Vec::new(),
+    };
+    let points = water_points(&dyadic, 0xD1AD, 0.125);
+    let exact = check_water_parity(&dyadic, &points, 0.0);
+    println!("dyadic fields: {exact:?}");
+
+    let standard = RegionGrid {
+        spec: RegionSpec::new(center, YearsBp(0.0), 1),
+        inner: wet_rough_field(REGION_RES, REGION_SIZE_M, 5, 128_000.0, 1.0e9),
+        apron: wet_rough_field(APRON_RES, APRON_SIZE_M, 6, 0.0, 155_000.0),
+        boulders: Vec::new(),
+    };
+    let points = water_points(&standard, 0x57A2, 1.0 / 64.0);
+    // Three ulps of a texel coordinate below 1,025 for each weight.
+    let weight_error = 2.0 * 3.0 * ulp(1024.0);
+    let region = check_water_parity(&standard, &points, weight_error);
+    println!("region fields: {region:?}");
+
+    for (name, p) in [("dyadic", &exact), ("region", &region)] {
+        assert!(
+            p.guarded >= 50,
+            "{name}: only {} points through the guard",
+            p.guarded
+        );
+        assert!(
+            p.blended >= 300,
+            "{name}: only {} points in the blend",
+            p.blended
+        );
+        assert!(
+            p.in_river >= 100,
+            "{name}: only {} points in a river",
+            p.in_river
+        );
+        assert!(
+            p.shore >= 100,
+            "{name}: only {} points on standing water's shore",
+            p.shore
+        );
+    }
+}
+
+/// A full-screen triangle whose fragments each run a long dependent loop: a pass with a known,
+/// sizeable GPU cost.
+const BUSY_PASS: &str = r#"
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    var v = p.x * 0.001 + p.y * 0.002;
+    for (var k = 0; k < 128; k++) {
+        v = fract(sin(v * 12.9898 + f32(k)) * 43758.5453);
+    }
+    return vec4<f32>(v, v, v, 1.0);
+}
+"#;
+
+/// One frame of `passes` busy passes between `timer`'s marker passes, submitted; `wait` waits
+/// for the GPU after it. Returns the readings that came in.
+fn submit_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    timer: &mut timefly::diagnostics::gpu_time::GpuTimer,
+    pipeline: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+    passes: u32,
+    wait: bool,
+) -> (bool, Vec<Option<f32>>) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    let timed = timer.begin(&mut encoder);
+    for _ in 0..passes {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("busy"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.draw(0..3, 0..1);
+    }
+    timer.end(
+        &mut encoder,
+        device,
+        &[(view, wgpu::TextureFormat::Rgba8Unorm)],
+    );
+    queue.submit([encoder.finish()]);
+    timer.submitted(queue);
+    let poll = if wait {
+        wgpu::PollType::wait_indefinitely()
+    } else {
+        wgpu::PollType::Poll
+    };
+    device.poll(poll).expect("poll");
+    (timed, timer.harvest())
+}
+
+/// Frames timed by a fresh [`GpuTimer`](timefly::diagnostics::gpu_time::GpuTimer), each with
+/// `passes` busy passes, the busy target as the frame's output, each waiting for its work.
+/// A primer frame comes first (a frame with no read predecessor is dropped), and empty frames
+/// after until every reading is in. The readings, in frame order.
+fn timed_frames(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+    passes: &[u32],
+) -> Vec<f32> {
+    let mut timer =
+        timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
+    let mut readings = Vec::new();
+    // A frame's reading arrives with the frame after it (its resolve waits for its work).
+    let frames = std::iter::once(0)
+        .chain(passes.iter().copied())
+        .chain([0, 0]);
+    for (i, n) in frames.enumerate() {
+        let (timed, got) = submit_frame(device, queue, &mut timer, pipeline, view, n, true);
+        assert!(timed, "a free slot for frame {i}");
+        readings.extend(got);
+    }
+    assert_eq!(
+        readings.first(),
+        Some(&None),
+        "the primer has no predecessor"
+    );
+    readings
+        .into_iter()
+        .skip(1)
+        .take(passes.len())
+        .map(|r| r.expect("a valid reading: begin and end written, end after begin"))
+        .collect()
+}
+
+/// `frames` frames of `passes` busy passes each, back to back (no wait), as when GPU-bound:
+/// frames that find no free slot go untimed. Then more of the same, waiting, until the readings
+/// are in. Every valid reading.
+fn back_to_back(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::RenderPipeline,
+    view: &wgpu::TextureView,
+    passes: u32,
+    frames: usize,
+) -> (Vec<f32>, usize) {
+    let mut timer =
+        timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
+    let mut readings = Vec::new();
+    let mut untimed = 0;
+    for i in 0..frames + 6 {
+        let (timed, got) = submit_frame(
+            device,
+            queue,
+            &mut timer,
+            pipeline,
+            view,
+            passes,
+            i >= frames,
+        );
+        untimed += usize::from(!timed);
+        readings.extend(got);
+    }
+    (readings.into_iter().flatten().collect(), untimed)
+}
+
+/// Rivers and lakes Task 10: the GPU frame time read from pass-level timestamps (one-pixel
+/// marker passes around the frame, `TIMESTAMP_QUERY` only) is positive, grows with the GPU work
+/// between them, and is not inflated when frames run back to back (on Apple silicon a marker
+/// pass with no dependency overlaps other passes).
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn the_gpu_frame_time_is_measured_on_this_gpu() {
+    use timefly::diagnostics::gpu_time::GpuTimer;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    println!("adapter: {:?}", adapter.get_info());
+    assert!(
+        adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
+        "this adapter offers no TIMESTAMP_QUERY: the game reports `gpu time: unavailable` here"
+    );
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::TIMESTAMP_QUERY,
+        ..Default::default()
+    }))
+    .expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("busy pass"),
+        source: wgpu::ShaderSource::Wgsl(BUSY_PASS.into()),
+    });
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("busy pass"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(format.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let view = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("busy target"),
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 1024,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    println!(
+        "timestamp period {} ns",
+        GpuTimer::new(&device, queue.get_timestamp_period()).period_ns()
+    );
+    // Warm up (pipeline compile, clocks), then the median of three frames per pass count.
+    timed_frames(&device, &queue, &pipeline, &view, &[4; 3]);
+    let median = |passes: u32| {
+        let mut ms = timed_frames(&device, &queue, &pipeline, &view, &[passes; 3]);
+        ms.sort_by(f32::total_cmp);
+        println!("{passes} busy passes, waited: {ms:?} ms");
+        ms[1]
+    };
+    let (none, one, four, sixteen) = (median(0), median(1), median(4), median(16));
+    println!("medians: 0 {none} ms, 1 {one} ms, 4 {four} ms, 16 {sixteen} ms");
+    assert!(
+        (0.0..1.0).contains(&none),
+        "the timer's own passes: {none} ms"
+    );
+    assert!(one > 0.0, "{one} ms");
+    // Close to linear in the work: the end waits for the last busy pass.
+    assert!(four > 3.0 * one, "4 passes {four} ms vs 1 pass {one} ms");
+    assert!(
+        sixteen > 3.0 * four,
+        "16 passes {sixteen} ms vs 4 passes {four} ms"
+    );
+    // Twenty frames back to back (review, fix round 1): when the ring runs out some frames go
+    // untimed, and a frame after an untimed one could start inside it and read up to double.
+    // Those are dropped, so no reading is: the worst stays with the median (a doubled reading
+    // is about 2×), and the median with the waited figure. That one only loosely: waited, the
+    // GPU idles between frames and may clock down (one run read 8.5 ms waited, 6.9 packed).
+    let (mut packed, untimed) = back_to_back(&device, &queue, &pipeline, &view, 4, 20);
+    packed.sort_by(f32::total_cmp);
+    let (mid, worst) = (packed[packed.len() / 2], packed[packed.len() - 1]);
+    println!(
+        "4 busy passes back to back: {} readings, {untimed} frames untimed, median {mid} ms, worst {worst} ms: {packed:?}",
+        packed.len()
+    );
+    // The test submits every frame at once (Bevy keeps a frame or two in flight), so most go
+    // untimed: the case under test, which must happen here.
+    assert!(
+        untimed > 0,
+        "every frame found a slot: no chain break was exercised"
+    );
+    assert!(packed.len() >= 6, "{} readings of 26 frames", packed.len());
+    assert!(
+        (mid - four).abs() <= 0.35 * four,
+        "back-to-back median {mid} ms vs waited {four} ms"
+    );
+    assert!(
+        worst <= 1.3 * mid,
+        "back-to-back worst {worst} ms vs their median {mid} ms"
+    );
+}
+
+const WATER: &str = include_str!("../assets/shaders/water.wesl");
+const SCATTER: &str = include_str!("../assets/shaders/scatter.wesl");
+
+/// The text of `fn name(...) { ... }` in `src`, up to its closing brace at the line start.
+fn wesl_fn(src: &str, name: &str) -> String {
+    let start = src
+        .find(&format!("\nfn {name}("))
+        .unwrap_or_else(|| panic!("fn {name}"))
+        + 1;
+    let end = start + src[start..].find("\n}\n").expect("the fn's end") + 3;
+    src[start..end].to_string()
+}
+
+/// The line `const NAME ...;` in `src`.
+fn wesl_const(src: &str, name: &str) -> String {
+    let start = src
+        .find(&format!("\nconst {name}:"))
+        .unwrap_or_else(|| panic!("const {name}"))
+        + 1;
+    let end = start + src[start..].find('\n').expect("the line's end");
+    src[start..end].to_string()
+}
+
+const WHITE_WATER_ENTRY: &str = r#"
+const TAU: f32 = 6.2831855;
+@group(0) @binding(0) var<storage, read> queries: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = id.x;
+    if (n >= arrayLength(&out)) {
+        return;
+    }
+    // (x, z) region metres, made on the CPU (a fused multiply-add here would move them by an
+    // ulp of 151 km, 1.6 cm), then two unit values; the time and the seed come from them.
+    let q = queries[n];
+    let xz = q.xy;
+    let p = vec2<f32>(8.0 * q.z - 4.0, 10.0 * q.w - 2.0);
+    let t = 3.0 + 7.0 * q.w;
+    let seed = u32(q.w * 255.0);
+    let dir = normalize(vec2<f32>(cos(q.z * 6.0), sin(q.z * 6.0)));
+    let lambda = 6.0 + 17.0 * q.w;
+    let crests = crest_patch(xz);
+    let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+    let flicker = crest_flicker(xz, t);
+    let pulses = collar_pulses(t, seed);
+    out[n] = vec4<f32>(
+        collar_shape(p, q.z, 16.0 * q.w, pulses.x, pulses.y, pulses.z),
+        white_water_foam(1.0, crest, crests, q.z - 0.5, flicker, q.w),
+        collar_foam(p * 3.0, 6.0 * q.z, t, seed),
+        flicker,
+    );
+}
+"#;
+
+/// Fix rounds 4 and 5: the white water's functions as the shipped shaders write them (cut from
+/// `scatter.wesl` and `water.wesl`, with `noise.wesl`) agree with their Rust mirrors on the GPU,
+/// at times from 3 to 10 s: the collars' pulsed shape and their flowing foam, the crests' warped
+/// standing waves, patches and flicker, and the foam weight.
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored"]
+fn wesl_white_water_matches_rust() {
+    use bevy::math::Vec2;
+    use timefly::boulders::{collar_foam, collar_pulses, collar_shape};
+    use timefly::water::{
+        crest_flicker, crest_patch, crest_warp, standing_waves, white_water_foam,
+    };
+    let mut src = String::from(NOISE);
+    for c in [
+        "STANDING_WAVE_CELL_M",
+        "FOAM_CREST_BAND",
+        "FOAM_MEAN",
+        "CREST_WARP",
+        "CREST_NOISE_M",
+        "CREST_PATCH_BAND",
+        "CREST_FLICKER_M",
+        "CREST_FLICKER_RATE",
+        "CREST_FLICKER_PERIOD_S",
+    ] {
+        src += &format!("{}\n", wesl_const(WATER, c));
+    }
+    for f in [
+        "brush",
+        "standing_waves",
+        "crest_warp",
+        "crest_patch",
+        "crest_flicker",
+        "white_water_foam",
+    ] {
+        src += &format!("{}\n", wesl_fn(WATER, f));
+    }
+    for f in [
+        "foam_noise",
+        "collar_shape",
+        "collar_pulses",
+        "foam_layer",
+        "collar_foam",
+    ] {
+        src += &format!("{}\n", wesl_fn(SCATTER, f));
+    }
+    src += WHITE_WATER_ENTRY;
+    let mut rng = SplitMix(0xC011A5);
+    let queries: Vec<[f32; 4]> = (0..16_384)
+        .map(|_| {
+            [
+                151_234.0 + 60.0 * rng.unit(),
+                -87_321.0 + 60.0 * rng.unit(),
+                rng.unit(),
+                rng.unit(),
+            ]
+        })
+        .collect();
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("a GPU adapter");
+    let (device, queue) =
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("white water parity"),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("white water parity"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let query_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("queries"),
+        contents: bytemuck::cast_slice(&queries),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let bytes = (queries.len() * 16) as u64;
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: query_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(queries.len().div_ceil(64) as u32, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, bytes);
+    queue.submit([encoder.finish()]);
+    read_buf
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    let got: Vec<[f32; 4]> =
+        bytemuck::cast_slice(&read_buf.slice(..).get_mapped_range().expect("mapped range"))
+            .to_vec();
+
+    let (mut diffs, mut shaped, mut foamed) = ([(); 4].map(|_| Vec::new()), 0, 0);
+    for (q, g) in queries.iter().zip(&got) {
+        let xz = Vec2::new(q[0], q[1]);
+        let p = Vec2::new(8.0 * q[2] - 4.0, 10.0 * q[3] - 2.0);
+        let t = 3.0 + 7.0 * q[3];
+        let seed = (q[3] * 255.0) as u32;
+        let a = q[2] * 6.0;
+        let dir = Vec2::new(a.cos(), a.sin()).normalize();
+        let lambda = 6.0 + 17.0 * q[3];
+        let crests = crest_patch(xz);
+        let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+        let flicker = crest_flicker(xz, t);
+        let want = [
+            collar_shape(p, q[2], 16.0 * q[3], collar_pulses(t, seed)),
+            white_water_foam(1.0, crest, crests, q[2] - 0.5, flicker, q[3]),
+            collar_foam(p * 3.0, 6.0 * q[2], t, seed),
+            flicker,
+        ];
+        shaped += usize::from(want[0] > 0.5);
+        foamed += usize::from(want[1] > 0.5);
+        for (d, (got, want)) in diffs.iter_mut().zip(g.iter().zip(&want)) {
+            d.push((got - want).abs());
+        }
+    }
+    // The shape (its pulses run through sin) and the collar foam (small coordinates): a few
+    // ulps. The noise itself agrees to 1e-6 (`wesl_noise_matches_golden`), but `brush` divides
+    // region metres by its cell (thousands of cells out here), and WGSL's division may be 2.5
+    // ulps off; the waves' phase runs through sin on hashed offsets; the foam's smoothsteps
+    // steepen both. So the worst and the 99th percentile are bounded separately.
+    let mut worst = [0.0f32; 4];
+    for (k, (max, p99)) in [(2e-3f32, 2e-4f32), (0.1, 1e-2), (2e-3, 2e-4), (3e-2, 5e-3)]
+        .into_iter()
+        .enumerate()
+    {
+        let d = &mut diffs[k];
+        d.sort_by(f32::total_cmp);
+        worst[k] = d[d.len() - 1];
+        let q99 = d[d.len() * 99 / 100];
+        assert!(
+            worst[k] <= max && q99 <= p99,
+            "output {k}: worst {}, p99 {q99}",
+            worst[k]
+        );
+    }
+    println!("worst differences {worst:?}; {shaped} in a collar, {foamed} foamed");
+    assert!(
+        shaped > 600 && foamed > 15,
+        "{shaped} shaped, {foamed} foamed"
+    );
 }

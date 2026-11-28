@@ -10,13 +10,17 @@ Datasets baked by `tools/bake` (rows filled in as the bake tasks land).
 | Global sea level (0–798 ka) | Spratt & Lisiecki (2016) via NOAA NCEI; see [Sea level](#sea-level) | NOAA NCEI public data; cite publication and dataset DOI | Task 7 (`timefly_bake.sealevel`) |
 | Terrain and bathymetry (region worlds) | ETOPO 2022 60″ surface, NOAA NCEI; see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | NOAA NCEI public data; cite doi:10.25921/fd45-gt74 | M2 Task 1 (`timefly_bake.etopo`, `tiles`) |
 | Climate classes (region worlds) | Köppen-Geiger 1991–2020, Beck et al. (2023); see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger) | CC BY 4.0 | M2 Task 1 (`timefly_bake.koppen`) |
+| Past climate, 0–120 ka (rivers) | Beyer, Krapp & Manica (2020), figshare 12293345; see [Past climate](#past-climate-beyer-et-al-2020) | CC BY 4.0 | Rivers and lakes Task 1 (`timefly_bake.beyer`) |
+| Present-day lakes (rivers, recent eras) | Natural Earth 1:10m lakes 5.0.0; see [Present-day lake map](#present-day-lake-map-natural-earth) | Public domain | Rivers and lakes Task 8b (`timefly_bake.lakemap`) |
+| Today's major river courses (rivers, recent eras) | Natural Earth 1:10m rivers + lake centerlines 5.1.2; see [Today's river courses](#todays-river-courses-natural-earth) | Public domain | Rivers and lakes Task 11b (`timefly_bake.rivers_today`) |
+| Ridged steps into today's courses (rivers, recent eras) | Derived from the region tiles (ETOPO 2022 60″) and the river courses above; see [Ridged steps](#ridged-steps-into-todays-courses) | NOAA NCEI public data; cite doi:10.25921/fd45-gt74 | Rivers and lakes Task 11g (`timefly --bake-ridged-steps`) |
 | Cultural chronology | `data/culture/civilizations.csv` | TBD | Milestone 5 import |
 
 ## Pinned downloads (`data/sources.json`)
 
 `data/sources.json` lists every raw file the bake reads, with its URL, path under `data/raw/`,
 SHA-256, size in bytes and licence: the PaleoDEM archive, the two plate-model archives, the 27
-ICE-6G_C slices, the sea-level file, ETOPO 2022 and the Köppen-Geiger archive (33 files). The URLs and checksums are
+ICE-6G_C slices, the sea-level file, ETOPO 2022, the Köppen-Geiger archive, the Natural Earth lakes and the Natural Earth rivers (35 files). The URLs and checksums are
 the ones in the tables below (`tools/bake/tests/test_fetch.py` checks that they agree). The
 PaleoDEM report PDF is reference reading for the age table, not a bake input, so it is not
 listed and CI never downloads it.
@@ -272,7 +276,7 @@ the sea-level curve, so glacial coastlines are approximated but Pleistocene ice 
 
 ## Region tiles: ETOPO 2022 and Köppen-Geiger
 
-Inputs (both pinned in `data/sources.json`; 33 files in all):
+Inputs (both pinned in `data/sources.json`):
 
 | File | Size (bytes) | SHA-256 |
 |---|---|---|
@@ -304,6 +308,137 @@ Each tile is a 5° × 5° `latlon` grid of 301 × 301 samples
 antimeridian), 2 channels, float16: elevation in metres, then the Köppen code. The manifest lists
 every tile with its byte size and SHA-256 and the two source checksums. Sizes:
 [`docs/testing/region-m2/performance.md`](../docs/testing/region-m2/performance.md).
+
+## Past climate: Beyer et al. 2020
+
+Beyer, R.M., Krapp, M. & Manica, A. (2020). An empirical evaluation of bioclimatic and
+vegetation reconstructions for the last 120,000 years. *Scientific Data* 7, 236,
+doi:10.1038/s41597-020-0552-1. Data: figshare doi:10.6084/m9.figshare.12293345 (article
+12293345), CC BY 4.0. Changes: BIO1 and BIO12 regridded to 1°.
+
+The data is one 1,333,236,636-byte file, `LateQuaternary_Environment.nc` (figshare file 22659026,
+`https://ndownloader.figshare.com/files/22659026`, md5 `d23abb7ce8671433ea36a2cae814ebab` per the
+figshare files API), HDF5 inside. It is **not** downloaded whole and is not in the `files` list
+of `data/sources.json`, so `timefly-fetch` never touches it. It has its own top-level
+`range_read` list, and `timefly-bake climate` reads from it with HTTP range requests through
+h5py (`timefly_bake.beyer.RangeFile`), holding 64 blocks in memory and writing nothing to
+disk. The ndownloader redirects every ranged GET to a signed URL that lives about ten seconds, so
+each request starts from the public URL and follows one redirect, which must go to https. The
+reader refuses to fetch more than `MAX_FETCH_BYTES` (100 MB). The API's size and md5 must match
+the pins before any block is read, and SHA-256 pins on the two extracted arrays
+(`range_read[].variables`) catch a changed file.
+
+What the file holds (read from this run's log and header): 72 time steps (`time`, int32, "years
+since present", -120000 to 0 in steps of 2000 up to 22 ka and 1000 below, i.e. ages 0 to 21 ka
+by 1, then 22 to 120 ka by 2), `latitude` 300 rows from -59.75 to 89.75 (south first, 0.5°) and
+`longitude` 720 columns from -179.75 to 179.75. Land only: sea and Antarctica are NaN or absent.
+Each bioclimatic variable is `(72, 300, 720)` float32, chunks `(24, 100, 240)`, gzip, about 19 MB
+stored. The variables carry only a `long_name` (no `units` attribute); the values are °C for
+`BIO1` and mm/yr for `BIO12` (Amazon about 27 °C and 1,850 mm, Sahara about 23 °C and 20-45 mm),
+and the coordinate variables' `units` attributes are mislabeled (latitude says `degrees_east`),
+so the bake places values by the numbers, not the labels.
+
+Baked ages (ka): 0 to 21 in steps of 1, then 22, 24, 26, then 30, 40, ..., 120 (35 grids).
+
+`cd tools/bake && uv run timefly-bake climate --sources ../../data/sources.json --out ../../crates/timefly/assets/data/climate`
+(`--record-pins` prints the two array digests instead of checking them) writes, flat in that
+folder: `manifest.json` (version 1, replaced last) and one `bio_<age>ka.<sha256>.tfgrid` per age.
+Each is a `latlon` F16 grid of shape (180, 360, 2): row 0 is centred on 89.5° N, column 0 on
+179.5° W, channel 0 is BIO1 (°C) and channel 1 is BIO12 (mm/yr), NaN where Beyer has no land
+value. The 1° value is the mean of the 2 × 2 half-degree cells that have one. The manifest lists
+every file's age, byte size and SHA-256, the figshare file id, the SHA-256 of each extracted
+0.5° array (`source.variables_sha256`) and the attribution. The first run fetched 39,621,532
+bytes in 66 requests (about 40 s); the 35 grids total 2,486,321 bytes. The tiny test fixture
+`crates/timefly/tests/assets/data/climate/` is written by
+`tools/bake/scripts/write_climate_fixture.py` through the same code on a synthetic file.
+
+## Present-day lake map: Natural Earth
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `data/raw/naturalearth/ne_10m_lakes.zip` | 2,349,685 | `0803a06f9c3cb4671d89b68c48b142aad9366ba40f665245e12a913fbc61722a` |
+
+Natural Earth 1:10m physical vectors, lakes, version 5.0.0, URL
+`https://naciscdn.org/naturalearth/10m/physical/ne_10m_lakes.zip` (public domain; no permission
+needed, credit appreciated). The zip holds a polygon shapefile in lon/lat degrees with 1,355
+features: 1,056 `Lake`, 69 `Alkaline Lake` and 230 `Reservoir` (`featurecla`). The Caspian is not
+among them (Natural Earth maps it as sea; the lake level table holds it).
+
+The rivers' continental pass checks lakes against it where the terrain is today's (recent eras;
+rivers and lakes Task 8b, owner ruling 2026-11-25): an open lake the map does not hold is cut
+through, and one standing above its mapped surface drops to it.
+
+`cd tools/bake && uv run timefly-bake lakemap --zip <ne_10m_lakes.zip> --etopo ../../data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc --out ../../data/hydrology/lake_map.bin`
+(`timefly_bake.lakemap`) reads the shapefile straight from the zip with its own small reader,
+keeps the lakes (`Lake`, `Alkaline Lake`; reservoirs are dropped, since dams are not in the
+terrain and the game spans the past), rasterises them at cell centres onto a 3′ equirectangular
+grid (7,200 × 3,600, row 0 north; islands are holes) and gives each lake the median of the ETOPO
+2022 60″ surface cells whose centres lie inside it. Lakes that hold no 3′ cell are left out:
+1,059 lakes, 54,152 cells, a 74,562-byte file (row run-lengths; the format is in the module's
+docstring, and `timefly_core::hydrology::lakemap` decodes it). Levels read: Titicaca 3,808.5 m,
+Victoria 1,133 m, the Great Salt Lake 1,278 m, the Dead Sea −427 m (the 10 km overview reads
+about −276 m there), Tanganyika 770 m, Malawi 474.5 m, Issyk-Kul 1,606.5 m.
+
+At the present-day snapshot the pass takes every lake from this map (Task 8b round 2): each
+mapped lake at its baked surface over its own lattice nodes, the lake level table's lakes at
+the table's levels; in past recent eras the map only caps open lakes.
+
+`data/hydrology/straits.json` lists seaways narrower than the pass's 10 km lattice (the
+Bosporus, sill about 35 m): with today's terrain the pass lowers their nodes to the sill, moved
+with the era's shift, so the Black Sea is sea at the present day and closed when the sea stood
+below the sill. Hand-made, like `lake_levels.json`; Task 11's Python reads it too.
+
+## Today's river courses: Natural Earth
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| `data/raw/naturalearth/ne_10m_rivers_lake_centerlines.geojson` | 7,307,743 | `bb854a900ecbd3b408df46d5e16e3e0f974ba55993f9d8b5c26e855273c0905a` |
+
+Natural Earth 1:10m physical vectors, rivers + lake centerlines, version 5.1.2, URL
+`https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_rivers_lake_centerlines.geojson`
+(public domain; no permission needed, credit appreciated). 1,455 MultiLineString features: 1,202
+`River` and 253 `Lake Centerline` (`featurecla`), `scalerank` 0–10.
+
+`cd tools/bake && uv run timefly-bake rivers-today --geojson <ne_10m_rivers_lake_centerlines.geojson> --etopo ../../data/raw/etopo/ETOPO_2022_v1_60s_N90W180_surface.nc --out ../../data/hydrology/rivers_today.json`
+(`timefly_bake.rivers_today`) keeps the `River` features of `scalerank` ≤ 7 (lake centrelines are
+left out: today's lakes are the lake map's), one polyline per line part (655 features, 1,275
+parts). It puts each part upstream first: the end whose lowest ETOPO 2022 60″ cell within 2′ (two
+cells either way) stands higher goes first, ties keeping Natural Earth's order (138 parts were
+reversed). It simplifies each part to 1 km (Ramer–Douglas–Peucker on great-circle distances) and
+rounds points to 0.001°, dropping parts that round to one point: 1,248 courses, 52,896 points
+(of 171,153), a 926,552-byte table, one course per line.
+
+Where the terrain is today's (recent eras; rivers and lakes Task 11b, owner ruling 2026-11-26),
+the continental pass burns each course into its routing: the running minimum of the era's node
+elevations along it, less 10 m (`TODAY_RIVER_BURN_M`), never below sea level on land. The river
+graph's bed there is the running minimum itself. Without it the lattice's routes across flat
+plains leave the real courses: the lower Indus ran about 90 km east of Sehwan.
+
+## Ridged steps into today's courses
+
+| File | Size (bytes) | Steps |
+|---|---|---|
+| `data/hydrology/ridged_steps.bin` | 151,180 | 18,894 |
+
+The steps a tributary may not take into a burnt course (rivers and lakes Task 11g, owner ruling
+2026-11-26): every lattice step from a node off the shipped courses into a course node, at the
+recent lattice (n = 900), whose terrain climbs more than `JOIN_RIDGE_M` = 100 m above the higher
+of the two nodes' unburnt elevations. The terrain along a step is the region tiles' 60″ lattice
+(ETOPO 2022 60″, see [Region tiles](#region-tiles-etopo-2022-and-köppen-geiger)) sampled every
+250 m between the node centres; a node's unburnt elevation is the 5′ overview at its centre (what
+the pass samples at the present day). The course nodes are those of `rivers_today.json` at the
+lattice. Without it the burnt trench pulls neighbouring nodes into it across ridges the 10 km
+nodes do not see: Hells Canyon's Salmon drained west into the Snake over a 726 m crest, and the
+regions carved a gash 1,167 m deep through it.
+
+`timefly --bake-ridged-steps` (native, hidden; run from the source tree with the bake's assets,
+e.g. `BEVY_ASSET_ROOT=<a folder holding assets/data> target/release/timefly --bake-ridged-steps`)
+writes it (`crates/timefly/src/ridged_bake.rs`): it reads the 574 tiles the steps cross, takes
+about 2 s, and gives the same bytes on every run. The file is stamped with the course table's
+FNV-1a hash, the lattice size and the threshold; `the_shipped_ridged_steps_match_the_course_table`
+fails when the table changes, so a course change forces a re-bake. Format and rule:
+`timefly_core::hydrology::ridged`. The pass forbids a step only where that era burnt its course
+node, in routing and in the lakes' basin rewrites.
 
 ## Performance and memory (Task 10)
 

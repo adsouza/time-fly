@@ -1,6 +1,7 @@
 use super::*;
 use crate::deep_time::YearsBp;
 use crate::geo::RenderDir;
+use crate::hydrology::params::NO_WATER_DROP_M;
 use crate::worldgen::generate::RegionSpec;
 use crate::worldgen::{APRON_RES, APRON_SIZE_M, REGION_RES, REGION_SIZE_M};
 use bevy_math::DVec3;
@@ -423,12 +424,7 @@ fn field(res: u32, size_m: f64, f: fn(f64, f64) -> f64) -> Field {
             elevation_m.push(f(x, z) as f32);
         }
     }
-    Field {
-        res,
-        size_m,
-        elevation_m,
-        surface: vec![[0; 4]; n],
-    }
+    Field::dry(res, size_m, elevation_m, vec![[0; 4]; n])
 }
 
 fn test_grid() -> RegionGrid {
@@ -436,6 +432,7 @@ fn test_grid() -> RegionGrid {
         spec: RegionSpec::new(RenderDir(DVec3::Y), YearsBp(0.0), 1),
         inner: field(REGION_RES, REGION_SIZE_M, inner_fn),
         apron: field(APRON_RES, APRON_SIZE_M, apron_fn),
+        boulders: Vec::new(),
     }
 }
 
@@ -516,6 +513,350 @@ fn blend_is_the_inner_field_inside_and_the_apron_outside() {
     assert!((h - (hi + ha) / 2.0).abs() < 1e-2, "{h} vs {hi} and {ha}");
 }
 
+/// `f` at each texel of a field shaped like `like`.
+fn texels_of(like: &Field, f: impl Fn(f64, f64) -> f32) -> Vec<f32> {
+    (0..like.res)
+        .flat_map(|row| (0..like.res).map(move |col| (row, col)))
+        .map(|(row, col)| {
+            let (x, z) = like.local_of(row, col);
+            f(x, z)
+        })
+        .collect()
+}
+
+#[test]
+fn blended_water_mirrors_blended_height() {
+    use crate::worldgen::generate::water::{decode_river, encode_river};
+    let mut grid = test_grid();
+    // Water levels, flows and a sub-texel river (22 m wide, along x = 1,234.5 m in the inner
+    // field: its texels hold the signed offset and ribbon, the apron's none).
+    let level = |x: f64, z: f64| (40.0 + 30.0 * (x / 11_000.0).cos() + z / 9_000.0) as f32;
+    let east = |x: f64, _z: f64| (1.5 * (x / 20_000.0).sin()) as f32;
+    let north = |_x: f64, z: f64| (0.75 * (z / 30_000.0).cos()) as f32;
+    let x0 = 1_234.5;
+    for (f, river) in [(&mut grid.inner, true), (&mut grid.apron, false)] {
+        f.water_level_m = texels_of(f, level);
+        let offsets = texels_of(f, |x, _| (x - x0) as f32);
+        let (es, ns) = (texels_of(f, east), texels_of(f, north));
+        f.river = (0..offsets.len())
+            .map(|i| {
+                let o = if river { offsets[i] } else { 0.0 };
+                let ribbon = if river { 11.0 - o.abs() } else { 1000.0 };
+                encode_river(ribbon, es[i], ns[i], o)
+            })
+            .collect();
+    }
+    // A grid whose heights are each quantity: blended_water must match blended_height_m on it.
+    let mirror = |pick: &dyn Fn(&Field, usize) -> f32| {
+        let mut m = grid.clone();
+        for f in [&mut m.inner, &mut m.apron] {
+            f.elevation_m = (0..f.river.len()).map(|i| pick(f, i)).collect();
+        }
+        m
+    };
+    let levels = mirror(&|f, i| f.water_level_m[i]);
+    let easts = mirror(&|f, i| decode_river(f.river[i])[1]);
+    let norths = mirror(&|f, i| decode_river(f.river[i])[2]);
+    let e1 = REGION_SIZE_M / 2.0;
+    let mut points: Vec<(f64, f64)> = vec![(0.0, 0.0), (e1, e1), (-e1, 3.0), (2.0e6, -1.0e6)];
+    for k in 0..400 {
+        let t = f64::from(k);
+        // Through the inner field, the blend (131-150 km) and the apron beyond.
+        points.push((
+            (t * 0.618_034).fract() * 3.2e5 - 1.6e5,
+            (t * 0.754_878).fract() * 3.2e5 - 1.6e5,
+        ));
+        points.push((
+            (t * 0.381_966).fract() * 2.6e6 - 1.3e6,
+            (t * 0.569_840).fract() * 2.6e6 - 1.3e6,
+        ));
+    }
+    for &(x, z) in &points {
+        let w = blended_water(&grid, x, z);
+        assert_eq!(
+            w.level_m.to_bits(),
+            blended_height_m(&levels, x, z).to_bits(),
+            "({x}, {z})"
+        );
+        assert_eq!(w.thickness_m, w.level_m - blended_height_m(&grid, x, z));
+        assert_eq!(
+            w.flow[0].to_bits(),
+            blended_height_m(&easts, x, z).to_bits()
+        );
+        assert_eq!(
+            w.flow[1].to_bits(),
+            blended_height_m(&norths, x, z).to_bits()
+        );
+        assert_eq!(
+            blended_surface_m(&grid, x, z),
+            blended_height_m(&grid, x, z).max(w.level_m)
+        );
+    }
+    // The sub-texel river keeps its width between texels 293 m apart, where every texel's own
+    // ribbon is negative: the ribbon is positive exactly within 11 m of the centreline.
+    let texel = grid.inner.spacing_m();
+    let mut inside = 0;
+    for k in 0..2000 {
+        let x = x0 - 40.0 + 0.04 * f64::from(k);
+        let z = -50_000.0 + 7.3 * f64::from(k);
+        let r = blended_water(&grid, x, z).ribbon_m;
+        let exact = 11.0 - (x - x0).abs() as f32;
+        assert!(
+            (r - exact).abs() < 0.3,
+            "({x}, {z}): ribbon {r}, exact {exact}"
+        );
+        inside += usize::from(r > 0.0);
+    }
+    assert!(inside > 500);
+    let col = ((x0 + e1) / texel).floor() as usize;
+    for c in [col, col + 1] {
+        assert!(
+            decode_river(grid.inner.river[512 * 1025 + c])[0] < -50.0,
+            "texel ribbons"
+        );
+    }
+}
+
+/// Two rivers 1.5 km apart, each 22 m wide, converging side by side (ruling 2 of Task 8): the
+/// texels west of the divide belong to the west river, on its left bank (offset `+`), those east
+/// of it to the east river, on its right bank (offset `−`). Between the last texel of one and the
+/// first of the other the interpolated offset passes through 0, where `hw − |o|` alone would
+/// rebuild an 11 m ribbon over dry ground. No ribbon may appear between the channels, and each
+/// river keeps its true width.
+#[test]
+fn converging_rivers_leave_no_ribbon_between_them() {
+    use crate::worldgen::generate::water::encode_river;
+    let mut grid = test_grid();
+    let (west, east) = (1_234.5, 2_734.5);
+    let divide = (west + east) / 2.0;
+    let half_width = 11.0f32;
+    let f = &mut grid.inner;
+    f.water_level_m = texels_of(f, |_, _| 5_000.0);
+    let offsets = texels_of(f, |x, _| {
+        if x < divide {
+            (x - west) as f32
+        } else {
+            (x - east) as f32
+        }
+    });
+    f.river = offsets
+        .iter()
+        .map(|&o| encode_river(half_width - o.abs(), 1.0, 0.0, o))
+        .collect();
+    let mut between = 0;
+    for k in 0..=6_000 {
+        let x = west - 40.0 + f64::from(k) * (east - west + 80.0) / 6_000.0;
+        let z = -20_000.0 + 3.7 * f64::from(k);
+        let r = blended_water(&grid, x, z).ribbon_m;
+        let d = (x - west).abs().min((x - east).abs()) as f32;
+        let exact = half_width - d;
+        if d > half_width + 1.0 {
+            between += 1;
+            assert!(
+                r < 0.0,
+                "({x}, {z}): a ribbon of {r} m {d} m from both rivers"
+            );
+        } else {
+            assert!(
+                (r - exact).abs() < 0.3,
+                "({x}, {z}): ribbon {r}, exact {exact}"
+            );
+        }
+    }
+    assert!(between > 5_000);
+    // The fixture creates the hazard: an unguarded blend of the two texels astride the divide
+    // passes through a zero offset with an 11 m half-width.
+    let texel = grid.inner.spacing_m();
+    let col = ((divide + REGION_SIZE_M / 2.0) / texel).floor() as usize;
+    let (a, b) = (offsets[512 * 1025 + col], offsets[512 * 1025 + col + 1]);
+    assert!(a > 400.0 && b < -400.0, "{a}, {b}");
+}
+
+/// A lake at 100 m on a sloping shore (Task 8b): lake texels store the level, dry ones
+/// `h − NO_WATER_DROP_M`. The wet/dry boundary must follow the ground's own `h = L` contour, as
+/// the terrain mesh shows it, not the zero contour of a level dropping across the dry texels.
+#[test]
+fn a_lake_shore_follows_the_ground_contour() {
+    const L: f32 = 100.0;
+    let mut grid = test_grid();
+    // About 3 m per texel, at an angle to the texel rows.
+    let (c, s) = (0.31f64.cos(), 0.31f64.sin());
+    let ground = move |x: f64, z: f64| 100.0 + 0.01 * (x * c + z * s);
+    for f in [&mut grid.inner, &mut grid.apron] {
+        f.elevation_m = texels_of(f, |x, z| ground(x, z) as f32);
+        f.water_level_m = f
+            .elevation_m
+            .iter()
+            .map(|&h| if h < L { L } else { h - NO_WATER_DROP_M as f32 })
+            .collect();
+    }
+    // The hazard: the same grid read with the level blended over every tap.
+    let mut levels = grid.clone();
+    for f in [&mut levels.inner, &mut levels.apron] {
+        f.elevation_m = f.water_level_m.clone();
+    }
+    let texel = grid.inner.spacing_m();
+    let (mut worst, mut worst_plain, mut lines) = (0.0f64, 0.0f64, 0);
+    for k in 0..40 {
+        // Lines across the shore (along the slope), through the inner field.
+        let t0 = -30_000.0 + 1_517.3 * f64::from(k);
+        let (ox, oz) = (-s * t0, c * t0);
+        let along = |u: f64| (ox + c * u, oz + s * u);
+        let crossing = |f: &dyn Fn(f64, f64) -> f32| {
+            let mut last = None;
+            for j in 0..=4000 {
+                let u = -2.0 * texel + 4.0 * texel * f64::from(j) / 4000.0;
+                let (x, z) = along(u);
+                let wet = f(x, z) > 0.0;
+                if last == Some(true) && !wet {
+                    return u;
+                }
+                last = Some(wet);
+            }
+            panic!("no shore on line {k}");
+        };
+        let shore = crossing(&|x, z| blended_water(&grid, x, z).thickness_m);
+        let contour = crossing(&|x, z| L - blended_height_m(&grid, x, z));
+        let plain =
+            crossing(&|x, z| blended_height_m(&levels, x, z) - blended_height_m(&grid, x, z));
+        worst = worst.max((shore - contour).abs() / texel);
+        worst_plain = worst_plain.max((plain - contour).abs() / texel);
+        lines += 1;
+        // The fly's floor stands at the level over the water, on the ground beyond it.
+        let (x, z) = along(contour - 0.3 * texel);
+        assert!(
+            (blended_surface_m(&grid, x, z) - L).abs() < 1e-3,
+            "line {k}"
+        );
+    }
+    println!("{lines} lines: shore within {worst:.4} texel; a plain blend {worst_plain:.3}");
+    assert!(worst <= 0.05, "the shore is {worst} texel from h = L");
+    assert!(
+        worst_plain > 0.2,
+        "the fixture creates the hazard: {worst_plain}"
+    );
+}
+
+/// Rivers keep the plain blend (Task 8b, round 2): where a river's texels meet dry banks, the
+/// level blends with the banks' `h − NO_WATER_DROP_M` as before, in `blended_water` and in the
+/// fly's floor alike, before and after the river texels are freed.
+#[test]
+fn a_river_beside_dry_banks_blends_as_before() {
+    use crate::worldgen::generate::water::encode_river;
+    let mut grid = test_grid();
+    let x0 = 1_234.5;
+    let texel = grid.inner.spacing_m();
+    let f = &mut grid.inner;
+    let offsets = texels_of(f, |x, _| (x - x0) as f32);
+    let half = 1.5 * texel as f32;
+    let channel: Vec<bool> = offsets.iter().map(|o| o.abs() < half).collect();
+    f.water_level_m = (0..offsets.len())
+        .map(|i| {
+            let h = f.elevation_m[i];
+            if channel[i] {
+                h + 2.0
+            } else {
+                h - NO_WATER_DROP_M as f32
+            }
+        })
+        .collect();
+    f.river = (0..offsets.len())
+        .map(|i| {
+            if channel[i] {
+                encode_river(half - offsets[i].abs(), 1.0, 0.0, offsets[i])
+            } else {
+                crate::worldgen::generate::water::RIVER_NONE
+            }
+        })
+        .collect();
+    let mut levels = grid.clone();
+    for f in [&mut levels.inner, &mut levels.apron] {
+        f.elevation_m = f.water_level_m.clone();
+    }
+    let points: Vec<(f64, f64)> = (0..400)
+        .map(|k| {
+            let t = f64::from(k);
+            (
+                x0 - 3.0 * texel + 6.0 * texel * (t * 0.618_034).fract(),
+                -60_000.0 + 297.3 * t,
+            )
+        })
+        .collect();
+    let mut banks = 0;
+    let surfaces: Vec<f32> = points
+        .iter()
+        .map(|&(x, z)| {
+            let plain = blended_height_m(&levels, x, z);
+            let w = blended_water(&grid, x, z);
+            assert_eq!(w.level_m.to_bits(), plain.to_bits(), "({x}, {z})");
+            let floor = blended_surface_m(&grid, x, z);
+            assert_eq!(
+                floor,
+                blended_height_m(&grid, x, z).max(plain),
+                "({x}, {z})"
+            );
+            // The hazard: a cell with river and dry taps, where flat standing water would stand
+            // metres above the plain blend.
+            banks += usize::from(plain < blended_height_m(&grid, x, z) - 1.0 && w.ribbon_m > -half);
+            floor
+        })
+        .collect();
+    assert!(banks > 20, "{banks} points on a bank cell");
+    grid.inner.free_rivers();
+    grid.apron.free_rivers();
+    for (&(x, z), &floor) in points.iter().zip(&surfaces) {
+        assert_eq!(
+            blended_surface_m(&grid, x, z),
+            floor,
+            "({x}, {z}) after freeing"
+        );
+    }
+}
+
+/// Once a grid's river texels are on the GPU the shell frees them (`Field::free_rivers`): the
+/// levels, and so the fly's floor, are unchanged, and `blended_water` reads no river.
+#[test]
+fn a_grid_without_its_rivers_keeps_its_levels() {
+    use crate::worldgen::generate::water::encode_river;
+    let mut grid = test_grid();
+    for f in [&mut grid.inner, &mut grid.apron] {
+        let n = f.river.len();
+        f.water_level_m = f.elevation_m.iter().map(|h| h + 2.0).collect();
+        f.river = (0..n)
+            .map(|i| encode_river(3.0, 1.0, -0.5, (i % 7) as f32))
+            .collect();
+    }
+    let before = grid.bytes();
+    let points = [
+        (0.0, 0.0),
+        (12_345.0, -67_890.0),
+        (140_000.0, 1.0),
+        (-9.0e5, 4.0e5),
+    ];
+    let kept: Vec<_> = points
+        .iter()
+        .map(|&(x, z)| (blended_surface_m(&grid, x, z), blended_water(&grid, x, z)))
+        .collect();
+    let freed = grid.inner.river.len() * 8 + grid.apron.river.len() * 8;
+    grid.inner.free_rivers();
+    grid.apron.free_rivers();
+    assert!(grid.inner.river.is_empty() && grid.apron.river.is_empty());
+    // One bit a texel stays, telling rivers from standing water.
+    let mask = 8 * (grid.inner.river_mask.len() + grid.apron.river_mask.len());
+    assert_eq!(before - grid.bytes(), freed - mask);
+    for (&(x, z), (surface, water)) in points.iter().zip(&kept) {
+        assert_eq!(blended_surface_m(&grid, x, z), *surface, "({x}, {z})");
+        let w = blended_water(&grid, x, z);
+        assert_eq!(
+            (w.level_m, w.thickness_m),
+            (water.level_m, water.thickness_m)
+        );
+        assert_eq!(w.flow, [0.0, 0.0], "({x}, {z})");
+        let none = crate::hydrology::params::RIBBON_NONE_M as f32;
+        assert!(w.ribbon_m >= none - 1.0, "({x}, {z}): {w:?}");
+    }
+}
+
 #[test]
 fn curvature_drop_is_the_sagitta() {
     assert_eq!(curvature_drop_m(0.0), 0.0);
@@ -531,6 +872,7 @@ fn flat_grid(f: fn(f64, f64) -> f64) -> RegionGrid {
         spec: RegionSpec::new(RenderDir(DVec3::Y), YearsBp(0.0), 1),
         inner: field(REGION_RES, REGION_SIZE_M, f),
         apron: field(APRON_RES, APRON_SIZE_M, f),
+        boulders: Vec::new(),
     }
 }
 

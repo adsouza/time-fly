@@ -19,7 +19,7 @@ use bevy::light::cluster::ClusterConfig;
 use bevy::light::{CascadeShadowConfig, CascadeShadowConfigBuilder};
 use bevy::prelude::*;
 use timefly_core::flight::altitudes::REGION_CLOUD_BASE_M;
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::blended_surface_m;
 use timefly_core::worldgen::generate::RegionGrid;
 
 use super::{TERRAIN_LAYER, TerrainScene, TerrainSettings};
@@ -196,10 +196,10 @@ pub struct RegionCamera;
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct TerrainSun;
 
-/// The debug camera over a grid: [`CAMERA_START_ALTITUDE_M`] above the higher of the ground and
-/// the sea at the centre, looking north (−z), pitched down [`DEBUG_PITCH_DEG`].
+/// The debug camera over a grid: [`CAMERA_START_ALTITUDE_M`] above the drawn surface (the ground
+/// or the water) at the centre, looking north (−z), pitched down [`DEBUG_PITCH_DEG`].
 pub fn debug_camera_transform(grid: &RegionGrid) -> Transform {
-    let ground = blended_height_m(grid, 0.0, 0.0).max(0.0);
+    let ground = blended_surface_m(grid, 0.0, 0.0);
     Transform::from_xyz(0.0, ground + CAMERA_START_ALTITUDE_M, 0.0)
         .with_rotation(Quat::from_rotation_x(-DEBUG_PITCH_DEG.to_radians()))
 }

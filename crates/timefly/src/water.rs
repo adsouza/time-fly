@@ -1,20 +1,33 @@
-//! The region's sea (M2 design §6.5, spec §7.5): a plane at sea level (`y = 0`), curved like the
+//! The region's water (M2 design §6.5, spec §7.5; rivers and lakes design §4.4): the sea, the
+//! lakes and the rivers, drawn from the fields' water textures (`water_image`), curved like the
 //! terrain, out to the apron's edge.
 //!
-//! [`WaterMaterial`] extends `StandardMaterial`, so the sea takes the region sun's light, the
+//! [`WaterMaterial`] extends `StandardMaterial`, so the water takes the region sun's light, the
 //! terrain's shadows, the fog and the tonemapping exactly as the land does. Its extension binds
-//! the terrain's own patch buffer (for the camera and the field layout) and height textures, and
-//! `water.wesl` (importing `package::terrain_cdlod`, the WESL copy of `blended_height_m`):
-//! - **Vertex:** a polar mesh centred on the camera ([`water_mesh`]), dropped by `d² / 2R` like
-//!   the terrain, then pulled toward the camera along the view ray by [`WATER_DEPTH_PULL`] of
-//!   the distance (plus [`WATER_PULL_M`]). That changes only depth, never the pixel, so the sea
-//!   wins depth ties against a terrain mesh lying near `y = 0` instead of z-fighting with it.
-//! - **Fragment:** the sea-floor depth is `−blended_height` at the fragment's surface point.
-//!   Fragments over land (depth ≤ 0) are discarded, so the shoreline is the height field's own
-//!   zero contour, per pixel. Then the depth tint ([`water_tint`]), foam where `0 < depth < 4 m`
-//!   (within [`FOAM_WIDTH_M`] of the edge on gentle coasts, [`foam_band_depth_m`]) broken up by
-//!   `noise.wesl`, Bevy PBR lighting, and a Schlick Fresnel blend (f0 = 0.02) toward
-//!   the sky's colour along the reflected ray.
+//! the terrain's own patch buffer (for the camera and the field layout) and the two water
+//! textures, and `water.wesl` (importing `package::terrain_cdlod`, whose `blended_water` is the
+//! WESL copy of `timefly_core::terrain::blended_water`):
+//! - **Vertex:** a polar mesh centred on the camera ([`water_mesh`]), at the drawn surface (the
+//!   water level, or the ground where that is higher: `blended_surface_m`), dropped by `d² / 2R`
+//!   like the terrain, then pulled toward the camera along the view ray by [`WATER_DEPTH_PULL`]
+//!   of the distance (plus [`WATER_PULL_M`]). That changes only depth, never the pixel, so the
+//!   water wins depth ties against the terrain at its shore instead of z-fighting with it.
+//! - **Fragment:** the water's thickness over the ground is `blended_water`'s at the fragment's
+//!   surface point. Fragments over dry ground (thickness ≤ 0), and outside a river's true width
+//!   (ribbon < 0), are discarded, so the shoreline is the fields' own zero contour, per pixel.
+//!   Then the depth tint ([`water_tint`] on standing water, [`river_tint`] on rivers), foam
+//!   where standing water is under 4 m thick (within [`FOAM_WIDTH_M`] of the edge on gentle
+//!   coasts, [`foam_band_depth_m`]) broken up by `noise.wesl`, Bevy PBR lighting, and a Schlick
+//!   Fresnel blend (f0 = 0.02) toward the sky's colour along the reflected ray.
+//!
+//! Rivers (Task 8): their ripples and foam scroll downstream along the flow, the flow-map
+//! technique with two phases half a period apart ([`flow_phase_weights`], [`FLOW_PERIOD_S`]),
+//! so the water moves without pulsing; in rapids (`rapid_from_speed` of the flow's speed) the
+//! scroll is faster, the ripples rougher ([`RAPID_NORMAL_GAIN`]) and the water broken and white
+//! ([`WHITE_WATER`]). Task 11c fix round 4: the standing waves' crests are warped and broken
+//! into still patches ([`crest_warp`], [`crest_patch`]), so the rapid's own foam is short,
+//! irregular crests over dark water; most of its white is the rocks' foam collars
+//! (`crate::boulders`).
 //!
 //! Waves (art pass §5.4, `waves.wesl`):
 //! - **Swell:** three directional components around the region's wind ([`water_waves`]). Below
@@ -29,8 +42,11 @@
 //!   edge. The vertex stage pulls the shallows toward the camera as if the sea were that much
 //!   higher, so water laid over the beach still wins depth ties with the terrain.
 //!
-//! The camera never goes below the sea (Task 9's clearance), so there is no underwater view.
-//! The water is opaque: the depth tint already stands for the floor beneath it.
+//! The camera never goes below the water (the fly's clearance over `blended_surface_m`), so there
+//! is no underwater view. The water is opaque: the depth tint already stands for the floor
+//! beneath it. On a region swap's first frame the scene holds no water: the water's entity and
+//! material are dropped (so the render world frees the old water's bind group with its
+//! textures) and rebuilt the frame after, over the new water textures.
 
 use std::sync::Arc;
 
@@ -94,6 +110,213 @@ pub fn water_radius_m(camera_height_m: f32) -> f32 {
 /// [`WATER_RING_GROWTH`] of the radius farther out.
 pub const WATER_RING_M: f32 = 25.0;
 pub const WATER_RING_GROWTH: f32 = 0.04;
+
+/// Where the water's thickness is below `−DRY_SINK_M` (dry ground), the mesh sits this far (m)
+/// under the ground and isn't pulled toward the camera, so the terrain hides it there and its
+/// fragments are rejected before they shade. Elsewhere it sits at the water's level, or at
+/// `ground − DRY_SINK_M` where that is higher, so near water it never dips under the level.
+/// A `water.wesl` constant.
+pub const DRY_SINK_M: f32 = 4.0;
+/// The flow map's period (s): each of the two phases scrolls the ripples downstream for this
+/// long, then restarts while the other shows. Divides [`crate::art::TIME_WRAP_S`].
+pub const FLOW_PERIOD_S: f32 = 2.0;
+/// The scale (m) of the ripples the flow carries.
+pub const FLOW_NORMAL_SCALE_M: f32 = 6.0;
+/// White water's foam strength in a full rapid.
+pub const RAPID_FOAM: f32 = 1.0;
+/// The scroll speeds up by `1 + RAPID_SCROLL × rapid`.
+pub const RAPID_SCROLL: f32 = 1.0;
+/// The ripples' slope grows by `1 + RAPID_NORMAL_GAIN × rapid`. A `water.wesl` constant.
+pub const RAPID_NORMAL_GAIN: f32 = 3.0;
+/// A fast mountain river's colour (sRGB): clear green-teal.
+pub const RIVER_CLEAR: Color = Color::srgb(0.10, 0.32, 0.33);
+/// A slow lowland river's colour (sRGB): silty brown.
+pub const RIVER_SILTY: Color = Color::srgb(0.36, 0.30, 0.20);
+/// Flow speeds (m/s): fully silty at or below the first, clear from the second.
+pub const SILT_SPEED_MPS: [f32; 2] = [1.0, 3.0];
+/// White water's colour (sRGB). A `water.wesl` constant (linear).
+pub const WHITE_WATER: Color = Color::srgb(0.92, 0.94, 0.93);
+/// Gravity (m/s²) for the standing waves' wavelength `2π v² / g` (Task 11c). A `water.wesl`
+/// constant.
+pub const GRAVITY_MPS2: f32 = 9.81;
+/// The rapids' standing waves' largest slope at `rapid` = 1 (a crest-to-trough height of about
+/// a tenth of the wavelength). A `water.wesl` constant.
+pub const STANDING_WAVE_SLOPE: f32 = 0.3;
+/// The standing waves are held in cells this big (m), each its own train about its own point,
+/// blended (`standing_waves` in `water.wesl`). At least the longest wavelength, a full rapid's
+/// 2π × 6² / g = 23 m. A `water.wesl` constant.
+pub const STANDING_WAVE_CELL_M: f32 = 32.0;
+/// White water's noise is this many times longer along the flow than across it. A `water.wesl`
+/// constant.
+pub const STREAK_STRETCH: f32 = 4.0;
+/// The streaks are drawn in this many fixed frames around the circle, the two either side of the
+/// flow blended. A `water.wesl` constant.
+pub const STREAK_DIRECTIONS: f32 = 24.0;
+/// Fix round 5 ("softer"): white water's foam is `smoothstep` over this wide band of the
+/// crests' patch strength times their flicker times `0.5 + streak`, gated off the troughs: soft
+/// streaks along the flow on the crests, not round sharp-edged blobs. A `water.wesl` constant.
+pub const FOAM_CREST_BAND: [f32; 2] = [0.05, 0.6];
+/// The crests' foam flickers in still noise cells this big (m)... A `water.wesl` constant.
+pub const CREST_FLICKER_M: f32 = 7.0;
+/// ...that change at this rate (cells a second)... A `water.wesl` constant.
+pub const CREST_FLICKER_RATE: f32 = 0.8;
+/// ...looping over this period (s), which divides Bevy's hour-long time wrap
+/// ([`crate::art::TIME_WRAP_S`]): two phases half a period apart, cross-faded as the flow map's
+/// are. A `water.wesl` constant.
+pub const CREST_FLICKER_PERIOD_S: f32 = 10.0;
+
+/// How much of the crests' foam stands at `xz` at time `t` (s), 0 to 1 (fix round 5): still
+/// noise that changes with time, so crest foam flickers, breaks and re-forms while the crests
+/// stay put. Its time axis loops ([`CREST_FLICKER_PERIOD_S`]): two phases, each restarting
+/// while its weight is 0, their noise normalised by the weights' length so the contrast holds.
+/// Mirrored in `water.wesl`.
+pub fn crest_flicker(xz: Vec2, t: f32) -> f32 {
+    let p = CREST_FLICKER_PERIOD_S;
+    let a = (t / p).rem_euclid(1.0);
+    let b = (a + 0.5).rem_euclid(1.0);
+    let (wa, wb) = (1.0 - (2.0 * a - 1.0).abs(), 1.0 - (2.0 * b - 1.0).abs());
+    let na = brush(xz, CREST_FLICKER_M, a * p * CREST_FLICKER_RATE, 251);
+    let nb = brush(xz, CREST_FLICKER_M, b * p * CREST_FLICKER_RATE + 37.5, 251);
+    let n = (wa * na + wb * nb) / (wa * wa + wb * wb).sqrt();
+    (0.55 + 0.6 * n).clamp(0.0, 1.0)
+}
+/// Where the crests and streaks can't be resolved, a full rapid's foam fades to this, the mean
+/// of its foam up close: the crests' own plus [`FOAM_ROCK_SHARE`]
+/// (`background_crest_foam_stays_under_its_cap` checks they agree). Fix round 4: most of a
+/// rapid's white is its rocks' collars, which fade out with distance, so the far mean stands in
+/// for them too. A `water.wesl` constant.
+pub const FOAM_MEAN: f32 = 0.19;
+/// The share of a full rapid's water its rocks' collars whiten up close (fix round 4, measured
+/// on the wide-rapid renders; the Task 11c report).
+pub const FOAM_ROCK_SHARE: f32 = 0.15;
+/// Fix round 4 (the owner's "rework the look": the crests read as a regular ladder): the
+/// standing waves' phase is shifted by this many wavelengths at most, by still noise
+/// ([`crest_warp`])... A `water.wesl` constant.
+pub const CREST_WARP: f32 = 0.5;
+/// ...whose cells are twice this, while the waves' strength comes in still patches this big
+/// (m, [`crest_patch`]). A `water.wesl` constant.
+pub const CREST_NOISE_M: f32 = 9.0;
+/// A patch's strength is `smoothstep` of its noise over this band. A `water.wesl` constant.
+pub const CREST_PATCH_BAND: [f32; 2] = [0.0, 0.3];
+/// The standing waves' slope keeps this share where the patches are gone. A `water.wesl`
+/// constant.
+pub const CREST_WAVE_FLOOR: f32 = 0.4;
+
+/// `water.wesl`'s `brush`: gradient noise at a world-space scale.
+fn brush(xz: Vec2, scale_m: f32, z: f32, seed: u32) -> f32 {
+    let q = xz / scale_m;
+    let c = q.floor();
+    let zc = z.floor();
+    timefly_core::worldgen::noise::gradient_noise3(
+        [c.x as i32, c.y as i32, zc as i32],
+        [q.x - c.x, q.y - c.y, z - zc],
+        seed,
+    )
+}
+
+/// The standing waves at `xz` in water flowing along unit `dir`, wavelength `lambda` (m), their
+/// phase shifted by `warp` wavelengths: `(sin, cos)` of the height pattern's phase, blended over
+/// the four cells of a [`STANDING_WAVE_CELL_M`] lattice around `xz`, each its own train with its
+/// own hashed phase. Mirrored in `water.wesl`.
+pub fn standing_waves(xz: Vec2, dir: Vec2, lambda: f32, warp: f32) -> Vec2 {
+    let g = xz / STANDING_WAVE_CELL_M - 0.5;
+    let c = g.floor();
+    let t = g - c;
+    let f = t * t * (Vec2::splat(3.0) - 2.0 * t);
+    let (mut sum, mut norm) = (Vec2::ZERO, 0.0);
+    for j in 0..2 {
+        for i in 0..2 {
+            let cell = c + Vec2::new(i as f32, j as f32);
+            let point = (cell + 0.5) * STANDING_WAVE_CELL_M;
+            let h = timefly_core::worldgen::noise::hash3([cell.x as i32, cell.y as i32, 0], 229);
+            let offset = (h >> 8) as f32 / 16_777_216.0;
+            let phase = (xz - point).dot(dir) / lambda + offset + warp;
+            let a = std::f32::consts::TAU * (phase - phase.floor());
+            let w = if i == 1 { f.x } else { 1.0 - f.x } * if j == 1 { f.y } else { 1.0 - f.y };
+            sum += w * Vec2::new(a.sin(), a.cos());
+            norm += w * w;
+        }
+    }
+    sum / norm.max(1e-6).sqrt()
+}
+
+/// The standing waves' still phase shift at `xz` (wavelengths). Mirrored in `water.wesl`.
+pub fn crest_warp(xz: Vec2) -> f32 {
+    CREST_WARP * brush(xz, 2.0 * CREST_NOISE_M, 0.0, 233)
+}
+
+/// How strong the standing waves are at `xz`, 0 to 1, in still patches about
+/// [`CREST_NOISE_M`] across. Mirrored in `water.wesl`.
+pub fn crest_patch(xz: Vec2) -> f32 {
+    let n = brush(xz, CREST_NOISE_M, 0.0, 239);
+    let t =
+        ((n - CREST_PATCH_BAND[0]) / (CREST_PATCH_BAND[1] - CREST_PATCH_BAND[0])).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// White water's foam weight (fix rounds 1, 4 and 5) at a rapid of `rapid`, a standing-wave
+/// `crest` (the height's sine, −1 in a trough, 1 on a crest), the crests' `patch` strength
+/// ([`crest_patch`]), the `streak` noise (after [`STREAK_CONTRAST`]; 4:1 along the flow and
+/// carried by it), the crests' `flicker` ([`crest_flicker`]), and `resolve`, how far the
+/// pattern is resolved (1 up close, 0 where it shrinks below a couple of pixels). Mirrored in
+/// `water.wesl`.
+pub fn white_water_foam(
+    rapid: f32,
+    crest: f32,
+    patch: f32,
+    streak: f32,
+    flicker: f32,
+    resolve: f32,
+) -> f32 {
+    let step = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let foam = step(
+        FOAM_CREST_BAND[0],
+        FOAM_CREST_BAND[1],
+        flicker * (0.5 + 0.5 * patch) * (0.3 + 0.7 * streak),
+    ) * step(-0.5, 0.5, crest);
+    rapid * (FOAM_MEAN + (foam - FOAM_MEAN) * resolve)
+}
+/// White water's streak noise is scaled by this before its threshold: up close the foam breaks
+/// into streaks and clumps over dark water, while where the noise is unresolved (at its mean, 0)
+/// a rapid is exactly as white as before. A `water.wesl` constant.
+pub const STREAK_CONTRAST: f32 = 1.6;
+
+/// The standing waves' wavelength (m) on water flowing at `speed_mps`: `2π v² / g`.
+pub fn standing_wavelength_m(speed_mps: f32) -> f32 {
+    std::f32::consts::TAU * speed_mps * speed_mps / GRAVITY_MPS2
+}
+
+/// The flow map's two phase weights at time `t_s`, shifted by `jitter` periods: triangles half
+/// a period apart, each 0 where its phase restarts (its offset jumps back to none), so they
+/// always sum to 1 and one of them always weighs at least 0.5. Mirrored in `water.wesl`, where
+/// each phase `p` samples the ripples at `xz − flow × p × FLOW_PERIOD_S`.
+pub fn flow_phase_weights(t_s: f32, jitter: f32) -> [f32; 2] {
+    let p = (t_s / FLOW_PERIOD_S + jitter).rem_euclid(1.0);
+    let q = (p + 0.5).rem_euclid(1.0);
+    [1.0 - (2.0 * p - 1.0).abs(), 1.0 - (2.0 * q - 1.0).abs()]
+}
+
+/// How silty a river flowing at `speed_mps` is: 1 at [`SILT_SPEED_MPS`]`[0]` and slower, 0 at
+/// `[1]` and faster (`1 − smoothstep`). Mirrored in `water.wesl`.
+pub fn river_silt(speed_mps: f32) -> f32 {
+    let [a, b] = SILT_SPEED_MPS;
+    let t = ((speed_mps - a) / (b - a)).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
+/// A river's own colour `depth_m` deep, flowing at `speed_mps`, before lighting: from
+/// [`RIVER_CLEAR`] to [`RIVER_SILTY`] by [`river_silt`]; the clear part darkens with depth as
+/// [`water_tint`] does (toward [`WATER_DEEP`] by `1 − e^(−d/scale)`), while silt keeps the
+/// water opaque brown. Mirrored by `river_tint` in `water.wesl`.
+pub fn river_tint(depth_m: f32, speed_mps: f32) -> Color {
+    let silt = river_silt(speed_mps);
+    let base = RIVER_CLEAR.to_linear().mix(&RIVER_SILTY.to_linear(), silt);
+    let t = 1.0 - (-depth_m.max(0.0) / WATER_DEPTH_SCALE_M).exp();
+    Color::LinearRgba(base.mix(&WATER_DEEP.to_linear(), t * (1.0 - silt)))
+}
 
 /// Water colour right at the shore (sRGB): a clear turquoise over sand.
 pub const WATER_SHALLOW: Color = Color::srgb(0.27, 0.66, 0.64);
@@ -250,6 +473,13 @@ pub struct WaterLook {
     /// `x`: [`BAND_SLOPE`]; `y`: [`BAND_PATCH_M`]; `z`, `w`: [`SWELL_FADE_DEPTH_M`], the depths
     /// over which every wave (displaced or normal-only) comes in from the shore.
     pub bands: Vec4,
+    /// The rivers' flow map: `x`: [`FLOW_PERIOD_S`]; `y`: [`FLOW_NORMAL_SCALE_M`]; `z`:
+    /// [`RAPID_FOAM`]; `w`: [`RAPID_SCROLL`].
+    pub flow: Vec4,
+    /// [`RIVER_CLEAR`], linear; `w`: [`SILT_SPEED_MPS`]`[0]`.
+    pub river_clear: Vec4,
+    /// [`RIVER_SILTY`], linear; `w`: [`SILT_SPEED_MPS`]`[1]`.
+    pub river_silty: Vec4,
     /// The six directional waves ([`water_waves`]): the three displaced swell components, then
     /// the three normal-only bands.
     pub waves: [Vec4; 6],
@@ -293,6 +523,9 @@ pub fn water_look(grid: &RegionGrid) -> WaterLook {
             SWELL_FADE_DEPTH_M[0],
             SWELL_FADE_DEPTH_M[1],
         ),
+        flow: Vec4::new(FLOW_PERIOD_S, FLOW_NORMAL_SCALE_M, RAPID_FOAM, RAPID_SCROLL),
+        river_clear: v(RIVER_CLEAR).extend(SILT_SPEED_MPS[0]),
+        river_silty: v(RIVER_SILTY).extend(SILT_SPEED_MPS[1]),
         waves: water_waves(wind),
     }
 }
@@ -383,16 +616,17 @@ pub fn water_mesh() -> Mesh {
 /// The sea's material.
 pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
 
-/// The sea's extension of `StandardMaterial`: the terrain's patch buffer and height textures
-/// (shared, never copied) and its look.
+/// The water's extension of `StandardMaterial`: the terrain's patch buffer and the fields' water
+/// textures (shared, never copied) and its look.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
 pub struct WaterExtension {
     #[storage(100, read_only)]
     pub patches: Handle<ShaderBuffer>,
-    #[texture(101, sample_type = "float", filterable = false)]
-    pub inner_height: Handle<Image>,
-    #[texture(102, sample_type = "float", filterable = false)]
-    pub apron_height: Handle<Image>,
+    /// `TerrainScene::inner_water` (`Rgba32Uint`, read with `textureLoad`).
+    #[texture(101, sample_type = "u_int")]
+    pub inner_water: Handle<Image>,
+    #[texture(102, sample_type = "u_int")]
+    pub apron_water: Handle<Image>,
     #[uniform(103)]
     pub look: WaterLook,
 }
@@ -414,12 +648,12 @@ impl MaterialExtension for WaterExtension {
     }
 }
 
-/// The sea's material over the terrain's patch buffer and height textures (shared with the
-/// pipeline warm-up, `crate::terrain::warmup`, so its pipeline keys match).
+/// The water's material over the terrain's patch buffer and the fields' water textures (shared
+/// with the pipeline warm-up, `crate::terrain::warmup`, so its pipeline keys match).
 pub fn water_material(
     patches: &Handle<ShaderBuffer>,
-    inner_height: &Handle<Image>,
-    apron_height: &Handle<Image>,
+    inner_water: &Handle<Image>,
+    apron_water: &Handle<Image>,
     look: WaterLook,
 ) -> WaterMaterial {
     WaterMaterial {
@@ -428,22 +662,35 @@ pub fn water_material(
             perceptual_roughness: 0.12,
             // f0 = 0.16 × reflectance² = 0.02 (WATER_F0).
             reflectance: (WATER_F0 / 0.16).sqrt(),
+            // Drawn after the opaque terrain (the alpha-mask phase; no fragment's alpha is under
+            // 0), so the depth test rejects the mesh where it lies under dry ground
+            // ([`DRY_SINK_M`]) before the fragment shader runs.
+            alpha_mode: AlphaMode::Mask(0.0),
             ..default()
         },
         extension: WaterExtension {
             patches: patches.clone(),
-            inner_height: inner_height.clone(),
-            apron_height: apron_height.clone(),
+            inner_water: inner_water.clone(),
+            apron_water: apron_water.clone(),
             look,
         },
     }
 }
 
-/// The sea for the current region (present while its entity exists).
+/// The water for the current region (present while the terrain scene is).
 #[derive(Resource, Debug)]
 pub struct RegionWater {
-    /// The grid whose heights it reads.
+    /// The grid whose water it draws.
     pub grid: Arc<RegionGrid>,
+    /// [`water_mesh`], kept across swaps.
+    pub mesh: Handle<Mesh>,
+    /// The drawn water, while the scene has water textures to bind.
+    pub drawn: Option<DrawnWater>,
+}
+
+/// The water's entity and its material, over one set of water textures.
+#[derive(Debug)]
+pub struct DrawnWater {
     pub entity: Entity,
     pub material: Handle<WaterMaterial>,
 }
@@ -470,12 +717,29 @@ pub(crate) fn add_water_systems(app: &mut App) {
     app.add_systems(Update, sync_water.after(TerrainSceneSystems));
 }
 
-/// Gathers the scene and the sea, decides (the sky's rule: build, rebind on a replaced grid,
-/// remove), and applies it.
+/// The scene's water textures, when both exist: on a replace's swap frame the scene holds no
+/// water (its handles are empty, `Handle::default()`, which Bevy's default image answers to).
+pub(crate) fn scene_water(
+    scene: &TerrainScene,
+    images: &Assets<Image>,
+) -> Option<[Handle<Image>; 2]> {
+    let ready = |h: &Handle<Image>| *h != Handle::default() && images.contains(h);
+    (ready(&scene.inner_water) && ready(&scene.apron_water))
+        .then(|| [scene.inner_water.clone(), scene.apron_water.clone()])
+}
+
+/// Gathers the scene and the water, decides (the sky's rule: build, rebind on a replaced grid,
+/// remove), and applies it. The water is drawn while the scene has water textures, by a material
+/// made over them. On a replace's swap frame (no water textures) the entity is despawned and the
+/// material removed with every handle to it: a material that merely rebinds keeps its old bind
+/// group, and with it the old water's textures, in the render world until its new one can be
+/// built (`RetryNextUpdate`), so old and new water would coexist (the hop's memory, Task 7). An
+/// unused material is unloaded the frame after, with the old textures.
 fn sync_water(
     mut commands: Commands,
     scene: Option<Res<TerrainScene>>,
     water: Option<ResMut<RegionWater>>,
+    images: Res<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
 ) {
@@ -484,47 +748,87 @@ fn sync_water(
         scene.as_ref().map(|s| &s.grid),
         water.as_ref().map(|w| &w.grid),
     );
+    let drop_drawn = |commands: &mut Commands,
+                      materials: &mut Assets<WaterMaterial>,
+                      drawn: Option<DrawnWater>| {
+        if let Some(d) = drawn {
+            commands.entity(d.entity).despawn();
+            materials.remove(&d.material);
+        }
+    };
     match (action, scene, water) {
         (SkyAction::Build, Some(scene), _) => {
-            let material = materials.add(water_material(
-                &scene.buffer,
-                &scene.inner_height,
-                &scene.apron_height,
-                water_look(&scene.grid),
-            ));
-            let entity = commands
-                .spawn((
-                    Name::new("Region sea"),
-                    Mesh3d(meshes.add(water_mesh())),
-                    MeshMaterial3d(material.clone()),
-                    Transform::IDENTITY,
-                    NoFrustumCulling,
-                    RenderLayers::layer(TERRAIN_LAYER),
-                ))
-                .id();
-            info!("region sea built");
+            let mesh = meshes.add(water_mesh());
+            let drawn = scene_water(&scene, &images)
+                .map(|w| draw_water(&mut commands, &mut materials, &scene, &mesh, w));
+            info!(drawn = drawn.is_some(), "region water built");
             commands.insert_resource(RegionWater {
                 grid: scene.grid.clone(),
-                entity,
-                material,
+                mesh,
+                drawn,
             });
         }
-        (SkyAction::Retint, Some(scene), Some(mut water)) => {
-            if let Some(mut m) = materials.get_mut(&water.material) {
-                m.extension.inner_height = scene.inner_height.clone();
-                m.extension.apron_height = scene.apron_height.clone();
-                m.extension.look = water_look(&scene.grid);
-            }
-            water.grid = scene.grid.clone();
-            info!("region sea rebound to the replaced grid");
-        }
-        (SkyAction::Teardown, _, Some(water)) => {
-            commands.entity(water.entity).despawn();
+        (SkyAction::Teardown, _, Some(mut water)) => {
+            drop_drawn(&mut commands, &mut materials, water.drawn.take());
             commands.remove_resource::<RegionWater>();
-            info!("region sea removed");
+            info!("region water removed");
+        }
+        (action @ (SkyAction::Retint | SkyAction::Keep), Some(scene), Some(mut water)) => {
+            if action == SkyAction::Retint {
+                water.grid = scene.grid.clone();
+                if let Some(d) = &water.drawn
+                    && let Some(mut m) = materials.get_mut(&d.material)
+                {
+                    m.extension.look = water_look(&scene.grid);
+                }
+            }
+            let bound = scene_water(&scene, &images);
+            let current = water.drawn.as_ref().and_then(|d| {
+                materials
+                    .get(&d.material)
+                    .map(|m| [m.extension.inner_water.id(), m.extension.apron_water.id()])
+            });
+            let wanted = bound.as_ref().map(|[i, a]| [i.id(), a.id()]);
+            if current != wanted {
+                drop_drawn(&mut commands, &mut materials, water.drawn.take());
+                let mesh = water.mesh.clone();
+                water.drawn =
+                    bound.map(|w| draw_water(&mut commands, &mut materials, &scene, &mesh, w));
+                info!(
+                    drawn = water.drawn.is_some(),
+                    "region water rebuilt over the scene's water"
+                );
+            }
         }
         _ => {}
     }
+}
+
+/// Spawns the water over the scene's water textures `[inner, apron]`.
+fn draw_water(
+    commands: &mut Commands,
+    materials: &mut Assets<WaterMaterial>,
+    scene: &TerrainScene,
+    mesh: &Handle<Mesh>,
+    [inner, apron]: [Handle<Image>; 2],
+) -> DrawnWater {
+    let material = materials.add(water_material(
+        &scene.buffer,
+        &inner,
+        &apron,
+        water_look(&scene.grid),
+    ));
+    let entity = commands
+        .spawn((
+            Name::new("Region water"),
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material.clone()),
+            Transform::IDENTITY,
+            NoFrustumCulling,
+            RenderLayers::layer(TERRAIN_LAYER),
+        ))
+        .id();
+    DrawnWater { entity, material }
 }
 
 #[cfg(test)]
@@ -780,19 +1084,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn water_look_matches_its_wesl_mirror() {
+    /// A 3 x 3 region in the Red Sea.
+    fn look_grid() -> RegionGrid {
         use timefly_core::deep_time::YearsBp;
         use timefly_core::geo::{geo_to_render, latlon_to_geo};
         use timefly_core::worldgen::generate::{Field, RegionSpec};
-        use timefly_core::worldgen::wind::wind_axis;
-        let field = |res: u32, size_m: f64| Field {
-            res,
-            size_m,
-            elevation_m: vec![-10.0; (res * res) as usize],
-            surface: vec![[0; 4]; (res * res) as usize],
+        let field = |res: u32, size_m: f64| {
+            Field::dry(
+                res,
+                size_m,
+                vec![-10.0; (res * res) as usize],
+                vec![[0; 4]; (res * res) as usize],
+            )
         };
-        let grid = RegionGrid {
+        RegionGrid {
             spec: RegionSpec {
                 inner_res: 3,
                 apron_res: 3,
@@ -800,7 +1105,14 @@ mod tests {
             },
             inner: field(3, 300_000.0),
             apron: field(3, 2_400_000.0),
-        };
+            boulders: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn water_look_matches_its_wesl_mirror() {
+        use timefly_core::worldgen::wind::wind_axis;
+        let grid = look_grid();
         let look = water_look(&grid);
         let wind = wind_axis(&grid.spec.frame()).0.as_vec2();
         assert!((look.wind.truncate().truncate() - wind).length() < 1e-6);
@@ -809,6 +1121,11 @@ mod tests {
         assert_eq!(look.swash, Vec4::new(8.0, 800.0, 3.0, 60.0));
         assert_eq!(look.mesh, Vec4::new(25.0, 0.04, 256.0, 1_750_000.0));
         assert_eq!(look.bands, Vec4::new(0.02, 6000.0, 2.0, 10.0));
+        // Task 8's rivers: the flow map, and the river tints with the silt's speeds.
+        assert_eq!(look.flow, Vec4::new(2.0, 6.0, RAPID_FOAM, RAPID_SCROLL));
+        let lin = |c: Color| Vec3::from_slice(&c.to_linear().to_f32_array()[..3]);
+        assert_eq!(look.river_clear, lin(RIVER_CLEAR).extend(1.0));
+        assert_eq!(look.river_silty, lin(RIVER_SILTY).extend(3.0));
         // Task 4's calm-from-altitude ramp.
         assert!(look.pull.y < look.pull.z);
         let names: Vec<String> = wesl_struct_fields(WATER_WESL, "WaterLook")
@@ -829,8 +1146,701 @@ mod tests {
                 "wind",
                 "mesh",
                 "bands",
+                "flow",
+                "river_clear",
+                "river_silty",
                 "waves"
             ]
+        );
+    }
+
+    #[test]
+    fn flow_period_divides_the_wrap() {
+        assert_divides_wrap(FLOW_PERIOD_S);
+        // Half a period apart, the second phase loops at the wrap too.
+        assert_divides_wrap(FLOW_PERIOD_S / 2.0);
+    }
+
+    #[test]
+    fn the_two_flow_phases_never_fade_together() {
+        let mut rng = 0x5EED_u64;
+        let mut unit = || {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (rng >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut resets = [0, 0];
+        for _ in 0..1000 {
+            let t = unit() * crate::art::TIME_WRAP_S;
+            let jitter = 2.0 * unit() - 1.0;
+            let w = flow_phase_weights(t, jitter);
+            assert!(
+                (w[0] + w[1] - 1.0).abs() < 1e-5,
+                "t {t}, jitter {jitter}: {w:?}"
+            );
+            assert!(
+                w[0].max(w[1]) >= 0.5 - 1e-6,
+                "t {t}, jitter {jitter}: {w:?}"
+            );
+            assert!(w.iter().all(|w| (0.0..=1.0).contains(w)), "{w:?}");
+            for k in 0..2 {
+                resets[k] += usize::from(w[k] < 0.02);
+            }
+        }
+        // Each phase fades out (where its offset jumps back) in its turn.
+        assert!(resets.iter().all(|&r| r > 5), "{resets:?}");
+        // A phase's weight is 0 exactly where its offset restarts.
+        assert_eq!(flow_phase_weights(0.0, 0.0), [0.0, 1.0]);
+        assert_eq!(flow_phase_weights(FLOW_PERIOD_S / 2.0, 0.0), [1.0, 0.0]);
+        // The shader mirrors it.
+        assert!(WATER_WESL.contains(
+            "fn flow_phase_weights(t_s: f32, jitter: f32) -> vec2<f32> {\n    let p = fract(t_s / look.flow.x + jitter);\n    let q = fract(p + 0.5);\n    return vec2<f32>(1.0 - abs(2.0 * p - 1.0), 1.0 - abs(2.0 * q - 1.0));"
+        ));
+    }
+
+    #[test]
+    fn rapids_decode_from_speed() {
+        use timefly_core::hydrology::params::{RAPID_SPEED_BASE_MS, RAPID_SPEED_GAIN_MS};
+        use timefly_core::worldgen::generate::rivers::rapid_from_speed;
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "RAPID_SPEED_BASE_MPS"),
+            RAPID_SPEED_BASE_MS as f32
+        );
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "RAPID_SPEED_GAIN_MPS"),
+            RAPID_SPEED_GAIN_MS as f32
+        );
+        assert!(WATER_WESL.contains(
+            "fn rapid_from_speed(speed_mps: f32) -> f32 {\n    return clamp((speed_mps - RAPID_SPEED_BASE_MPS) / RAPID_SPEED_GAIN_MPS, 0.0, 1.0);"
+        ));
+        // Lowland rivers carry no white water; the steepest rapids are all white.
+        assert_eq!(rapid_from_speed(1.0), 0.0);
+        assert_eq!(rapid_from_speed(6.0), 1.0);
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "RAPID_NORMAL_GAIN"),
+            RAPID_NORMAL_GAIN
+        );
+        // The shader reads the rapid from the flow's speed.
+        assert!(WATER_WESL.contains("let rapid = rapid_from_speed(length(w.flow));"));
+    }
+
+    #[test]
+    fn river_tint_is_browner_when_slow() {
+        let brown = |c: Color| {
+            let c = c.to_linear();
+            c.red - c.blue
+        };
+        assert_eq!(river_silt(0.3), 1.0);
+        assert_eq!(river_silt(SILT_SPEED_MPS[0]), 1.0);
+        assert_eq!(river_silt(SILT_SPEED_MPS[1]), 0.0);
+        assert_eq!(river_silt(5.0), 0.0);
+        for depth in [0.5, 2.0, 10.0, 30.0] {
+            assert_eq!(
+                river_tint(depth, 0.5).to_linear(),
+                river_tint(depth, 0.0).to_linear()
+            );
+            let mut last = f32::MAX;
+            for k in 0..=60 {
+                let speed = k as f32 * 0.1;
+                let b = brown(river_tint(depth, speed));
+                assert!(b <= last + 1e-6, "{depth} m at {speed} m/s");
+                last = b;
+            }
+            assert!(brown(river_tint(depth, 0.5)) > brown(river_tint(depth, 4.0)) + 0.05);
+        }
+        // Slow and shallow is the silty colour; fast and shallow the clear one.
+        assert_eq!(river_tint(0.0, 0.5).to_linear(), RIVER_SILTY.to_linear());
+        assert_eq!(river_tint(0.0, 4.0).to_linear(), RIVER_CLEAR.to_linear());
+        // Clear water darkens with depth; silty water stays silty.
+        assert!(river_tint(30.0, 4.0).luminance() < river_tint(1.0, 4.0).luminance());
+        assert_eq!(river_tint(30.0, 0.5).to_linear(), RIVER_SILTY.to_linear());
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "RIBBON_NONE_M"),
+            timefly_core::hydrology::params::RIBBON_NONE_M as f32
+        );
+    }
+
+    /// `const NAME: vec3<f32> = vec3<f32>(r, g, b);` in a WESL source.
+    fn wesl_const_vec3(src: &str, name: &str) -> Vec3 {
+        let decl = format!("const {name}: vec3<f32> = vec3<f32>(");
+        let start = src.find(&decl).unwrap_or_else(|| panic!("const {name}")) + decl.len();
+        let end = start + src[start..].find(')').unwrap();
+        let v: Vec<f32> = src[start..end]
+            .split(',')
+            .map(|c| c.trim().parse().unwrap())
+            .collect();
+        Vec3::from_slice(&v)
+    }
+
+    #[test]
+    fn white_water_matches_its_wesl_mirror() {
+        let want = Vec3::from_slice(&WHITE_WATER.to_linear().to_f32_array()[..3]);
+        let got = wesl_const_vec3(WATER_WESL, "WHITE_WATER");
+        assert!((got - want).abs().max_element() < 5e-4, "{got} vs {want}");
+    }
+
+    /// Task 11c's white water: its constants mirrored in `water.wesl`, the wavelength rule, and
+    /// the rapids-only gate (lakes, the sea and slow rivers run none of it).
+    #[test]
+    fn white_water_constants_match_their_wesl_mirrors() {
+        for (name, value) in [
+            ("GRAVITY_MPS2", GRAVITY_MPS2),
+            ("STANDING_WAVE_SLOPE", STANDING_WAVE_SLOPE),
+            ("STANDING_WAVE_CELL_M", STANDING_WAVE_CELL_M),
+            ("STREAK_STRETCH", STREAK_STRETCH),
+            ("STREAK_DIRECTIONS", STREAK_DIRECTIONS),
+            ("STREAK_CONTRAST", STREAK_CONTRAST),
+            ("CREST_WARP", CREST_WARP),
+            ("CREST_NOISE_M", CREST_NOISE_M),
+            ("CREST_WAVE_FLOOR", CREST_WAVE_FLOOR),
+        ] {
+            assert_eq!(wesl_const_f32(WATER_WESL, name), value, "{name}");
+        }
+        assert!(WATER_WESL.contains("let lambda = TAU * speed * speed / GRAVITY_MPS2;"));
+        // The hydraulic wavelength: 5.8 m at the rapids' 3 m/s, 23 m at 6 m/s, which the cells
+        // must hold.
+        assert!((standing_wavelength_m(3.0) - 5.765).abs() < 0.01);
+        assert!((standing_wavelength_m(6.0) - 23.06).abs() < 0.01);
+        assert!(STANDING_WAVE_CELL_M >= standing_wavelength_m(6.0));
+        // Only rivers in rapids: the block sits inside the river branch, gated on the rapid,
+        // and scales by river_w; the standing waves are sampled at xz (they stay put) while the
+        // streaks ride the flow map's x0 and x1.
+        let river = WATER_WESL.find("    if river {").unwrap();
+        let gate = WATER_WESL.find("        if rapid > 0.0 {").unwrap();
+        let end = WATER_WESL.find("    let lake_tilt").unwrap();
+        assert!(river < gate && gate < end);
+        let block = &WATER_WESL[gate..end];
+        assert!(block.contains("let waves = standing_waves(xz, dir, lambda, crest_warp(xz));"));
+        assert!(block.contains("let crests = crest_patch(xz);"));
+        assert!(block.contains("let n0 = streaks(x0, dir, s, footprint, t);"));
+        assert!(block.contains("let n1 = streaks(x1, dir, s, footprint, t);"));
+        assert!(block.contains("* river_w);"));
+        assert!(block.contains(
+            "white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, flicker, ww)"
+        ));
+        assert!(block.contains("let flicker = crest_flicker(xz, t);"));
+    }
+
+    /// Fix rounds 1, 4 and 5: foam streaked along the flow on the standing waves' crests, more
+    /// where their patches are strong, only where their flicker stands, none in their troughs
+    /// whatever the streaks do, soft (it ramps over a wide band of the streaks), and the mean
+    /// where unresolved.
+    #[test]
+    fn white_water_foams_on_crests_not_troughs() {
+        let streak_max = STREAK_CONTRAST * 0.88;
+        for k in 0..=40 {
+            let streak = -streak_max + 2.0 * streak_max * k as f32 / 40.0;
+            for patch in [0.0, 0.5, 1.0] {
+                assert_eq!(
+                    white_water_foam(1.0, -1.0, patch, streak, 1.0, 1.0),
+                    0.0,
+                    "a trough, streak {streak}"
+                );
+                assert!(
+                    white_water_foam(1.0, 1.0, 0.0, streak, 1.0, 1.0)
+                        <= white_water_foam(1.0, 1.0, 1.0, streak, 1.0, 1.0),
+                    "a weaker patch, less foam, streak {streak}"
+                );
+                assert_eq!(
+                    white_water_foam(1.0, 1.0, patch, streak, 0.0, 1.0),
+                    0.0,
+                    "flickered off, streak {streak}"
+                );
+            }
+        }
+        assert!(
+            white_water_foam(1.0, 1.0, 1.0, 0.5, 1.0, 1.0) > 0.9,
+            "a crest, a bright streak"
+        );
+        assert!(
+            white_water_foam(1.0, 1.0, 1.0, -0.4, 1.0, 1.0) < 0.05,
+            "a crest, a dark streak"
+        );
+        // Soft: from 10% to 90% white over at least 0.3 of the streak noise (round 4's crest
+        // foam did it over 0.19).
+        let at = |s: f32| white_water_foam(1.0, 1.0, 1.0, s, 1.0, 1.0);
+        let (mut lo, mut hi) = (None, None);
+        for k in 0..=200 {
+            let st = -0.5 + k as f32 * 0.01;
+            if lo.is_none() && at(st) >= 0.1 {
+                lo = Some(st);
+            }
+            if hi.is_none() && at(st) >= 0.9 {
+                hi = Some(st);
+            }
+        }
+        assert!(hi.unwrap() - lo.unwrap() >= 0.3, "{lo:?} to {hi:?}");
+        assert_eq!(
+            white_water_foam(0.0, 1.0, 1.0, 0.5, 1.0, 1.0),
+            0.0,
+            "no rapid, no foam"
+        );
+        assert_eq!(
+            white_water_foam(1.0, -1.0, 1.0, 0.0, 1.0, 0.0),
+            FOAM_MEAN,
+            "unresolved: the mean"
+        );
+        // The shader's copy.
+        for line in [
+            "        flicker * (0.5 + 0.5 * crests) * (0.3 + 0.7 * streak),",
+            "    ) * smoothstep(-0.5, 0.5, crest);",
+            "    return rapid * mix(FOAM_MEAN, foam, resolve);",
+            "    let na = brush(xz, CREST_FLICKER_M, a * p * CREST_FLICKER_RATE, 251u);",
+            "    let nb = brush(xz, CREST_FLICKER_M, b * p * CREST_FLICKER_RATE + 37.5, 251u);",
+            "    let n = (wa * na + wb * nb) * inverseSqrt(wa * wa + wb * wb);",
+            "    return clamp(0.55 + 0.6 * n, 0.0, 1.0);",
+            "fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32, warp: f32) -> vec2<f32> {",
+            "            let a = TAU * fract(dot(xz - point, dir) / lambda + offset + warp);",
+            "            let offset = f32(hash3(vec3<i32>(i32(cell.x), i32(cell.y), 0), 229u) >> 8u) / 16777216.0;",
+            "    return CREST_WARP * brush(xz, 2.0 * CREST_NOISE_M, 0.0, 233u);",
+            "    return smoothstep(CREST_PATCH_BAND.x, CREST_PATCH_BAND.y, brush(xz, CREST_NOISE_M, 0.0, 239u));",
+            "            let strength = CREST_WAVE_FLOOR + (1.0 - CREST_WAVE_FLOOR) * crests;",
+        ] {
+            assert!(WATER_WESL.contains(line), "{line}");
+        }
+        assert_eq!(wesl_const_f32(WATER_WESL, "FOAM_MEAN"), FOAM_MEAN);
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "CREST_FLICKER_M"),
+            CREST_FLICKER_M
+        );
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "CREST_FLICKER_RATE"),
+            CREST_FLICKER_RATE
+        );
+        for (name, band) in [
+            ("FOAM_CREST_BAND", FOAM_CREST_BAND),
+            ("CREST_PATCH_BAND", CREST_PATCH_BAND),
+        ] {
+            assert!(WATER_WESL.contains(&format!(
+                "const {name}: vec2<f32> = vec2<f32>({:?}, {:?});",
+                band[0], band[1]
+            )));
+        }
+    }
+
+    /// Fix round 5: the crests' foam flickers with time while the crests stay put. At a fixed
+    /// point the flicker swings over seconds (its mean over time near its mean over space), and
+    /// the standing waves take no time at all.
+    /// Bevy wraps `globals.time` every hour: the crests' flicker must not jump there.
+    #[test]
+    fn crest_flicker_is_continuous_across_the_time_wrap() {
+        assert_divides_wrap(CREST_FLICKER_PERIOD_S);
+        assert_eq!(
+            wesl_const_f32(WATER_WESL, "CREST_FLICKER_PERIOD_S"),
+            CREST_FLICKER_PERIOD_S
+        );
+        let (before, after) = (crate::art::TIME_WRAP_S - 0.005, 0.005);
+        for k in 0..200 {
+            let xz = Vec2::new(151_234.0 + 3.7 * k as f32, -87_321.0 + 2.9 * k as f32);
+            let jump = (crest_flicker(xz, before) - crest_flicker(xz, after)).abs();
+            assert!(jump < 0.03, "{xz}: flicker jumps {jump}");
+        }
+    }
+
+    #[test]
+    fn crest_foam_flickers_while_the_crests_stay() {
+        let mut spread = 0.0f32;
+        for k in 0..20 {
+            let xz = Vec2::new(151_234.0 + 13.0 * k as f32, -87_321.0 + 7.0 * k as f32);
+            let v: Vec<f32> = (0..60).map(|i| crest_flicker(xz, i as f32 * 0.1)).collect();
+            let (lo, hi) = v
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+            spread += (hi - lo) / 20.0;
+        }
+        println!("flicker swings {spread:.2} over 6 s on average");
+        assert!(spread > 0.2, "{spread}");
+        // The waves' signature has no time: they are sampled at xz alone.
+        assert!(
+            WATER_WESL.contains("let waves = standing_waves(xz, dir, lambda, crest_warp(xz));")
+        );
+    }
+
+    /// The crests' foam over a stretch of a full rapid at `speed_mps` flowing along `dir`, sampled
+    /// every `step_m` over `n × n` points from `origin`, with normally spread streaks (σ = 0.25 ×
+    /// contrast, by the logistic quantile of a hash): the mean foam weight and the share of
+    /// points over half white.
+    fn crest_cover(origin: Vec2, dir: Vec2, speed_mps: f32, step_m: f32, n: u32) -> (f32, f32) {
+        let lambda = standing_wavelength_m(speed_mps);
+        let (mut sum, mut white) = (0.0, 0);
+        for i in 0..n {
+            for j in 0..n {
+                let xz = origin + Vec2::new(i as f32, j as f32) * step_m;
+                let h = timefly_core::worldgen::noise::hash3([i as i32, j as i32, 7], 31);
+                let u = ((h >> 8) as f32 + 0.5) / 16_777_216.0;
+                let streak = 0.25 * STREAK_CONTRAST * (u / (1.0 - u)).ln() / 1.702;
+                let crest = standing_waves(xz, dir, lambda, crest_warp(xz)).x;
+                let t = (i * 7 + j * 13) as f32 * 0.37;
+                let f = white_water_foam(
+                    1.0,
+                    crest,
+                    crest_patch(xz),
+                    streak,
+                    crest_flicker(xz, t),
+                    1.0,
+                );
+                sum += f;
+                white += usize::from(f > 0.5);
+            }
+        }
+        let count = (n * n) as f32;
+        (sum / count, white as f32 / count)
+    }
+
+    /// Fix round 4: away from the rocks the crests' foam covers well under a tenth of a full
+    /// rapid, and its mean is the unresolved mean (so a distant rapid isn't brighter or darker
+    /// than a near one), at the rapids' speeds and in two directions.
+    #[test]
+    fn background_crest_foam_stays_under_its_cap() {
+        let mut means = Vec::new();
+        for (speed, dir) in [(3.5, Vec2::X), (6.0, Vec2::new(0.6, -0.8))] {
+            let (mean, white) = crest_cover(Vec2::new(151_234.0, -87_321.0), dir, speed, 0.7, 500);
+            println!("{speed} m/s: mean foam {mean:.3}, {white:.3} over half white");
+            assert!(white < 0.07, "{speed} m/s: {white} white");
+            means.push(mean);
+        }
+        let mean = means.iter().sum::<f32>() / means.len() as f32;
+        assert!(
+            (mean + FOAM_ROCK_SHARE - FOAM_MEAN).abs() < 0.02,
+            "near {mean} and the rocks' {FOAM_ROCK_SHARE}, far {FOAM_MEAN}"
+        );
+    }
+
+    /// Fix round 4: the crests are not a ladder. The crests' strength (the waves' height times
+    /// their patch, which the foam thresholds) one wavelength along the flow is weakly
+    /// correlated with itself (a regular train correlates fully), and so is it a crest spacing
+    /// across the flow (a crest running straight across the river would correlate fully); the
+    /// waves without the warp and the patches are the ladder the owner saw.
+    #[test]
+    fn the_crests_are_not_a_ladder() {
+        let speed = 6.0;
+        let lambda = standing_wavelength_m(speed);
+        let dir = Vec2::X;
+        let step = lambda / 16.0;
+        let signal = |xz: Vec2, irregular: bool| {
+            let (warp, patch) = if irregular {
+                (crest_warp(xz), crest_patch(xz))
+            } else {
+                (0.0, 1.0)
+            };
+            standing_waves(xz, dir, lambda, warp).x * patch
+        };
+        // The correlation of the signal with itself `lag` samples on, along `axis`, over lines.
+        let correlation = |axis: Vec2, irregular: bool| {
+            let mut v: Vec<(f32, f32)> = Vec::new();
+            for line in 0..40 {
+                let start = Vec2::new(53_117.0, -20_011.0) + axis.perp() * (37.0 * line as f32);
+                for k in 0..400 {
+                    let a = start + axis * (step * k as f32);
+                    v.push((signal(a, irregular), signal(a + axis * lambda, irregular)));
+                }
+            }
+            let n = v.len() as f32;
+            let (ma, mb) = v
+                .iter()
+                .fold((0.0, 0.0), |(x, y), &(a, b)| (x + a / n, y + b / n));
+            let (mut c, mut va, mut vb) = (0.0, 0.0, 0.0);
+            for &(a, b) in &v {
+                c += (a - ma) * (b - mb);
+                va += (a - ma) * (a - ma);
+                vb += (b - mb) * (b - mb);
+            }
+            c / (va * vb).sqrt()
+        };
+        let along = (correlation(dir, false), correlation(dir, true));
+        let across = (
+            correlation(dir.perp(), false),
+            correlation(dir.perp(), true),
+        );
+        println!("one wavelength on: along {along:?}, across {across:?} (ladder, now)");
+        // The ladder's own cells (32 m, each with its own phase) already decorrelate it to
+        // about 0.45; the warp and the patches take it under 0.1.
+        assert!(
+            along.0 > 0.4 && across.0 > 0.4,
+            "the ladder: {along:?} {across:?}"
+        );
+        assert!(along.1 < 0.15, "along the flow: {}", along.1);
+        assert!(across.1 < 0.15, "across the flow: {}", across.1);
+    }
+
+    /// No shader names a value with one of WGSL's reserved words (fix round 4: a parameter
+    /// called `patch` failed every water pipeline at run time, and no test compiles the shaders
+    /// with their imports). Checks every `let`, `var` and `const` and every function parameter
+    /// in `assets/shaders`.
+    #[test]
+    fn shaders_name_nothing_with_a_reserved_word() {
+        const RESERVED: &[&str] = &[
+            "NULL",
+            "Self",
+            "abstract",
+            "active",
+            "alignas",
+            "alignof",
+            "as",
+            "asm",
+            "asm_fragment",
+            "async",
+            "attribute",
+            "auto",
+            "await",
+            "become",
+            "binding_array",
+            "cast",
+            "catch",
+            "class",
+            "co_await",
+            "co_return",
+            "co_yield",
+            "coherent",
+            "column_major",
+            "common",
+            "compile",
+            "compile_fragment",
+            "concept",
+            "const_cast",
+            "consteval",
+            "constexpr",
+            "constinit",
+            "crate",
+            "debugger",
+            "decltype",
+            "delete",
+            "demote",
+            "demote_to_helper",
+            "do",
+            "dynamic_cast",
+            "enum",
+            "explicit",
+            "export",
+            "extends",
+            "extern",
+            "external",
+            "fallthrough",
+            "filter",
+            "final",
+            "finally",
+            "friend",
+            "from",
+            "fxgroup",
+            "get",
+            "goto",
+            "groupshared",
+            "highp",
+            "impl",
+            "implements",
+            "import",
+            "inline",
+            "instanceof",
+            "interface",
+            "layout",
+            "lowp",
+            "macro",
+            "macro_rules",
+            "match",
+            "mediump",
+            "meta",
+            "mod",
+            "module",
+            "move",
+            "mut",
+            "mutable",
+            "namespace",
+            "new",
+            "nil",
+            "noexcept",
+            "noinline",
+            "nointerpolation",
+            "noperspective",
+            "null",
+            "nullptr",
+            "of",
+            "operator",
+            "package",
+            "packoffset",
+            "partition",
+            "pass",
+            "patch",
+            "pixelfragment",
+            "precise",
+            "precision",
+            "premerge",
+            "priv",
+            "protected",
+            "pub",
+            "public",
+            "readonly",
+            "ref",
+            "regardless",
+            "register",
+            "reinterpret_cast",
+            "require",
+            "resource",
+            "restrict",
+            "self",
+            "set",
+            "shared",
+            "sizeof",
+            "smooth",
+            "snorm",
+            "static",
+            "static_assert",
+            "static_cast",
+            "std",
+            "subroutine",
+            "super",
+            "target",
+            "template",
+            "this",
+            "thread_local",
+            "throw",
+            "trait",
+            "try",
+            "type",
+            "typedef",
+            "typeid",
+            "typename",
+            "typeof",
+            "union",
+            "unless",
+            "unorm",
+            "unsafe",
+            "unsized",
+            "use",
+            "using",
+            "varying",
+            "virtual",
+            "volatile",
+            "wgsl",
+            "where",
+            "with",
+            "writeonly",
+            "yield",
+        ];
+        let ident = |t: &str| -> String {
+            t.trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect()
+        };
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/shaders");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "wesl") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let mut names = Vec::new();
+                for kw in ["let ", "var ", "const "] {
+                    for (i, _) in code.match_indices(kw) {
+                        let before = code[..i].chars().last();
+                        if before.is_none_or(|c| !(c.is_alphanumeric() || c == '_')) {
+                            let rest = &code[i + kw.len()..];
+                            // `var<uniform> name`: skip the address space.
+                            let rest = rest
+                                .split_once('>')
+                                .map_or(rest, |(a, b)| if a.starts_with('<') { b } else { rest });
+                            names.push(ident(rest));
+                        }
+                    }
+                }
+                if let Some(sig) = code.trim_start().strip_prefix("fn ")
+                    && let Some((_, params)) = sig.split_once('(')
+                {
+                    for p in params.split(',').filter(|p| p.contains(':')) {
+                        names.push(ident(p.split(':').next().unwrap()));
+                    }
+                }
+                for name in names.into_iter().filter(|n| !n.is_empty()) {
+                    checked += 1;
+                    assert!(
+                        !RESERVED.contains(&name.as_str()),
+                        "{}:{}: `{name}` is a WGSL reserved word",
+                        path.display(),
+                        n + 1
+                    );
+                }
+            }
+        }
+        assert!(checked > 500, "{checked} names");
+    }
+
+    /// The water is drawn after the opaque terrain (the alpha-mask phase, with a cutoff no
+    /// fragment fails) so the depth test rejects its fragments under the ground before they
+    /// shade (review fix round 1), and it culls back faces as an opaque surface should.
+    #[test]
+    fn the_water_draws_after_the_terrain() {
+        let m = water_material(
+            &Handle::default(),
+            &Handle::default(),
+            &Handle::default(),
+            water_look(&look_grid()),
+        );
+        assert_eq!(m.base.alpha_mode, AlphaMode::Mask(0.0));
+        assert_eq!(
+            m.base.cull_mode,
+            Some(bevy::render::render_resource::Face::Back)
+        );
+        assert!(!m.base.double_sided);
+        // The terrain stays opaque, so it is drawn first.
+        assert_eq!(StandardMaterial::default().alpha_mode, AlphaMode::Opaque);
+    }
+
+    /// Dry vertices sit `DRY_SINK_M` under the ground, unpulled, so the terrain hides the mesh
+    /// over dry land; near water the mesh never dips under the water's level (review fix round 1).
+    #[test]
+    fn dry_vertices_sink_under_the_ground() {
+        assert_eq!(wesl_const_f32(WATER_WESL, "DRY_SINK_M"), DRY_SINK_M);
+        assert!(
+            WATER_WESL.contains("let level = max(w.level, w.level - w.thickness - DRY_SINK_M);")
+        );
+        assert!(WATER_WESL.contains("let wet = smoothstep(-DRY_SINK_M, 0.0, w.thickness);"));
+        assert!(WATER_WESL.contains("* wet, 0.5 * distance);"));
+        // The rule, modelled: water level `l`, ground `l − t`.
+        let surface = |l: f32, t: f32| l.max(l - t - DRY_SINK_M);
+        // Wet: at the level. A bank lower than the sink: at the level. A higher bank: sunk, yet
+        // still above the water beside it.
+        assert_eq!(surface(10.0, 2.0), 10.0);
+        assert_eq!(surface(10.0, -0.5 * DRY_SINK_M), 10.0);
+        assert_eq!(surface(10.0, -20.0), 30.0 - DRY_SINK_M);
+        for t in [-1000.0f32, -64.0, -5.0, -4.0, -1.0, 0.0, 3.0] {
+            let y = surface(10.0, t);
+            assert!(y >= 10.0, "{t}: under the water");
+            assert!(y <= (10.0 - t).max(10.0), "{t}: over the ground");
+        }
+    }
+
+    /// The sea bound the terrain's two height textures; the water binds the two water textures
+    /// in their place, and no height texture (Task 7: word 1 carries `level − h`).
+    #[test]
+    fn the_water_binds_no_more_textures_than_before() {
+        use bevy::reflect::structs::Struct;
+        let ext = WaterExtension {
+            patches: Handle::default(),
+            inner_water: Handle::default(),
+            apron_water: Handle::default(),
+            look: water_look(&look_grid()),
+        };
+        let images: Vec<&str> = (0..ext.field_len())
+            .filter(|&i| {
+                ext.field_at(i)
+                    .and_then(|f| f.try_downcast_ref::<Handle<Image>>())
+                    .is_some()
+            })
+            .map(|i| ext.name_at(i).unwrap())
+            .collect();
+        assert_eq!(images, ["inner_water", "apron_water"]);
+        let textures: Vec<&str> = WATER_WESL
+            .lines()
+            .filter(|l| l.starts_with("@group(") && l.contains(": texture_"))
+            .collect();
+        assert_eq!(textures.len(), 2, "{textures:?}");
+        assert!(
+            textures.iter().all(|l| l.contains("texture_2d<u32>")),
+            "{textures:?}"
         );
     }
 

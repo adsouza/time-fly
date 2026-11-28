@@ -1,0 +1,52 @@
+{
+ "version": 1,
+ "grid": {
+  "deg": 1.0,
+  "rows": 180,
+  "cols": 360,
+  "channels": [
+   "bio1_c",
+   "bio12_mm"
+  ]
+ },
+ "ages_ka": [
+  0.0,
+  10.0,
+  21.0,
+  26.0
+ ],
+ "files": [
+  {
+   "age_ka": 0.0,
+   "file": "bio_0ka.7b0e0149cb4ed4149fd1b25feb767ba908b9d66846e3a16b3c36083dea29f9fd.tfgrid",
+   "bytes": 1553,
+   "sha256": "7b0e0149cb4ed4149fd1b25feb767ba908b9d66846e3a16b3c36083dea29f9fd"
+  },
+  {
+   "age_ka": 10.0,
+   "file": "bio_10ka.8df1413a0c497c6e418994af23d36713974ce526738ae0a499e4a4d1818489b0.tfgrid",
+   "bytes": 1451,
+   "sha256": "8df1413a0c497c6e418994af23d36713974ce526738ae0a499e4a4d1818489b0"
+  },
+  {
+   "age_ka": 21.0,
+   "file": "bio_21ka.551dee511da13487b4e1afcf3c0104f539b31fed54a50c282dabb061abab7d8f.tfgrid",
+   "bytes": 1453,
+   "sha256": "551dee511da13487b4e1afcf3c0104f539b31fed54a50c282dabb061abab7d8f"
+  },
+  {
+   "age_ka": 26.0,
+   "file": "bio_26ka.b451fd367a294fec348681ca6a76287c062998f8f03a50b59db8a5ee00aef648.tfgrid",
+   "bytes": 1454,
+   "sha256": "b451fd367a294fec348681ca6a76287c062998f8f03a50b59db8a5ee00aef648"
+  }
+ ],
+ "source": {
+  "figshare_file": 22659026,
+  "variables_sha256": {
+   "BIO1": "65e2c584df1290d7356089f2d8c6959fe42f5ab0d4cbc52884e89a103f4034c1",
+   "BIO12": "663eed3f93d7b49cbf72f91eae8b78a78610c434142b431d4156be081e718347"
+  }
+ },
+ "attribution": "Beyer, R.M., Krapp, M. & Manica, A. (2020). An empirical evaluation of bioclimatic and vegetation reconstructions for the last 120,000 years. Scientific Data 7, 236, doi:10.1038/s41597-020-0552-1; data: figshare doi:10.6084/m9.figshare.12293345. CC BY 4.0. Changes: BIO1 and BIO12 regridded to 1 degree."
+}

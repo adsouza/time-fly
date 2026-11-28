@@ -512,10 +512,13 @@ fn after_the_hop_the_fly_returns_to_its_height_above_ground() {
         "{}",
         end.height_m
     );
-    // Down all the way, and the cloud only clearing, gone within its clear time.
+    // Down all the way, and the cloud only clearing, gone within its clear time once the swap's
+    // fields are complete (`REPLACE_EXTRA_HELD_FRAMES` frames held first).
     assert!(frames.windows(2).all(|w| w[1].height_m <= w[0].height_m));
     assert!(frames.windows(2).all(|w| w[1].density <= w[0].density));
-    let clear = (CLOUD_CLEAR_S / 0.1).ceil() as usize;
+    let held = crate::terrain::REPLACE_EXTRA_HELD_FRAMES as usize;
+    assert!(frames[..held].iter().all(|f| f.density == 1.0));
+    let clear = (CLOUD_CLEAR_S / 0.1).ceil() as usize + held;
     assert!(frames[clear..].iter().all(|f| f.density == 0.0));
     assert!(frames.iter().all(|f| !has(&f.actions, leaves)));
 
@@ -616,9 +619,10 @@ fn bench_grounds() -> Vec<Box<dyn Fn(f32, f32) -> f32>> {
 fn the_region_bench_path_never_triggers_a_hop() {
     let dt = 1.0 / 60.0;
     for (g, ground) in bench_grounds().iter().enumerate() {
-        let path = BenchPath::plan(ground);
+        let surface = |x: f32, z: f32| ground(x, z).max(0.0);
+        let path = BenchPath::plan(ground, surface);
         let samples: Vec<_> = (0..=(SCRIPT_SECS / dt) as u32)
-            .map(|k| path.at(k as f32 * dt, ground))
+            .map(|k| path.at(k as f32 * dt, surface))
             .collect();
         for (k, w) in samples.windows(2).enumerate() {
             let xz = |f: &FlyState| Vec2::new(f.pos_m.x, f.pos_m.z);
@@ -887,6 +891,83 @@ fn the_hop_swaps_worlds_under_the_cloud() {
             .all(|w| w[1].density <= w[0].density)
     );
     assert_eq!(frames[flying].density, 0.0);
+}
+
+/// The hop's memory (follow-up): the swap's staged replace draws the new water over the old
+/// heights for one frame only, the swap frame, at density exactly 1; the cloud clears over the
+/// complete new fields. The old region's ground is 300 m higher, so the heights tell apart.
+#[test]
+fn a_hops_staged_swap_draws_mixed_fields_only_under_the_opaque_cloud() {
+    let (mut app, _) = hop_app(5, false, EDGE_M - 10_000.0);
+    // A set-up step, not a flow the game has: the scene replaces its grid while flying. Let that
+    // replace finish before recording.
+    enter(&mut app, &grid(alps(), YearsBp(0.0), HOP_GROUND_M + 300.0));
+    run_until(&mut app, 5, |a| {
+        !a.world()
+            .resource::<crate::terrain::TerrainScene>()
+            .fields_pending()
+    });
+    app.world_mut().resource_mut::<FlyState>().pos_m.y = HOP_GROUND_M + 300.0 + HOP_AGL_M;
+    app.init_resource::<FieldFrames>()
+        .add_systems(Last, record_fields);
+    run_until(&mut app, 600, |a| swapped(&phase(a)));
+    run_until(&mut app, 600, |a| phase(a) == NavPhase::Flying);
+    let frames = app.world().resource::<FieldFrames>().0.clone();
+    let swap = frames
+        .iter()
+        .position(|f| f.centre != alps())
+        .expect("the swap");
+    assert!(
+        frames[swap].pending,
+        "the swap frame starts the staged replace"
+    );
+    assert_mixed_fields_only_under_the_cloud(&frames, 1);
+    // The owner's rulings (2026-11-25): two more frames in cloud than M3, whose clear started on
+    // the frame after the swap.
+    let extra = crate::terrain::REPLACE_EXTRA_HELD_FRAMES as usize;
+    assert_eq!(extra, 2);
+    assert_eq!(1 + extra, 3, "three opaque frames from the swap on");
+    let opaque = frames[swap..]
+        .iter()
+        .take_while(|f| f.density == 1.0)
+        .count();
+    assert_eq!(opaque, 1 + extra, "frames held opaque from the swap on");
+    assert!(
+        frames[swap + 1 + extra].density < 1.0,
+        "then the cloud clears"
+    );
+}
+
+/// The pure decision: a hop's end holds the cloud at exactly 1 for every frame the terrain
+/// scene says its fields would end incomplete (`fields_settling`), then clears as before.
+#[test]
+fn a_hops_end_holds_the_cloud_while_the_fields_settle() {
+    let (phase, i) = hop_end(HOP_AGL_M, HOP_AGL_M);
+    let settling = NavInputs {
+        fields_settling: true,
+        ..i
+    };
+    let (held, _) = step_nav(phase, &settling);
+    assert_eq!(held.cloud_density(&settling), 1.0);
+    assert_eq!(held, phase, "the clear does not start");
+    let (clearing, _) = step_nav(held, &i);
+    assert!(clearing.cloud_density(&i) < 1.0);
+    // A snapshot change's fade-in waits the same way.
+    let fade = NavPhase::ChangingSnapshot {
+        fade: Fade {
+            elapsed_s: 0.5 * SNAPSHOT_FADE_S,
+            duration_s: SNAPSHOT_FADE_S,
+        },
+        to: YearsBp(100e6),
+        requested: alps(),
+        agl_m: 500.0,
+        generated: true,
+        placed: true,
+    };
+    let (held, _) = step_nav(fade, &settling);
+    assert_eq!(held.cloud_density(&settling), 1.0, "{held:?}");
+    let (clearing, _) = step_nav(held, &i);
+    assert!(clearing.cloud_density(&i) < 1.0, "{clearing:?}");
 }
 
 /// The time a hop has held at full cover, for the caption: only in the hold, before its end.
@@ -1833,13 +1914,13 @@ fn a_failed_corner_retarget_lands_inside_on_both_axes() {
 /// The most frames at `dt_s` a hop may draw in a row at full cover (I2): its hold's budget,
 /// and the frame that ends it.
 fn max_whiteout_frames(dt_s: f32) -> usize {
-    (HOLD_MAX_S / dt_s).ceil() as usize + 2
+    (HOLD_MAX_S / dt_s).ceil() as usize + 2 + crate::terrain::REPLACE_EXTRA_HELD_FRAMES as usize
 }
 
 /// The most frames at `dt_s` a hop's end (the clear and the return to its height) may last
 /// (I2): [`HOP_END_MAX_S`], whatever the ground does to the return (the final review).
 fn max_ending_frames(dt_s: f32) -> usize {
-    (HOP_END_MAX_S / dt_s).ceil() as usize + 1
+    (HOP_END_MAX_S / dt_s).ceil() as usize + 1 + crate::terrain::REPLACE_EXTRA_HELD_FRAMES as usize
 }
 
 /// An ended hop (swapped into the neighbour) in the Alps' region, `agl_m` above the ground,

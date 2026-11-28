@@ -17,13 +17,17 @@ use std::time::Duration;
 use bevy::platform::time::Instant;
 use timefly_core::formats::Grid;
 use timefly_core::geodynamics::CrustModel;
+use timefly_core::hydrology::params::MAX_BOULDERS;
+use timefly_core::hydrology::{EraHydrology, LatticeSizes, hydro_lattice_for, river_tile_margin_m};
 use timefly_core::surface::Timeline;
 use timefly_core::worldgen::coarse::{
     CoarseField, FieldError, SnapshotField, frames_needed, snapshot_field,
 };
-use timefly_core::worldgen::generate::{FieldKind, FieldRows, RegionGrid, RegionPrep, RegionSpec};
-use timefly_core::worldgen::tiles::TileSet;
-use tracing::{info, instrument};
+use timefly_core::worldgen::generate::{
+    FieldKind, FieldRows, RegionGenerator, RegionGrid, RegionPrep, RegionSpec,
+};
+use timefly_core::worldgen::tiles::{TILE_MARGIN_M, TileSet};
+use tracing::{info, instrument, warn};
 
 /// Rows per parallel task on native: small enough to balance the pool's threads.
 pub const NATIVE_BLOCK_ROWS: u32 = 16;
@@ -63,6 +67,10 @@ pub struct GenInputs {
     pub frames: Vec<Option<Arc<Grid>>>,
     /// Some needed tile is missing (`tiles.missing(&needed)` is not empty).
     pub fallback: bool,
+    /// The era's continental pass ([`crate::hydro`]), or `None` when it is disabled or failed.
+    /// The generator refines its rivers and lakes on the region's terrain (`RegionPrep::new`'s
+    /// `hydro`); with `None` the region has M3's heights and only the sea for water.
+    pub hydro: Option<Arc<EraHydrology>>,
 }
 
 fn field<'a>(
@@ -85,18 +93,31 @@ fn field<'a>(
     .map_err(GenError::Field)
 }
 
-/// The tiles the region's inner field reads, from a probe field built without tiles
-/// (`tiles_needed` does not depend on the tiles loaded or on `fallback`).
-#[instrument(level = "debug", skip_all, fields(snapshot_myr = spec.snapshot.myr()), err)]
+/// The tiles the region's inner field reads, widened by `margin_m` beyond the inner square
+/// ([`tile_margin_m`]), from a probe field built without tiles (`tiles_needed` does not depend
+/// on the tiles loaded or on `fallback`).
+#[instrument(level = "debug", skip_all, fields(snapshot_myr = spec.snapshot.myr(), margin_m), err)]
 pub fn tiles_needed(
     spec: &RegionSpec,
     timeline: &Timeline,
     crust: &CrustModel,
     frames: &[Option<Arc<Grid>>],
+    margin_m: f64,
 ) -> Result<Vec<(u8, u8)>, GenError> {
     let empty = TileSet::new();
     let probe = field(spec, timeline, crust, &empty, frames, false)?;
-    Ok(probe.tiles_needed(&spec.frame()))
+    Ok(probe.tiles_needed_with_margin(&spec.frame(), margin_m))
+}
+
+/// How far beyond the inner square a region reads its tiles: [`TILE_MARGIN_M`], or with the
+/// era's pass enabled ([`HydroSettings`](crate::hydro::HydroSettings), `hydro_sizes`), the reach
+/// of its rivers' refinement on the era's lattice ([`river_tile_margin_m`], about 116 km on the
+/// recent lattice), whichever is wider.
+pub fn tile_margin_m(timeline: &Timeline, age_myr: f64, hydro_sizes: Option<LatticeSizes>) -> f64 {
+    hydro_sizes.map_or(TILE_MARGIN_M, |sizes| {
+        let (lattice, _) = hydro_lattice_for(timeline, age_myr, sizes);
+        TILE_MARGIN_M.max(river_tile_margin_m(&lattice))
+    })
 }
 
 impl GenInputs {
@@ -110,6 +131,30 @@ impl GenInputs {
             self.fallback,
         )
     }
+}
+
+/// Warns once when the region had more boulders than [`MAX_BOULDERS`] (core does not log).
+/// The cap is a guard (Task 11c fix round 1): the keep fraction keeps every bench region under
+/// it, and a region past it disagrees with its neighbours where they overlap.
+fn warn_dropped_boulders<F: CoarseField>(generator: &RegionGenerator<'_, F>) {
+    if let Some(msg) = boulder_cap_warning(generator.spec(), generator.boulders_dropped()) {
+        warn!("{msg}");
+    }
+}
+
+/// The boulder cap's warning for a region with `dropped` boulders past it, if any: the region
+/// (its centre and age) and the overflow.
+fn boulder_cap_warning(spec: &RegionSpec, dropped: u32) -> Option<String> {
+    (dropped > 0).then(|| {
+        let (lat, lon) =
+            timefly_core::geo::geo_to_latlon(timefly_core::geo::render_to_geo(spec.center));
+        format!(
+            "region {lat:.3},{lon:.3} at {} years has {dropped} boulders past the cap of \
+             {MAX_BOULDERS}; dropped them (its rapids overflow the keep fraction, so it disagrees \
+             with its neighbours there)",
+            spec.snapshot.0
+        )
+    })
 }
 
 /// Consecutive row ranges of at most `block` rows covering `0..rows`, in order.
@@ -135,8 +180,9 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
 
     let started = Instant::now();
     let field = inputs.field()?;
-    let owned = RegionPrep::new(inputs.spec, &field).finish();
+    let owned = RegionPrep::new(inputs.spec, &field, inputs.hydro.as_deref()).finish();
     let prep_ms = started.elapsed().as_secs_f64() * 1e3;
+    warn_dropped_boulders(&owned);
     trace_generation("prep done: lattice and coast field", || {
         owned.working_bytes()
     });
@@ -152,10 +198,7 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
         }
     });
     trace_generation("rows done: row blocks", || {
-        blocks
-            .iter()
-            .map(|b| b.elevation_m.capacity() * 4 + b.surface.capacity() * 4)
-            .sum()
+        blocks.iter().map(FieldRows::bytes).sum()
     });
     let apron_blocks = blocks.split_off(inner_blocks);
     let grid = generator.assemble(blocks, apron_blocks);
@@ -172,7 +215,7 @@ pub fn generate_parallel(inputs: &GenInputs) -> Result<RegionGrid, GenError> {
 }
 
 /// A future that is pending once: it hands control back to whoever polls the run.
-struct YieldOnce(bool);
+pub(crate) struct YieldOnce(pub(crate) bool);
 
 impl Future for YieldOnce {
     type Output = ();
@@ -190,53 +233,62 @@ impl Future for YieldOnce {
 /// A slice budget the run reads at every check and its owner may change between slices
 /// ([`BudgetedRun::set_budget`]), in nanoseconds.
 #[derive(Clone, Debug)]
-struct SharedBudget(Arc<AtomicU64>);
+pub(crate) struct SharedBudget(Arc<AtomicU64>);
 
 impl SharedBudget {
-    fn new(budget: Duration) -> SharedBudget {
+    pub(crate) fn new(budget: Duration) -> SharedBudget {
         let b = SharedBudget(Arc::new(AtomicU64::new(0)));
         b.set(budget);
         b
     }
 
-    fn set(&self, budget: Duration) {
+    pub(crate) fn set(&self, budget: Duration) {
         let nanos = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
         self.0.store(nanos, Ordering::Relaxed);
     }
 
-    fn get(&self) -> Duration {
+    pub(crate) fn get(&self) -> Duration {
         Duration::from_nanos(self.0.load(Ordering::Relaxed))
     }
 }
 
 /// The time spent in the current slice, and the slices so far.
-struct Slice {
+pub(crate) struct Slice {
     budget: SharedBudget,
     started: Instant,
-    count: u32,
-    longest: Duration,
+    pub(crate) count: u32,
+    pub(crate) longest: Duration,
+    /// The time of every slice so far, the current one up to its last [`Slice::record`].
+    pub(crate) total: Duration,
+    /// The time of the finished slices.
+    done: Duration,
 }
 
 impl Slice {
-    fn new(budget: SharedBudget) -> Slice {
+    pub(crate) fn new(budget: SharedBudget) -> Slice {
         Slice {
             budget,
             started: Instant::now(),
             count: 1,
             longest: Duration::ZERO,
+            total: Duration::ZERO,
+            done: Duration::ZERO,
         }
     }
 
-    /// Counts the time spent so far in this slice towards the longest slice.
-    fn record(&mut self) -> Duration {
+    /// Counts the time spent so far in this slice towards the longest slice and the total.
+    pub(crate) fn record(&mut self) -> Duration {
         let spent = self.started.elapsed();
         self.longest = self.longest.max(spent);
+        self.total = self.done + spent;
         spent
     }
 
     /// Yields when the slice's budget is spent and starts the next slice on resuming.
-    async fn yield_if_spent(&mut self) {
-        if self.record() >= self.budget.get() {
+    pub(crate) async fn yield_if_spent(&mut self) {
+        let spent = self.record();
+        if spent >= self.budget.get() {
+            self.done += spent;
             YieldOnce(false).await;
             self.started = Instant::now();
             self.count += 1;
@@ -256,13 +308,14 @@ async fn run_budgeted(
     slice.longest = earlier;
     let field = inputs.field()?;
     slice.yield_if_spent().await;
-    let mut prep = RegionPrep::new(inputs.spec, &field);
+    let mut prep = RegionPrep::new(inputs.spec, &field, inputs.hydro.as_deref());
     while !prep.step(WEB_PREP_STEP) {
         slice.yield_if_spent().await;
     }
     slice.yield_if_spent().await;
     // Done stepping, so this does no lattice work; timed like everything else.
     let generator = prep.finish();
+    warn_dropped_boulders(&generator);
     slice.yield_if_spent().await;
     let mut done: [Vec<FieldRows>; 2] = [Vec::new(), Vec::new()];
     for (k, kind) in [FieldKind::Inner, FieldKind::Apron].into_iter().enumerate() {
@@ -373,5 +426,27 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         assert!(y.as_mut().poll(&mut cx).is_pending());
         assert!(y.as_mut().poll(&mut cx).is_ready());
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use timefly_core::deep_time::YearsBp;
+    use timefly_core::geo::{geo_to_render, latlon_to_geo};
+
+    use super::*;
+
+    /// The boulder cap is a guard (Task 11c fix round 1): forced past it, the warning names the
+    /// region and the overflow; within it, nothing.
+    #[test]
+    fn the_boulder_cap_guard_warns_when_forced() {
+        let spec = RegionSpec::new(geo_to_render(latlon_to_geo(28.0, 86.9)), YearsBp(0.0), 1);
+        let msg = boulder_cap_warning(&spec, 8_580).expect("a warning past the cap");
+        assert!(msg.contains("28.000") && msg.contains("86.900"), "{msg}");
+        assert!(
+            msg.contains("8580") && msg.contains(&MAX_BOULDERS.to_string()),
+            "{msg}"
+        );
+        assert_eq!(boulder_cap_warning(&spec, 0), None);
     }
 }

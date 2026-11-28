@@ -30,7 +30,7 @@ use crate::geo::{RenderDir, geo_to_latlon, render_to_geo};
 use crate::geodynamics::{CrustModel, PlateId};
 use crate::surface::{DeepBracket, FrameSelection, FrameSource, Timeline};
 use crate::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
-use crate::worldgen::tiles::TileSet;
+use crate::worldgen::tiles::{TILE_MARGIN_M, TileSet};
 
 /// Source spacing of the deep (PaleoDEM) frames: about 1°.
 pub const DEEP_SPACING_M: f64 = 111_000.0;
@@ -110,13 +110,21 @@ pub trait CoarseField: Sync {
         }
     }
 
-    /// Every tile the inner field around `frame` reads, sorted. Callers load exactly these,
-    /// and set the field's `fallback` when any is missing ([`TileSet::missing`]). The default is
-    /// the era-frame square ([`TileSet::needed_for`]); fields whose reads move (a plate's
-    /// present-day position in the deep eras) or that read no tiles override it. Independent of
-    /// which tiles are loaded.
+    /// Every tile the inner field around `frame` reads, sorted: the inner square widened by
+    /// [`TILE_MARGIN_M`] ([`tiles_needed_with_margin`](Self::tiles_needed_with_margin)).
+    /// Callers load exactly these, and set the field's `fallback` when any is missing
+    /// ([`TileSet::missing`]). Independent of which tiles are loaded.
     fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
-        TileSet::needed_for(frame)
+        self.tiles_needed_with_margin(frame, TILE_MARGIN_M)
+    }
+
+    /// Every tile reads within `margin_m` of the inner square around `frame` can touch, sorted
+    /// (a region's river reads pass `river_tile_margin_m`). The default is the era-frame square
+    /// ([`TileSet::needed_for_margin`]); fields whose reads move (a plate's present-day position
+    /// in the deep eras) or that read no tiles override it. Independent of which tiles are
+    /// loaded.
+    fn tiles_needed_with_margin(&self, frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
+        TileSet::needed_for_margin(frame, margin_m)
     }
 }
 
@@ -227,9 +235,9 @@ impl CoarseField for CrossfadeField<'_> {
         }
     }
 
-    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
-        let mut out = self.recent.tiles_needed(frame);
-        out.extend(self.deep.tiles_needed(frame));
+    fn tiles_needed_with_margin(&self, frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
+        let mut out = self.recent.tiles_needed_with_margin(frame, margin_m);
+        out.extend(self.deep.tiles_needed_with_margin(frame, margin_m));
         out.sort_unstable();
         out.dedup();
         out
@@ -277,11 +285,11 @@ impl CoarseField for SnapshotField<'_> {
         }
     }
 
-    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+    fn tiles_needed_with_margin(&self, frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
         match self {
-            SnapshotField::Recent(f) => f.tiles_needed(frame),
-            SnapshotField::Deep(f) => f.tiles_needed(frame),
-            SnapshotField::Bridge(f) => f.tiles_needed(frame),
+            SnapshotField::Recent(f) => f.tiles_needed_with_margin(frame, margin_m),
+            SnapshotField::Deep(f) => f.tiles_needed_with_margin(frame, margin_m),
+            SnapshotField::Bridge(f) => f.tiles_needed_with_margin(frame, margin_m),
         }
     }
 }

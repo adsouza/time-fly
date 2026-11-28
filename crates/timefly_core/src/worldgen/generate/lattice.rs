@@ -328,6 +328,18 @@ impl Lattice {
         }
     }
 
+    /// The highest-weight tap's key kind at a direction: [`interp`](Self::interp)'s `kind`.
+    pub(super) fn kind_at<F: CoarseField>(&self, field: &F, dir: RenderDir) -> KeyKind {
+        let (mut best_w, mut kind) = (-1.0, KeyKind::EraFixed);
+        for ((face, col, row), w) in bilinear_taps(dir, self.n) {
+            if w > best_w {
+                best_w = w;
+                kind = self.node(field, face, col, row).kind;
+            }
+        }
+        kind
+    }
+
     pub(super) fn elevation<F: CoarseField>(&self, field: &F, dir: RenderDir) -> f64 {
         bilinear_taps(dir, self.n)
             .iter()

@@ -56,6 +56,30 @@ Climate classes for region worlds
   (1 km) Koppen-Geiger maps for 1901-2099 based on constrained CMIP6 projections.
   Scientific Data 10, 724. Licence: CC BY 4.0.
 
+Past climate for rivers, 120,000 years ago to the present
+  Beyer, R.M., Krapp, M. & Manica, A. (2020). An empirical evaluation of bioclimatic
+  and vegetation reconstructions for the last 120,000 years. Scientific Data 7, 236.
+  https://doi.org/10.1038/s41597-020-0552-1
+  Data: figshare, https://doi.org/10.6084/m9.figshare.12293345
+  Licence: Creative Commons Attribution 4.0 International (CC BY 4.0),
+  https://creativecommons.org/licenses/by/4.0/
+  Changes: annual mean temperature (BIO1) and annual precipitation (BIO12) regridded
+  to 1 degree.
+
+Present-day lakes for rivers
+  Natural Earth, 1:10m physical vectors, lakes (version 5.0.0).
+  Made with Natural Earth. Free vector and raster map data @ naturalearthdata.com.
+  Terms: public domain.
+  Changes: reservoirs dropped, lakes rasterised to 3 arc-minutes, surface levels from
+  ETOPO 2022.
+
+Today's river courses for rivers
+  Natural Earth, 1:10m physical vectors, rivers + lake centerlines (version 5.1.2).
+  Made with Natural Earth. Free vector and raster map data @ naturalearthdata.com.
+  Terms: public domain.
+  Changes: rivers of scalerank 7 or less kept, lake centerlines dropped, oriented
+  upstream by ETOPO 2022, simplified to 1 km.
+
 Data notes
   Biomes in deep-time eras are zonal approximations, not reconstructions.
   Biomes in ice-age eras use the present-day climate.

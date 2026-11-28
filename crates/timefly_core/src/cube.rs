@@ -59,8 +59,7 @@ pub fn bilinear_taps(dir: RenderDir, n: u32) -> [((CubeFace, u32, u32), f64); 4]
         if (0.0..nf).contains(&i) && (0.0..nf).contains(&j) {
             (face, i as u32, j as u32)
         } else {
-            let point = face_point(face, 2.0 * (i + 0.5) / nf - 1.0, 2.0 * (j + 0.5) / nf - 1.0);
-            dir_to_texel(RenderDir(point.normalize()), n)
+            texel_beyond(face, i as i64, j as i64, n)
         }
     };
     [
@@ -69,6 +68,19 @@ pub fn bilinear_taps(dir: RenderDir, n: u32) -> [((CubeFace, u32, u32), f64); 4]
         (tap(i0, j0 + 1.0), (1.0 - fu) * fv),
         (tap(i0 + 1.0, j0 + 1.0), fu * fv),
     ]
+}
+
+/// The texel holding the centre of texel `(col, row)` of `face`'s grid when that index lies
+/// past the face's edge: the centre extended onto the face's plane, then projected. This is the
+/// seam rule shared by [`bilinear_taps`] and the water pass's lattice neighbours.
+pub(crate) fn texel_beyond(face: CubeFace, col: i64, row: i64, n: u32) -> (CubeFace, u32, u32) {
+    let nf = f64::from(n);
+    let point = face_point(
+        face,
+        2.0 * (col as f64 + 0.5) / nf - 1.0,
+        2.0 * (row as f64 + 0.5) / nf - 1.0,
+    );
+    dir_to_texel(RenderDir(point.normalize()), n)
 }
 
 /// The face and face coordinates `(sc, tc)` of a direction, under the shared tie rule.

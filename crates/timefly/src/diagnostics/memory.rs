@@ -248,14 +248,18 @@ mod tests {
             "{before:?} vs {rusage}"
         );
         assert!(before.internal > 0 && before.internal <= before.footprint + (64 << 20));
-        // A 64 MiB block written through shows up as in use, then as held.
-        let block = vec![1u8; 64 << 20];
-        let with = split().unwrap();
-        assert!(
-            with.malloc_in_use >= before.malloc_in_use + (60 << 20),
-            "{with:?}"
-        );
-        assert!(with.malloc_held >= with.malloc_in_use);
-        drop(block);
+        // A 64 MiB block written through shows up as in use, then as held. The statistics are
+        // the process's, and other tests run on other threads, freeing as they go, so a reading
+        // may fall short; one of a few tries must see the block.
+        let grew = (0..5).any(|_| {
+            let before = split().unwrap();
+            let block = vec![1u8; 64 << 20];
+            let with = split().unwrap();
+            assert!(with.malloc_held >= with.malloc_in_use, "{with:?}");
+            let grew = with.malloc_in_use >= before.malloc_in_use + (60 << 20);
+            drop(block);
+            grew
+        });
+        assert!(grew, "a 64 MiB block never showed as in use");
     }
 }

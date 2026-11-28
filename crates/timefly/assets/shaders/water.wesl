@@ -1,12 +1,33 @@
-// The region's sea (M2 design §6.5): a plane at sea level, curved like the terrain, lit through
-// Bevy's StandardMaterial PBR path (sun, terrain shadows, fog, tonemapping).
+// The region's water (M2 design §6.5; rivers and lakes design §4.4): the sea, the lakes and the
+// rivers, drawn from the fields' water textures, curved like the terrain, lit through Bevy's
+// StandardMaterial PBR path (sun, terrain shadows, fog, tonemapping).
 //
-// The mesh is a polar grid in metres from the camera. The vertex stage adds the camera's xz and
-// the curvature drop d² / 2R (as cdlod_vertex does), then pulls the vertex toward the camera along
-// its view ray: depth changes, the pixel does not, so the sea wins depth ties with a terrain mesh
-// lying near y = 0. The fragment stage reads the sea-floor depth from the terrain's own height
-// textures (blended_height, the WESL copy of blended_height_m) and discards fragments over land,
-// so the shoreline is the height field's zero contour at rest.
+// The mesh is a polar grid in metres from the camera. The vertex stage puts it at the drawn
+// surface (the water level, or the ground where that is higher, `blended_surface_m`), adds the
+// camera's xz and the curvature drop d² / 2R (as cdlod_vertex does), then pulls the vertex toward
+// the camera along its view ray: depth changes, the pixel does not, so the water wins depth ties
+// with the terrain at its shore. The fragment stage reads the water at its surface point
+// (blended_water, the WESL copy of timefly_core::terrain::blended_water) and discards it where
+// the water's thickness over the ground is not positive, or outside a river's true width (its
+// ribbon below 0), so the shoreline is the fields' own zero contour at rest.
+//
+// Rivers (ribbon below RIBBON_NONE_M): their ripples and white water scroll downstream along
+// the flow, two phases half a period apart (`flow_phase_weights`), so the water moves and never
+// pulses; rapids (`rapid_from_speed`) scroll faster, ripple harder and break white. Their tint
+// is silty brown when slow, clear when fast (`river_tint`). Lakes and the sea (ribbon at least
+// RIBBON_NONE_M) keep the swell, the swash and the shore's foam below.
+//
+// White water in rapids (Task 11c), only where `rapid` > 0:
+// - Standing waves: a normal-only pattern that holds still while the foam runs through it, its
+//   crests across the flow at the hydraulic wavelength 2π v² / g (`standing_waves`), its slope
+//   growing with the rapid. Fix round 4: their phase is warped (`crest_warp`) and their strength
+//   broken into patches (`crest_patch`) by still noise, so the crests are short and irregular,
+//   not a ladder across the river.
+// - Foam on the standing waves' crests where the patches are strong (`white_water_foam`), broken
+//   by noise stretched STREAK_STRETCH : 1 along the flow (`streaks`) and carried by the flow
+//   map, its coarse clumps breaking and re-forming with time; none in the troughs, which read as
+//   dark, fast, streaked water; faded to its mean where unresolved. Most of a rapid's white is
+//   the rocks' own: their collars (scatter.wesl), which this shader cannot see.
 //
 // Waves (art pass §5.4, waves.wesl):
 // - Swell: below 1 km the vertex stage raises and lowers the surface by three directional
@@ -20,9 +41,9 @@
 //   wins depth ties with the terrain there.
 
 import package::terrain_cdlod::{
-    TerrainBuffer, TerrainParams, blended_height, fog_position, texel_step,
+    TerrainBuffer, TerrainParams, WaterSample, blended_water, fog_position, texel_step,
 };
-import package::noise::gradient_noise3;
+import package::noise::{gradient_noise3, hash3};
 import package::waves::{
     TAU, SWASH_MAX_AMPLITUDE_M, SWASH_PROBE_M, swash_amplitude_m, swash_level_m, swash_reach_factor,
     wave_phase, swell_spacing_weight,
@@ -61,14 +82,21 @@ struct WaterLook {
     // x: each band's largest slope; y: the bands' patch noise scale (m); z, w: floor depths (m)
     // over which every wave comes in from the shore.
     bands: vec4<f32>,
+    // The rivers' flow map: x: period (s); y: ripple scale (m); z: white water's foam
+    // strength; w: the rapids' extra scroll.
+    flow: vec4<f32>,
+    // rgb: a fast river's clear colour; w: the speed (m/s) at or below which it is fully silty.
+    river_clear: vec4<f32>,
+    // rgb: a slow river's silty colour; w: the speed (m/s) from which it is clear.
+    river_silty: vec4<f32>,
     // Three displaced swell components, then three normal-only bands: (dir.x, dir.z,
     // wavelength m, period s), as `wave_phase` takes them.
     waves: array<vec4<f32>, 6>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<storage, read> terrain: TerrainBuffer;
-@group(constants::MATERIAL_BIND_GROUP) @binding(101) var inner_height: texture_2d<f32>;
-@group(constants::MATERIAL_BIND_GROUP) @binding(102) var apron_height: texture_2d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(101) var inner_water: texture_2d<u32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(102) var apron_water: texture_2d<u32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(103) var<uniform> look: WaterLook;
 
 struct Vertex {
@@ -83,15 +111,89 @@ struct WaterVertexOutput {
     @location(1) @interpolate(flat) instance_index: u32,
 }
 
-// The sea floor's elevation gradient (uphill, rise over run) at xz: a central difference of the
-// blended height over one texel of the dominant field, so it varies smoothly across texel edges.
+// `DRY_SINK_M` in water.rs: dry vertices sit this far (m) under the ground, unpulled.
+const DRY_SINK_M: f32 = 4.0;
+// `RIBBON_NONE_M` in timefly_core::hydrology::params: the ribbon of water that is not a river.
+const RIBBON_NONE_M: f32 = 1000.0;
+// `RAPID_SPEED_BASE_MS`, `RAPID_SPEED_GAIN_MS` in timefly_core::hydrology::params.
+const RAPID_SPEED_BASE_MPS: f32 = 3.0;
+const RAPID_SPEED_GAIN_MPS: f32 = 3.0;
+// `RAPID_NORMAL_GAIN` in water.rs: rapids ripple this much harder.
+const RAPID_NORMAL_GAIN: f32 = 3.0;
+// `WHITE_WATER` in water.rs, linear.
+const WHITE_WATER: vec3<f32> = vec3<f32>(0.8276, 0.8689, 0.8481);
+// Flow speeds (m/s) over which water turns from standing to river: rivers run at 0.3 m/s or
+// more (LOWLAND_SPEED_MS), standing water has none, and where a river meets a lake the flow
+// fades to 0 exactly where the ribbon reaches RIBBON_NONE_M, so the look changes without a seam.
+const RIVER_SPEED_MPS: vec2<f32> = vec2<f32>(0.05, 0.3);
+// A river's ripples' largest slope (before the rapids' gain).
+const RIVER_RIPPLE_SLOPE: f32 = 0.06;
+// `GRAVITY_MPS2` in water.rs: the standing waves' wavelength is 2π v² / g.
+const GRAVITY_MPS2: f32 = 9.81;
+// `STANDING_WAVE_SLOPE` in water.rs: the standing waves' largest slope in a full rapid.
+const STANDING_WAVE_SLOPE: f32 = 0.3;
+// `STANDING_WAVE_CELL_M` in water.rs: the cells (m) whose own frames hold the standing waves.
+const STANDING_WAVE_CELL_M: f32 = 32.0;
+// `STREAK_STRETCH` in water.rs: the white water's noise is this many times longer along the
+// flow than across it.
+const STREAK_STRETCH: f32 = 4.0;
+// `STREAK_DIRECTIONS` in water.rs: the streaks' frames, this many evenly around the circle.
+const STREAK_DIRECTIONS: f32 = 24.0;
+// `FOAM_CREST_BAND`, `FOAM_MEAN`, `CREST_FLICKER_M`, `CREST_FLICKER_RATE`,
+// `CREST_FLICKER_PERIOD_S` in water.rs: white water's foam stands on the standing waves' crests, broken by the streaks, with lace off the troughs,
+// and fades to its mean where unresolved (`white_water_foam`).
+const FOAM_CREST_BAND: vec2<f32> = vec2<f32>(0.05, 0.6);
+const CREST_FLICKER_M: f32 = 7.0;
+const CREST_FLICKER_RATE: f32 = 0.8;
+const CREST_FLICKER_PERIOD_S: f32 = 10.0;
+const FOAM_MEAN: f32 = 0.19;
+// `CREST_WARP`, `CREST_NOISE_M`, `CREST_PATCH_BAND`, `CREST_WAVE_FLOOR` in water.rs: the
+// standing waves' still phase warp (wavelengths) and patches (`crest_warp`, `crest_patch`).
+const CREST_WARP: f32 = 0.5;
+const CREST_NOISE_M: f32 = 9.0;
+const CREST_PATCH_BAND: vec2<f32> = vec2<f32>(0.0, 0.3);
+const CREST_WAVE_FLOOR: f32 = 0.4;
+// `STREAK_CONTRAST` in water.rs: the streaks' noise is scaled by this before the foam's
+// threshold, so up close the foam breaks into streaks and clumps over dark water, while where
+// it is unresolved (the noise at its mean, 0) the rapid is as white as before.
+const STREAK_CONTRAST: f32 = 1.6;
+
+// The water at xz (`blended_water` over this material's water textures).
+fn water_at(params: TerrainParams, xz: vec2<f32>) -> WaterSample {
+    return blended_water(inner_water, apron_water, params, xz);
+}
+
+// The floor's elevation gradient under standing water (uphill, rise over run) at xz: minus the
+// gradient of the water's thickness (its level is flat), by a central difference over one texel
+// of the dominant field, so it varies smoothly across texel edges.
 fn floor_gradient(params: TerrainParams, xz: vec2<f32>) -> vec2<f32> {
     let e = texel_step(params, xz);
-    let dx = blended_height(inner_height, apron_height, params, xz + vec2<f32>(e, 0.0))
-        - blended_height(inner_height, apron_height, params, xz - vec2<f32>(e, 0.0));
-    let dz = blended_height(inner_height, apron_height, params, xz + vec2<f32>(0.0, e))
-        - blended_height(inner_height, apron_height, params, xz - vec2<f32>(0.0, e));
-    return vec2<f32>(dx, dz) / (2.0 * e);
+    let dx = water_at(params, xz + vec2<f32>(e, 0.0)).thickness
+        - water_at(params, xz - vec2<f32>(e, 0.0)).thickness;
+    let dz = water_at(params, xz + vec2<f32>(0.0, e)).thickness
+        - water_at(params, xz - vec2<f32>(0.0, e)).thickness;
+    return -vec2<f32>(dx, dz) / (2.0 * e);
+}
+
+// `rapid_from_speed` in timefly_core: how much of a rapid a river flowing at this speed is.
+fn rapid_from_speed(speed_mps: f32) -> f32 {
+    return clamp((speed_mps - RAPID_SPEED_BASE_MPS) / RAPID_SPEED_GAIN_MPS, 0.0, 1.0);
+}
+
+// `flow_phase_weights` in water.rs: the two flow phases' triangle weights, half a period apart,
+// each 0 where its phase restarts.
+fn flow_phase_weights(t_s: f32, jitter: f32) -> vec2<f32> {
+    let p = fract(t_s / look.flow.x + jitter);
+    let q = fract(p + 0.5);
+    return vec2<f32>(1.0 - abs(2.0 * p - 1.0), 1.0 - abs(2.0 * q - 1.0));
+}
+
+// `river_tint` in water.rs: clear to silty by the speed; the clear part darkens with depth.
+fn river_tint(depth_m: f32, speed_mps: f32) -> vec3<f32> {
+    let silt = 1.0 - smoothstep(look.river_clear.w, look.river_silty.w, speed_mps);
+    let base = mix(look.river_clear.rgb, look.river_silty.rgb, silt);
+    let t = 1.0 - exp(-max(depth_m, 0.0) / look.shallow.w);
+    return mix(base, look.deep.rgb, t * (1.0 - silt));
 }
 
 // Land vertices this far above the sea (m) still carry the swash's depth lift, so the
@@ -111,16 +213,25 @@ fn vertex(in: Vertex) -> WaterVertexOutput {
     let rel = in.position.xz * (reach / look.mesh.w);
     let xz = params.camera.xz + rel;
     let drop = dot(rel, rel) / (2.0 * params.lattice.z);
-    // Low down: the swell's height, and the swash's amplitude for the depth lift below. Higher
-    // up, neither shows and the vertex reads no heights.
+    // The surface: the water's level, or DRY_SINK_M under the ground where that is higher. Dry
+    // vertices then sit just under the ground, not at their texels' level (NO_WATER_DROP_M below
+    // it), so the terrain hides the mesh over dry land (the water draws after the terrain, and
+    // its fragments there are rejected before they shade), while between a river's vertex and a
+    // bank's the mesh never dips under the river's level.
+    let w = water_at(params, xz);
+    let level = max(w.level, w.level - w.thickness - DRY_SINK_M);
+    // How much of the depth pull applies: all of it on water, none on dry ground.
+    let wet = smoothstep(-DRY_SINK_M, 0.0, w.thickness);
+    // Low down, on standing water: the swell's height, and the swash's amplitude for the depth
+    // lift below. Higher up, and on rivers, neither shows.
+    // `water_vertex_spacing_m`: the ring step or the arc between segments.
+    let r = length(rel);
+    let spacing = max(max(look.mesh.x, r * look.mesh.y), TAU * r / look.mesh.z);
     var swell = 0.0;
     var lift = 0.0;
-    let height_fade = 1.0 - smoothstep(look.swell.y, look.swell.z, params.camera.y);
-    if height_fade > 0.0 {
-        let depth = -blended_height(inner_height, apron_height, params, xz);
-        // `water_vertex_spacing_m`: the ring step or the arc between segments.
-        let r = length(rel);
-        let spacing = max(max(look.mesh.x, r * look.mesh.y), TAU * r / look.mesh.z);
+    let height_fade = 1.0 - smoothstep(look.swell.y, look.swell.z, params.camera.y - w.level);
+    if height_fade > 0.0 && w.ribbon >= RIBBON_NONE_M {
+        let depth = w.thickness;
         var sum = 0.0;
         for (var i = 0u; i < 3u; i++) {
             let w = look.waves[i];
@@ -131,13 +242,13 @@ fn vertex(in: Vertex) -> WaterVertexOutput {
             lift = height_fade * swash_amplitude_m(length(floor_gradient(params, xz)));
         }
     }
-    let surface = vec3<f32>(xz.x, swell - drop, xz.y);
+    let surface = vec3<f32>(xz.x, level + swell - drop, xz.y);
     let ray = surface - view.world_position;
     let distance = length(ray);
-    // The pull of a sea `lift` metres higher (along the ray, `lift / sin` of its slope), so water
+    // The pull of water `lift` metres higher (along the ray, `lift / sin` of its slope), so water
     // the swash lays over the beach still wins depth ties with the terrain beneath it.
     let lifted = lift * distance / max(abs(ray.y), 1e-3);
-    let pull = min(look.pull.x + look.sky_horizon.w * distance + lifted, 0.5 * distance);
+    let pull = min((look.pull.x + look.sky_horizon.w * distance + lifted) * wet, 0.5 * distance);
     let pulled = surface - ray * (pull / max(distance, 1e-3));
     var out: WaterVertexOutput;
     out.position = position_world_to_clip(pulled);
@@ -163,6 +274,110 @@ fn brush(xz: vec2<f32>, scale_m: f32, z: f32, seed: u32) -> f32 {
     return gradient_noise3(vec3<i32>(i32(c.x), i32(c.y), i32(zc)), vec3<f32>(q - c, z - zc), seed);
 }
 
+// Standing waves at xz in water flowing along unit `dir`, wavelength `lambda` (m), their phase
+// shifted by `warp` wavelengths: the height pattern's (sin, cos) of its phase, so the height is
+// `sin` and its slope along `dir` is `cos` (times 2π / λ and the amplitude). Its crests run
+// across the flow and never move. A single phase `dot(xz, dir) / λ` would sweep the crests round
+// wherever the flow turns or λ changes (xz is hundreds of kilometres from the origin), so each
+// cell of a STANDING_WAVE_CELL_M lattice holds its own train about its own point with its own
+// phase, and the four around xz are blended with smooth weights, normalised so the blend keeps
+// the pattern's strength. `standing_waves` in water.rs.
+fn standing_waves(xz: vec2<f32>, dir: vec2<f32>, lambda: f32, warp: f32) -> vec2<f32> {
+    let g = xz / STANDING_WAVE_CELL_M - 0.5;
+    let c = floor(g);
+    let f = smoothstep(vec2<f32>(0.0), vec2<f32>(1.0), g - c);
+    var sum = vec2<f32>(0.0);
+    var norm = 0.0;
+    for (var j = 0; j < 2; j++) {
+        for (var i = 0; i < 2; i++) {
+            let cell = c + vec2<f32>(f32(i), f32(j));
+            let point = (cell + 0.5) * STANDING_WAVE_CELL_M;
+            let offset = f32(hash3(vec3<i32>(i32(cell.x), i32(cell.y), 0), 229u) >> 8u) / 16777216.0;
+            let a = TAU * fract(dot(xz - point, dir) / lambda + offset + warp);
+            let w = select(1.0 - f.x, f.x, i == 1) * select(1.0 - f.y, f.y, j == 1);
+            sum += w * vec2<f32>(sin(a), cos(a));
+            norm += w * w;
+        }
+    }
+    return sum * inverseSqrt(max(norm, 1e-6));
+}
+
+// `crest_warp` in water.rs: the standing waves' still phase shift at xz (wavelengths), so their
+// crests wander instead of running straight across the river.
+fn crest_warp(xz: vec2<f32>) -> f32 {
+    return CREST_WARP * brush(xz, 2.0 * CREST_NOISE_M, 0.0, 233u);
+}
+
+// `crest_patch` in water.rs: how strong the standing waves are at xz, 0 to 1, in still patches
+// about CREST_NOISE_M across: the crests break into short, irregular ones.
+fn crest_patch(xz: vec2<f32>) -> f32 {
+    return smoothstep(CREST_PATCH_BAND.x, CREST_PATCH_BAND.y, brush(xz, CREST_NOISE_M, 0.0, 239u));
+}
+
+// White water's noise at xz, in frames turned to the unit flow `dir` and stretched
+// STREAK_STRETCH : 1 along it: streaks `s` metres across (a fine octave churning at t × 0.5) and
+// clumps four times larger (a coarse one at t × 0.3, so they break and re-form), each faded to
+// its mean as it shrinks below a couple of pixels. Frames are fixed for each of
+// STREAK_DIRECTIONS directions (a frame turned with the flow itself would sweep the pattern
+// round where it bends, xz being far from the origin); the two either side of `dir` are
+// blended, normalised so the blend keeps the noise's strength.
+fn streaks(xz: vec2<f32>, dir: vec2<f32>, s: f32, footprint: f32, t: f32) -> f32 {
+    let wf = octave_weight(footprint, s);
+    let wc = octave_weight(footprint, 4.0 * s);
+    let k = atan2(dir.y, dir.x) / TAU * STREAK_DIRECTIONS;
+    let k0 = floor(k);
+    let a = k - k0;
+    var n = vec2<f32>(0.0);
+    for (var i = 0; i < 2; i++) {
+        let bin = k0 + f32(i);
+        let angle = bin * TAU / STREAK_DIRECTIONS;
+        let along_dir = vec2<f32>(cos(angle), sin(angle));
+        let q = vec2<f32>(dot(xz, vec2<f32>(-along_dir.y, along_dir.x)), dot(xz, along_dir));
+        // The bin's own seed, the same either side of the turn at ±π.
+        let seed = u32(bin - STREAK_DIRECTIONS * floor(bin / STREAK_DIRECTIONS));
+        let fine = brush(q * vec2<f32>(1.0, 1.0 / STREAK_STRETCH), s, t * 0.5, 241u + seed);
+        let coarse = brush(q * vec2<f32>(1.0, 1.0 / STREAK_STRETCH), 4.0 * s, t * 0.3, 307u + seed);
+        n[i] = fine * wf + 0.7 * coarse * wc;
+    }
+    return (n.x * (1.0 - a) + n.y * a) * inverseSqrt((1.0 - a) * (1.0 - a) + a * a);
+}
+
+// `crest_flicker` in water.rs: how much of the crests' foam stands at xz at time t (s), 0 to 1:
+// still noise about CREST_FLICKER_M across that changes with time, so crest foam flickers,
+// breaks and re-forms while the crests themselves stay put. Its time axis loops over
+// CREST_FLICKER_PERIOD_S (a divisor of the time wrap): two phases cross-faded as the flow map's.
+fn crest_flicker(xz: vec2<f32>, t: f32) -> f32 {
+    let p = CREST_FLICKER_PERIOD_S;
+    let a = fract(t / p);
+    let b = fract(a + 0.5);
+    let wa = 1.0 - abs(2.0 * a - 1.0);
+    let wb = 1.0 - abs(2.0 * b - 1.0);
+    let na = brush(xz, CREST_FLICKER_M, a * p * CREST_FLICKER_RATE, 251u);
+    let nb = brush(xz, CREST_FLICKER_M, b * p * CREST_FLICKER_RATE + 37.5, 251u);
+    let n = (wa * na + wb * nb) * inverseSqrt(wa * wa + wb * wb);
+    return clamp(0.55 + 0.6 * n, 0.0, 1.0);
+}
+
+// `white_water_foam` in water.rs: the foam weight at a rapid, a standing-wave crest (−1 in a
+// trough, 1 on a crest), the crests' patch strength (`patch` is a WGSL reserved word), the
+// streak noise (4:1 along the flow, carried by it), the crests' flicker and how far they are
+// resolved: soft streaks on the crests, none in a trough, none where the patch is gone.
+fn white_water_foam(
+    rapid: f32,
+    crest: f32,
+    crests: f32,
+    streak: f32,
+    flicker: f32,
+    resolve: f32,
+) -> f32 {
+    let foam = smoothstep(
+        FOAM_CREST_BAND.x,
+        FOAM_CREST_BAND.y,
+        flicker * (0.5 + 0.5 * crests) * (0.3 + 0.7 * streak),
+    ) * smoothstep(-0.5, 0.5, crest);
+    return rapid * mix(FOAM_MEAN, foam, resolve);
+}
+
 // The thinnest water (m) the shore's foam band ends at (FOAM_MIN_DEPTH_M in water.rs).
 const FOAM_MIN_DEPTH_M: f32 = 0.02;
 // The swash's foam line: water thinner than this fraction of the amplitude, and never thinner
@@ -184,11 +399,17 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     if max(abs(xz.x), abs(xz.y)) > params.apron.x * 0.5 {
         discard;
     }
-    let depth = -blended_height(inner_height, apron_height, params, xz);
-    // No swash lifts the sea over land this high.
-    if depth <= -SWASH_MAX_AMPLITUDE_M {
+    let w = water_at(params, xz);
+    let depth = w.thickness;
+    // No swash lifts the water over ground this high; and outside a river's true width (drawn
+    // at least about a pixel wide, so a thin river stays a line from afar) there is no water.
+    if depth <= -SWASH_MAX_AMPLITUDE_M || w.ribbon + 0.5 * footprint < 0.0 {
         discard;
     }
+    let river = w.ribbon < RIBBON_NONE_M;
+    // How much of the river look applies: all of it on a river, none on standing water, ramped
+    // across the cell where a river meets a lake (`RIVER_SPEED_MPS`).
+    let river_w = select(0.0, smoothstep(RIVER_SPEED_MPS.x, RIVER_SPEED_MPS.y, length(w.flow)), river);
     let t = globals.time;
 
     // Swash: in the shallows the level rises and falls by the reach times the floor's slope,
@@ -199,18 +420,18 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     var floor_slope_m = 0.0;
     var amplitude = 0.0;
     var level = 0.0;
-    if depth < max(look.swash.z, look.deep.w) {
+    if river_w < 1.0 && depth < max(look.swash.z, look.deep.w) {
         let gradient = floor_gradient(params, xz);
         floor_slope_m = length(gradient);
         amplitude = swash_amplitude_m(floor_slope_m);
         if depth < look.swash.z {
             // Toward the shore: downhill from land, uphill from the sea.
             let toward = gradient / max(floor_slope_m, 1e-9) * select(-1.0, 1.0, depth > 0.0);
-            let probe = -blended_height(inner_height, apron_height, params, xz + toward * SWASH_PROBE_M);
+            let probe = water_at(params, xz + toward * SWASH_PROBE_M).thickness;
             let phase = 2.0 * TAU * brush(xz, look.swash.y, 0.0, 101u);
             let ease = 1.0 - smoothstep(0.5 * look.swash.z, look.swash.z, depth);
             level = swash_level_m(floor_slope_m, t, look.swash.x, phase) * ease
-                * swash_reach_factor(depth, probe, amplitude);
+                * swash_reach_factor(depth, probe, amplitude) * (1.0 - river_w);
         }
     }
     // The water's thickness over the floor; land wherever the floor is above the water level.
@@ -242,7 +463,58 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
         wave_slope += a * cos(wave_phase(w, xz, t)) * w.xy;
     }
     wave_slope *= smoothstep(look.bands.z, look.bands.w, depth);
-    let tilt = rel / params.lattice.z + ripple - wave_slope;
+
+    // Rivers: ripples and white water carried downstream by the flow (region +x, +z), sampled
+    // at xz - flow × phase × period for each of the two phases, faster in rapids. The phase is
+    // jittered over 400 m so the restarts don't sweep the river in step.
+    var flow_tilt = vec2<f32>(0.0);
+    var white = 0.0;
+    if river {
+        let rapid = rapid_from_speed(length(w.flow));
+        let jitter = brush(xz, 400.0, 0.0, 139u);
+        let weights = flow_phase_weights(t, jitter);
+        let p = fract(t / look.flow.x + jitter);
+        let q = fract(p + 0.5);
+        let reach = w.flow * look.flow.x * (1.0 + look.flow.w * rapid);
+        let x0 = xz - reach * p;
+        let x1 = xz - reach * q;
+        let s = look.flow.y;
+        let ws = octave_weight(footprint, s);
+        let wl = octave_weight(footprint, 4.0 * s);
+        let r0 = vec2<f32>(
+            brush(x0, s, 0.0, 151u) * ws + 0.6 * brush(x0, 4.0 * s, 0.0, 157u) * wl,
+            brush(x0, s, 0.0, 163u) * ws + 0.6 * brush(x0, 4.0 * s, 0.0, 167u) * wl,
+        );
+        let r1 = vec2<f32>(
+            brush(x1, s, 0.0, 151u) * ws + 0.6 * brush(x1, 4.0 * s, 0.0, 157u) * wl,
+            brush(x1, s, 0.0, 163u) * ws + 0.6 * brush(x1, 4.0 * s, 0.0, 167u) * wl,
+        );
+        flow_tilt = (weights.x * r0 + weights.y * r1) * RIVER_RIPPLE_SLOPE
+            * (1.0 + RAPID_NORMAL_GAIN * rapid) * river_w;
+        if rapid > 0.0 {
+            let speed = length(w.flow);
+            let dir = w.flow / speed;
+            // Standing waves: still, so sampled at xz (not carried by the flow map); the normal
+            // tilts by minus the height's slope.
+            let lambda = TAU * speed * speed / GRAVITY_MPS2;
+            let crests = crest_patch(xz);
+            let waves = standing_waves(xz, dir, lambda, crest_warp(xz));
+            let ww = octave_weight(footprint, lambda);
+            let strength = CREST_WAVE_FLOOR + (1.0 - CREST_WAVE_FLOOR) * crests;
+            flow_tilt -= dir * (STANDING_WAVE_SLOPE * rapid * ww * strength * waves.y * river_w);
+            // White water: foam on the crests the flow carries it through, broken by streaks
+            // along the flow that churn as they go, dark fast water in the troughs; where the
+            // pattern can't be resolved it fades to its mean.
+            let n0 = streaks(x0, dir, s, footprint, t);
+            let n1 = streaks(x1, dir, s, footprint, t);
+            let n = STREAK_CONTRAST * (weights.x * n0 + weights.y * n1);
+            let flicker = crest_flicker(xz, t);
+            white = look.flow.z * white_water_foam(rapid, waves.x, crests, n, flicker, ww)
+                * river_w;
+        }
+    }
+    let lake_tilt = (ripple - wave_slope) * (1.0 - river_w);
+    let tilt = rel / params.lattice.z + lake_tilt + flow_tilt;
     let normal = normalize(vec3<f32>(tilt.x, 1.0, tilt.y));
 
     // Foam: a band where the water is less than FOAM_DEPTH_M thick, kept within FOAM_WIDTH_M of
@@ -258,10 +530,11 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     let line_thickness = max(SWASH_LINE_FRACTION * amplitude, SWASH_LINE_MIN_M);
     let line_width = line_thickness / max(floor_slope_m, 1e-4);
     let line = (1.0 - smoothstep(0.0, line_thickness, water)) * octave_weight(footprint, line_width);
-    let foam = max(
+    let shore_foam = max(
         smoothstep(0.45, 0.6, band * (0.8 + n)),
         smoothstep(0.5, 0.75, line * (0.9 + n)),
-    ) * w25;
+    ) * w25 * (1.0 - river_w);
+    let foam = max(shore_foam, white);
 
     var mesh: VertexOutput;
     mesh.position = in.position;
@@ -281,7 +554,9 @@ fn fragment(in: WaterVertexOutput, @builtin(front_facing) is_front: bool) -> Fra
     mesh.visibility_range_dither = 0;
 
     var pbr_input = pbr_input_from_standard_material(mesh, is_front);
-    let albedo = mix(water_tint(water), vec3<f32>(0.85, 0.88, 0.86), foam);
+    let own = mix(water_tint(water), river_tint(water, length(w.flow)), river_w);
+    let foam_colour = mix(vec3<f32>(0.85, 0.88, 0.86), WHITE_WATER, river_w);
+    let albedo = mix(own, foam_colour, foam);
     pbr_input.material.base_color = vec4<f32>(albedo, 1.0) * pbr_input.material.base_color;
     pbr_input.material.perceptual_roughness = mix(pbr_input.material.perceptual_roughness, 0.9, foam);
     var color = apply_pbr_lighting(pbr_input);

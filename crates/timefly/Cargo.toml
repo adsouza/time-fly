@@ -26,6 +26,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 bytemuck = { version = "1.19", features = ["derive"] }
 tracing = "0.1"
+# The pre-flight adapter check (`gpu::probe_native`) and the GPU frame timer's queries
+# (`diagnostics::gpu_time`). The same wgpu as Bevy's (one copy in the lock file), so its backend
+# features unify with the ones Bevy enables on each target.
+wgpu = { version = "30.0.2", default-features = false }
 
 # basis-universal builds a C++ transcoder that needs a libc sysroot, which wasm32-unknown-unknown
 # does not have, so it is enabled on native targets only.
@@ -41,9 +45,6 @@ directories = "6"
 fd-lock = "4"
 opener = { version = "0.9", features = ["reveal"] }
 rfd = "0.18"
-# The pre-flight adapter check (`gpu::probe_native`). The same wgpu as Bevy's (one copy in the
-# lock file), so its backend features unify with the ones Bevy enables.
-wgpu = { version = "30.0.2", default-features = false }
 
 # Process memory and the OS version for the scrub bench (already in the tree via winit/wgpu).
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
@@ -86,3 +87,6 @@ ruzstd = "0.9"
 half = "2"
 # The fly camera's clearance property test (already a timefly_core dev-dependency).
 proptest = "1.12"
+# Validates the composed WESL shaders on the CPU (`tests/shader_compile.rs`): the same naga as
+# Bevy's wgpu (one copy in the lock file), with its WGSL front end, which wgpu enables already.
+naga = { version = "30.0.2", features = ["wgsl-in"] }

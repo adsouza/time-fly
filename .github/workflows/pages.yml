@@ -8,6 +8,7 @@ on:
       - '.github/workflows/pages.yml'
       - 'packaging/web/**'
       - 'packaging/stage_tiles.py'
+      - 'packaging/stage_climate.py'
   workflow_dispatch:
 
 permissions:
@@ -35,6 +36,15 @@ jobs:
         with:
           path: crates/timefly/assets/data/tiles
           key: baked-tiles-${{ hashFiles('data/sources.json', 'tools/bake/**') }}
+
+      # Past climate (Beyer et al. 2020, 35 grids, about 2.5 MB): range-read from figshare by the
+      # bake itself, so it needs no raw data.
+      - name: Cache baked climate
+        id: climate-cache
+        uses: actions/cache@v6
+        with:
+          path: crates/timefly/assets/data/climate
+          key: baked-climate-${{ hashFiles('data/sources.json', 'tools/bake/**') }}
 
       - name: Cache raw data
         if: steps.bake-cache.outputs.cache-hit != 'true' || steps.tiles-cache.outputs.cache-hit != 'true'
@@ -87,16 +97,27 @@ jobs:
         working-directory: tools/bake
         run: uv run --locked timefly-bake tiles --raw ../../data/raw --out ../../crates/timefly/assets/data/tiles
 
+      - name: Bake past climate
+        if: steps.climate-cache.outputs.cache-hit != 'true'
+        working-directory: tools/bake
+        run: uv run --locked timefly-bake climate --sources ../../data/sources.json --out ../../crates/timefly/assets/data/climate
+
       # The client fetches the tile manifest, the overview and only the tiles a region needs.
-      - name: Assemble the site with the production globe and tiles
+      # stage_climate.py fails unless all 35 climate grids are there and match their manifest:
+      # without them the game would run on the zonal climate (ClimateIndex::fail).
+      - name: Assemble the site with the production globe, tiles and climate
         run: |
+          echo "baked climate from cache: ${{ steps.climate-cache.outputs.cache-hit == 'true' }}"
           cp packaging/web/index.html _site/
           cp packaging/linux/io.github.adsouza.TimeFly.svg _site/favicon.svg
-          rsync -a --exclude=/data/tiles/ crates/timefly/assets/ _site/assets/
+          rsync -a --exclude=/data/tiles/ --exclude=/data/climate/ crates/timefly/assets/ _site/assets/
           python3 packaging/stage_tiles.py crates/timefly/assets/data/tiles _site/assets/data/tiles
+          python3 packaging/stage_climate.py crates/timefly/assets/data/climate _site/assets/data/climate
           rm -f _site/assets/data/globe/bake.log _site/assets/data/tiles/bake.log
           test -f _site/assets/data/globe/manifest.json
           test -f _site/assets/data/tiles/manifest.json
+          test -f _site/assets/data/climate/manifest.json
+          test ! -e _site/assets/data/climate/bake.log
 
       # GitHub Pages: at most 1 GB per site and 100 MB per file.
       - name: Check the site against the Pages limits

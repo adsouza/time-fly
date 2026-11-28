@@ -1,0 +1,70 @@
+{
+  "description": "Present-day surface levels (m) of big deep lakes whose bed, not surface, ETOPO 2022 holds (owner decision, 2026-11-25). Each entry is a point inside the lake and its surface level. In modes with data lakes, the depression basin holding the lattice node nearest the point becomes a data lake at this level, and at the present day the lake map's lakes below its level in that basin or beside its footprint join it (the map bakes these lakes at their bed; Task 11f). overview_m is the 5-arc-minute overview's value at the point, sampled by the controller; Task 11 re-checks it against the real overview. Read by timefly_core (compiled in) and the Python reference pass (Task 11).",
+  "lakes": [
+    {
+      "name": "Caspian Sea",
+      "lat": 42.0,
+      "lon": 50.5,
+      "level_m": -28.0,
+      "overview_m": -660.0,
+      "source": "Wikipedia, Caspian Sea; DAHITI satellite altimetry (https://dahiti.dgfi.tum.de/39/); 2025 record-low reports",
+      "note": "long-run average about -26 to -27 m (Baltic datum); 2025 about -29.4 m",
+      "endorheic": true,
+      "endorheic_source": "Wikipedia, 'Caspian Sea' (read 2026-11-26): 'An endorheic basin, it is situated in both Europe and Asia'; infobox type 'Endorheic', outflow 'Evaporation'. The flag makes the lake terminal whatever its balance, and its nodes below its level seed routing like the sea at that level (rivers Task 11d fix round 2)."
+    },
+    {
+      "name": "Lake Baikal",
+      "lat": 53.5,
+      "lon": 108.0,
+      "level_m": 455.5,
+      "overview_m": -148.5,
+      "source": "English Wikipedia, 'Lake Baikal' (read 2026-11-26): infobox surface elevation '455.5 m (1,494 ft)', uncited there. Checked against the regulated range, 455.54 to 457.85 m (Russian Government decree No. 234 of 26 March 2001, as a UNESCO World Heritage document reports it), and the long-term average of 456.43 m in the UNDP-GEF Baikal Project's 'State of the environment report: the Lake Baikal basin', section 1.5 (GEF IW:LEARN archive, read 2026-11-26).",
+      "note": "the bottom of the regulated range, within 1 m of the long-term average"
+    },
+    {
+      "name": "Lake Superior",
+      "lat": 47.7,
+      "lon": -87.5,
+      "level_m": 183.4,
+      "overview_m": 27.0,
+      "source": "English Wikipedia, 'Lake Superior' (read 2026-11-26): infobox surface elevation '601.71 ft (183.40 m) (2013 average)', citing US Army Corps of Engineers, 'Great Lakes Water Levels' (PDF, retrieved 2013-06-27).",
+      "note": ""
+    },
+    {
+      "name": "Lake Michigan",
+      "lat": 44.0,
+      "lon": -87.0,
+      "level_m": 176.0,
+      "overview_m": 61.9,
+      "source": "English Wikipedia, 'Lake Michigan' (read 2026-11-26): infobox surface elevation '577 ft (176 m)', citing Wright, J. W. (ed.), The New York Times Almanac (2007 ed.), Penguin Books, 2006, p. 64. 'Lake Michigan-Huron' (read 2026-11-26) gives the same 577 ft (176 m) and calls the two 'hydrologically a single lake'. The USACE long-term average for 1918-2023, 578.90 ft IGLD 1985 (176.45 m), as the Indiana DNR's water level table reports it (read 2026-11-26), lies 0.45 m above.",
+      "note": "one water body with Lake Huron, at one level: two entries, so that each arm keeps the level if the lattice ever splits them at the Straits of Mackinac (8 km wide, under the 10 km spacing)"
+    },
+    {
+      "name": "Lake Huron",
+      "lat": 44.8,
+      "lon": -82.4,
+      "level_m": 176.0,
+      "overview_m": 64.3,
+      "source": "English Wikipedia, 'Lake Huron' (read 2026-11-26): infobox surface elevation '577 ft (176 m)', citing US EPA, 'Great Lakes Factsheet No. 1' (2012-06-25, retrieved 2014-03-06).",
+      "note": "one water body with Lake Michigan, at one level (see Lake Michigan's note)"
+    },
+    {
+      "name": "Lake Erie",
+      "lat": 42.2,
+      "lon": -81.2,
+      "level_m": 173.0,
+      "overview_m": 152.0,
+      "source": "English Wikipedia, 'Lake Erie' (read 2026-11-26): infobox surface elevation '569 ft (173 m)', citing US EPA, 'Physical Features of the Great Lakes' (2015-09-16, archived 2019-10-18). The article's geography section gives a mean of 571 ft (174 m), citing The New York Times Almanac (2007 ed.), p. 64.",
+      "note": ""
+    },
+    {
+      "name": "Lake Ontario",
+      "lat": 43.7,
+      "lon": -77.9,
+      "level_m": 74.0,
+      "overview_m": -79.3,
+      "source": "English Wikipedia, 'Lake Ontario' (read 2026-11-26): infobox surface elevation '74 m (243 ft)', citing US EPA, 'Great Lakes Atlas: Factsheet #1' (2011-04-11, archived 2011-11-06).",
+      "note": ""
+    }
+  ]
+}

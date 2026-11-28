@@ -28,7 +28,7 @@ use crate::fly_camera::{CAMERA_CEILING_M, CAMERA_CLEARANCE_M, fly_speed};
 use crate::globe::EARTH_RADIUS_KM;
 use crate::region::{RegionGenerated, RegionPlugin, RegionSnapshotChanged, RequestPurpose};
 use crate::time::TimePlugin;
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::blended_surface_m;
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures
@@ -470,7 +470,14 @@ fn the_fallback_notice_shows_for_three_seconds_after_a_fallback_region() {
     assert_eq!(FALLBACK_NOTICE_TEXT, "terrain detail unavailable here");
 }
 
+thread_local! {
+    /// The frames [`frame`]'s stand-in for the terrain scene still holds the cloud for; every
+    /// test's inputs start from [`inputs`], which clears it.
+    static SETTLING_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 fn inputs() -> NavInputs {
+    SETTLING_FRAMES.set(0);
     NavInputs {
         now_s: 10.0,
         load_s: 10.0,
@@ -496,6 +503,7 @@ fn inputs() -> NavInputs {
         preload_failed: false,
         vertical_held: false,
         time_queued: false,
+        fields_settling: false,
     }
 }
 
@@ -505,6 +513,21 @@ fn inputs() -> NavInputs {
 fn frame(phase: NavPhase, i: &mut NavInputs) -> (NavPhase, Vec<NavAction>, f32, f32) {
     let before = phase.cloud_density(i);
     let (next, actions) = step_nav(phase, i);
+    // As the terrain scene: a swap this frame (a hop's, a snapshot change's) leaves the next
+    // `REPLACE_EXTRA_HELD_FRAMES` frames' fields incomplete (`TerrainScene::holds_cloud`).
+    let swapped = actions.iter().any(|a| {
+        matches!(
+            a,
+            NavAction::SwapToNeighbour | NavAction::PlaceAfterChange { .. }
+        )
+    });
+    let left = if swapped {
+        crate::terrain::REPLACE_EXTRA_HELD_FRAMES
+    } else {
+        SETTLING_FRAMES.get().saturating_sub(1)
+    };
+    SETTLING_FRAMES.set(left);
+    i.fields_settling = left > 0;
     for action in &actions {
         match *action {
             NavAction::SnapTime(t) => i.time = t,
@@ -1752,12 +1775,12 @@ fn globe_data() -> GlobeData {
 }
 
 fn flat(res: u32, size_m: f64, h: f32) -> Field {
-    Field {
+    Field::dry(
         res,
         size_m,
-        surface: vec![[0, 0, 0, 0]; (res * res) as usize],
-        elevation_m: vec![h; (res * res) as usize],
-    }
+        vec![h; (res * res) as usize],
+        vec![[0, 0, 0, 0]; (res * res) as usize],
+    )
 }
 
 fn grid(center: RenderDir, snapshot: YearsBp, ground_m: f32) -> Arc<RegionGrid> {
@@ -1769,6 +1792,7 @@ fn grid(center: RenderDir, snapshot: YearsBp, ground_m: f32) -> Arc<RegionGrid> 
         },
         inner: flat(9, REGION_SIZE_M, ground_m),
         apron: flat(9, APRON_SIZE_M, ground_m),
+        boulders: Vec::new(),
     })
 }
 
@@ -2003,6 +2027,8 @@ fn snapshot_change_regenerates_around_the_carried_position() {
         bytes_fetched: 0,
         frames_fetched: 0,
         fallback: false,
+        hydro_wait_ms: 0,
+        hydrology: false,
     });
     app.world_mut().write_message(RegionSnapshotChanged {
         from: YearsBp(0.0),
@@ -2240,6 +2266,8 @@ fn fake_job(
         bytes_fetched: 0,
         frames_fetched: 0,
         fallback: false,
+        hydro_wait_ms: 0,
+        hydrology: false,
     });
     changed.write(RegionSnapshotChanged {
         from: active.map_or(YearsBp(0.0), |a| a.grid.spec.snapshot),
@@ -2268,7 +2296,7 @@ fn check_clearance(
         return;
     };
     let p = t.translation;
-    let ground = blended_height_m(&scene.grid, f64::from(p.x), f64::from(p.z)).max(0.0);
+    let ground = blended_surface_m(&scene.grid, f64::from(p.x), f64::from(p.z));
     seen.checked += 1;
     if p.y < ground + CAMERA_CLEARANCE_M - 1e-3 {
         seen.violations.push(format!(
@@ -2329,6 +2357,126 @@ fn the_camera_clears_the_terrain_shown_through_a_snapshot_change() {
             "after {after}: {:#?}",
             seen.violations
         );
+    }
+}
+
+/// One frame's terrain fields as drawn: whether the heights and the water textures are the
+/// scene grid's (read back from the images' first texel), and the cloud.
+#[derive(Copy, Clone, Debug)]
+struct FieldsDrawn {
+    density: f32,
+    pending: bool,
+    heights_current: bool,
+    water_current: bool,
+    centre: RenderDir,
+}
+
+#[derive(Resource, Default)]
+struct FieldFrames(Vec<FieldsDrawn>);
+
+fn record_fields(
+    scene: Option<Res<crate::terrain::TerrainScene>>,
+    images: Res<Assets<Image>>,
+    density: Res<CloudDensity>,
+    mut frames: ResMut<FieldFrames>,
+) {
+    let Some(scene) = scene else { return };
+    // `None` where no texture is bound (a staged replace's swap frame has no water).
+    let first = |h: &Handle<Image>| {
+        let data = images.get(h).and_then(|i| i.data.as_ref())?;
+        Some(f32::from_le_bytes(data[..4].try_into().unwrap()))
+    };
+    let g = &scene.grid;
+    frames.0.push(FieldsDrawn {
+        density: density.0,
+        pending: scene.fields_pending(),
+        heights_current: first(&scene.inner_height) == Some(g.inner.elevation_m[0])
+            && first(&scene.apron_height) == Some(g.apron.elevation_m[0]),
+        water_current: first(&scene.inner_water) == Some(g.inner.water_level_m[0])
+            && first(&scene.apron_water) == Some(g.apron.water_level_m[0]),
+        centre: g.spec.center,
+    });
+}
+
+/// The hop's memory (third stage), for any swap: every frame whose fields are incomplete (no
+/// water bound) or mixed (another grid's heights) is drawn at density exactly 1. Per replace
+/// there are `1 + REPLACE_EXTRA_HELD_FRAMES` of them in a row: the swap frame, with no water,
+/// then the new water over the old heights. `replaces` is how many the frames hold.
+fn assert_mixed_fields_only_under_the_cloud(frames: &[FieldsDrawn], replaces: usize) {
+    use crate::terrain::REPLACE_EXTRA_HELD_FRAMES;
+    let held = 1 + REPLACE_EXTRA_HELD_FRAMES as usize;
+    let mixed: Vec<usize> = (0..frames.len())
+        .filter(|&k| !(frames[k].heights_current && frames[k].water_current))
+        .collect();
+    for &k in &mixed {
+        let f = frames[k];
+        assert_eq!(f.density, 1.0, "frame {k} draws incomplete fields: {f:?}");
+        assert!(f.pending && !f.heights_current, "frame {k}: {f:?}");
+    }
+    assert!(
+        frames
+            .iter()
+            .all(|f| f.pending == !(f.heights_current && f.water_current))
+    );
+    assert_eq!(
+        mixed.len(),
+        replaces * held,
+        "{held} staged frames per replace: {mixed:?}"
+    );
+    for run in mixed.chunks(held) {
+        assert!(
+            run.windows(2).all(|w| w[1] == w[0] + 1),
+            "not in a row: {mixed:?}"
+        );
+        assert!(
+            !frames[run[0]].water_current,
+            "the swap frame binds no water"
+        );
+        assert!(frames[run[held - 1]].water_current, "then the new water");
+        assert!(
+            frames[run[held - 1] + 1].heights_current,
+            "complete after {held} frames"
+        );
+    }
+}
+
+/// The hop's memory (third stage): a snapshot change's staged replace draws incomplete or mixed
+/// fields only at density exactly 1, whether the region is ready early or late.
+#[test]
+fn a_snapshot_change_replaces_the_fields_under_the_opaque_cloud() {
+    for after in [0, 1, 3, 12] {
+        let mut app = nav_app(false);
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<bevy::render::storage::ShaderBuffer>()
+            .init_asset::<crate::terrain::material::TerrainMaterial>()
+            .add_plugins(crate::fly_camera::FlyCameraPlugin)
+            .insert_resource(FakeJob {
+                after,
+                ground_m: 2_150.0,
+                pending: None,
+            })
+            .init_resource::<FieldFrames>()
+            .add_systems(Update, fake_job.in_set(crate::region::RegionSystems))
+            .add_systems(Last, record_fields);
+        crate::terrain::add_terrain_systems(&mut app);
+        app.world_mut().spawn((
+            crate::globe::GlobeCamera,
+            Camera::default(),
+            IsDefaultUiCamera,
+        ));
+        enter(&mut app, &grid(RenderDir(ON_PLATE), YearsBp(0.0), 288.0));
+        app.world_mut().resource_mut::<FlyState>().pos_m = Vec3::new(0.0, 562.0, -5_000.0);
+        app.update();
+        set_time(&mut app, 100e6);
+        for _ in 0..40 {
+            app.update();
+        }
+        assert_eq!(phase(&app), NavPhase::Flying, "after {after}");
+        let frames = &app.world().resource::<FieldFrames>().0;
+        assert!(frames.last().unwrap().heights_current);
+        assert_mixed_fields_only_under_the_cloud(frames, 1);
     }
 }
 

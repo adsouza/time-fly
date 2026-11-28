@@ -169,7 +169,12 @@ All levels share: **painterly shading** (§9), the **world generator** (§8), Be
 ### 7.5 Water surface
 
 - A water plane at the era's sea level, with painterly Fresnel, depth tint and shoreline foam.
-- Lakes and rivers come from the generator's hydrology *(builder; can start with sea level only)*.
+- Lakes and rivers come from the generator's hydrology *(builder; can start with sea level only)*. **Built in the rivers and lakes milestone, with open items** (`docs/superpowers/specs/2026-11-25-rivers-and-lakes-design.md`, plan `docs/superpowers/plans/2026-11-25-rivers-and-lakes.md`; the open items are listed under §14):
+  - A continental pass per era routes runoff over a cube lattice (about 10 km for the last 0.2 Myr, 51 km deeper) into rivers by discharge and lakes at their own levels. Today's lakes come from a present-day lake map (Natural Earth) with a hand-made, cited level table for the big deep lakes whose bed ETOPO holds (the Caspian, Baikal, the Great Lakes). Today's major river courses (Natural Earth) are burnt into the routing in every era with today's terrain.
+  - Each region refines the rivers on its own terrain: relaxed into real valleys, meandering on flats, carved at hydraulic width and depth, with tributaries joining down their own valleys. Rapids get clustered boulders and white water. Overlapping regions agree bit for bit, with two exceptions: where the boulder cap's guard fires a region keeps a prefix of its rocks, which its neighbour may not (it never fires in the bench regions; it logs a warning), and rocks are left out of the band where the inner field blends into the apron, which lies in a different place in each region (by design).
+  - The water draws at the era's sea level, at each lake's own level and along each river's surface, from one packed water texture per field.
+  - **Climate source:** runoff and evaporation come from Beyer, Krapp & Manica 2020 (annual mean temperature BIO1 and precipitation BIO12; figshare article 12293345, CC BY 4.0), read by HTTP range requests and baked at 1° for every Beyer age up to 26 ka and every 10 kyr from 30 to 120 ka: 35 grids, about 2.5 MB. Ages past 120 ka use the deep biome zonal rule *(rivers and lakes design §4.1)*. Köppen still drives the region's biome look.
+  - A reality check (`docs/testing/rivers/reality-check.md`) compares the present-day pass with a 1′ reference over the Indus and the Amazon, eight lakes and 22 river outlets.
 
 ### 7.6 Underwater
 
@@ -186,7 +191,7 @@ All levels share: **painterly shading** (§9), the **world generator** (§8), Be
 | Past elevation, 0–540 Ma | PALEOMAP PaleoDEMs (Scotese & Wright), 1°, 5 Myr intervals |
 | Plate polygons and rotations | PALEOMAP plate model via GPlates / pyGPlates (**must match the PaleoDEMs**) |
 | Ice sheets and sea level, last ~26 ka | ICE-6G_C or similar |
-| Past climate and biome | Quaternary: CHELSA-TraCE21k or PaleoClim. Deep time: PALEOMAP climate-belt reconstructions |
+| Past climate and biome | Quaternary: CHELSA-TraCE21k or PaleoClim. Deep time: PALEOMAP climate-belt reconstructions. *(Rivers and lakes: runoff uses Beyer et al. 2020, BIO1 and BIO12 baked at 1° up to 120 ka; see §7.5.)* |
 | Present-day land cover | ESA WorldCover or MODIS land cover |
 | Past human land use and **population density**, ~10 ka to present | HYDE 3.x (cropland, pasture, population) |
 | Watercraft by region and era | A hand-authored **maritime presence table** (waters, era range, vessel types) compiled from the literature and cross-checked with the CSV (builder compiles; owner reviews) |
@@ -289,7 +294,13 @@ Watercraft appear on rivers, lakes, coasts and seas **only where and when the hi
 1. **Globe + slider:** plate-piece sphere, continuous drift, ice and sea level, painterly sky. Proves the data pipeline end to end.
 2. **Region worlds:** world generator, CDLOD fixes, painterly terrain, water, era vegetation palette.
 3. **Zoom-and-swap:** globe ↔ region and region ↔ region (M3). Region ↔ local moves to the local-worlds milestone, since local worlds don't exist before it *(builder's call, proposed in the M3 design §1.1 item 8; the owner did not object)*.
-   - Then **lakes and rivers** at region scale, from the generator's hydrology (§7.5): a milestone of their own between M3 and M4 *(owner, 2026-11-24)*.
+   - Then **lakes and rivers** at region scale, from the generator's hydrology (§7.5): a milestone of their own between M3 and M4 *(owner, 2026-11-24)*. **Built, with open items** (2026-11-27; `docs/testing/rivers/`):
+     - The reality check's Indus box fails its "every reference link has a game river" bar (74 of 84; the Shyok and the Arghandab are not in Natural Earth's rivers); the owner's call.
+     - Chrome WebGPU (2026-11-27, the owner's run of `385bdfc` in Chrome 158): region bench and journey bench **PASS**; the continental pass 2.1–3.8 s per era (target ≤ 5 s); the deep eras' `sample` step runs past the 6 ms step goal (up to 17 ms, 39 ms at start-up), a follow-up.
+     - The white-water look ships as it is *(owner, 2026-11-27: "Ship, tune later")*; lacier wakes are a follow-up.
+     - The native hop-memory gate (+64 MiB) now judges a hop against the flight before it *(owner, 2026-11-27: "Fix the hop-memory baseline")*. At the final HEAD hop memory passes in every run (worst +32.6, +30.5 and +41.5 MiB; a first hop the old baseline read at +68.9 MiB now reads −253.9). One of the two judged journey runs failed its Andes flight (uncapped p95 16.81 ms against 16.67), which a third run did not repeat; the owner's call.
+
+     Follow-ups after it *(owner)*: a coastline mask for polders, lagoons and New Orleans; channel losses (the Nile reads about 5× its gauged flow at Aswan); a lake map re-baked from water surfaces; lacier white-water wakes; the drawn bank's kinks on narrow rivers; the render issues listed in `docs/testing/rivers/manual-checks.md` (the Andes valley steps and water slivers, Sri Lanka's short rivers, the Sichuan pit, the Volga's single-channel delta, Baikal's shore patches, Mega-Chad's speckled shore).
 4. **Local worlds:** CDLOD at fine scale with vegetation, entered from regions (region ↔ local), likely through the same cloud *(builder's call, not yet decided)*. Then the voxel close-up tier and underwater.
 5. **Captions, settlements and ships:** CSV import, captions, extra snapshots. Then generated settlements in local worlds, starting with one vernacular kit. Then ships, starting with one vessel type on one stretch of water.
 6. **First street site:** one kit, distant blocks, interiors. Then more sites.

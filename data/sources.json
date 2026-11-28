@@ -1,5 +1,5 @@
 {
-  "comment": "Raw inputs of the globe and region-tile bakes, pinned by SHA-256 and size. Fetch with `cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`. Provenance, citations and terms: data/README.md. The PaleoDEM report PDF (data/raw/report/) is reference reading only and is not fetched.",
+  "comment": "Raw inputs of the globe and region-tile bakes, pinned by SHA-256 and size. Fetch with `cd tools/bake && uv run timefly-fetch --sources ../../data/sources.json --raw ../../data/raw`. Provenance, citations and terms: data/README.md. The PaleoDEM report PDF (data/raw/report/) is reference reading only and is not fetched. `range_read` lists a file that is never downloaded whole: `timefly-bake climate` reads only the chunks it needs by HTTP range requests (data/README.md, Past climate).",
   "files": [
     {
       "path": "paleodem/Scotese_Wright_2018_Maps_1-88_1degX1deg_PaleoDEMS_nc.zip",
@@ -231,6 +231,40 @@
       "sha256": "bb84453d4541f1a0bc5a804ead83f483c19ce70f16a5197f6d3a7b6a63e65562",
       "bytes": 130618411,
       "licence": "CC BY 4.0 (Beck et al. 2023, Scientific Data 10, 724)"
+    },
+    {
+      "path": "naturalearth/ne_10m_lakes.zip",
+      "url": "https://naciscdn.org/naturalearth/10m/physical/ne_10m_lakes.zip",
+      "sha256": "0803a06f9c3cb4671d89b68c48b142aad9366ba40f665245e12a913fbc61722a",
+      "bytes": 2349685,
+      "licence": "Public domain (Natural Earth, naturalearthdata.com; version 5.0.0 lakes)"
+    },
+    {
+      "path": "naturalearth/ne_10m_rivers_lake_centerlines.geojson",
+      "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_rivers_lake_centerlines.geojson",
+      "sha256": "bb854a900ecbd3b408df46d5e16e3e0f974ba55993f9d8b5c26e855273c0905a",
+      "bytes": 7307743,
+      "licence": "Public domain (Natural Earth, naturalearthdata.com; version 5.1.2 rivers + lake centerlines)"
+    }
+  ],
+  "range_read": [
+    {
+      "name": "beyer2020",
+      "url": "https://ndownloader.figshare.com/files/22659026",
+      "figshare_article": 12293345,
+      "figshare_file": 22659026,
+      "file": "LateQuaternary_Environment.nc",
+      "bytes": 1333236636,
+      "md5": "d23abb7ce8671433ea36a2cae814ebab",
+      "variables": {
+        "BIO1": {
+          "sha256": "8b43bc25ed8779c7f97035644f2701ee924ec1c9b2c2ea68b886f2d610bc9bcc"
+        },
+        "BIO12": {
+          "sha256": "4a00690539181fa3932a6dd1c12ca4b415a8c1932223d065e6947dcfba6e8620"
+        }
+      },
+      "licence": "CC BY 4.0 (Beyer, Krapp & Manica 2020, doi:10.1038/s41597-020-0552-1)"
     }
   ]
 }

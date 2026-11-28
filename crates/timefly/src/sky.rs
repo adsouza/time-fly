@@ -467,12 +467,7 @@ mod tests {
                 }
             }
         }
-        let field = Field {
-            res,
-            size_m: 300_000.0,
-            elevation_m,
-            surface,
-        };
+        let field = Field::dry(res, 300_000.0, elevation_m, surface);
         let centre = geo_to_render(latlon_to_geo(23.0, 10.0));
         let grid = RegionGrid {
             spec: RegionSpec {
@@ -482,6 +477,7 @@ mod tests {
             },
             inner: field.clone(),
             apron: field.clone(),
+            boulders: Vec::new(),
         };
         assert_eq!(
             region_look(&grid),
@@ -501,12 +497,7 @@ mod tests {
     #[test]
     fn sky_actions_follow_the_scene() {
         use timefly_core::worldgen::generate::{Field, RegionSpec};
-        let field = Field {
-            res: 2,
-            size_m: 1.0,
-            elevation_m: vec![0.0; 4],
-            surface: vec![[0; 4]; 4],
-        };
+        let field = Field::dry(2, 1.0, vec![0.0; 4], vec![[0; 4]; 4]);
         let grid = |seed| {
             Arc::new(RegionGrid {
                 spec: RegionSpec::new(
@@ -516,6 +507,7 @@ mod tests {
                 ),
                 inner: field.clone(),
                 apron: field.clone(),
+                boulders: Vec::new(),
             })
         };
         let (a, b) = (grid(1), grid(1));

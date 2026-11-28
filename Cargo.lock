@@ -5678,6 +5678,7 @@ dependencies = [
  "half",
  "js-sys",
  "libc",
+ "naga",
  "opener",
  "proptest",
  "rfd",

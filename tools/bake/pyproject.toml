@@ -10,11 +10,13 @@ dependencies = [
     "cryptography>=50.0.2",
     "tifffile>=2026.11.16",
     "imagecodecs>=2026.11.11",
+    "h5py>=3.16.0",
 ]
 
 [project.scripts]
 timefly-bake = "timefly_bake.cli:main"
 timefly-fetch = "timefly_bake.fetch:main"
+timefly-hydro-ref = "timefly_bake.hydro_ref:main"
 
 [dependency-groups]
 dev = [

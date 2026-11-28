@@ -55,7 +55,7 @@ impl std::fmt::Display for DataSummary {
 
 /// A window-less app that loads the manifest in `globe_dir` (the bake's output folder). With a
 /// session, it also has the diagnostics and the real log layers.
-fn data_check_app(globe_dir: &Path, session: Option<&Session>) -> App {
+pub(crate) fn data_check_app(globe_dir: &Path, session: Option<&Session>) -> App {
     let mut app = App::new();
     if let Some(session) = session {
         // Before `LogPlugin`, which takes its layers from the diagnostics resources.
@@ -81,7 +81,7 @@ fn data_check_app(globe_dir: &Path, session: Option<&Session>) -> App {
 }
 
 /// Updates `app` until the load leaves `Loading` or `timeout` passes.
-fn settle(app: &mut App, timeout: Duration) -> Result<DataSummary, String> {
+pub(crate) fn settle(app: &mut App, timeout: Duration) -> Result<DataSummary, String> {
     let deadline = Instant::now() + timeout;
     loop {
         app.update();

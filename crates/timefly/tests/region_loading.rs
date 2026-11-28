@@ -23,6 +23,10 @@ use bevy::prelude::*;
 use bevy::state::app::StatesPlugin;
 use bevy::time::TimeUpdateStrategy;
 use timefly::data::{GlobeData, GlobeDataPlugin, GlobeLoadState};
+use timefly::hydro::{
+    HydroCache, HydroPassFailed, HydroPassFinished, HydroPlugin, HydroPurpose, HydroRequested,
+    HydroSettings, HydroStatus,
+};
 use timefly::region::frames::{CpuGrid, FRAME_CACHE_SLOTS, FrameCache};
 use timefly::region::generate::{BudgetedRun, GenInputs, generate_parallel, tiles_needed};
 use timefly::region::tiles::{OVERVIEW_PATH, TILE_MANIFEST_PATH, TileCache, tile_path};
@@ -35,9 +39,10 @@ use timefly::region::{
 use timefly_core::deep_time::YearsBp;
 use timefly_core::formats::{Grid, read_tfgrid};
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
+use timefly_core::hydrology::{EraHydrology, LatticeSizes, river_tile_margin_m};
 use timefly_core::sha256::sha256_hex;
 use timefly_core::worldgen::generate::RegionSpec;
-use timefly_core::worldgen::tiles::{TILE_SAMPLES, TileSet};
+use timefly_core::worldgen::tiles::{TILE_MARGIN_M, TILE_SAMPLES, TileSet};
 
 /// Generation must finish within this (the brief's bound).
 const REGION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -50,6 +55,15 @@ const SMALL: RegionSettings = RegionSettings {
     inner_res: 129,
     apron_res: 65,
     mode: GenMode::Parallel,
+};
+
+/// [`SMALL`] generated in time-boxed slices of 1 ns: one slice per frame, so a job's progress
+/// counts frames, not wall time.
+const ONE_SLICE_A_FRAME: RegionSettings = RegionSettings {
+    mode: GenMode::Budgeted {
+        budget: Duration::from_nanos(1),
+    },
+    ..SMALL
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -643,8 +657,10 @@ fn a_long_pause_does_not_time_out_loads() {
 
 #[test]
 fn a_stalled_overview_times_out_and_the_region_still_loads() {
-    let (mut app, stalls) = stalling_region_app(&tiny_root(), SMALL);
+    // Stalled from the start: the overview loads with the globe data, not with the request.
+    let stalls = Stalls::default();
     stalls.lock().unwrap().push(OVERVIEW_PATH.into());
+    let mut app = region_app_with(&tiny_root(), SMALL, Some(stalls), |_| {});
     one_second_per_update(&mut app);
     request(&mut app, 0.0, 0.0, 0.0);
     run_until(&mut app, RegionState::InRegion);
@@ -863,7 +879,10 @@ fn until_overview_in_flight(app: &mut App) {
 #[test]
 fn a_cancelled_job_keeps_the_overview() {
     for cancel in ["leave", "supersede"] {
-        let mut app = region_app(&tiny_root(), SMALL);
+        // The overview loads with the globe data; held in flight until the job is cancelled.
+        let stalls = Stalls::default();
+        stalls.lock().unwrap().push(OVERVIEW_PATH.into());
+        let mut app = region_app_with(&tiny_root(), SMALL, Some(stalls.clone()), |_| {});
         request(&mut app, 0.0, 0.0, 0.0);
         until_overview_in_flight(&mut app);
         match cancel {
@@ -877,6 +896,7 @@ fn a_cancelled_job_keeps_the_overview() {
             }
             _ => request(&mut app, 0.0, 0.0, 400.0e6),
         }
+        stalls.lock().unwrap().clear();
         run_until(&mut app, RegionState::InRegion);
         let cache = app.world().resource::<TileCache>();
         assert!(
@@ -1136,6 +1156,11 @@ fn the_large_budget_reaches_the_time_boxed_slices() {
 
 /// The generation inputs for a present-day region at (0°, 0°), read straight from the files.
 fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
+    inputs_with(app, spec, None)
+}
+
+/// [`inputs`] with the era's pass, and the tiles its rivers read.
+fn inputs_with(app: &App, spec: RegionSpec, hydro: Option<Arc<EraHydrology>>) -> GenInputs {
     let data = app.world().resource::<GlobeData>();
     let frames: Vec<Option<Arc<Grid>>> = (0..data.timeline.frames().len())
         .map(|f| {
@@ -1143,10 +1168,16 @@ fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
             Some(Arc::new(read_tfgrid(&fs::read(path).unwrap()).unwrap()))
         })
         .collect();
-    let needed = tiles_needed(&spec, &data.timeline, &data.crust, &frames).unwrap();
+    let margin = hydro.as_deref().map_or(TILE_MARGIN_M, |h| {
+        TILE_MARGIN_M.max(river_tile_margin_m(&h.lattice))
+    });
+    let needed = tiles_needed(&spec, &data.timeline, &data.crust, &frames, margin).unwrap();
     let mut tiles = TileSet::new();
     for &(r, c) in &needed {
-        let bytes = fs::read(tiny_root().join(tile_path(r, c))).unwrap();
+        // The fixture holds four tiles; a wider set falls back outside them.
+        let Ok(bytes) = fs::read(tiny_root().join(tile_path(r, c))) else {
+            continue;
+        };
         tiles.insert(r, c, read_tfgrid(&bytes).unwrap()).unwrap();
     }
     let overview = fs::read(tiny_root().join(OVERVIEW_PATH)).unwrap();
@@ -1158,6 +1189,7 @@ fn inputs(app: &App, spec: RegionSpec) -> GenInputs {
         fallback: !tiles.missing(&needed).is_empty(),
         tiles,
         frames,
+        hydro,
     }
 }
 
@@ -1189,6 +1221,48 @@ fn budgeted_run_is_time_boxed() {
     // One slice overshoots its budget by at most one prep step or one row; generous for
     // unoptimised builds.
     assert!(longest < budget + Duration::from_millis(30), "{longest:?}");
+}
+
+/// Task 6's refinement runs the same in time-boxed slices as across the pool: a region with
+/// the era's rivers and lakes generates bit for bit the same grid under the web's budget.
+#[test]
+fn a_region_with_rivers_generates_the_same_on_the_web_budget() {
+    use timefly_core::worldgen::generate::RIVER_NONE;
+    let mut app = hydro_app(&tiny_root(), None, |_| {});
+    update_until(&mut app, "the 0 ka pass", |app| {
+        !hydro_seen(app).finished().is_empty()
+    });
+    let hydro = app
+        .world_mut()
+        .resource_mut::<HydroCache>()
+        .get(YearsBp(0.0))
+        .expect("the 0 ka pass");
+    let spec = RegionSpec {
+        inner_res: 257,
+        apron_res: 129,
+        ..RegionSpec::new(dir(0.0, 0.0), YearsBp(0.0), 7)
+    };
+    let inputs = inputs_with(&app, spec, Some(hydro));
+    let expected = generate_parallel(&inputs).unwrap();
+    // Not vacuous: the region has rivers (and the refinement carved them).
+    let rivers = |f: &timefly_core::worldgen::generate::Field| {
+        f.river.iter().filter(|&&r| r != RIVER_NONE).count()
+    };
+    let (inner, apron) = (rivers(&expected.inner), rivers(&expected.apron));
+    println!("river texels: {inner} inner, {apron} apron");
+    assert!(inner + apron > 0, "the test needs a region with rivers");
+    let dry = generate_parallel(&inputs_with(&app, spec, None)).unwrap();
+    assert_ne!(dry.inner.elevation_m, expected.inner.elevation_m);
+    let mut run = BudgetedRun::new(inputs, Duration::from_millis(6), Duration::ZERO);
+    let mut slices = 0;
+    let grid = loop {
+        slices += 1;
+        if let Some(result) = run.poll_slice() {
+            break result.unwrap();
+        }
+    };
+    assert!(slices > 3, "{slices} slices");
+    assert_eq!(grid, expected);
 }
 
 /// The last "region tiles ready" log line's `bytes` and `needed` fields.
@@ -1351,11 +1425,20 @@ fn a_neighbour_generates_without_replacing_the_active_region() {
 
 #[test]
 fn cancelling_a_preload_keeps_the_region() {
-    let mut app = app_in_region(SMALL);
+    // One slice a frame: the job moves only with updates. With `SMALL`'s pool the 129² neighbour,
+    // its tiles cached, is spawned in the first update and polled in the second, so on a busy
+    // machine it finished between them and landed before the cancel (a flake in full-suite runs).
+    let mut app = app_in_region(ONE_SLICE_A_FRAME);
     let before = active(&app);
     neighbour(&mut app, 0.0, 0.3);
     app.update();
+    // The busy machine: wall time passes between the two frames. With the pool this fails.
+    std::thread::sleep(Duration::from_millis(300));
     app.update();
+    assert!(
+        pending(&app).is_none(),
+        "the neighbour must still be in flight when it is cancelled"
+    );
     app.world_mut().write_message(RegionPreloadCancelled);
     settle(&mut app, 500);
     assert!(pending(&app).is_none(), "a cancelled job must not land");
@@ -1590,16 +1673,23 @@ mod hops {
     use timefly::time::{GlobeTime, TimePlugin};
     use timefly_core::flight::hop::EDGE_M;
 
-    fn phase(app: &App) -> NavPhase {
-        app.world().resource::<Navigation>().phase
-    }
-
     /// Navigation over the tiny bake, in the region at (0°, 0°) at `years`, flying (the fly's
     /// pose is scripted, as the bench writes it), `step` a frame.
     fn hop_app(stalls: Option<Stalls>, years: f64, step: Duration) -> App {
+        hop_app_with(stalls, years, step, |_| {})
+    }
+
+    /// [`hop_app`], with `more` plugins (added after navigation, before the first update).
+    pub(super) fn hop_app_with(
+        stalls: Option<Stalls>,
+        years: f64,
+        step: Duration,
+        more: impl FnOnce(&mut App),
+    ) -> App {
         let mut app = region_app_with(&tiny_root(), SMALL, stalls, |app| {
             app.init_resource::<ButtonInput<KeyCode>>()
                 .add_plugins((TimePlugin, RegionNavigationPlugin));
+            more(app);
         });
         app.insert_resource(TimeUpdateStrategy::ManualDuration(step));
         app.world_mut().resource_mut::<GlobeTime>().years = YearsBp(years);
@@ -1613,9 +1703,13 @@ mod hops {
         app
     }
 
+    pub(super) fn phase(app: &App) -> NavPhase {
+        app.world().resource::<Navigation>().phase
+    }
+
     /// Flies the fly east from 25 km short of the edge at `speed` (at its controls' share of
     /// it, as the fly camera would), until `done`.
-    fn fly_east(app: &mut App, speed: f32, step: Duration, done: impl Fn(&App) -> bool) {
+    pub(super) fn fly_east(app: &mut App, speed: f32, step: Duration, done: impl Fn(&App) -> bool) {
         {
             let mut fly = app.world_mut().resource_mut::<FlyState>();
             fly.pos_m = Vec3::new(EDGE_M - 25_000.0, 3_000.0, 0.0);
@@ -1696,5 +1790,544 @@ mod hops {
             fly.yaw
         );
         assert_eq!(state(&app), RegionState::InRegion);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rivers and lakes, Task 4: the continental pass in the shell
+
+/// Lattices small enough for a test: 6 × 16² nodes in recent eras, 6 × 8² in deep ones.
+const HYDRO_SIZES: LatticeSizes = LatticeSizes {
+    recent_n: 16,
+    deep_n: 8,
+};
+
+/// The pass's messages and the regions generated, in the order they were sent.
+#[derive(Clone, Debug, PartialEq)]
+enum HydroEvent {
+    Requested(HydroRequested),
+    Finished(HydroPassFinished),
+    Failed(HydroPassFailed),
+    Generated(RegionGenerated),
+}
+
+#[derive(Resource, Default)]
+struct HydroSeen(Vec<HydroEvent>);
+
+impl HydroSeen {
+    fn requested(&self) -> Vec<HydroRequested> {
+        self.0
+            .iter()
+            .filter_map(|e| match e {
+                HydroEvent::Requested(r) => Some(*r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn finished(&self) -> Vec<HydroPassFinished> {
+        self.0
+            .iter()
+            .filter_map(|e| match e {
+                HydroEvent::Finished(f) => Some(*f),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn generated(&self) -> Vec<RegionGenerated> {
+        self.0
+            .iter()
+            .filter_map(|e| match e {
+                HydroEvent::Generated(g) => Some(*g),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn position(&self, f: impl Fn(&HydroEvent) -> bool) -> Option<usize> {
+        self.0.iter().position(f)
+    }
+}
+
+/// Read in `Last` (`MinimalPlugins` swaps message buffers only after a fixed update).
+fn record_hydro(
+    mut seen: ResMut<HydroSeen>,
+    mut requested: MessageReader<HydroRequested>,
+    mut finished: MessageReader<HydroPassFinished>,
+    mut failed: MessageReader<HydroPassFailed>,
+    mut generated: MessageReader<RegionGenerated>,
+) {
+    seen.0
+        .extend(requested.read().map(|r| HydroEvent::Requested(*r)));
+    seen.0
+        .extend(failed.read().map(|f| HydroEvent::Failed(f.clone())));
+    seen.0
+        .extend(finished.read().map(|f| HydroEvent::Finished(*f)));
+    seen.0
+        .extend(generated.read().map(|g| HydroEvent::Generated(*g)));
+}
+
+/// Adds the pass at the test sizes, globe time and the recorder.
+fn add_hydro(app: &mut App, enabled: bool) {
+    add_hydro_sized(app, enabled, HYDRO_SIZES);
+}
+
+fn add_hydro_sized(app: &mut App, enabled: bool, sizes: LatticeSizes) {
+    use timefly::time::TimePlugin;
+    if !app.is_plugin_added::<TimePlugin>() {
+        app.add_plugins(TimePlugin);
+    }
+    app.add_plugins(HydroPlugin)
+        .insert_resource(HydroSettings { enabled, sizes })
+        .init_resource::<HydroSeen>()
+        .add_systems(Last, record_hydro);
+}
+
+/// A headless app with the globe data, regions and the continental pass, the globe data loaded.
+fn hydro_app(root: &Path, stalls: Option<Stalls>, more: impl FnOnce(&mut App)) -> App {
+    region_app_with(root, SMALL, stalls, |app| {
+        add_hydro(app, true);
+        more(app);
+    })
+}
+
+fn hydro_seen(app: &App) -> &HydroSeen {
+    app.world().resource::<HydroSeen>()
+}
+
+/// Updates until `done`, failing after the timeout.
+fn update_until(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+    let deadline = Instant::now() + REGION_TIMEOUT;
+    while !done(app) {
+        app.update();
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not after {REGION_TIMEOUT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn ka(k: f64) -> YearsBp {
+    YearsBp(k * 1000.0)
+}
+
+/// The tile manifest and the overview load once the globe data is ready, with no region
+/// requested: the continental pass reads the overview on the globe.
+#[test]
+fn the_tile_index_loads_with_the_globe() {
+    let mut app = region_app(&tiny_root(), SMALL);
+    update_until(&mut app, "the overview", |app| {
+        app.world().resource::<TileCache>().overview().is_some()
+    });
+    assert_eq!(state(&app), RegionState::Globe);
+    assert!(app.world().resource::<Seen>().generated.is_empty());
+    assert!(
+        app.world().resource::<TileCache>().is_empty(),
+        "no tiles yet"
+    );
+}
+
+/// The present day's pass runs on the globe once the globe data is ready and the time has
+/// settled, with no region job.
+#[test]
+fn the_pass_runs_once_the_globe_data_is_ready() {
+    let mut app = hydro_app(&tiny_root(), None, |_| {});
+    update_until(&mut app, "the 0 ka pass", |app| {
+        !hydro_seen(app).finished().is_empty()
+    });
+    let seen = hydro_seen(&app);
+    assert_eq!(
+        seen.requested(),
+        [HydroRequested {
+            age: YearsBp(0.0),
+            purpose: HydroPurpose::Prefetch
+        }]
+    );
+    let done = seen.finished()[0];
+    assert_eq!(done.age, YearsBp(0.0));
+    assert_eq!(done.nodes, 6 * 16 * 16);
+    assert_eq!((done.slices, done.platform), (1, "native"));
+    assert!(done.wall_ms >= done.cpu_ms, "{done:?}");
+    assert!(seen.generated().is_empty());
+    assert_eq!(state(&app), RegionState::Globe);
+    let cache = app.world().resource::<HydroCache>();
+    assert!(matches!(cache.status(YearsBp(0.0)), HydroStatus::Ready(h) if h.age == YearsBp(0.0)));
+    assert!(cache.running().is_none());
+}
+
+/// A dive at 21 ka waits for its era's pass, which it asks for once, and generates with it.
+#[test]
+fn a_dive_waits_for_its_eras_pass() {
+    let mut app = hydro_app(&tiny_root(), None, |_| {});
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    let seen = hydro_seen(&app);
+    let finished = seen
+        .position(|e| matches!(e, HydroEvent::Finished(f) if f.age == ka(21.0)))
+        .expect("the 21 ka pass finished");
+    let generated = seen
+        .position(|e| matches!(e, HydroEvent::Generated(_)))
+        .expect("the region generated");
+    assert!(finished < generated, "{:?}", seen.0);
+    let region = seen.generated()[0];
+    assert!(region.hydrology, "{region:?}");
+    assert!(region.hydro_wait_ms > 0, "{region:?}");
+    let asked = seen
+        .requested()
+        .into_iter()
+        .filter(|r| r.purpose == HydroPurpose::Region)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        asked,
+        [HydroRequested {
+            age: ka(21.0),
+            purpose: HydroPurpose::Region
+        }]
+    );
+}
+
+/// Review Focus 1: without the climate data (an older bake, a failed fetch) the pass falls back
+/// to the zonal rule with one `warn`, finishes, and the region still gets its hydrology without
+/// waiting for any timeout.
+#[test]
+fn missing_climate_falls_back_to_the_zonal_rule() {
+    let root = tiny_copy("no-climate");
+    fs::remove_dir_all(root.join("data/climate")).unwrap();
+    let mut app = hydro_app(&root, None, |_| {});
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    // Another era, so a second pass also meets the missing climate.
+    app.world_mut().write_message(RegionLeft);
+    request(&mut app, 0.0, 0.0, 10.0e3);
+    app.world_mut().resource_mut::<Seen>().states.clear();
+    run_until(&mut app, RegionState::InRegion);
+    let warnings = warnings_naming("climate data unavailable");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("data/climate/manifest.json"),
+        "{warnings:?}"
+    );
+    let seen = hydro_seen(&app);
+    let ages: Vec<YearsBp> = seen.finished().iter().map(|f| f.age).collect();
+    assert!(
+        ages.contains(&ka(21.0)) && ages.contains(&ka(10.0)),
+        "{ages:?}"
+    );
+    for region in seen.generated() {
+        assert!(region.hydrology, "{region:?}");
+        assert!(region.hydro_wait_ms < 5_000, "{region:?}");
+    }
+    let zonal = logs()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| {
+            l.contains("continental pass done")
+                && l.contains("age_years=21000.0")
+                && l.contains("climate=\"zonal\"")
+        })
+        .count();
+    assert!(zonal >= 1, "the 21 ka pass used the zonal rule");
+}
+
+/// Review Focus 2: the slider dragged through ten snapshots, one per frame, then held: one pass
+/// runs, for the era it settled on.
+#[test]
+fn dragging_the_slider_runs_one_pass_for_the_settled_era() {
+    use timefly::time::GlobeTime;
+    use timefly_core::deep_time::STANDARD_SNAPSHOTS;
+    // The load clock stands still while the globe loads, so the present never settles.
+    let mut app = hydro_app(&tiny_root(), None, |app| {
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+    });
+    app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+        16,
+    )));
+    for &years in &STANDARD_SNAPSHOTS[1..=10] {
+        app.world_mut().resource_mut::<GlobeTime>().years = YearsBp(years);
+        app.update();
+    }
+    let held = YearsBp(STANDARD_SNAPSHOTS[10]);
+    assert_eq!(held, YearsBp(1.0e6));
+    update_until(&mut app, "the held era's pass", |app| {
+        !hydro_seen(app).finished().is_empty()
+    });
+    // Long enough for anything else wrongly asked for to finish too.
+    settle(&mut app, 500);
+    let seen = hydro_seen(&app);
+    assert_eq!(
+        seen.requested(),
+        [HydroRequested {
+            age: held,
+            purpose: HydroPurpose::Prefetch
+        }]
+    );
+    let finished = seen.finished();
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0].age, held);
+    assert_eq!(finished[0].nodes, 6 * 8 * 8, "a deep era's lattice");
+    assert!(app.world().resource::<HydroCache>().len() <= 2);
+}
+
+/// Review Focus 2: a region's request replaces a prefetch in flight, so the region's era
+/// finishes first (here the prefetch is held by a stalled climate grid and never finishes).
+#[test]
+fn a_region_request_preempts_a_prefetch() {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(tiny_root().join("data/climate/manifest.json")).unwrap())
+            .unwrap();
+    let present = format!(
+        "data/climate/{}",
+        manifest["files"][0]["file"].as_str().unwrap()
+    );
+    assert!(present.contains("bio_0ka"));
+    let stalls = Stalls::default();
+    stalls.lock().unwrap().push(present.into());
+    let mut app = hydro_app(&tiny_root(), Some(stalls.clone()), |_| {});
+    update_until(&mut app, "the present day's prefetch in flight", |app| {
+        app.world().resource::<HydroCache>().status(YearsBp(0.0)) == HydroStatus::Running
+    });
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    settle(&mut app, 300);
+    let seen = hydro_seen(&app);
+    assert_eq!(
+        seen.requested(),
+        [
+            HydroRequested {
+                age: YearsBp(0.0),
+                purpose: HydroPurpose::Prefetch
+            },
+            HydroRequested {
+                age: ka(21.0),
+                purpose: HydroPurpose::Region
+            }
+        ]
+    );
+    let ages: Vec<YearsBp> = seen.finished().iter().map(|f| f.age).collect();
+    assert_eq!(ages, [ka(21.0)], "the prefetch was replaced");
+    assert!(seen.generated()[0].hydrology);
+    let cache = app.world().resource::<HydroCache>();
+    assert_eq!(cache.status(YearsBp(0.0)), HydroStatus::Absent);
+    stalls.lock().unwrap().clear();
+}
+
+/// Review fix round 1: a region request that replaces a prefetch already running natively
+/// cancels its task, and the region's pass starts only once that task has stopped: never two
+/// passes at once. The lattice is large enough (6 × 320² nodes) for the prefetch to be caught
+/// mid-run.
+#[test]
+fn replacing_a_running_pass_stops_it_before_the_next_starts() {
+    use timefly::hydro::job::HydroTasks;
+    let sizes = LatticeSizes {
+        recent_n: 320,
+        deep_n: 8,
+    };
+    let mut app = region_app_with(&tiny_root(), SMALL, None, |app| {
+        add_hydro_sized(app, true, sizes);
+    });
+    update_until(&mut app, "the present day's prefetch running", |app| {
+        app.world().resource::<HydroTasks>().live() == 1
+    });
+    assert_eq!(
+        app.world().resource::<HydroCache>().status(YearsBp(0.0)),
+        HydroStatus::Running
+    );
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    let tasks = app.world().resource::<HydroTasks>();
+    assert_eq!(tasks.replaced(), 1);
+    assert_eq!(tasks.peak(), 1, "two passes ran at once");
+    assert_eq!(
+        (tasks.cancelled(), tasks.completed_after_replace()),
+        (1, 0),
+        "the replaced task did not stop early"
+    );
+    assert!(!tasks.draining() && tasks.live() == 0);
+    let seen = hydro_seen(&app);
+    let ages: Vec<YearsBp> = seen.finished().iter().map(|f| f.age).collect();
+    assert_eq!(ages, [ka(21.0)]);
+    assert!(seen.generated()[0].hydrology);
+}
+
+/// Disabled, no pass runs, not even on the settled globe, and a region never waits.
+#[test]
+fn a_disabled_pass_never_holds_a_region() {
+    let mut app = region_app_with(&tiny_root(), SMALL, None, |app| add_hydro(app, false));
+    settle(&mut app, 700);
+    request(&mut app, 0.0, 0.0, 21.0e3);
+    run_until(&mut app, RegionState::InRegion);
+    let seen = hydro_seen(&app);
+    let region = seen.generated()[0];
+    assert!(!region.hydrology, "{region:?}");
+    assert_eq!(region.hydro_wait_ms, 0);
+    assert!(
+        seen.requested().is_empty() && seen.finished().is_empty(),
+        "{:?}",
+        seen.0
+    );
+    assert!(app.world().resource::<HydroCache>().is_empty());
+}
+
+/// A hop's neighbour waits for its era's pass like a dive (here the cache was emptied in
+/// flight), and the hop swaps to a neighbour that has it.
+#[test]
+fn a_hop_neighbour_waits_for_its_eras_pass() {
+    use hops::{fly_east, hop_app_with, phase};
+    use timefly::region::navigate::NavPhase;
+    let step = Duration::from_millis(50);
+    let mut app = hop_app_with(None, 0.0, step, |app| add_hydro(app, true));
+    let entered = hydro_seen(&app).generated();
+    assert_eq!(entered.len(), 1);
+    assert!(entered[0].hydrology, "{entered:?}");
+    app.insert_resource(HydroCache::default());
+    let before = hydro_seen(&app).0.len();
+    fly_east(&mut app, 10_000.0, step, |a| {
+        matches!(phase(a), NavPhase::Hopping { swapped: true, .. })
+    });
+    let seen = &hydro_seen(&app).0[before..];
+    let asked = seen
+        .iter()
+        .position(|e| {
+            matches!(e, HydroEvent::Requested(r)
+                if *r == HydroRequested { age: YearsBp(0.0), purpose: HydroPurpose::Region })
+        })
+        .expect("the neighbour asked for its era");
+    let finished = seen
+        .iter()
+        .position(|e| matches!(e, HydroEvent::Finished(f) if f.age == YearsBp(0.0)))
+        .expect("the era's pass ran again");
+    let generated = seen
+        .iter()
+        .position(|e| matches!(e, HydroEvent::Generated(_)))
+        .expect("the neighbour generated");
+    assert!(asked < finished && finished < generated, "{seen:?}");
+    let HydroEvent::Generated(neighbour) = &seen[generated] else {
+        unreachable!()
+    };
+    assert!(
+        neighbour.hydrology && neighbour.hydro_wait_ms > 0,
+        "{neighbour:?}"
+    );
+    assert!(app.world().resource::<Seen>().failed.is_empty());
+}
+
+/// The real present day's pass at the plan's sizes (n = 900), natively: the in-app task (the
+/// globe's 0 ka prefetch: loads, parallel sampling and the pass), then the same inputs through
+/// the web's time-boxed path at 6 and 12 ms on one thread. Prints for the Task 4 report.
+///
+/// The worktree has no globe data: point `TIMEFLY_REAL_ASSET_ROOT` at a folder whose `data`
+/// links to the main checkout's `crates/timefly/assets/data`.
+#[test]
+#[ignore = "needs the real bake, tiles and climate; prints the pass's native timing"]
+fn real_continental_pass_timing() {
+    use std::sync::atomic::AtomicBool;
+    use timefly::hydro::climate::{CLIMATE_MANIFEST_PATH, ClimateManifest, climate_table};
+    use timefly::hydro::job::{HydroInputs, HydroRun, run_parallel};
+
+    let root = std::env::var_os("TIMEFLY_REAL_ASSET_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"));
+    if !root.join(TILE_MANIFEST_PATH).exists() {
+        eprintln!("no real data under {}; skipped", root.display());
+        return;
+    }
+    let mut app = region_app_with(&root, RegionSettings::default(), None, |app| {
+        add_hydro_sized(app, true, LatticeSizes::default());
+    });
+    println!(
+        "async compute threads: {}",
+        bevy::tasks::AsyncComputeTaskPool::get().thread_num()
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while hydro_seen(&app).finished().is_empty() {
+        app.update();
+        assert!(Instant::now() < deadline, "no pass after 120 s");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    println!("in-app: {:?}", hydro_seen(&app).finished()[0]);
+    for line in logs().lock().unwrap().iter() {
+        if line.contains("continental pass done") || line.contains("lake level table") {
+            println!("    {line}");
+        }
+    }
+
+    // The same inputs, read from the files, for the time-boxed path.
+    let data = app.world().resource::<GlobeData>();
+    let read = |path: &str| Arc::new(read_tfgrid(&fs::read(root.join(path)).unwrap()).unwrap());
+    let frames: Vec<Option<Arc<Grid>>> = (0..data.timeline.frames().len())
+        .map(|f| Some(read(data.frame_path(f).path().to_str().unwrap())))
+        .collect();
+    let mut tiles = TileSet::new();
+    tiles
+        .set_overview(
+            app.world()
+                .resource::<TileCache>()
+                .overview()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+    let climate =
+        ClimateManifest::parse(&fs::read(root.join(CLIMATE_MANIFEST_PATH)).unwrap()).unwrap();
+    for age in [YearsBp(0.0), YearsBp(21_000.0)] {
+        let ([y, o], w) = climate.bracket(age).unwrap();
+        let inputs = HydroInputs {
+            age,
+            sizes: LatticeSizes::default(),
+            timeline: data.timeline.clone(),
+            crust: data.crust.clone(),
+            tiles: tiles.clone(),
+            frames: frames.clone(),
+            climate: Some(([read(&y.path()), read(&o.path())], w)),
+            table: climate_table(),
+        };
+        println!("== {} years", age.0);
+        let t = Instant::now();
+        let parallel = run_parallel(&inputs, &AtomicBool::new(false)).unwrap();
+        println!(
+            "run_parallel again: {:?} (sampling {:?}, longest step {:?} ({}), peak {:.1} MiB, result {:.1} MiB)",
+            t.elapsed(),
+            parallel.sampling,
+            parallel.longest_step,
+            parallel.longest_step_stage,
+            parallel.peak_bytes as f64 / 1048576.0,
+            parallel.hydrology.bytes() as f64 / 1048576.0
+        );
+        for budget_ms in [6u64, 12] {
+            let mut run = HydroRun::new(inputs.clone(), Duration::from_millis(budget_ms));
+            let t = Instant::now();
+            let out = loop {
+                if let Some(r) = run.poll_slice() {
+                    break r.unwrap();
+                }
+            };
+            assert_eq!(out.hydrology, parallel.hydrology);
+            println!(
+                "time-boxed at {budget_ms} ms: {:?} wall, {} slices, cpu {:?}, longest slice {:?}, \
+                 longest step {:?} ({}); at 60 Hz ≈ {:.1} s",
+                t.elapsed(),
+                out.slices,
+                out.cpu,
+                out.longest_slice,
+                out.longest_step,
+                out.longest_step_stage,
+                f64::from(out.slices) * 16.7e-3
+            );
+            // Rivers and lakes Task 10, fix round 1: on the web a slice overruns its budget by
+            // up to one step, so no step may be long (release builds only: a debug build is
+            // several times slower).
+            if budget_ms == 6 && !cfg!(debug_assertions) {
+                assert!(
+                    out.longest_step <= Duration::from_millis(2),
+                    "{} years: longest step {:?} in {}",
+                    age.0,
+                    out.longest_step,
+                    out.longest_step_stage
+                );
+            }
+        }
     }
 }

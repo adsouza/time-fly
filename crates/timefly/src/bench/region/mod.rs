@@ -11,8 +11,10 @@
 //! times, sampling memory on the globe after each leave.
 //!
 //! **Blocks.** One per region, in the scrub bench's format: frame statistics under the R14 rule
-//! (M1 ruling R14, see [`super::passes`]), generation milliseconds, tiles and bytes fetched,
-//! the load window, memory and the bake revision. Then a summary block with the gates:
+//! (M1 ruling R14, see [`super::passes`]), generation milliseconds ([`generation_ms`]: without
+//! the wait for the era's continental pass, which gets its own line), tiles and bytes fetched,
+//! the load window, memory, the bake revision and the flight's GPU frame times (reported only;
+//! [`gpu_frame_line`]). Then a summary block with the gates:
 //!
 //! - **Frame rate** (R14), per region.
 //! - **First-region worst frame** (ruling R11): no frame from the first request to the first
@@ -28,6 +30,10 @@
 //! - **Memory cycles**: after each leave the memory returns within
 //!   [`CYCLE_MEMORY_TOLERANCE`] of the first cycle's. Natively the process footprint; on the web
 //!   the wasm linear memory (it only grows, so the check is that it stops growing).
+//!
+//! The summary also reports each continental pass that finished during the run ([`pass_lines`]:
+//! wall and CPU time against 1,000 ms natively and 5,000 ms on the web, reported only) and how
+//! frames were timed on the GPU ([`gpu_status_line`]).
 //!
 //! **Stopping early.** A stop is a region, or the globe pan before a panned one. A region that
 //! fails a gate decided within it (its gated R14 flight, its pan, its first-entry generation and
@@ -50,19 +56,22 @@ use bevy::render::renderer::RenderAdapterInfo;
 use bevy::window::{Monitor, PresentMode, PrimaryMonitor, PrimaryWindow};
 use timefly_core::deep_time::YearsBp;
 use timefly_core::geo::{RenderDir, geo_to_latlon, geo_to_render, latlon_to_geo, render_to_geo};
-use timefly_core::terrain::blended_height_m;
+use timefly_core::terrain::{blended_height_m, blended_surface_m};
 
 use super::{
     EarlyStop, MAX_MISSED_SHARE, MEDIAN_TOLERANCE, MISSED_INTERVALS, Pacing, STALL_BUDGETS,
-    bench_exit, frame_budget_ms, frame_time_stats, header_lines_titled, memory, mib, missed_frames,
-    on_failure_line, pacing, passes, stall_count, stopped_early_lines,
+    bench_exit, frame_budget_ms, frame_time_stats, gpu_available, gpu_frame_line, gpu_status_line,
+    header_lines_titled, memory, mib, missed_frames, on_failure_line, pacing, pass_lines, passes,
+    stall_count, stopped_early_lines,
 };
 use crate::args::RegionArg;
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
+use crate::diagnostics::gpu_time::{GpuFrameMeasured, GpuFrameTime};
 use crate::fly_camera::{FlyState, FlySystems};
 use crate::globe::GlobeRenderStatus;
 use crate::globe_flight::{GlobeFlightState, GlobeFlightSystems};
+use crate::hydro::HydroPassFinished;
 use crate::region::launch::launch_request;
 use crate::region::navigate::{NavPhase, Navigation, NavigationSystems};
 use crate::region::{
@@ -128,12 +137,14 @@ pub fn pan_globe(from: (f64, f64), to: (f64, f64), altitude_km: f64, t_s: f64) -
 ///   desert (ruling R30).
 /// - **Himalayas** (0 ka, Everest's area): the highest relief; the memory cycles' region
 ///   ([`CYCLE_REGION`]).
+/// - **Indus tributaries** (0 ka, the Jhelum and the Chenab leaving the mountains; rivers and
+///   lakes Task 10): rivers drawn over the region, and a rapids region (boulders).
 /// - **Sundaland** (21 ka): the exposed tropical shelf and its 21 ka coast.
 /// - **Japan** (era frame, 1 Ma): mountains and both coasts, the close-coast case.
 /// - **Beringia** (21 ka): land below today's sea level and its 21 ka coast.
 /// - a globe pan to the **Rockies ice margin** (21 ka): ice edge and the glacial snowline.
 /// - **Panama** (era frame, 3 Ma): the closing isthmus where plate pieces meet.
-pub const BENCH_REGIONS: [BenchRegion; 8] = [
+pub const BENCH_REGIONS: [BenchRegion; 9] = [
     BenchRegion {
         name: "Pangaea interior",
         arg: RegionArg {
@@ -159,6 +170,16 @@ pub const BENCH_REGIONS: [BenchRegion; 8] = [
         arg: RegionArg {
             lat_deg: 28.0,
             lon_deg: 86.9,
+            years: 0.0,
+        },
+        pan_from_previous: false,
+        flight_gated: true,
+    },
+    BenchRegion {
+        name: "Indus tributaries",
+        arg: RegionArg {
+            lat_deg: 32.5,
+            lon_deg: 74.5,
             years: 0.0,
         },
         pan_from_previous: false,
@@ -332,7 +353,7 @@ fn push_dunes_line(out: &mut Vec<String>, game: &Game) {
     out.insert(at, dunes_line(dunes));
 }
 
-/// The summary's line naming what was benched: `regions: all 8` or
+/// The summary's line naming what was benched: `regions: all 9` or
 /// `regions: single (LAT, LON at AGE years)`.
 pub fn regions_line(config: &RegionBenchConfig) -> String {
     match config.single_region() {
@@ -352,6 +373,9 @@ pub struct RegionBenchPlugin(pub RegionBenchConfig);
 impl Plugin for RegionBenchPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(RegionBench::new(self.0.clone()))
+            // Read whether or not the pass and the GPU timer run in this app.
+            .add_message::<HydroPassFinished>()
+            .add_message::<GpuFrameMeasured>()
             .add_systems(Startup, banner::spawn_banner)
             .add_systems(
                 Update,
@@ -439,6 +463,8 @@ struct RegionRun {
     generated: Option<RegionGenerated>,
     path: Option<BenchPath>,
     flight_ms: Vec<f32>,
+    /// GPU frame times read while flying the path (each arrives a few frames late).
+    gpu_ms: Vec<f32>,
     segment_ms: [Vec<f32>; 5],
     /// The globe pan that led here, if any.
     pan_ms: Vec<f32>,
@@ -471,6 +497,8 @@ pub struct RegionBench {
     cycles: Vec<CycleRun>,
     /// Web: the JS heap's peak over the run, where the browser reports it.
     js_heap_peak: Option<u64>,
+    /// The continental passes that finished during the run, in order.
+    passes: Vec<HydroPassFinished>,
     reports: Vec<String>,
     summary: Option<String>,
     /// The summary's result, once it is out.
@@ -489,6 +517,7 @@ impl RegionBench {
             stage: Stage::WaitingForGlobe,
             cycles: Vec::new(),
             js_heap_peak: None,
+            passes: Vec::new(),
             reports: Vec::new(),
             summary: None,
             passed: None,
@@ -600,6 +629,9 @@ struct Game<'w, 's> {
     globe: Option<Res<'w, GlobeData>>,
     options: Option<Res<'w, TerrainOptions>>,
     generated: MessageReader<'w, 's, RegionGenerated>,
+    passes: MessageReader<'w, 's, HydroPassFinished>,
+    gpu_frames: MessageReader<'w, 's, GpuFrameMeasured>,
+    gpu: Option<Res<'w, GpuFrameTime>>,
 }
 
 impl Game<'_, '_> {
@@ -661,7 +693,9 @@ fn drive_region_bench(
     let now = game.real.elapsed_secs_f64();
     let frame_ms = game.real.delta_secs() * 1000.0;
     let generated: Vec<RegionGenerated> = game.generated.read().copied().collect();
+    let gpu_ms: Vec<f32> = game.gpu_frames.read().map(|m| m.ms).collect();
     let bench = &mut *bench;
+    bench.passes.extend(game.passes.read().copied());
     #[cfg(target_arch = "wasm32")]
     {
         bench.js_heap_peak = super::max_opt(bench.js_heap_peak, memory::web_memory().0);
@@ -763,6 +797,7 @@ fn drive_region_bench(
             bench.segment = banner::segment_at(script);
             let run = &mut bench.runs[region];
             run.flight_ms.push(frame_ms);
+            run.gpu_ms.extend(&gpu_ms);
             let segment = Segment::ALL
                 .iter()
                 .position(|s| *s == Segment::at(script.min(SCRIPT_SECS)))
@@ -868,7 +903,7 @@ fn drive_region_bench(
             if let Some(g) = generated.last()
                 && let Some(record) = bench.cycles.get_mut(cycle as usize)
             {
-                record.generation_ms = Some(g.millis);
+                record.generation_ms = Some(generation_ms(g));
             }
             let started = started || game.state() != RegionState::Globe;
             let failed = (started && game.state() == RegionState::Globe) || now - since > timeout;
@@ -945,7 +980,7 @@ fn fly(bench: &RegionBench, region: usize, script: f32, game: &Game, controls: &
     };
     let grid = &active.grid;
     **fly = path.at(script, |x, z| {
-        blended_height_m(grid, f64::from(x), f64::from(z))
+        blended_surface_m(grid, f64::from(x), f64::from(z))
     });
 }
 
@@ -1066,6 +1101,14 @@ pub(crate) fn host_stall_line(window: &str, frames: &[f32]) -> String {
     )
 }
 
+/// A region's generation time (ms) without its wait for the era's continental pass, which the
+/// block reports on its own line (`RegionGenerated::hydro_wait_ms`) and the summary on its pass
+/// lines. The region job already takes the wait out of `RegionGenerated::millis` (rivers and
+/// lakes Task 4), so this is `millis`; the warm-generation and first-entry gates read it here.
+pub fn generation_ms(g: &RegionGenerated) -> u32 {
+    g.millis
+}
+
 /// A region's first-entry generation (`millis`) against the web's [`WEB_GEN_TARGET_MS`]: `None`
 /// natively (reported only), else whether it is within the target (no region generated fails).
 pub fn first_entry_gate(millis: Option<u32>, web: bool) -> Option<bool> {
@@ -1180,22 +1223,33 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
         out.push(format!("bake: {}", globe.revision.summary()));
     }
     match &r.generated {
-        Some(g) => out.push(format!(
-            "generation: {} ms; tiles fetched {} ({} bytes); frames fetched {}; fallback {}",
-            g.millis,
-            g.tiles_fetched,
-            g.bytes_fetched,
-            g.frames_fetched,
-            if g.fallback {
-                "yes (a tile is missing)"
-            } else {
-                "no"
-            }
-        )),
+        Some(g) => {
+            out.push(format!(
+                "generation: {} ms; tiles fetched {} ({} bytes); frames fetched {}; fallback {}",
+                generation_ms(g),
+                g.tiles_fetched,
+                g.bytes_fetched,
+                g.frames_fetched,
+                if g.fallback {
+                    "yes (a tile is missing)"
+                } else {
+                    "no"
+                }
+            ));
+            out.push(format!(
+                "  continental pass wait: {} ms (not in the generation; {})",
+                g.hydro_wait_ms,
+                if g.hydrology {
+                    "generated with the era's rivers and lakes"
+                } else {
+                    "generated without hydrology"
+                }
+            ));
+        }
         None => out.push("generation: no region generated".to_string()),
     }
     let web = cfg!(target_arch = "wasm32");
-    let millis = r.generated.map(|g| g.millis);
+    let millis = r.generated.as_ref().map(generation_ms);
     let gen_gate = first_entry_gate(millis, web);
     out.push(match gen_gate {
         Some(ok) => format!(
@@ -1320,6 +1374,11 @@ fn region_block(bench: &mut RegionBench, region: usize, game: &Game, display: &S
     for (segment, frames) in Segment::ALL.iter().zip(&r.segment_ms) {
         out.push(format!("  {}", stat_line(segment.label(), frames)));
     }
+    out.push(gpu_frame_line(
+        spec.name,
+        &r.gpu_ms,
+        gpu_available(game.gpu.as_deref()),
+    ));
     let pass = region_passes(
         r.failure.is_some(),
         flight_pass,
@@ -1467,7 +1526,7 @@ fn finish(
         .zip(&bench.runs)
         .filter(|(_, run)| run.generated.is_some() || run.failure.is_some())
         .map(|(spec, run)| {
-            let millis = run.generated.map(|g| g.millis);
+            let millis = run.generated.as_ref().map(generation_ms);
             let shown = millis.map_or("none".to_string(), |m| format!("{m} ms"));
             match first_entry_gate(millis, web) {
                 Some(ok) => {
@@ -1532,6 +1591,8 @@ fn finish(
     if bench.cycles.iter().any(|c| c.failed) {
         pass = false;
     }
+    out.extend(pass_lines(&bench.passes));
+    out.push(gpu_status_line(game.gpu.as_deref()));
     if let Some(stop) = &bench.stopped {
         let cycles = bench.config.cycles;
         let then = (cycles > 0).then(|| {
@@ -1656,6 +1717,7 @@ mod tests {
                 "Pangaea interior",
                 "Red Sea",
                 "Himalayas",
+                "Indus tributaries",
                 "Sundaland",
                 "Japan",
                 "Beringia",
@@ -1677,6 +1739,8 @@ mod tests {
                 arg(20.0, 37.5, 0.0),
                 // Ruling R24: Everest (27.99, 86.93) is in the inner field.
                 arg(28.0, 86.9, 0.0),
+                // Rivers and lakes Task 10: the Jhelum and the Chenab out of the mountains.
+                arg(32.5, 74.5, 0.0),
                 // Ruling R26: 21 ka anomaly land and coast on the tropical shelf.
                 arg(5.0, 107.0, 21_000.0),
                 arg(36.0, 138.5, 1.0e6),
@@ -1690,16 +1754,60 @@ mod tests {
         let pans: Vec<_> = BENCH_REGIONS.iter().map(|r| r.pan_from_previous).collect();
         assert_eq!(
             pans,
-            [false, false, false, false, false, false, true, false]
+            [false, false, false, false, false, false, false, true, false]
         );
-        assert_eq!(BENCH_REGIONS[5].arg.years, BENCH_REGIONS[6].arg.years);
-        assert_eq!(stop_count(&BENCH_REGIONS), 9);
-        assert_eq!(after_region(0, 8, 10), Next::Region(1));
-        assert_eq!(after_region(6, 8, 10), Next::Region(7));
-        assert_eq!(after_region(7, 8, 10), Next::Cycle(0));
-        assert_eq!(after_region(7, 8, 0), Next::Summary);
+        assert_eq!(BENCH_REGIONS[6].arg.years, BENCH_REGIONS[7].arg.years);
+        assert_eq!(stop_count(&BENCH_REGIONS), 10);
+        assert_eq!(after_region(0, 9, 10), Next::Region(1));
+        assert_eq!(after_region(7, 9, 10), Next::Region(8));
+        assert_eq!(after_region(8, 9, 10), Next::Cycle(0));
+        assert_eq!(after_region(8, 9, 0), Next::Summary);
         // A single-region run goes from its one region straight to the summary.
         assert_eq!(after_region(0, 1, 0), Next::Summary);
+    }
+
+    #[test]
+    fn bench_regions_include_the_indus_tributaries() {
+        let i = BENCH_REGIONS
+            .iter()
+            .position(|r| r.name == "Indus tributaries")
+            .expect("the Indus tributaries are a bench region");
+        assert_eq!(BENCH_REGIONS[i - 1].name, "Himalayas", "right after them");
+        let indus = BENCH_REGIONS[i];
+        assert_eq!(
+            indus.arg,
+            RegionArg {
+                lat_deg: 32.5,
+                lon_deg: 74.5,
+                years: 0.0
+            }
+        );
+        assert!(!indus.pan_from_previous);
+        assert!(indus.flight_gated);
+    }
+
+    #[test]
+    fn generation_excludes_the_pass_wait() {
+        use timefly_core::geo::{geo_to_render, latlon_to_geo};
+        use timefly_core::worldgen::generate::RegionSpec;
+        // The region job already takes the wait out of `millis` (Task 4): the Red Sea's first
+        // entry in a release session read `millis: 517, hydro_wait_ms: 1000`, so subtracting
+        // the wait again reported 0 ms.
+        let g = RegionGenerated {
+            spec: RegionSpec::new(geo_to_render(latlon_to_geo(20.0, 37.5)), YearsBp(0.0), 1),
+            millis: 517,
+            tiles_fetched: 6,
+            bytes_fetched: 733_137,
+            frames_fetched: 1,
+            fallback: false,
+            hydro_wait_ms: 1_000,
+            hydrology: true,
+        };
+        assert_eq!(generation_ms(&g), 517);
+        // The wait never changes the figure.
+        for hydro_wait_ms in [0, 400, 5_000] {
+            assert_eq!(generation_ms(&RegionGenerated { hydro_wait_ms, ..g }), 517);
+        }
     }
 
     #[test]
@@ -1716,6 +1824,7 @@ mod tests {
                 ("Pangaea interior", false),
                 ("Red Sea", false),
                 ("Himalayas", true),
+                ("Indus tributaries", true),
                 ("Sundaland", true),
                 ("Japan", true),
                 ("Beringia", true),
@@ -1775,21 +1884,21 @@ mod tests {
     fn a_stopped_run_names_its_stops_the_pan_included() {
         let names = stop_names(&BENCH_REGIONS);
         assert_eq!(names.len(), stop_count(&BENCH_REGIONS));
-        assert_eq!(names[5], "Beringia");
-        assert_eq!(names[6], "globe pan Beringia -> Rockies ice margin");
-        assert_eq!(names[7], "Rockies ice margin");
+        assert_eq!(names[6], "Beringia");
+        assert_eq!(names[7], "globe pan Beringia -> Rockies ice margin");
+        assert_eq!(names[8], "Rockies ice margin");
         // Stopped by the pan's region: the pan counts as a run stop.
         let stop = EarlyStop {
-            stops_run: banner::stop_number(6, &BENCH_REGIONS),
+            stops_run: banner::stop_number(7, &BENCH_REGIONS),
             gate: "globe pan frame rate FAIL".to_string(),
         };
         let [at, run, skipped] = stopped_early_lines(&stop, &names, Some("the 10 memory cycles"));
         assert_eq!(
             at,
-            "stopped early at stop 8 of 9, Rockies ice margin: globe pan frame rate FAIL; --keep-going runs every stop"
+            "stopped early at stop 9 of 10, Rockies ice margin: globe pan frame rate FAIL; --keep-going runs every stop"
         );
         assert!(
-            run.starts_with("stops run: 8 of 9: Pangaea interior, ")
+            run.starts_with("stops run: 9 of 10: Pangaea interior, ")
                 && run.ends_with(", Rockies ice margin"),
             "{run}"
         );
@@ -1799,7 +1908,7 @@ mod tests {
         );
         // The last stop: nothing skipped.
         let last = EarlyStop {
-            stops_run: 9,
+            stops_run: 10,
             gate: "x".to_string(),
         };
         assert_eq!(
@@ -1833,11 +1942,11 @@ mod tests {
         assert_eq!(regions_line(&c), "regions: single (20, 37.5 at 0 years)");
         assert_eq!(
             regions_line(&RegionBenchConfig::new(30, true)),
-            "regions: all 8"
+            "regions: all 9"
         );
         // The full bench is unchanged.
         let full = RegionBench::new(RegionBenchConfig::new(30, true));
-        assert_eq!(full.stop_count(), 9);
+        assert_eq!(full.stop_count(), 10);
         assert_eq!(full.config.regions, BENCH_REGIONS.to_vec());
     }
 

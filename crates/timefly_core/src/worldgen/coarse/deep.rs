@@ -322,6 +322,12 @@ impl<'a> DeepField<'a> {
         near_plate_land.then_some(own)
     }
 
+    /// The globe's reference surface at overview level, never the two-level modern path: what
+    /// the deep eras' continental water pass samples (rivers and lakes design §4.1).
+    pub fn reference_sample(&self, era_dir: RenderDir) -> CoarseSample {
+        self.sample_with(era_dir, SourceLevel::Overview)
+    }
+
     pub(super) fn sample_with(&self, era_dir: RenderDir, level: SourceLevel) -> CoarseSample {
         let era = era_dir.0.normalize();
         // The globe's input as given, so the result is bit-identical to the globe's.
@@ -387,9 +393,9 @@ impl CoarseField for DeepField<'_> {
         }
     }
 
-    fn tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+    fn tiles_needed_with_margin(&self, frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
         if self.is_modern() {
-            self.modern_tiles_needed(frame)
+            self.modern_tiles_needed(frame, margin_m)
         } else {
             Vec::new()
         }

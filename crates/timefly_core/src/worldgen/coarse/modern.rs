@@ -41,7 +41,7 @@ use crate::globe::{
 };
 use crate::worldgen::REGION_SIZE_M;
 use crate::worldgen::frame::{EARTH_RADIUS_M, RegionFrame};
-use crate::worldgen::tiles::{SourceLevel, TILE_MARGIN_M, TileSet};
+use crate::worldgen::tiles::{SourceLevel, TileSet};
 
 use super::{
     CoarseSample, DEEP_SPACING_M, DeepField, KeyKind, cube_bilinear, koppen_code, lat_lon,
@@ -382,16 +382,17 @@ impl<'a> DeepField<'a> {
         }
     }
 
-    /// The tiles the inner field around `frame` reads on the two-level path: the era square
-    /// itself (shell nodes) and the square carried by the present-day rotation of every plate
-    /// valid at a support node the square taps (a superset of the carriers).
-    pub(super) fn modern_tiles_needed(&self, frame: &RegionFrame) -> Vec<(u8, u8)> {
+    /// The tiles reads within `margin_m` of the inner square around `frame` touch on the
+    /// two-level path: the era square itself (shell nodes) and the square carried by the
+    /// present-day rotation of every plate valid at a support node the square taps (a superset
+    /// of the carriers).
+    pub(super) fn modern_tiles_needed(&self, frame: &RegionFrame, margin_m: f64) -> Vec<(u8, u8)> {
         let basis = frame.basis();
         // Sample points finer than the smallest support cell (a cube corner's, about 0.47 of a
         // face-centre cell), over the square widened by a cell, hit every cell that intersects
         // the square, so their taps are every node a texel can take its plate from.
         let cell_m = DEEP_SPACING_M / 4.0;
-        let half = REGION_SIZE_M / 2.0 + TILE_MARGIN_M + cell_m;
+        let half = REGION_SIZE_M / 2.0 + margin_m + cell_m;
         let step = 0.2 * cell_m;
         let count = (2.0 * half / step).ceil() as u32;
         let mut nodes: HashSet<(CubeFace, u32, u32)> = HashSet::new();
@@ -412,12 +413,12 @@ impl<'a> DeepField<'a> {
                 None
             });
         }
-        let mut out = TileSet::needed_for(frame);
+        let mut out = TileSet::needed_for_margin(frame, margin_m);
         let mut plates: Vec<u32> = plates.into_iter().collect();
         plates.sort_unstable();
         for p in plates {
             if let PresentRead::Rotate(q) = self.present[p as usize] {
-                out.extend(TileSet::needed_for_rotated(frame, q));
+                out.extend(TileSet::needed_for_rotated_margin(frame, q, margin_m));
             }
         }
         out.sort_unstable();

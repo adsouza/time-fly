@@ -21,12 +21,12 @@ fn field(res: u32, size_m: f64) -> Field {
             elevation_m.push((1000.0 + 40.0 * x - 25.0 * z + 300.0 * (x * 0.7).sin()) as f32);
         }
     }
-    Field {
+    Field::dry(
         res,
         size_m,
-        surface: vec![[0, 0, 0, 0]; (res * res) as usize],
         elevation_m,
-    }
+        vec![[0, 0, 0, 0]; (res * res) as usize],
+    )
 }
 
 fn grid() -> Arc<RegionGrid> {
@@ -39,6 +39,7 @@ fn grid() -> Arc<RegionGrid> {
         },
         inner: field(33, REGION_SIZE_M),
         apron: field(17, APRON_SIZE_M),
+        boulders: Vec::new(),
     })
 }
 
@@ -341,13 +342,13 @@ fn leaving_frees_the_terrain() {
         app.update();
     }
     assert!(!patch_entities(&mut app).is_empty());
-    assert_eq!(app.world().resource::<Assets<Image>>().len(), 5);
-    // A replaced region (a snapshot change) swaps the four field textures.
+    assert_eq!(app.world().resource::<Assets<Image>>().len(), 7);
+    // A replaced region (a snapshot change) swaps the six field textures.
     let replaced = Arc::new((*grid).clone());
     enter(&mut app, &replaced);
     app.update();
     app.update();
-    assert_eq!(app.world().resource::<Assets<Image>>().len(), 5);
+    assert_eq!(app.world().resource::<Assets<Image>>().len(), 7);
     assert!(Arc::ptr_eq(
         &app.world().resource::<TerrainScene>().grid,
         &replaced
@@ -418,6 +419,485 @@ fn the_scene_takes_the_dune_switch_from_the_options() {
     assert_eq!(look(&app).wind.w, 0.0);
 }
 
+/// A field with water on every texel: a level above the ground on even columns (a lake or a
+/// river), below it on odd ones (dry), and river texels whose four values differ everywhere.
+fn wet_field(res: u32, size_m: f64) -> Field {
+    use timefly_core::worldgen::generate::water::encode_river;
+    let mut f = field(res, size_m);
+    for i in 0..(res * res) as usize {
+        let (row, col) = (i as u32 / res, i as u32 % res);
+        let h = f.elevation_m[i];
+        f.water_level_m[i] = if col % 2 == 0 {
+            h + 3.25 + row as f32
+        } else {
+            h - 64.0
+        };
+        // Distinct values within f16's range and precision.
+        let k = (i % 97) as f32;
+        f.river[i] = encode_river(
+            12.5 - 1.5 * k,
+            0.25 + 0.125 * k,
+            -0.75 + 0.0625 * k,
+            -40.0 + 2.5 * k,
+        );
+    }
+    f
+}
+
+/// A water texel's words as WGSL reads them: `[W, W − h]` from `bitcast<f32>` and
+/// `[ribbon, offset, flow_x, flow_z]` from `unpack2x16float`.
+fn decode_water_texel(data: &[u8], index: usize) -> ([f32; 2], [f32; 4]) {
+    use timefly_core::worldgen::generate::water::decode_river;
+    let at = index * material::WATER_TEXEL_BYTES;
+    let word = |k: usize| u32::from_le_bytes(data[at + 4 * k..at + 4 * k + 4].try_into().unwrap());
+    let half = |w: u32| [(w & 0xFFFF) as u16, (w >> 16) as u16];
+    let [ribbon, offset] = half(word(2));
+    let [flow_x, flow_z] = half(word(3));
+    let [ribbon, flow_x, flow_z, offset] = decode_river([ribbon, flow_x, flow_z, offset]);
+    (
+        [f32::from_bits(word(0)), f32::from_bits(word(1))],
+        [ribbon, offset, flow_x, flow_z],
+    )
+}
+
+#[test]
+fn the_water_texture_holds_level_thickness_ribbon_and_flow() {
+    use timefly_core::worldgen::generate::water::decode_river;
+    let f = wet_field(5, 1_000.0);
+    let image = material::water_image(&f);
+    assert_eq!(
+        image.texture_descriptor.format,
+        bevy::render::render_resource::TextureFormat::Rgba32Uint
+    );
+    assert_eq!(image.size(), UVec2::new(5, 5));
+    assert_eq!(image.asset_usage, RenderAssetUsages::RENDER_WORLD);
+    let data = image.data.as_ref().unwrap();
+    assert_eq!(data.len(), 25 * material::WATER_TEXEL_BYTES);
+    for i in 0..25 {
+        let ([level, thickness], [ribbon, offset, flow_x, flow_z]) = decode_water_texel(data, i);
+        let w = f.water_level_m[i];
+        let [want_ribbon, east, north, want_offset] = decode_river(f.river[i]);
+        assert_eq!(level.to_bits(), w.to_bits(), "texel {i}");
+        assert_eq!(thickness, w - f.elevation_m[i], "texel {i}");
+        assert_eq!((ribbon, offset), (want_ribbon, want_offset), "texel {i}");
+        // Region +z points south: flow_z is minus the north flow.
+        assert_eq!((flow_x, flow_z), (east, -north), "texel {i}");
+    }
+    // Texel (col 3, row 2) is index 2 × 5 + 3, as in the height texture; it is dry.
+    let ([level, thickness], _) = decode_water_texel(data, 13);
+    assert_eq!(level, f.elevation_m[13] - 64.0);
+    assert_eq!(thickness, -64.0);
+    // A lake texel stands above its ground.
+    assert!(decode_water_texel(data, 12).0[1] > 0.0);
+}
+
+/// The texture carries everything `blended_water` reads: a reader that interpolates the decoded
+/// texels as the shader will (the half-width `ribbon + |offset|` and the offset, then
+/// `half-width − |offset|`) gets the core's sample, inside the inner field.
+#[test]
+fn the_water_texture_rebuilds_blended_water() {
+    use timefly_core::terrain::{BLEND_APRON_TEXELS, blended_water};
+    // An apron fine enough (9.4 km) that the blend toward it starts 112.5 km out.
+    let mut grid = (*grid()).clone();
+    grid.spec.apron_res = 257;
+    grid.inner = wet_field(33, REGION_SIZE_M);
+    grid.apron = wet_field(257, APRON_SIZE_M);
+    let image = material::water_image(&grid.inner);
+    let data = image.data.as_ref().unwrap();
+    let f = &grid.inner;
+    let e0 = f.size_m / 2.0 - BLEND_APRON_TEXELS * grid.apron.spacing_m();
+    let mut checked = 0;
+    for (x, z) in [
+        (0.0, 0.0),
+        (1_234.5, -6_789.0),
+        (-50_000.3, 20_000.7),
+        (e0 - 1.0, -e0 + 1.0),
+        (4_687.5, 9_375.0),
+    ] {
+        let (u, v) = (
+            (x + f.size_m / 2.0) / f.spacing_m(),
+            (z + f.size_m / 2.0) / f.spacing_m(),
+        );
+        let (c0, r0) = (u.floor(), v.floor());
+        let (fu, fv) = ((u - c0) as f32, (v - r0) as f32);
+        let texel = |r: f64, c: f64| decode_water_texel(data, (r as usize) * 33 + c as usize);
+        let lerp2 = |q: &dyn Fn(([f32; 2], [f32; 4])) -> f32| {
+            let top = q(texel(r0, c0)) + (q(texel(r0, c0 + 1.0)) - q(texel(r0, c0))) * fu;
+            let bottom = q(texel(r0 + 1.0, c0))
+                + (q(texel(r0 + 1.0, c0 + 1.0)) - q(texel(r0 + 1.0, c0))) * fu;
+            top + (bottom - top) * fv
+        };
+        let level = lerp2(&|t| t.0[0]);
+        let thickness = lerp2(&|t| t.0[1]);
+        let hw = lerp2(&|t| t.1[0] + t.1[1].abs());
+        let offset = lerp2(&|t| t.1[1]);
+        let flow = [lerp2(&|t| t.1[2]), lerp2(&|t| t.1[3])];
+        let want = blended_water(&grid, x, z);
+        assert_eq!(level, want.level_m, "({x}, {z})");
+        assert!(
+            (thickness - want.thickness_m).abs() <= 1e-3,
+            "({x}, {z}): {thickness} vs {want:?}"
+        );
+        assert_eq!(hw - offset.abs(), want.ribbon_m, "({x}, {z})");
+        assert_eq!(flow, [want.flow[0], -want.flow[1]], "({x}, {z})");
+        checked += 1;
+    }
+    assert_eq!(checked, 5);
+}
+
+/// What one upload costs: the six field textures' bytes, as `field_texture_bytes` reports them
+/// (and the scene logs at `debug`). At the standard resolutions that is 24 B a texel over
+/// 1,025² + 513² texels, 30.1 MiB, of which the water is 20.0 MiB (M3: 10.0 MiB in all).
+#[test]
+fn the_field_textures_cost_24_bytes_a_texel() {
+    use timefly_core::worldgen::{APRON_RES, REGION_RES};
+    let grid = grid();
+    let mut images = Assets::<Image>::default();
+    let fields = upload_fields(&grid, &mut images);
+    let uploaded: usize = [
+        &fields.inner_height,
+        &fields.apron_height,
+        &fields.inner_surface,
+        &fields.apron_surface,
+        &fields.inner_water,
+        &fields.apron_water,
+    ]
+    .iter()
+    .map(|h| images.get(*h).unwrap().data.as_ref().unwrap().len())
+    .sum();
+    assert_eq!(uploaded, field_texture_bytes(&grid));
+    assert_eq!(uploaded, (33 * 33 + 17 * 17) * 24);
+    let texels = (REGION_RES as usize).pow(2) + (APRON_RES as usize).pow(2);
+    assert_eq!(texels, 1_313_794);
+    assert_eq!(texels * material::WATER_TEXEL_BYTES, 21_020_704);
+    assert_eq!(texels * 24, 31_531_056);
+}
+
+/// A grid for the swap tests: [`wet_field`]s raised by `lift_m`, so two of them tell apart.
+fn wet_grid(lift_m: f32) -> RegionGrid {
+    let mut grid = (*grid()).clone();
+    grid.inner = wet_field(33, REGION_SIZE_M);
+    grid.apron = wet_field(17, APRON_SIZE_M);
+    for f in [&mut grid.inner, &mut grid.apron] {
+        f.elevation_m.iter_mut().for_each(|h| *h += lift_m);
+        f.water_level_m.iter_mut().for_each(|w| *w += lift_m);
+    }
+    grid
+}
+
+/// Enters `grid` as the region job does: the region holds the only reference.
+fn enter_owned(app: &mut App, grid: RegionGrid) {
+    let frame = RegionFrame {
+        center: grid.spec.center,
+    };
+    app.insert_resource(ActiveRegion {
+        grid: Arc::new(grid),
+        frame,
+    });
+}
+
+/// The first texel of an `R32Float` or an `Rgba32Uint` image, as f32 (the height, the level).
+fn first_f32(app: &App, id: AssetId<Image>) -> f32 {
+    let image = app.world().resource::<Assets<Image>>().get(id).unwrap();
+    f32::from_le_bytes(image.data.as_ref().unwrap()[..4].try_into().unwrap())
+}
+
+/// The hop's memory (follow-up): once the fields are on the GPU, the active grid lets its river
+/// texels go (8 B a texel, 10 MiB at full size). Nothing on the CPU reads them; the water
+/// textures hold them.
+#[test]
+fn the_active_grid_frees_its_rivers_once_uploaded() {
+    for replaced in [false, true] {
+        let mut app = pool_app();
+        if replaced {
+            enter_owned(&mut app, wet_grid(0.0));
+            for _ in 0..3 {
+                app.update();
+            }
+        }
+        let grid = wet_grid(500.0);
+        let (full, river) = (grid.bytes(), grid.inner.river.clone());
+        // The river texels go; one bit a texel stays (the river mask).
+        let freed = (33 * 33 + 17 * 17) * 8
+            - 8 * ((33 * 33usize).div_ceil(64) + (17 * 17usize).div_ceil(64));
+        enter_owned(&mut app, grid);
+        for _ in 0..3 {
+            app.update();
+        }
+        let world = app.world();
+        let region = world.resource::<ActiveRegion>();
+        let scene = world.resource::<TerrainScene>();
+        assert!(
+            Arc::ptr_eq(&region.grid, &scene.grid),
+            "replaced {replaced}"
+        );
+        assert!(region.grid.inner.river.is_empty() && region.grid.apron.river.is_empty());
+        assert_eq!(full - region.grid.bytes(), freed, "replaced {replaced}");
+        // The water texture still carries them.
+        let image = world
+            .resource::<Assets<Image>>()
+            .get(&scene.inner_water)
+            .unwrap();
+        let data = image.data.as_ref().unwrap();
+        for i in [0, 17, 500, 1088] {
+            let [ribbon, east, north, offset] =
+                timefly_core::worldgen::generate::water::decode_river(river[i]);
+            let (_, [r, o, x, z]) = decode_water_texel(data, i);
+            assert_eq!([r, o, x, z], [ribbon, offset, east, -north], "texel {i}");
+        }
+    }
+}
+
+/// The hop's memory (third and fourth stages, the owner's rulings of 2026-11-25): a replace
+/// spreads its uploads over four frames. The swap frame removes the old water (the render world
+/// frees it a frame later); the next makes the new water, when the old is gone; the third
+/// uploads nothing, so the water's staging drains; the fourth replaces the heights and surface
+/// codes. Navigation keeps the cloud opaque for the frames that end incomplete (`holds_cloud`):
+/// the swap frame and [`REPLACE_EXTRA_HELD_FRAMES`] more.
+#[test]
+fn a_replace_frees_the_old_water_before_making_the_new() {
+    use crate::water::{RegionWater, WaterMaterial, add_water_systems};
+    assert_eq!(
+        REPLACE_EXTRA_HELD_FRAMES, 2,
+        "the owner's rulings: two more frames in cloud"
+    );
+    let mut app = pool_app();
+    app.init_asset::<crate::sky::SkyMaterial>()
+        .init_asset::<WaterMaterial>();
+    crate::sky::add_sky_systems(&mut app);
+    add_water_systems(&mut app);
+    enter_owned(&mut app, wet_grid(0.0));
+    for _ in 0..3 {
+        app.update();
+    }
+    let old = {
+        let s = app.world().resource::<TerrainScene>();
+        assert_eq!(
+            (s.steps_remaining(), s.fields_pending(), s.holds_cloud()),
+            (0, false, false)
+        );
+        [
+            s.inner_height.id(),
+            s.apron_height.id(),
+            s.inner_surface.id(),
+            s.apron_surface.id(),
+            s.inner_water.id(),
+            s.apron_water.id(),
+        ]
+    };
+    let (old_h, new_h, new_w) = (
+        first_f32(&app, old[0]),
+        wet_grid(500.0).inner.elevation_m[0],
+        wet_grid(500.0).inner.water_level_m[0],
+    );
+    enter_owned(&mut app, wet_grid(500.0));
+    // The swap frame: the old water is gone and the new one not made yet; the old heights.
+    app.update();
+    {
+        let s = app.world().resource::<TerrainScene>();
+        assert_eq!(
+            (s.steps_remaining(), s.fields_pending(), s.holds_cloud()),
+            (3, true, true)
+        );
+        let images = app.world().resource::<Assets<Image>>();
+        assert!(images.get(&s.inner_water).is_none() && images.get(&s.apron_water).is_none());
+        assert!(
+            images.get(old[4]).is_none() && images.get(old[5]).is_none(),
+            "old water kept"
+        );
+        assert_eq!(s.inner_height.id(), old[0]);
+        assert_eq!(first_f32(&app, s.inner_height.id()), old_h);
+        assert!(Arc::ptr_eq(
+            &s.grid,
+            &app.world().resource::<ActiveRegion>().grid
+        ));
+        assert!(
+            s.grid.inner.river.is_empty(),
+            "the rivers freed on the swap frame"
+        );
+        assert_eq!(images.len(), 5, "no water set at all");
+    }
+    // The next frame: the new water, still the old heights; then a frame that uploads nothing.
+    for (k, left) in [(1, 2), (2, 1)] {
+        app.update();
+        let s = app.world().resource::<TerrainScene>();
+        assert_eq!(
+            (s.steps_remaining(), s.fields_pending(), s.holds_cloud()),
+            (left, true, left > 1),
+            "swap + {k}"
+        );
+        assert_eq!(first_f32(&app, s.inner_water.id()), new_w);
+        assert_eq!(first_f32(&app, s.inner_height.id()), old_h);
+        assert_eq!(s.inner_height.id(), old[0], "swap + {k}: heights untouched");
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 7);
+    }
+    // The fourth: the new heights and surfaces; the old ones go.
+    app.update();
+    let world = app.world();
+    let s = world.resource::<TerrainScene>();
+    assert_eq!(
+        (s.steps_remaining(), s.fields_pending(), s.holds_cloud()),
+        (0, false, false)
+    );
+    assert_eq!(first_f32(&app, s.inner_height.id()), new_h);
+    let m = world
+        .resource::<Assets<TerrainMaterial>>()
+        .get(&s.material)
+        .unwrap();
+    assert_eq!(m.extension.inner_height, s.inner_height);
+    assert_eq!(m.extension.apron_surface, s.apron_surface);
+    assert_eq!(s.height_range_m, height_range_m(&s.grid));
+    // The water binds the new water (it reads no heights).
+    let water = world.resource::<RegionWater>();
+    let wm = world
+        .resource::<Assets<WaterMaterial>>()
+        .get(&water.drawn.as_ref().unwrap().material)
+        .unwrap();
+    assert_eq!(wm.extension.inner_water, s.inner_water);
+    assert_eq!(wm.extension.apron_water, s.apron_water);
+    let images = world.resource::<Assets<Image>>();
+    assert!(
+        old[..4].iter().all(|&id| images.get(id).is_none()),
+        "old fields kept"
+    );
+    assert_eq!(images.len(), 7);
+}
+
+/// The swap frame binds no water (Task 7's stages), so the water draws nothing until the new
+/// water is made (Task 8). Its material must go entirely, not be rebound: a material whose bind
+/// group can't be built keeps its old one in the render world (`RetryNextUpdate`), holding the
+/// old water's texture views, until the material asset is unused. So on the swap frame the water
+/// entity is despawned and the material removed with every handle to it; the frame after, a new
+/// material binds the new water. The mesh is kept.
+#[test]
+fn the_sea_draws_nothing_while_its_water_is_missing() {
+    use crate::water::{RegionWater, WaterMaterial, add_water_systems};
+    let mut app = pool_app();
+    app.init_asset::<crate::sky::SkyMaterial>()
+        .init_asset::<WaterMaterial>();
+    crate::sky::add_sky_systems(&mut app);
+    add_water_systems(&mut app);
+    enter_owned(&mut app, wet_grid(0.0));
+    for _ in 0..3 {
+        app.update();
+    }
+    // The drawn water: its entity, material id, the material's water textures and the mesh.
+    let sea = |app: &mut App| {
+        let world = app.world_mut();
+        let drawn: Vec<_> = world
+            .query::<(Entity, &MeshMaterial3d<WaterMaterial>, &Mesh3d)>()
+            .iter(world)
+            .map(|(e, m, mesh)| (e, m.0.id(), mesh.0.id()))
+            .collect();
+        let materials = world.resource::<Assets<WaterMaterial>>();
+        let water = world.resource::<RegionWater>();
+        let bound = water.drawn.as_ref().map(|d| {
+            let m = materials.get(&d.material).unwrap();
+            (
+                d.entity,
+                d.material.id(),
+                m.extension.inner_water.id(),
+                m.extension.apron_water.id(),
+            )
+        });
+        (drawn, materials.len(), bound, water.mesh.id())
+    };
+    let scene_water = |app: &App| {
+        let s = app.world().resource::<TerrainScene>();
+        (s.inner_water.id(), s.apron_water.id())
+    };
+    let old = scene_water(&app);
+    let (drawn, count, bound, mesh) = sea(&mut app);
+    let (entity, old_material, inner, apron) = bound.expect("the water drawn");
+    assert_eq!(drawn, [(entity, old_material, mesh)]);
+    assert_eq!((count, inner, apron), (1, old.0, old.1));
+    enter_owned(&mut app, wet_grid(500.0));
+    // The swap frame: no water entity, no material asset, no handle to the old one.
+    app.update();
+    let (drawn, count, bound, kept_mesh) = sea(&mut app);
+    assert!(
+        drawn.is_empty(),
+        "the water is drawn on the swap frame: {drawn:?}"
+    );
+    assert_eq!(count, 0, "the old water's material is still an asset");
+    assert!(bound.is_none());
+    assert_eq!(kept_mesh, mesh, "the mesh is rebuilt");
+    assert!(app.world().get_entity(entity).is_err());
+    // The next frame: a new material over the new water.
+    app.update();
+    let new = scene_water(&app);
+    assert_ne!(new, old);
+    let (drawn, count, bound, _) = sea(&mut app);
+    let (entity, material, inner, apron) = bound.expect("the new water drawn");
+    assert_ne!(material, old_material);
+    assert_eq!(drawn, [(entity, material, mesh)]);
+    assert_eq!((count, inner, apron), (1, new.0, new.1));
+    // And it stays bound, the same material, through the heights' frames.
+    for _ in 0..3 {
+        app.update();
+        let (_, count, again, _) = sea(&mut app);
+        assert_eq!((count, again), (1, Some((entity, material, new.0, new.1))));
+    }
+}
+
+/// A snapshot change uploads the new grid's water and drops the old textures.
+#[test]
+fn a_replaced_region_rebinds_the_water_textures() {
+    let mut grid = (*grid()).clone();
+    grid.inner = wet_field(33, REGION_SIZE_M);
+    grid.apron = wet_field(17, APRON_SIZE_M);
+    let grid = Arc::new(grid);
+    let mut app = pool_app();
+    enter(&mut app, &grid);
+    for _ in 0..3 {
+        app.update();
+    }
+    let water = |app: &App| {
+        let scene = app.world().resource::<TerrainScene>();
+        (scene.inner_water.id(), scene.apron_water.id())
+    };
+    let level = |app: &App, id: AssetId<Image>| {
+        let image = app.world().resource::<Assets<Image>>().get(id).unwrap();
+        decode_water_texel(image.data.as_ref().unwrap(), 0).0[0]
+    };
+    // Ids, not handles: a handle held here would keep the old textures alive.
+    let (inner, apron) = water(&app);
+    assert_eq!(level(&app, inner), grid.inner.water_level_m[0]);
+    assert_eq!(level(&app, apron), grid.apron.water_level_m[0]);
+    let size = |app: &App, id: AssetId<Image>| {
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(id)
+            .unwrap()
+            .size()
+    };
+    assert_eq!(size(&app, inner), UVec2::splat(33));
+    assert_eq!(size(&app, apron), UVec2::splat(17));
+
+    // The new snapshot's lake stands 100 m higher.
+    let mut replaced = (*grid).clone();
+    for f in [&mut replaced.inner, &mut replaced.apron] {
+        f.water_level_m.iter_mut().for_each(|w| *w += 100.0);
+    }
+    let replaced = Arc::new(replaced);
+    enter(&mut app, &replaced);
+    for _ in 0..3 {
+        app.update();
+    }
+    let (new_inner, new_apron) = water(&app);
+    assert_ne!(new_inner, inner);
+    assert_ne!(new_apron, apron);
+    assert_eq!(level(&app, new_inner), replaced.inner.water_level_m[0]);
+    assert_eq!(level(&app, new_apron), replaced.apron.water_level_m[0]);
+    let images = app.world().resource::<Assets<Image>>();
+    assert!(
+        images.get(inner).is_none() && images.get(apron).is_none(),
+        "old water kept"
+    );
+    // Four field textures, two water textures and the palette.
+    assert_eq!(images.len(), 7);
+}
+
 #[test]
 fn sky_and_water_follow_the_scene() {
     use crate::sky::{RegionSky, SkyMaterial, add_sky_systems};
@@ -440,14 +920,14 @@ fn sky_and_water_follow_the_scene() {
         let sky = world.resource::<RegionSky>();
         let water = world.resource::<RegionWater>();
         assert!(Arc::ptr_eq(&sky.grid, &grid) && Arc::ptr_eq(&water.grid, &grid));
-        // The sea reads the terrain's own buffer and height textures.
+        // The water reads the terrain's own buffer and the fields' water textures.
         let m = world
             .resource::<Assets<WaterMaterial>>()
-            .get(&water.material)
+            .get(&water.drawn.as_ref().unwrap().material)
             .unwrap();
         assert_eq!(m.extension.patches, scene.buffer);
-        assert_eq!(m.extension.inner_height, scene.inner_height);
-        assert_eq!(m.extension.apron_height, scene.apron_height);
+        assert_eq!(m.extension.inner_water, scene.inner_water);
+        assert_eq!(m.extension.apron_water, scene.apron_water);
         // The region camera carries the era's fog and the sky-coloured ambient light.
         let camera = world.entity(scene.camera);
         assert!(camera.contains::<DistanceFog>());
@@ -462,22 +942,28 @@ fn sky_and_water_follow_the_scene() {
             .extension
             .look;
         assert_eq!(look, look_for(&grid, TerrainOptions::default()));
-        (sky.dome, water.entity)
+        (sky.dome, water.drawn.as_ref().unwrap().entity)
     };
 
-    // A snapshot change: the same entities, rebound to the new grid and retinted for its era.
+    // A snapshot change: the same sky dome, rebound to the new grid and retinted for its era. The
+    // water is rebuilt over the new water textures (its material can't outlive the old ones:
+    // `the_sea_draws_nothing_while_its_water_is_missing`).
     let mut deep = (*grid).clone();
     deep.spec.snapshot = YearsBp(540.0e6);
     let deep = Arc::new(deep);
     enter(&mut app, &deep);
-    app.update();
-    app.update();
+    // A replace takes four frames (`a_replace_frees_the_old_water_before_making_the_new`).
+    for _ in 0..4 {
+        app.update();
+    }
     {
         let world = app.world();
         let scene = world.resource::<TerrainScene>();
         let sky = world.resource::<RegionSky>();
         let water = world.resource::<RegionWater>();
-        assert_eq!((sky.dome, water.entity), (dome, sea));
+        let drawn = water.drawn.as_ref().unwrap();
+        assert_eq!(sky.dome, dome);
+        assert_ne!(drawn.entity, sea);
         assert_eq!(
             sky.era,
             timefly_core::worldgen::biome::VegetationEra::Barren
@@ -485,9 +971,10 @@ fn sky_and_water_follow_the_scene() {
         assert!(Arc::ptr_eq(&water.grid, &deep));
         let m = world
             .resource::<Assets<WaterMaterial>>()
-            .get(&water.material)
+            .get(&drawn.material)
             .unwrap();
-        assert_eq!(m.extension.inner_height, scene.inner_height);
+        assert_eq!(m.extension.inner_water, scene.inner_water);
+        assert_eq!(m.extension.look, crate::water::water_look(&deep));
         let fog = world
             .entity(scene.camera)
             .get::<DistanceFog>()
@@ -716,7 +1203,7 @@ fn view_ranges_grow_smoothly_and_hide_the_shadow_seam() {
     }
 }
 
-/// The fly's clearance reads `blended_height_m` (no drop: the drop at zero distance is zero), but
+/// The fly's clearance reads `blended_surface_m` (no drop: the drop at zero distance is zero), but
 /// the terrain and the water draw the ground dropped by the curvature measured from the chase
 /// camera, which sits behind the fly. The two agree to within a centimetre at the clearance and a
 /// fraction of a percent of the height above the ground anywhere up to the ceiling.
@@ -726,8 +1213,10 @@ fn clearance_matches_the_drawn_ground_under_the_fly() {
     assert_eq!(CAMERA_CEILING_M, REGION_CLOUD_BASE_M as f32);
     let grid = grid();
     let ground = |x: f64, z: f64| f64::from(timefly_core::terrain::blended_height_m(&grid, x, z));
+    let surface_at =
+        |x: f64, z: f64| f64::from(timefly_core::terrain::blended_surface_m(&grid, x, z));
     for (x, z) in [(0.0, 0.0), (90_000.0, -40_000.0), (-149_000.0, 149_000.0)] {
-        let surface = ground(f64::from(x), f64::from(z)).max(0.0) as f32;
+        let surface = surface_at(f64::from(x), f64::from(z)) as f32;
         for agl in [CAMERA_CLEARANCE_M, 1_000.0, 8_000.0, 60_000.0, 150_000.0] {
             let y = (surface + agl).min(CAMERA_CEILING_M);
             for yaw in [0.0f32, 1.0, 2.5, 4.0] {
@@ -736,12 +1225,12 @@ fn clearance_matches_the_drawn_ground_under_the_fly() {
                     yaw,
                     pitch: -0.3,
                 };
-                let eye = region_chase_pose(&fly, |x, z| ground(x, z).max(0.0)).eye;
+                let eye = region_chase_pose(&fly, surface_at).eye;
                 let offset = (eye.x - f64::from(x)).hypot(eye.z - f64::from(z));
                 let clearance = ground(f64::from(x), f64::from(z)) - curvature_drop_m(0.0);
                 let drawn = ground(f64::from(x), f64::from(z)) - curvature_drop_m(offset);
                 let gap = clearance - drawn;
-                let height = f64::from(y) - clearance.max(0.0);
+                let height = f64::from(y) - f64::from(surface);
                 assert!(gap >= 0.0, "the drawn ground is above the clearance's");
                 let allowed = if agl <= CAMERA_CLEARANCE_M {
                     0.01

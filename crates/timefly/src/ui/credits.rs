@@ -168,6 +168,13 @@ mod tests {
             "10.5194/cp-12-1079-2016",
             "10.25921/rd66-5820",
             "NOAA",
+            "Beyer",
+            "Krapp",
+            "10.1038/s41597-020-0552-1",
+            "10.6084/m9.figshare.12293345",
+            "Natural Earth",
+            "naturalearthdata.com",
+            "rivers + lake centerlines",
             "Bevy",
         ] {
             assert!(CREDITS_TEXT.contains(needle), "credits.txt lacks {needle}");

@@ -115,7 +115,7 @@ impl Detail {
     }
 
     /// Noise position (m on the sphere) and seed of a lattice key.
-    fn noise_input(&self, key: &LatticeKey) -> (DVec3, u32) {
+    pub(super) fn noise_input(&self, key: &LatticeKey) -> (DVec3, u32) {
         match *key {
             LatticeKey::Geographic(v) => (v.normalize() * EARTH_RADIUS_M, self.seed),
             LatticeKey::Tracked {
