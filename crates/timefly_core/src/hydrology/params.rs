@@ -123,6 +123,13 @@ pub const JOIN_PATH_HALF_WIDTH_FRACTION: f64 = 1.0;
 /// 1.17, 1.23 and 1.26 times its chord (p90 1.23, 1.46, 1.64, 1.72). 0.1 takes nearly all the
 /// gain without the longest detours.
 pub const JOIN_PATH_CLIMB_WEIGHT: f64 = 0.1;
+/// A river segment whose corridor course stands more than this many metres over its pass bed at
+/// some interior sub-point is refined along the least-cost path to that bed instead (the join
+/// search, [`JOIN_PATH_HALF_WIDTH_FRACTION`] spacings either side), so a valley the corridor
+/// misses carries its river rather than a slot carved through the ground beside it (the Verde
+/// north of Phoenix: its valley 3–6 km off the corridor, a 150–400 m slot; bug shot
+/// 2026-11-27). Segments on today's burnt courses keep their anchors.
+pub const REROUTE_CUT_M: f64 = 150.0;
 
 // Sampling. The apron uses `max(SUBPOINT_M, apron texel / 2)`.
 

@@ -17,12 +17,14 @@
 //! Floors: floor_at at every lattice point (NaN reads as +∞).
 //! Cost: 8-neighbour steps; a step of great-circle length ℓ between points a and b costs
 //!   ℓ × (1 + JOIN_PATH_CLIMB_WEIGHT × max(0, (f_a + f_b)/2 − (line_a + line_b)/2)), line the
-//!   straight line in t between the floors at p0 and p1. Dijkstra from (0, 0) to (I, 0); the
+//!   straight line in t between the floors at p0 and p1 (for a rerouted deep cut, between its
+//!   pass beds at its ends: [`REROUTE_CUT_M`](crate::hydrology::params::REROUTE_CUT_M)). Dijkstra from (0, 0) to (I, 0); the
 //!   heap orders by (cost bits, point index), neighbours in a fixed order, a cost replaced only
 //!   when strictly lower. The chord (row 0) is a lattice path, so the path never costs more.
 //! Centreline: the path's points resampled at K + 1 equal arc-length fractions,
 //!   K = ceil(path length / s), each between its two path points on their great circle; then the
-//!   interior points smoothed once, [1, 2, 1] / 4 and normalised. The ends are p0 and p1.
+//!   interior points smoothed [1, 2, 1] / 4 and normalised, once (four times for a rerouted deep
+//!   cut). The ends are p0 and p1.
 //! ```
 //!
 //! The path stays within H of the chord between the relaxed ends, so the gather's relaxation
@@ -43,6 +45,11 @@ use crate::worldgen::frame::EARTH_RADIUS_M;
 /// 10.2 km half-width at 500 m) take under half of it; a coarse lattice's (tests', at 100 km
 /// spacings) would otherwise take hundreds of thousands.
 const MAX_POINTS: usize = 4096;
+
+/// How many times a rerouted deep cut's centreline is smoothed [1, 2, 1] / 4 (a joining
+/// segment's once): about a 700 m Gaussian at 500 m sub-points, so a staircase of 45° and 0°
+/// lattice steps becomes a curve no texel grid reads as kinks.
+const REROUTE_SMOOTHING_PASSES: u32 = 4;
 
 /// The eight steps, in the search's fixed order: `(di, dj)`.
 const STEPS: [(i32, i32); 8] = [
@@ -67,6 +74,9 @@ pub(super) struct JoinGrid {
     ni: u32,
     /// Rows either side, `J`.
     nj: u32,
+    /// The line a step's climb is measured from, at `t = 0` and `t = 1`: the ends' floors when
+    /// `None` (a joining segment), the pass bed for a rerouted deep cut.
+    reference: Option<[f64; 2]>,
 }
 
 fn clean(f: f64) -> f64 {
@@ -77,7 +87,14 @@ impl JoinGrid {
     /// The lattice between the relaxed ends `p0` and `p1` whose chord has the unit `normal`
     /// (left of travel), `half_m` either side, at spacing `subpoint_m`, or coarser where that
     /// would pass [`MAX_POINTS`] (a coarse lattice's long links).
-    pub(super) fn new(p0: DVec3, p1: DVec3, normal: DVec3, subpoint_m: f64, half_m: f64) -> Self {
+    pub(super) fn new(
+        p0: DVec3,
+        p1: DVec3,
+        normal: DVec3,
+        subpoint_m: f64,
+        half_m: f64,
+        reference: Option<[f64; 2]>,
+    ) -> Self {
         let len = p0.angle_between(p1) * EARTH_RADIUS_M;
         let step_m = subpoint_m.max((len * 2.0 * half_m / MAX_POINTS as f64).sqrt());
         JoinGrid {
@@ -87,6 +104,7 @@ impl JoinGrid {
             step_m,
             ni: (len / step_m).ceil().max(1.0) as u32,
             nj: (half_m / step_m).floor().max(0.0) as u32,
+            reference,
         }
     }
 
@@ -151,7 +169,9 @@ impl JoinGrid {
     /// The cost of the step between points `a` and `b` (indices).
     fn step_cost(&self, floors: &[f64], a: usize, b: usize) -> f64 {
         let ((ia, ja), (ib, jb)) = (self.of_index(a), self.of_index(b));
-        let (f0, f1) = (floors[self.index(0, 0)], floors[self.index(self.ni, 0)]);
+        let [f0, f1] = self
+            .reference
+            .unwrap_or([floors[self.index(0, 0)], floors[self.index(self.ni, 0)]]);
         let line = |i: u32| f0 + (f1 - f0) * f64::from(i) / f64::from(self.ni);
         let above = (0.5 * (floors[a] + floors[b]) - 0.5 * (line(ia) + line(ib))).max(0.0);
         let len = self.point(ia, ja).angle_between(self.point(ib, jb)) * EARTH_RADIUS_M;
@@ -257,15 +277,26 @@ impl JoinGrid {
                 chord_point(pts[seg], pts[seg + 1], t)
             })
             .collect();
-        (0..resampled.len())
-            .map(|k| {
-                if k == 0 || k + 1 == resampled.len() {
-                    resampled[k]
-                } else {
-                    (resampled[k - 1] + 2.0 * resampled[k] + resampled[k + 1]).normalize()
-                }
-            })
-            .collect()
+        // A rerouted deep cut smooths more: its search crosses gentle ground too, where many
+        // paths cost nearly the same and the cheapest is a staircase of the lattice's steps.
+        let passes = if self.reference.is_some() {
+            REROUTE_SMOOTHING_PASSES
+        } else {
+            1
+        };
+        let mut line = resampled;
+        for _ in 0..passes {
+            line = (0..line.len())
+                .map(|k| {
+                    if k == 0 || k + 1 == line.len() {
+                        line[k]
+                    } else {
+                        (line[k - 1] + 2.0 * line[k] + line[k + 1]).normalize()
+                    }
+                })
+                .collect();
+        }
+        line
     }
 }
 
@@ -289,7 +320,7 @@ mod tests {
 
     fn grid(p0: DVec3, p1: DVec3) -> JoinGrid {
         let normal = p0.cross(p1).normalize();
-        JoinGrid::new(p0, p1, normal, 500.0, 6_000.0)
+        JoinGrid::new(p0, p1, normal, 500.0, 6_000.0, None)
     }
 
     proptest! {
@@ -334,7 +365,7 @@ mod tests {
     #[test]
     fn a_long_links_lattice_stays_small() {
         let (p0, p1) = (at(0.0, 0.0), at(200_000.0, 0.0));
-        let g = JoinGrid::new(p0, p1, p0.cross(p1).normalize(), 500.0, 100_000.0);
+        let g = JoinGrid::new(p0, p1, p0.cross(p1).normalize(), 500.0, 100_000.0, None);
         assert!(
             g.len() <= MAX_POINTS + 2 * g.columns() as usize + g.rows(),
             "{}",
@@ -342,7 +373,7 @@ mod tests {
         );
         assert!(g.step_m > 500.0);
         let (p0, p1) = (at(0.0, 0.0), at(34_000.0, 0.0));
-        let g = JoinGrid::new(p0, p1, p0.cross(p1).normalize(), 500.0, 10_245.0);
+        let g = JoinGrid::new(p0, p1, p0.cross(p1).normalize(), 500.0, 10_245.0, None);
         assert_eq!(g.step_m, 500.0);
     }
 

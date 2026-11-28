@@ -813,6 +813,101 @@ fn a_river_beside_dry_banks_blends_as_before() {
     }
 }
 
+/// A perched river (the Verde north of Phoenix, bug shot 2026-11-27 16:28:29): the river's
+/// footprint, the texels within its valley half-width, holds its level 80 m above their ground
+/// (the lattice level stands above the fine valley floor), and the dry texels beyond store
+/// `h − NO_WATER_DROP_M` and [`RIVER_NONE`](crate::worldgen::generate::water::RIVER_NONE). A
+/// dry texel is outside the water: where a footprint texel meets one, no ribbon may appear, so
+/// no water strip runs along the footprint's edge parallel to the river.
+#[test]
+fn a_perched_river_draws_no_water_at_its_footprints_edge() {
+    use crate::worldgen::generate::water::{RIVER_NONE, encode_river};
+    let mut grid = test_grid();
+    let x0 = 1_234.5;
+    let texel = grid.inner.spacing_m();
+    let half_width = 11.0f32;
+    let reach = 5.2 * texel as f32;
+    let f = &mut grid.inner;
+    let offsets = texels_of(f, |x, _| (x - x0) as f32);
+    let footprint: Vec<bool> = offsets.iter().map(|o| o.abs() < reach).collect();
+    f.water_level_m = (0..offsets.len())
+        .map(|i| {
+            let h = f.elevation_m[i];
+            if footprint[i] {
+                h + 80.0
+            } else {
+                h - NO_WATER_DROP_M as f32
+            }
+        })
+        .collect();
+    f.river = (0..offsets.len())
+        .map(|i| {
+            if footprint[i] {
+                encode_river(half_width - offsets[i].abs(), 1.0, 0.0, offsets[i])
+            } else {
+                RIVER_NONE
+            }
+        })
+        .collect();
+    let (mut edge_cells, mut inside) = (0, 0);
+    for k in 0..4_000 {
+        let t = f64::from(k);
+        let x = x0 - 7.0 * texel + 14.0 * texel * (t * 0.618_034).fract();
+        let z = -60_000.0 + 29.3 * t;
+        let w = blended_water(&grid, x, z);
+        let d = (x - x0).abs() as f32;
+        // The hazard: a cell between a footprint texel and a dry one, where the level still
+        // stands over the ground.
+        edge_cells += usize::from(
+            d > reach - texel as f32 && d < reach + texel as f32 && w.thickness_m > 0.0,
+        );
+        if d > half_width + 1.0 {
+            assert!(
+                !(w.ribbon_m > 0.0 && w.thickness_m > 0.0),
+                "({x}, {z}): water drawn {d} m from the river (ribbon {}, thickness {})",
+                w.ribbon_m,
+                w.thickness_m
+            );
+        } else if d < half_width - 1.0 {
+            inside += 1;
+            assert!(
+                w.ribbon_m > 0.0,
+                "({x}, {z}): the river itself, ribbon {}",
+                w.ribbon_m
+            );
+        }
+    }
+    assert!(
+        edge_cells > 50,
+        "the fixture creates the hazard: {edge_cells}"
+    );
+    assert!(inside > 2, "points on the river: {inside}");
+}
+
+/// The crossing guard's fallback (two rivers, or a sharp bend, in one cell) interpolates the
+/// taps' ribbons; a dry tap among them is outside the water, not [`RIBBON_NONE_M`] of it.
+#[test]
+fn the_crossing_guard_keeps_dry_taps_dry() {
+    use crate::hydrology::params::RIBBON_NONE_M;
+    use crate::worldgen::generate::water::{RIVER_NONE, encode_river};
+    let spacing = 293.0;
+    let river = |o: f32| TapTexel::new(0.0, 80.0, encode_river(11.0 - o.abs(), 1.0, 0.0, o));
+    let dry = TapTexel::new(0.0, -(NO_WATER_DROP_M as f32), RIVER_NONE);
+    // Offsets of both signs 600 m apart: more than CROSSING_REACH_TEXELS texels.
+    let taps = [river(-300.0), river(300.0), river(-300.0), dry];
+    // The hazard: the dry tap's own ribbon is RIBBON_NONE_M.
+    assert_eq!(dry.river[0], RIBBON_NONE_M as f32);
+    for (fu, fv) in [(0.9f32, 0.9f32), (0.7, 0.8), (0.5, 0.95)] {
+        let w = water_from_taps(&taps, fu, fv, spacing);
+        assert!(
+            !(w.ribbon_m > 0.0 && w.thickness_m > 0.0),
+            "({fu}, {fv}): ribbon {} thickness {}",
+            w.ribbon_m,
+            w.thickness_m
+        );
+    }
+}
+
 /// Once a grid's river texels are on the GPU the shell frees them (`Field::free_rivers`): the
 /// levels, and so the fly's floor, are unchanged, and `blended_water` reads no river.
 #[test]

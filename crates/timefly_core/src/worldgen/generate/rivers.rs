@@ -51,6 +51,12 @@
 //!   On a plain or a slope the minimum lies at the search's edge, and taking it sent each
 //!   segment sideways out of its pinned node and back (hairpins); a real valley is an
 //!   interior minimum.
+//! Reroute (a deep cut): a segment that is not joining and has neither end on one of today's
+//!   courses, whose corridor course (above) stands more than REROUTE_CUT_M over its pass bed B
+//!   (lerped between its ends' beds by the sub-point's t) at some interior sub-point, searches
+//!   the joining lattice between its relaxed ends with the climb measured from that lerped bed
+//!   instead of the ends' floors, its centreline smoothed four times; the path replaces the
+//!   corridor only where its own deepest cut is smaller. K counts the path's length.
 //! Meander (R only): node values A = 1.5·w·(1 − smoothstep(MEANDER_FLAT_SLOPE, pass slope)),
 //!   λ = 11·w, A = 0 if λ < 2 km; the pass slope is (bed − down bed) / len. A node's normal is
 //!   left of the bisector of its outgoing chord and its main incoming one (largest discharge,
@@ -101,7 +107,7 @@ use crate::hydrology::params::{
     DEPTH_EXP, INCISION_WINDOW_M, JOIN_PATH_HALF_WIDTH_FRACTION, LEVEL_BELOW_BED, LOWLAND_SPEED_MS,
     MANNING_N, MAX_CHANNEL_DISCHARGE_M3S, MEANDER_AMPLITUDE_PER_WIDTH, MEANDER_FLAT_SLOPE,
     MEANDER_MIN_WAVELENGTH_M, MEANDER_WAVELENGTH_PER_WIDTH, NODE_SEARCH_GRID, RAPID_SLOPE,
-    RAPID_SPEED_BASE_MS, RAPID_SPEED_GAIN_MS, TODAY_RIVER_ANCHOR_MAX_SPACINGS,
+    RAPID_SPEED_BASE_MS, RAPID_SPEED_GAIN_MS, REROUTE_CUT_M, TODAY_RIVER_ANCHOR_MAX_SPACINGS,
     VALLEY_HALF_WIDTH_PER_WIDTH, VALLEY_WALL_SLOPE, WIDTH_COEFF, WIDTH_EXP,
 };
 use crate::hydrology::{CubeLattice, Down, EraHydrology, HydroGraph, RiverNode};
@@ -233,6 +239,40 @@ fn is_joining(hydro: &EraHydrology, n: &RiverNode) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether segment `n` is rerouted when its corridor cuts deep ([`REROUTE_CUT_M`]): it is no
+/// joining segment and neither end is on one of today's burnt courses (they keep their anchors).
+fn may_reroute(hydro: &EraHydrology, n: &RiverNode) -> bool {
+    if is_joining(hydro, n) || hydro.anchor(n.node).is_some() {
+        return false;
+    }
+    match n.down {
+        Down::River(j) => hydro
+            .anchor(hydro.rivers.nodes()[j as usize].node)
+            .is_none(),
+        _ => true,
+    }
+}
+
+/// Segment `river`'s pass beds `[at its node, at its down node]`: `B` at `t = 0` and `t = 1`.
+fn end_beds(hydro: &EraHydrology, river: u32) -> [f64; 2] {
+    [
+        f64::from(hydro.rivers.nodes()[river as usize].bed_m),
+        f64::from(hydro.rivers.down_bed_m(river)),
+    ]
+}
+
+/// The deepest cut of a course of `K + 1` points: the most any interior point's floor (finite)
+/// stands over the pass bed lerped between `beds` at its `t`, or −∞.
+fn max_cut(floors: &[f64], k_max: u32, beds: [f64; 2]) -> f64 {
+    (1..k_max)
+        .filter_map(|k| {
+            let f = floors[k as usize];
+            let bed = beds[0] + (beds[1] - beds[0]) * t_of(k, k_max);
+            f.is_finite().then_some(f - bed)
+        })
+        .fold(f64::NEG_INFINITY, f64::max)
 }
 
 /// A river node relaxed for the refinement: to its anchor on one of today's burnt courses
@@ -448,9 +488,48 @@ pub fn relaxed_centreline(
     };
     let normal = chord_normal(p0, p1, c0, c1);
     if is_joining(hydro, n) {
-        let grid = JoinGrid::new(p0, p1, normal, subpoint_m, join_half_m(&lattice));
+        let grid = JoinGrid::new(p0, p1, normal, subpoint_m, join_half_m(&lattice), None);
         return grid.centreline(&grid.read_all(floor_at), subpoint_m);
     }
+    let points = corridor_points(hydro, river, (p0, p1, normal), subpoint_m, floor_at);
+    if may_reroute(hydro, n) {
+        let k_max = (points.len() - 1) as u32;
+        let floors: Vec<f64> = points
+            .iter()
+            .map(|&p| clean(floor_at(RenderDir(p))))
+            .collect();
+        let beds = end_beds(hydro, river);
+        let cut = max_cut(&floors, k_max, beds);
+        if cut > REROUTE_CUT_M {
+            let half = join_half_m(&lattice);
+            let grid = JoinGrid::new(p0, p1, normal, subpoint_m, half, Some(beds));
+            let path = grid.centreline(&grid.read_all(floor_at), subpoint_m);
+            let floors: Vec<f64> = path
+                .iter()
+                .map(|&p| clean(floor_at(RenderDir(p))))
+                .collect();
+            if max_cut(&floors, (path.len() - 1) as u32, beds) < cut {
+                return path;
+            }
+        }
+    }
+    points
+}
+
+/// The corridor course of non-joining segment `river` between its relaxed ends `p0`, `p1`
+/// (chord `normal`): the raw offsets tapered and smoothed, `K + 1` points.
+fn corridor_points(
+    hydro: &EraHydrology,
+    river: u32,
+    (p0, p1, normal): (DVec3, DVec3, DVec3),
+    subpoint_m: f64,
+    floor_at: &impl Fn(RenderDir) -> f64,
+) -> Vec<DVec3> {
+    let lattice = hydro.lattice;
+    let nodes = hydro.rivers.nodes();
+    let n = &nodes[river as usize];
+    let end = end_node(n, nodes);
+    let (c0, c1) = (lattice.dir(n.node).0, lattice.dir(end).0);
     let k_max = sub_count(lattice.distance_m(n.node, end), subpoint_m);
     let corridor = corridor_m(&lattice);
     let mut raw: Vec<f64> = (0..=k_max)
@@ -619,6 +698,13 @@ struct Seg {
     /// The segment joins a burnt course: it follows its least-cost path ([`super::join`]); its
     /// lattice once the ends are relaxed, and its floors read so far.
     join: bool,
+    /// Whether a deep corridor cut reroutes the segment ([`may_reroute`]), and once it does,
+    /// the pass beds its path search climbs from ([`REROUTE_CUT_M`]).
+    may_reroute: bool,
+    reroute: Option<[f64; 2]>,
+    /// A rerouted segment's corridor course: its points, its `K` and its deepest cut, kept
+    /// where the path does not cut less.
+    corridor_course: Option<(Vec<DVec3>, u32, f64)>,
     grid: Option<JoinGrid>,
     join_floors: Vec<f64>,
     raw: Vec<f64>,
@@ -639,6 +725,17 @@ impl Seg {
     fn m_at(&self, k: u32) -> f64 {
         self.m_down + (1.0 - t_of(k, self.k_max)) * self.len
     }
+}
+
+/// What follows a unit of a segment's corridor ([`RiverBuilder::corridor_step`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CorridorNext {
+    /// Its next unit.
+    More,
+    /// Its corridor cut deep: it starts over as a path search from column 0.
+    Restart,
+    /// It is complete.
+    Done,
 }
 
 /// Where a [`RiverBuilder`] is.
@@ -821,6 +918,9 @@ impl<'a> RiverBuilder<'a> {
                     m_start: path.m_start(i),
                     k_max: sub_count(len, subpoint_m),
                     join: is_joining(hydro, n),
+                    may_reroute: may_reroute(hydro, n),
+                    reroute: None,
+                    corridor_course: None,
                     grid: None,
                     join_floors: Vec::new(),
                     raw: Vec::new(),
@@ -914,12 +1014,12 @@ impl<'a> RiverBuilder<'a> {
                         self.phase = Phase::Points(0, 0);
                         continue;
                     }
-                    let (done, extra) = self.corridor_step(s, k, floor_at);
+                    let (next, extra) = self.corridor_step(s, k, floor_at);
                     used = used.saturating_add(1 + extra);
-                    self.phase = if done {
-                        Phase::Corridor(s + 1, 0)
-                    } else {
-                        Phase::Corridor(s, k + 1)
+                    self.phase = match next {
+                        CorridorNext::More => Phase::Corridor(s, k + 1),
+                        CorridorNext::Restart => Phase::Corridor(s, 0),
+                        CorridorNext::Done => Phase::Corridor(s + 1, 0),
                     };
                 }
                 Phase::Points(r, k) => {
@@ -970,26 +1070,34 @@ impl<'a> RiverBuilder<'a> {
         (p0, p1, chord_normal(p0, p1, c0, c1))
     }
 
-    /// One unit of segment `s`'s corridor: raw offset `k` (the ends are 0), or on a joining
-    /// segment its lattice's column `k`. Returns whether the segment is complete (points,
-    /// floors and τ filled), and the units beyond this one it took (a joining path's search:
-    /// one per [`JOIN_SEARCH_POINTS_PER_UNIT`] lattice points).
+    /// One unit of segment `s`'s corridor: raw offset `k` (the ends are 0), or on a joining or
+    /// rerouted segment its lattice's column `k`. Returns what follows (a corridor that cuts
+    /// deep, [`cuts_deep`], starts over as a path search), and the units beyond this one it took
+    /// (a path search: one per [`JOIN_SEARCH_POINTS_PER_UNIT`] lattice points).
     fn corridor_step(
         &mut self,
         s: usize,
         k: u32,
         floor_at: &impl Fn(RenderDir) -> f64,
-    ) -> (bool, u32) {
+    ) -> (CorridorNext, u32) {
         let (p0, p1, normal) = self.ends(s);
         let (points, extra) = if self.segs[s].join {
             let lattice = &self.hydro.lattice;
             let seg = &mut self.segs[s];
+            let reference = seg.reroute;
             let grid = seg.grid.get_or_insert_with(|| {
-                JoinGrid::new(p0, p1, normal, self.subpoint_m, join_half_m(lattice))
+                JoinGrid::new(
+                    p0,
+                    p1,
+                    normal,
+                    self.subpoint_m,
+                    join_half_m(lattice),
+                    reference,
+                )
             });
             grid.read_column(k, floor_at, &mut seg.join_floors);
             if k + 1 < grid.columns() {
-                return (false, 0);
+                return (CorridorNext::More, 0);
             }
             let grid = seg.grid.take().expect("a joining segment's lattice");
             let floors = std::mem::take(&mut seg.join_floors);
@@ -1006,7 +1114,7 @@ impl<'a> RiverBuilder<'a> {
                 self.segs[s].raw[k as usize] = raw_offset(c, normal, self.corridor, floor_at);
             }
             if k + 1 < k_max {
-                return (false, 0);
+                return (CorridorNext::More, 0);
             }
             let lattice = &self.hydro.lattice;
             let (c0, c1) = (
@@ -1016,10 +1124,42 @@ impl<'a> RiverBuilder<'a> {
             taper(&mut self.segs[s].raw, p0 == c0, p1 == c1);
             (smoothed_points(p0, p1, normal, &self.segs[s].raw), 0)
         };
+        let mut points = points;
         let seg = &self.segs[s];
-        let floor: Vec<f64> = (0..=seg.last_k())
-            .map(|k| clean(floor_at(RenderDir(points[k as usize]))))
+        // Every point, the end included: the deepest cut compares whole courses.
+        let mut floor: Vec<f64> = points
+            .iter()
+            .map(|&p| clean(floor_at(RenderDir(p))))
             .collect();
+        if !seg.join && seg.may_reroute {
+            let beds = end_beds(self.hydro, seg.river);
+            let cut = max_cut(&floor, seg.k_max, beds);
+            if cut > REROUTE_CUT_M {
+                let seg = &mut self.segs[s];
+                seg.join = true;
+                seg.reroute = Some(beds);
+                seg.corridor_course = Some((points, seg.k_max, cut));
+                seg.raw = Vec::new();
+                return (CorridorNext::Restart, 0);
+            }
+        }
+        if let (Some(beds), Some((corridor, k_corridor, cut))) =
+            (seg.reroute, seg.corridor_course.as_ref())
+        {
+            if max_cut(&floor, seg.k_max, beds) >= *cut {
+                // The path cuts no less: the corridor stays.
+                points = corridor.clone();
+                let k = *k_corridor;
+                floor = points
+                    .iter()
+                    .map(|&p| clean(floor_at(RenderDir(p))))
+                    .collect();
+                self.segs[s].k_max = k;
+            }
+            self.segs[s].corridor_course = None;
+        }
+        let seg = &self.segs[s];
+        floor.truncate(seg.last_k() as usize + 1);
         let tau = (0..=seg.last_k())
             .map(|k| {
                 let after = self
@@ -1033,7 +1173,7 @@ impl<'a> RiverBuilder<'a> {
         seg.floor = floor;
         seg.tau = tau;
         seg.raw = Vec::new();
-        (true, extra)
+        (CorridorNext::Done, extra)
     }
 
     /// The smallest τ over the sub-points in the window of the point at `m_x` on segment `s`.
@@ -3033,6 +3173,121 @@ mod tests {
         assert!(metres_between(last, p1) <= 1.5 * SUBPOINT_M);
     }
 
+    /// The corridor course of non-joining segment `river`, as `relaxed_centreline` built it
+    /// before deep cuts were rerouted.
+    fn relaxed_corridor(
+        hydro: &EraHydrology,
+        river: u32,
+        subpoint_m: f64,
+        floor_at: &impl Fn(RenderDir) -> f64,
+    ) -> Vec<DVec3> {
+        let nodes = hydro.rivers.nodes();
+        let n = &nodes[river as usize];
+        let end = end_node(n, nodes);
+        let (c0, c1) = (hydro.lattice.dir(n.node).0, hydro.lattice.dir(end).0);
+        let p0 = relax_river_node(hydro, n.node, floor_at);
+        let p1 = relax_river_node(hydro, end, floor_at);
+        let ends = (p0, p1, chord_normal(p0, p1, c0, c1));
+        corridor_points(hydro, river, ends, subpoint_m, floor_at)
+    }
+
+    /// A winding valley the lattice's straight links cannot follow (the Verde north of Phoenix,
+    /// bug shot 2026-11-27 16:28:29): the main river's valley meets the equator at every node and
+    /// swings 6 km north between them, beyond the corridor's reach, cut into a plateau 400 m
+    /// over the bed with walls of slope 0.25 (1.6 km wide each side, as the Verde's slot was). Its floor runs 5 m under the pass bed, so the river belongs in
+    /// it. A river of 300 m³/s, too narrow to meander.
+    fn winding_valley() -> (EraHydrology, impl Fn(RenderDir) -> f64) {
+        let a380 = col_along(380);
+        let bed = move |a: f64| 900.0 - 1e-4 * (a - a380);
+        let hydro = river_hydro(LAT, &[main_chain(|_| 300.0, bed)], vec![]);
+        // The nodes' own positions: the lattice's spacing varies across the face.
+        let nodes: Vec<f64> = (380..=441).map(col_along).collect();
+        let floor = move |d: RenderDir| {
+            let (a, n) = (along_m(d.0), north_m(d.0));
+            let i = nodes.partition_point(|&x| x <= a).clamp(1, nodes.len() - 1);
+            let frac = ((a - nodes[i - 1]) / (nodes[i] - nodes[i - 1])).clamp(0.0, 1.0);
+            let valley = 6000.0 * (std::f64::consts::PI * frac).sin();
+            (bed(a) - 5.0 + 0.25 * (n - valley).abs()).min(bed(a) + 400.0)
+        };
+        (hydro, floor)
+    }
+
+    /// More sub-points than a corridor course of one lattice step takes (about 23 at 500 m):
+    /// the segment took its longer path.
+    const K_REROUTED_MIN: usize = 30;
+
+    /// A segment whose corridor course would cut far below the fine floor is refined along the
+    /// least-cost path to the pass bed instead, so the river runs in its valley, never more than
+    /// 50 m below the floor under it, and carves no slot through the plateau.
+    #[test]
+    fn a_river_follows_its_valley_where_the_corridor_misses_it() {
+        let (hydro, floor) = winding_valley();
+        // The hazard: the corridor misses the valley between the nodes, where the plateau
+        // stands 500 m over the bed.
+        let river = hydro.rivers.index_of(eq(405)).expect("a main river node");
+        let corridor_top = relaxed_corridor(&hydro, river, SUBPOINT_M, &floor)
+            .iter()
+            .map(|&p| floor(RenderDir(p)))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(corridor_top > 1200.0, "{corridor_top}");
+        let rr = build(&hydro, &floor);
+        for (r, points) in by_river(&rr) {
+            let bad: Vec<String> = points
+                .iter()
+                .filter(|sp| floor(RenderDir(sp.dir)) - f64::from(sp.level_m) >= 50.0)
+                .map(|sp| {
+                    format!(
+                        "({:.0} km, {:.1} km)",
+                        (along_m(sp.dir) - col_along(380)) / 1000.0,
+                        north_m(sp.dir) / 1000.0
+                    )
+                })
+                .collect();
+            eprintln!(
+                "DEBUG river {r} node col {:?}: {} pts, {} bad {:?}",
+                (380..=440).find(|&c| hydro.rivers.index_of(eq(c)) == Some(r)),
+                points.len(),
+                bad.len(),
+                &bad[..bad.len().min(6)]
+            );
+        }
+        let mut checked = 0;
+        for (r, points) in by_river(&rr) {
+            for sp in &points {
+                let cut = floor(RenderDir(sp.dir)) - f64::from(sp.level_m);
+                assert!(
+                    cut < 50.0,
+                    "river {r}: {cut:.0} m under the floor at {:?}",
+                    sp.dir
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "{checked} sub-points");
+        // A segment starts over as a path search mid-build: the result is the same for any
+        // budget, one unit a step included.
+        let one = build_at(&hydro, centre(), &floor, 1);
+        assert_eq!(bits(rr.subpoints()), bits(one.subpoints()));
+        // Another region 67 km east refines the same rerouted segment bit for bit.
+        let other = build_at(&hydro, LAT.dir(eq(415)), &floor, 997);
+        let here = by_river(&rr);
+        let there = by_river(&other);
+        let shared = hydro.rivers.index_of(eq(410)).expect("a main river node");
+        assert!(
+            here[&shared].len() > K_REROUTED_MIN,
+            "{} sub-points",
+            here[&shared].len()
+        );
+        assert_eq!(bits(&here[&shared]), bits(&there[&shared]));
+        // The reality check's centreline takes the same path.
+        let line = relaxed_centreline(&hydro, river, SUBPOINT_M, &floor);
+        let top = line
+            .iter()
+            .map(|&p| floor(RenderDir(p)))
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(top < 1000.0, "the centreline crosses {top:.0} m");
+    }
+
     /// Task 11e: two regions whose edges cut the joining corridor differently refine the joining
     /// path bit for bit the same, and the path leaves its chord by more than a texel inside both.
     #[test]
@@ -3073,6 +3328,22 @@ mod tests {
         }));
     }
 
+    /// How many of the network's refined segments take a rerouted path: their centreline is not
+    /// their corridor.
+    fn rerouted(hydro: &EraHydrology, floor: &impl Fn(RenderDir) -> f64) -> usize {
+        let nodes = hydro.rivers.nodes();
+        (0..nodes.len() as u32)
+            .filter(|&r| {
+                let n = &nodes[r as usize];
+                n.discharge_m3s >= MIN_Q
+                    && matches!(n.down, Down::River(_))
+                    && may_reroute(hydro, n)
+                    && relaxed_centreline(hydro, r, SUBPOINT_M, floor)
+                        != relaxed_corridor(hydro, r, SUBPOINT_M, floor)
+            })
+            .count()
+    }
+
     /// FNV-1a over every bit of every sub-point of a region's rivers inside its square (centred
     /// on `centre`): a set the gather's reach does not change.
     fn rivers_hash(rr: &RegionRivers, centre: RenderDir) -> u64 {
@@ -3106,12 +3377,16 @@ mod tests {
 
     /// Task 11e: a network with no burnt course (so no joining segment) refines exactly as it
     /// did before the joining paths, over the sub-points inside the region's square (the gather's
-    /// widened reach adds segments outside it): the hashes are 8a8a2be's. The hand-built tree with
-    /// its notched floor, and a real pass over the synthetic continent.
+    /// widened reach adds segments outside it). The hand-built tree with its notched floor, and a
+    /// real pass over the synthetic continent. The hashes were 8a8a2be's until deep cuts were
+    /// rerouted ([`REROUTE_CUT_M`]): both fixtures hold corridors cutting deeper than that (the
+    /// tree's floor rises 20 m per km north of the main river while its tributaries' beds rise
+    /// 40 m a node; the continent's 250 m waves), where the path cuts less, so the hashes are
+    /// re-pinned at that change and each fixture is checked to hold a rerouted segment.
     ///
     /// The hashes are bit-exact, and the floor, the pass and the refinement all call `libm`'s
     /// transcendentals (`sin`, `cos`, `asin`, `atan2`), whose last bits differ between macOS and
-    /// glibc. So the comparison with 8a8a2be's hashes runs on macOS only, where they were taken;
+    /// glibc. So the comparison with the pinned hashes runs on macOS only, where they were taken;
     /// elsewhere (CI's Linux) the test checks that the refinement is deterministic.
     #[test]
     fn links_that_do_not_join_a_course_are_unchanged() {
@@ -3126,6 +3401,10 @@ mod tests {
             2030.0 - 3e-4 * (a - col_along(380)) + 0.02 * n.abs() - notch
         };
         let tree_hash = rivers_hash(&build_at(&hydro, centre(), &floor, 997), centre());
+        assert!(
+            rerouted(&hydro, &floor) > 0,
+            "the tree holds a rerouted segment"
+        );
         let hydro = pass(75);
         let floor =
             |d: RenderDir| continent(d) + 40.0 * (d.0.y * 3000.0).sin() * (d.0.z * 2100.0).cos();
@@ -3138,11 +3417,15 @@ mod tests {
             .expect("rivers on the continent");
         let at = hydro.lattice.dir(big.node);
         let pass_hash = rivers_hash(&build_at(&hydro, at, &floor, 997), at);
+        assert!(
+            rerouted(&hydro, &floor) > 0,
+            "the continent holds a rerouted segment"
+        );
         println!("hashes: tree {tree_hash:#018x}, pass {pass_hash:#018x}");
         if cfg!(target_os = "macos") {
             assert_eq!(
                 (tree_hash, pass_hash),
-                (0x00bd_9c86_9150_bb4c, 0xfbb4_3919_e357_0e49)
+                (0x7327_afa9_5f85_ef70, 0x1738_6046_6526_909b)
             );
         } else {
             assert_eq!(

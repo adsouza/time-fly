@@ -440,8 +440,10 @@ fn paint(params: TerrainParams, xz: vec2<f32>, height: f32, slope: f32, footprin
     // Tree-scale breakup inside the canopy: crowns lit and shaded.
     c = c * (1.0 + canopy * 0.12 * (n60 + 0.8 * n9));
 
-    // Sand along non-Barren shores, just above the sea.
-    // (The shore flag is read through the warp, so the height bounds keep these at the coast.)
+    // Sand along non-Barren shores, just above the sea. The shore flag marks texels near sea
+    // level in a coast's coarse cells, where the sea may stand (the generator's own sea test),
+    // so a low plain inland gets none; it is read through the warp, so the height bounds keep
+    // the sand at the coast.
     let beach = shore * (1.0 - barren) * (1.0 - smoothstep(1.0, 9.0, height + 6.0 * n60));
     c = mix(c, BEACH_SAND, beach * 0.6);
 
