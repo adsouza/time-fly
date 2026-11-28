@@ -17,7 +17,7 @@ frame is tied to texel values. Images are in `defects/`.
 |---|-------|-------|------------------------------|--------|
 | A | Globe 250 Ma: dashed blue strokes, a line ending in a blob, slivers | Gaps between rigid plates show the ocean shell | Yes (globe code identical to `main`) | Diagnosed; fix proposed (skirts) |
 | B | Phoenix: dotted dark lines beside the river; Andes: dark-blue slivers beside the river | Dry `RIVER_NONE` taps leak a +1,000 m ribbon into a perched river's footprint edge | No (rivers milestone) | **Fixed**, tests RED → GREEN, renders before/after |
-| C | Phoenix: river breaks at a hook beside a dark pit; Sichuan: near-black pit | A 2–3 texel slot, 400 m deep, carved under a flat lattice-held level; hidden by the coarse mesh from afar | No (rivers milestone) | Diagnosed; options for the owner |
+| C | Phoenix: river breaks at a hook beside a dark pit; Sichuan: near-black pit | The course runs 3–6 km off its valley, past the corridor's reach; the bed forces a 400 m slot through the plateau, which the coarse mesh hides from afar | No (rivers milestone) | **Fixed**: deep-cut segments rerouted by least-cost path; tests, reality check, renders |
 | D | Kanto: tan bands along rivers and coast | The beach rule paints all land under ~9 m, not the coast | Yes (M2 rule, unchanged) | Diagnosed; fix proposed |
 | E | Kanto: small blocky lakes in the bands | Sea-level water in the Tone lowlands decided per hydro tap / lake-map cell | Mixed (DEM-sign rule) | Diagnosed; known follow-up |
 | F | Phoenix: teal blocky patches at the horizon | Mogollon Rim forest canopy colour on 1.85 km Köppen cells | Yes | Confirmed not water |
@@ -99,37 +99,69 @@ remain, a separate cause, not investigated).
 (5.0–5.2 GB free; a `timefly` test binary costs about 900 MB) and the guard was already deleting
 build dirs.
 
-## C. The hook and the pit: a narrow slot under a held level
+## C. The hook and the pit: a course off its valley (fixed)
 
 **Shot:** Phoenix (the Verde north of Bartlett Lake). Probably also the Sichuan pit (§14), not
 checked.
 
 **Diagnosis.**
 
-- The river's course is a polyline with sharp corners; the "hook" is one of them (row 330 in
-  `defects/phoenix-texels-projected.jpg`; `defects/phoenix-slot-6km.jpg` shows the corners).
-- Downstream of it, the level is held flat at 941 m for 14 km (rows 320–368), then drops 110 m in
-  2 km (rows 368–380, where the bed is carved to 753 m, 170 m under the water). The held reach is
-  carved as a slot 2–3 texels (600–900 m) wide and up to 400 m deep into a 1,300–1,550 m plateau
-  (the real Verde is at about 750–800 m there).
-- The water is present the whole way: offsets change sign cleanly between neighbouring texels
-  and the half-width is a steady 11.3 m. From 6 km it draws as a continuous river
-  (`defects/phoenix-slot-6km.jpg`).
-- From 70 km (the shot), the coarse CDLOD mesh bridges the slot and the water, pulled toward the
-  camera by only 1 m + 6e-4 · d (about 43 m), is hidden under it. The terrain shader's per-pixel
-  normals still paint the slot's 400 m west wall in shadow: the black "pit".
+- The "hook" is a corner of the course's polyline: a lattice node, where one straight link meets
+  the next (row 330 in `defects/phoenix-texels-projected.jpg`).
+- Downstream of it the course crosses a plateau at 1,000–1,550 m while the fine DEM's own Verde
+  valley, its floor at 790–890 m, runs 3–6 km east of it (rows 332–372, read from the
+  uncarved texels beside the carve). The relaxation that moves a course onto its valley floor
+  reaches only about ±3 km: node relaxation ±2.7 km, sub-point offsets ±3.3 km (`C` = 0.4 of
+  the 11 km lattice spacing, interior minima only). The valley lies just past it.
+- A river's bed is `min(B, τ)`: the coarse pass bed `B` (here 941–942 m, flat for 14 km) or
+  lower where the fine floor allows, never higher. So the carve cut a slot 600–900 m wide and up
+  to 400 m deep through the plateau to reach `B`.
+- From 70 km the terrain mesh (LOD 3, 1.17 km quads) bridges the slot. The water is drawn the
+  whole way: a render with the distant terrain dropped shows the river continuous through the
+  slot (`defects/phoenix-mesh-experiment.jpg`, third panel; a 10× finer water mesh alone changes
+  nothing). The water's depth pull, about 43 m there, cannot reach it under the bridge, and the
+  per-pixel shading paints the slot's west wall black: the "pit".
 
-**Before the milestone:** no; the carve and the held levels are the rivers milestone's.
+**Before the milestone:** no; the carve and the river courses are the rivers milestone's.
 
-**Options (owner's call):**
-1. Shape deep cuts so the mesh can resolve them: widen the valley with depth (a wall slope that
-   keeps a cut at least N texels wide per 100 m of depth), so a 400 m cut is a broad V rather
-   than a slot.
-2. Hide less: test the water against the fine height rather than the morphing mesh, or pull it
-   further toward the camera where the mesh is coarse (risks water over rocks, cf. the depth-pull
-   note in `water.wesl`).
-3. Fix the level: held reaches follow the lattice's spill, not the real valley; a reach relaxed
-   onto the fine DEM's valley floor (as burnt courses are) would need no slot at all.
+**Fix (commit on this branch, the owner's choice of 2026-11-28).** A segment whose corridor
+course stands more than `REROUTE_CUT_M` = 150 m over its pass bed at some interior sub-point is
+refined along the least-cost path instead: the joining search of Task 11e (one lattice spacing
+either side of the chord), with each step's climb measured from the pass bed lerped along the
+segment rather than from the straight line between its ends' floors (with the ends' line, a
+path between two plateau nodes has no reason to leave the chord). The path is smoothed four
+times instead of once, since on gentle ground the cheapest 8-neighbour path is a staircase. It
+replaces the corridor only where its own deepest cut is smaller. Segments with an end on one of
+today's burnt courses keep their anchors; joining segments are unchanged. `relaxed_centreline`
+(the reality check's) applies the same rule, so every region and the check agree.
+
+**Tests.** `a_river_follows_its_valley_where_the_corridor_misses_it`: a valley that meets the
+lattice at every node and swings 6 km off between them, cut into a plateau 400 m over the bed;
+every refined sub-point stays within 50 m of the floor (RED: 75 m and more with the reroute off),
+the result is identical at a budget of one unit a step, a second region 67 km away refines the
+rerouted segment bit for bit the same, and the reality check's centreline crosses no plateau.
+`links_that_do_not_join_a_course_are_unchanged` is re-pinned: both its fixtures hold corridors
+that cut far deeper than 150 m (2 km in the tree), and the test now asserts each holds a rerouted
+segment. `placed_boulders_and_collars_lie_in_the_drawn_water` judges its 200 m river against
+`MAX_BOULDERS`, which that river already hit before the change (16,040 of 47,866 kept, the
+check passing by 0.5%); the rerouted course is longer (53,088 generated, 16,115 kept). All 397
+`timefly_core` tests pass and clippy is clean.
+
+**The reality check.** Same 270 summary lines and verdicts as `9814212`: everything passes
+except the Indus box, which failed identically before. Two of the Amazon box's missed links in
+the Peruvian Andes moved slightly (worst 62.5 → 61.0 km, 27.7 → 28.4 km); the box passes.
+
+**Renders.** `defects/phoenix-reroute-shot.jpg` (the bug shot's pose; left before, right after):
+the river runs on past the hook instead of vanishing into a black gash; a few short breaks
+remain where the real valley's own shadowed wall hides the water from 70 km.
+`defects/phoenix-reroute-6km.jpg` (6 km, 45° down; top before, bottom after): the course leaves
+the straight link and curves down the real valley; the slot, its two black trenches and the
+smeared walls across the plateau are gone. The hook's corner stays: the upstream segment's
+corridor does not cut deep enough to be rerouted.
+
+**Not measured:** region generation time in release (`time_a_river_dense_region`). A rerouted
+segment costs one path search like a joining segment (at most 4,096 lattice points); the debug
+replays generated the Phoenix region in 372 ms of preparation.
 
 ## D. Kanto's tan bands: the beach rule is elevational
 
