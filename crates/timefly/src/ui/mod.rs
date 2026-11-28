@@ -8,6 +8,7 @@ pub mod altitude;
 pub mod bug_shot;
 pub mod credits;
 pub mod fps;
+mod polygons;
 pub mod position;
 pub mod slider;
 pub mod status;

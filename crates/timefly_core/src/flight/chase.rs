@@ -19,7 +19,7 @@ pub const GLOBE_CHASE_DIVE_LOOK_DEG: f64 = 50.0;
 /// The lowest the globe's chase eye may sit above the fly's horizon (degrees): the region's
 /// [`CHASE_ELEVATION_DEG`]. A drag moves the eye and the look together, so at and below
 /// [`DIVE_ALTITUDE_KM`] a drag up stops with the view looking 15° down, the region's start look;
-/// higher it stops steeper, up to 33.8° at the top ([`CHASE_GLOBE_TOP_PITCH_DEG`] − 50°). Lower,
+/// higher it stops steeper, up to 35° at the top ([`CHASE_GLOBE_TOP_PITCH_DEG`] − 50°). Lower,
 /// a fly descending nose down shows the eye its wings edge-on (M3 Task 14:
 /// below about 15°; 2° of wing at the old floor of 5°, `creature`'s edge-on test).
 pub const GLOBE_CHASE_MIN_ELEVATION_DEG: f64 = CHASE_ELEVATION_DEG;
@@ -31,7 +31,7 @@ pub const GLOBE_CHASE_DIVE_ELEVATION_DEG: f64 =
 /// The globe chase eye's elevation at [`GLOBE_MAX_ALTITUDE_KM`] (degrees), owner's choice
 /// "A: globe centred" (M3 Task 14): behind the fly, never overhead, and high enough that the
 /// globe is behind the fly. From an eye at elevation `E` behind a fly at radius `r` the fly is
-/// seen over the globe only when `r·cos E < R`, 64° at the top; at 70° the fly sits over the
+/// seen over the globe only when `r·cos E < R`; at 70° the fly sits over the
 /// globe's upper part, and the look ([`CHASE_GLOBE_TOP_PITCH_DEG`]) centres the whole globe.
 pub const GLOBE_CHASE_TOP_ELEVATION_DEG: f64 = 70.0;
 /// The highest a drag may raise the globe's chase eye (degrees): still behind the fly.
@@ -156,7 +156,7 @@ pub fn globe_chase_distance_km(altitude_km: f64) -> f64 {
 /// a drag down little room).
 pub fn globe_look_offset_range(altitude_km: f64) -> (f64, f64) {
     // |eye|² = r² + 2·r·d·sin(e) + d² for the eye at elevation e, distance d behind a fly at
-    // radius r: the 3R cap bounds sin(e).
+    // radius r: the camera distance cap bounds sin(e).
     let r = EARTH_RADIUS_KM + altitude_km;
     let d = globe_chase_distance_km(altitude_km);
     let cap = GLOBE_MAX_CAMERA_DISTANCE_KM;
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_never_goes_past_three_radii() {
+    fn the_camera_stays_within_two_and_three_quarter_radii() {
         // 64 headings, and look pitches across the drag's whole range (and beyond, which the
         // pose clamps), at the top altitude and on the way down.
         for alt in [

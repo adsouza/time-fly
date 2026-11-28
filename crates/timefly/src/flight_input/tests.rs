@@ -64,6 +64,11 @@ fn flight(app: &App) -> timefly_core::flight::globe::GlobeFlight {
 #[test]
 fn flight_input_touch_controls_the_globe_without_keyboard() {
     let (mut app, window) = globe_app();
+    // Leave room to tilt down before starting the gesture.
+    app.world_mut()
+        .resource_mut::<GlobeFlightState>()
+        .0
+        .altitude_km = 5_000.0;
     let start = flight(&app);
     let a = Vec2::new(120.0, 320.0);
     let b = Vec2::new(280.0, 320.0);

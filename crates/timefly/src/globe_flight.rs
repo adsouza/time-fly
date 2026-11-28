@@ -6,7 +6,7 @@
 //!   special case. [`GlobeLook`] holds the view drag's offset.
 //! - **Input** ([`GlobeFlightSystems::Step`]), on the globe and while a dive waits in the cloud
 //!   (the player can climb back out to cancel it): the region's keys ([`crate::fly_camera::keys_to_input`]), the
-//!   drag and the scroll wheel (up descends, down climbs, M1's zoom habit), mapped by
+//!   drag and scroll momentum (up descends, down climbs, M1's zoom habit), mapped by
 //!   [`globe_input`] and stepped by `globe_fly_step`. Below the dive altitude a descent eases
 //!   into the floor inside the cloud ([`descent_ease`]).
 //!   A drag turns the fly and tilts the view (dragging down looks further down, as in a
@@ -17,7 +17,7 @@
 //!   (`crate::terrain::RegionViewSystems`) and before the bridge cameras copy the globe camera,
 //!   [`GlobeCameraSync`]): `globe_chase_pose` in kilometres, the look pitch rising with altitude
 //!   (`globe_look_pitch_deg`: 50° at the dive, so the ground fills the lower two-thirds of the
-//!   frame, to 83.8° at the top, where the whole globe is centred) and the eye behind the fly,
+//!   frame, to 85° at the top, where the whole globe is centred) and the eye behind the fly,
 //!   rising from 55° at the dive (the fly 5° below the view's centre, as in a region) to 70° at
 //!   the top (`globe_chase_elevation_deg`: never overhead, the fly over the globe's upper part;
 //!   owner's "A: globe centred", M3 Task 14). The glide is the region's ([`ChaseGlide`]); the held offsets are carried
@@ -91,11 +91,10 @@ pub struct GlobeLook {
 /// Opening chase pose calibrated to a camera at 2.75 Earth radii with Hainan Island
 /// (19.2° N, 109.7° E) at screen centre. The northbound fly starts a little north of the island.
 pub(crate) fn opening_globe_flight() -> (GlobeFlightState, GlobeLook) {
-    let flight = GlobeFlight {
-        altitude_km: 7_537.36,
-        ..GlobeFlight::start(21.302_997, 109.7)
-    };
-    (GlobeFlightState(flight), GlobeLook { offset_deg: 1.43 })
+    (
+        GlobeFlightState(GlobeFlight::start(22.075_932, 109.7)),
+        GlobeLook::default(),
+    )
 }
 
 /// Globe flight's systems: [`GlobeFlightSystems::Step`] turns input into
@@ -331,6 +330,11 @@ pub(crate) fn apply_globe_flight(
         carry,
         time.delta_secs_f64(),
     );
+    // The glide can lag behind the desired eye as the fly climbs. Keep the smoothed eye
+    // inside the distance limit and carry the target with it to preserve the view direction.
+    let capped_eye = eye.clamp_length_max(GLOBE_MAX_CAMERA_DISTANCE_KM);
+    let target = target + (capped_eye - eye);
+    let eye = capped_eye;
     let want_camera =
         Transform::from_translation(eye.as_vec3()).looking_at(target.as_vec3(), up.as_vec3());
     if *camera != want_camera {
@@ -606,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_never_goes_past_three_radii() {
+    fn the_camera_stays_within_two_and_three_quarter_radii() {
         // 64 headings at the top, each with the drag's whole range (and past it), every frame
         // of the glide between them.
         let (mut app, cam) = app(16.0 / 9.0);
@@ -622,7 +626,7 @@ mod tests {
                     app.update();
                     let r = camera(&app, cam).translation.as_dvec3().length();
                     assert!(
-                        r <= GLOBE_MAX_CAMERA_DISTANCE_KM + 1.0,
+                        r / EARTH_RADIUS_KM <= 2.75 + 1e-6,
                         "heading {i}, offset {offset}, frame {frame}: {r} km"
                     );
                 }
@@ -799,51 +803,140 @@ mod tests {
         }
     }
 
+    fn scroll_once(app: &mut App, unit: MouseScrollUnit, y: f32) {
+        let mut scroll = app.world_mut().resource_mut::<AccumulatedMouseScroll>();
+        scroll.unit = unit;
+        scroll.delta = Vec2::new(0.0, y);
+        app.update();
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseScroll>()
+            .delta = Vec2::ZERO;
+    }
+
     #[test]
-    fn the_scroll_wheel_climbs_and_descends_on_the_globe() {
+    fn the_scroll_wheel_coasts_in_both_directions_and_stops() {
+        let (mut app, _) = app(16.0 / 9.0);
+        app.init_resource::<AccumulatedMouseScroll>();
+        let start = 3_000.0;
+        set_flight(&mut app, at(start));
+        app.update();
+
+        scroll_once(&mut app, MouseScrollUnit::Line, 2.0);
+        let descending = flight(&app).altitude_km;
+        assert!(descending < start);
+        app.update();
+        let coasting = flight(&app).altitude_km;
+        assert!(coasting < descending);
+        assert!(descending - coasting < start - descending);
+        run(&mut app, 60);
+        let low = flight(&app).altitude_km;
+        assert!((0.8 * start..0.82 * start).contains(&low), "{low}");
+        app.update();
+        assert_eq!(flight(&app).altitude_km, low);
+
+        scroll_once(&mut app, MouseScrollUnit::Pixel, -2.0 * PIXELS_PER_LINE);
+        let climbing = flight(&app).altitude_km;
+        assert!(climbing > low);
+        app.update();
+        assert!(flight(&app).altitude_km > climbing);
+        run(&mut app, 60);
+        let high = flight(&app).altitude_km;
+        assert!((1.2 * low..1.23 * low).contains(&high), "{high}");
+        app.update();
+        assert_eq!(flight(&app).altitude_km, high);
+    }
+
+    #[test]
+    fn scrolling_reverses_immediately_and_stops_over_ui() {
         let (mut app, _) = app(16.0 / 9.0);
         app.init_resource::<AccumulatedMouseScroll>();
         set_flight(&mut app, at(3_000.0));
         app.update();
-        let scroll = |app: &mut App, unit: MouseScrollUnit, y: f32| {
-            let mut s = app.world_mut().resource_mut::<AccumulatedMouseScroll>();
-            s.unit = unit;
-            s.delta = Vec2::new(0.0, y);
-            app.update();
-            app.world_mut()
-                .resource_mut::<AccumulatedMouseScroll>()
-                .delta = Vec2::ZERO;
-            app.update();
-            flight(app).altitude_km
-        };
-        // Scrolling up (away) descends, as M1's zoom closed in: each line is
-        // SCROLL_CLIMB_S_PER_LINE of full climb at the keys' speed (0.8 × altitude a second).
-        let per_line = SPEED_PER_ALTITUDE * SCROLL_CLIMB_S_PER_LINE;
-        let a = scroll(&mut app, MouseScrollUnit::Line, 2.0);
-        assert!((a - 3_000.0 * (1.0 - 2.0 * per_line)).abs() < 1e-6, "{a}");
-        let b = scroll(&mut app, MouseScrollUnit::Pixel, -2.0 * PIXELS_PER_LINE);
-        assert!((b - a * (1.0 + 2.0 * per_line)).abs() < 1e-3, "{b}");
-        // Not over the UI.
+
+        scroll_once(&mut app, MouseScrollUnit::Line, 3.0);
+        let descending = flight(&app).altitude_km;
+        scroll_once(&mut app, MouseScrollUnit::Line, -0.25);
+        let reversed = flight(&app).altitude_km;
+        assert!(reversed > descending);
+
         app.insert_resource(PointerOverUi(true));
-        assert_eq!(scroll(&mut app, MouseScrollUnit::Line, 3.0), b);
+        scroll_once(&mut app, MouseScrollUnit::Line, 3.0);
+        app.insert_resource(PointerOverUi(false));
+        run(&mut app, 10);
+        assert_eq!(flight(&app).altitude_km, reversed);
+    }
+
+    #[test]
+    fn scrolling_out_and_coasting_stops_at_two_and_three_quarter_radii() {
+        let (mut app, cam) = app(16.0 / 9.0);
+        app.init_resource::<AccumulatedMouseScroll>();
+        set_flight(&mut app, at(6_500.0));
+        app.update();
+
+        scroll_once(&mut app, MouseScrollUnit::Line, -8.0);
+        for _ in 0..240 {
+            let radii = camera(&app, cam).translation.as_dvec3().length() / EARTH_RADIUS_KM;
+            assert!(radii <= 2.75 + 1e-6, "{radii}R");
+            app.update();
+        }
+        let radii = camera(&app, cam).translation.as_dvec3().length() / EARTH_RADIUS_KM;
+        assert!((radii - 2.75).abs() < 1e-6, "{radii}R");
+
+        scroll_once(&mut app, MouseScrollUnit::Line, 1.0);
+        run(&mut app, 60);
+        let radii = camera(&app, cam).translation.as_dvec3().length() / EARTH_RADIUS_KM;
+        assert!(radii < 2.75);
+    }
+
+    #[test]
+    fn vertical_keys_and_world_transitions_cancel_scroll_momentum() {
+        use crate::region::navigate::World;
+        use bevy::state::app::StatesPlugin;
+
+        let (mut app, _) = app(16.0 / 9.0);
+        app.add_plugins(StatesPlugin)
+            .init_state::<RegionState>()
+            .init_resource::<Navigation>()
+            .init_resource::<AccumulatedMouseScroll>();
+        set_flight(&mut app, at(3_000.0));
+        app.update();
+
+        scroll_once(&mut app, MouseScrollUnit::Line, 3.0);
+        let descending = flight(&app).altitude_km;
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyE);
+        app.update();
+        let climbing = flight(&app).altitude_km;
+        assert!(climbing > descending);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::KeyE);
+        app.update();
+        assert_eq!(flight(&app).altitude_km, climbing);
+
+        scroll_once(&mut app, MouseScrollUnit::Line, 3.0);
+        let before_transition = flight(&app).altitude_km;
+        app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Emerging {
+            world: World::Globe,
+            elapsed_s: 0.5,
+        };
+        app.update();
+        app.world_mut().resource_mut::<Navigation>().phase = NavPhase::Globe;
+        run(&mut app, 10);
+        assert_eq!(flight(&app).altitude_km, before_transition);
     }
 
     #[test]
     fn scrolling_can_reach_one_point_one_five_radii_before_the_cloud() {
         let (mut app, cam) = app(16.0 / 9.0);
         app.init_resource::<AccumulatedMouseScroll>();
-        set_flight(&mut app, at(750.0));
+        set_flight(&mut app, at(745.0));
         app.update();
         let close_distance_km = 1.15 * EARTH_RADIUS_KM;
         assert!(f64::from(camera(&app, cam).translation.length()) > close_distance_km);
 
-        let mut scroll = app.world_mut().resource_mut::<AccumulatedMouseScroll>();
-        scroll.unit = MouseScrollUnit::Line;
-        scroll.delta = Vec2::Y;
-        app.update();
-        app.world_mut()
-            .resource_mut::<AccumulatedMouseScroll>()
-            .delta = Vec2::ZERO;
+        scroll_once(&mut app, MouseScrollUnit::Line, 1.0);
         run(&mut app, 60);
 
         let altitude_km = flight(&app).altitude_km;

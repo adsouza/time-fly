@@ -27,7 +27,7 @@
 //!    [`LEAVE_SETTLE_SECS`] before memory is sampled.
 //!
 //! The keys go through `ButtonInput<KeyCode>`, the shell's own input path: [`drive_journey_keys`]
-//! presses them before navigation reads them, and re-presses any the window let go (a lost focus
+//! presses them before flight input is gathered, and re-presses any the window let go (a lost focus
 //! releases every key). Measuring runs after navigation, on the frame's own phase and cloud.
 //!
 //! **Summary and gates** (one block, in the scrub and region benches' format):
@@ -75,6 +75,7 @@
 //! after the summary: 0 on PASS, `FAILED_RESULT_EXIT_CODE` on FAIL, as the other benches.
 
 use bevy::ecs::system::SystemParam;
+use bevy::input::InputSystems;
 use bevy::math::DVec3;
 use bevy::prelude::*;
 use timefly_core::deep_time::YearsBp;
@@ -1164,19 +1165,15 @@ impl Plugin for JourneyBenchPlugin {
             .add_message::<HydroPassFinished>()
             .init_resource::<GpuBenchmarkScope>()
             .add_message::<GpuFrameMeasured>()
-            .add_systems(
-                Update,
-                (
-                    // Keys first, so navigation and both flies read them this frame.
-                    drive_journey_keys.before(NavigationSystems),
-                    measure_journey.after(NavigationSystems),
-                ),
-            );
+            // Bevy clears key edges in InputSystems. The flight intent gathered in Update
+            // must see the scripted Backspace press in that same frame.
+            .add_systems(PreUpdate, drive_journey_keys.after(InputSystems))
+            .add_systems(Update, measure_journey.after(NavigationSystems));
         trace::add_trace(app);
     }
 }
 
-/// Holds the script's keys down through `ButtonInput<KeyCode>`, before navigation reads them.
+/// Holds the script's keys down through `ButtonInput<KeyCode>` for this frame's flight intent.
 fn drive_journey_keys(
     mut bench: ResMut<JourneyBench>,
     nav: Option<Res<Navigation>>,

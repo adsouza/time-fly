@@ -27,6 +27,7 @@ use bevy::render::storage::ShaderBuffer;
 use bevy::render::view::{DebandDither, Tonemapping};
 use bevy::render::{Render, RenderApp, RenderSystems};
 use bevy::shader::ShaderCacheError;
+use timefly_core::flight::altitudes::GLOBE_MAX_CAMERA_DISTANCE_KM;
 use timefly_core::flight::chase::globe_chase_pose;
 use timefly_core::globe::{DeepSampling, source_id_ranks};
 use timefly_core::surface::{FrameSelection, Timeline};
@@ -64,7 +65,7 @@ pub const SUN_DIRECTION: Vec3 = Vec3::new(0.55, 0.32, 0.77);
 /// Space behind the globe.
 pub const SPACE_COLOR: Color = Color::srgb(0.035, 0.04, 0.07);
 /// Fallback distance for bridge cameras before syncing to the globe camera.
-pub const CAMERA_DISTANCE_KM: f32 = 3.0 * EARTH_RADIUS_KM as f32;
+pub const CAMERA_DISTANCE_KM: f32 = GLOBE_MAX_CAMERA_DISTANCE_KM as f32;
 
 /// Subdivisions of the ocean shell and atmosphere cube-spheres.
 const SHELL_SUBDIVISIONS: u32 = 48;
@@ -315,7 +316,7 @@ pub struct GlobeCameraSync;
 
 /// An offscreen camera of the bridge, rendering one globe layer.
 #[derive(Component)]
-struct BridgeCamera {
+pub(crate) struct BridgeCamera {
     layer: usize,
 }
 

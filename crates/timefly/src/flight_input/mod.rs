@@ -25,6 +25,11 @@ pub use self::keyboard::{
 use self::target::{Destination, TargetWorld};
 use self::touch::Gestures;
 
+/// Time constant for the part of a scroll gesture that continues after the event.
+const SCROLL_COAST_S: f64 = 0.12;
+const MAX_SCROLL_COAST_LINES: f64 = 4.0;
+const SCROLL_STOP_LINES: f64 = 0.005;
+
 /// Motion for the current frame, in the same local axes as the keyboard. The duration is
 /// normally the frame time. For a fast gesture it can be longer, so motion tracks finger
 /// displacement even when the frame time is short.
@@ -134,6 +139,7 @@ impl TouchUi<'_, '_> {
 struct InputState {
     view: FlightView,
     mouse_look: bool,
+    coast_scroll_lines: f64,
     gestures: Gestures,
     destination: Option<Destination>,
 }
@@ -173,7 +179,7 @@ fn gather_intent(
         .as_ref()
         .filter(|_| state.mouse_look)
         .map_or(Vec2::ZERO, |m| m.delta);
-    let scroll_lines = devices
+    let raw_scroll_lines = devices
         .scroll
         .as_ref()
         .filter(|_| !over_ui)
@@ -181,10 +187,17 @@ fn gather_intent(
             MouseScrollUnit::Line => f64::from(s.delta.y),
             MouseScrollUnit::Pixel => f64::from(s.delta.y / PIXELS_PER_LINE),
         });
+    let raw_scroll_lines = if raw_scroll_lines.is_finite() {
+        raw_scroll_lines
+    } else {
+        0.0
+    };
 
     let window = ui.window.single().ok();
+    let mut lost_focus = false;
     for event in devices.focus.read() {
         if window.is_some_and(|(id, _)| id == event.window && !event.focused) {
+            lost_focus = true;
             state.mouse_look = false;
             state.gestures = Gestures::default();
             state.destination = None;
@@ -222,6 +235,18 @@ fn gather_intent(
     let pan = touch.pan * (1.5 / short_side);
     let travel_s = Vec3::new(pan.x, -pan.y, -touch.pinch * 0.75);
     let look_delta = mouse_look + touch.look;
+    let scroll_lines = if view == FlightView::Globe
+        && !over_ui
+        && !lost_focus
+        && window.is_none_or(|(_, w)| w.focused)
+        && held.move_local.y == 0.0
+        && travel_s.y == 0.0
+    {
+        step_scroll(&mut state.coast_scroll_lines, raw_scroll_lines, dt_s)
+    } else {
+        state.coast_scroll_lines = 0.0;
+        0.0
+    };
     let (movement, dt_s) = combine_movement(held, travel_s, dt_s);
     let mut intent = FlightIntent {
         movement,
@@ -239,6 +264,7 @@ fn gather_intent(
         || travel_s != Vec3::ZERO
         || held != FlightAxes::default()
         || mouse_look != Vec2::ZERO
+        || raw_scroll_lines != 0.0
         || scroll_lines != 0.0
         || leave;
     if !can_target || interrupted || touch.started {
@@ -256,6 +282,27 @@ fn gather_intent(
         state.destination = None;
     }
     *output = intent;
+}
+
+/// Apply half the wheel motion right away and release the rest with an exponential decay.
+/// Opposite scroll input drops the pending motion so it can reverse direction immediately.
+fn step_scroll(pending_lines: &mut f64, lines: f64, dt_s: f64) -> f64 {
+    if dt_s <= 0.0 {
+        return 0.0;
+    }
+    if *pending_lines * lines < 0.0 {
+        *pending_lines = 0.0;
+    }
+    let immediate = 0.5 * lines;
+    let pending =
+        (*pending_lines + immediate).clamp(-MAX_SCROLL_COAST_LINES, MAX_SCROLL_COAST_LINES);
+    let remaining = pending * (-dt_s / SCROLL_COAST_S).exp();
+    *pending_lines = if remaining.abs() > SCROLL_STOP_LINES {
+        remaining
+    } else {
+        0.0
+    };
+    immediate + (pending - remaining)
 }
 
 fn combine_movement(mut held: FlightAxes, travel_s: Vec3, dt_s: f64) -> (FlightAxes, f64) {

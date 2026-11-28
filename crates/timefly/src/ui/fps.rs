@@ -1,10 +1,11 @@
-//! A small translucent frame-rate readout in the top-right corner (`60 fps`).
+//! Small translucent frame-rate and polygon-count readouts in the top-right corner.
 //!
 //! The rate is frames over real seconds, refreshed every [`FPS_REFRESH_S`]: steady enough to
 //! read, and the text is re-laid out twice a second rather than every frame.
 
 use bevy::prelude::*;
 
+use super::polygons::{PolygonCount, add_polygon_count};
 use super::{CORNER_BUTTON_PX, CORNER_GAP_PX, GUTTER_PX, TEXT_COLOR};
 
 /// Seconds of real time each shown rate averages over (and how often it changes).
@@ -30,6 +31,9 @@ pub fn fps_label(fps: f32) -> String {
 #[derive(Component)]
 pub struct FpsText;
 
+#[derive(Component)]
+struct PolygonText;
+
 /// Frames and real seconds counted since the last refresh.
 #[derive(Default)]
 struct FpsWindow {
@@ -42,15 +46,23 @@ pub struct FpsOverlayPlugin;
 
 impl Plugin for FpsOverlayPlugin {
     fn build(&self, app: &mut App) {
+        add_polygon_count(app);
         app.add_systems(Startup, spawn_fps_overlay)
-            .add_systems(Update, update_fps);
+            .add_systems(Update, (update_fps, update_polygons));
     }
 }
 
 fn spawn_fps_overlay(mut commands: Commands) {
+    commands.spawn((Name::new("FPS readout"), FpsText, corner_readout(GUTTER_PX)));
     commands.spawn((
-        Name::new("FPS readout"),
-        FpsText,
+        Name::new("Polygon count readout"),
+        PolygonText,
+        corner_readout(GUTTER_PX + CORNER_BUTTON_PX.y + 4.0),
+    ));
+}
+
+fn corner_readout(top: f32) -> impl Bundle {
+    (
         Text::new(""),
         TextFont::from_font_size(14.0),
         TextColor(TEXT_COLOR),
@@ -58,7 +70,7 @@ fn spawn_fps_overlay(mut commands: Commands) {
         // the 14 px text (about 17 px a line) centred in it.
         Node {
             position_type: PositionType::Absolute,
-            top: px(GUTTER_PX),
+            top: px(top),
             right: px(GUTTER_PX + CORNER_BUTTON_PX.x + CORNER_GAP_PX),
             height: px(CORNER_BUTTON_PX.y),
             padding: UiRect::axes(px(8), px(1.5)),
@@ -69,7 +81,7 @@ fn spawn_fps_overlay(mut commands: Commands) {
         // Above the captions, like the bench banner; never takes the pointer.
         GlobalZIndex(10),
         Pickable::IGNORE,
-    ));
+    )
 }
 
 fn update_fps(
@@ -93,6 +105,29 @@ fn update_fps(
         if t.0 != label {
             t.0.clone_from(&label);
         }
+    }
+}
+
+fn update_polygons(
+    count: Res<PolygonCount>,
+    mut shown: Local<Option<u64>>,
+    mut text: Query<&mut Text, With<PolygonText>>,
+) {
+    let Some(count) = count.sample() else {
+        return;
+    };
+    if *shown == Some(count) {
+        return;
+    }
+    *shown = Some(count);
+    let mut label = count.to_string();
+    let digits = label.len();
+    for i in (1..digits).rev().filter(|i| (digits - i).is_multiple_of(3)) {
+        label.insert(i, ',');
+    }
+    label.push_str(" polys");
+    for mut text in &mut text {
+        text.0.clone_from(&label);
     }
 }
 
@@ -156,5 +191,24 @@ mod tests {
         let world = app.world_mut();
         let mut q = world.query_filtered::<&Text, With<FpsText>>();
         assert_eq!(q.single(world).unwrap().0, "60 fps");
+    }
+
+    #[test]
+    fn the_polygon_count_appears_below_fps() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, FpsOverlayPlugin));
+        app.update();
+        let world = app.world_mut();
+        let mut polygons = world.query_filtered::<(&Node, &Text), With<PolygonText>>();
+        let (node, text) = polygons.single(world).unwrap();
+        let (top, right) = (node.top, node.right);
+        assert!(text.0.is_empty());
+        let mut fps = world.query_filtered::<&Node, With<FpsText>>();
+        assert_eq!(right, fps.single(world).unwrap().right);
+        assert_eq!(top, px(GUTTER_PX + CORNER_BUTTON_PX.y + 4.0));
+
+        world.resource::<PolygonCount>().publish(1_234_567);
+        app.update();
+        assert_eq!(polygons.single(app.world()).unwrap().1.0, "1,234,567 polys");
     }
 }
