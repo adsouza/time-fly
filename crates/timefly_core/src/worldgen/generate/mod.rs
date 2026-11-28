@@ -93,7 +93,8 @@ pub fn encode_snowline_raise(raise_m: f64) -> u8 {
 pub fn decode_snowline_raise(byte: u8) -> f64 {
     f64::from(byte & SURFACE_RAISE_STEPS) / f64::from(SURFACE_RAISE_STEPS) * MAX_SNOWLINE_RAISE_M
 }
-/// Heights within this many metres of sea level count as shoreline.
+/// Heights within this many metres of sea level count as shoreline, where the sea may stand
+/// (the texel's coarse cell has a corner below sea level, joined to the ocean).
 pub const SHORE_BAND_M: f64 = 15.0;
 /// Coast distance where the apron holds no coast at all.
 pub const COAST_UNKNOWN_KM: f32 = 1.0e6;
@@ -942,13 +943,15 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
         let (carved, water) = self.sampler().texel(kind, era_dir);
         Texel {
             h: carved.h as f32,
-            surface: self.surface(carved.dir, carved.h, &carved.coarse),
+            surface: self.surface(carved.dir, carved.h, &carved.coarse, carved.sea),
             water_level_m: water.level_m,
             river: water.river,
         }
     }
 
-    fn surface(&self, dir: RenderDir, h: f64, coarse: &Coarse) -> [u8; 4] {
+    /// The texel's surface bytes. `sea`: the sea may stand there (a coarse corner below sea
+    /// level, joined to the ocean where there is a pass): the texel's water rule's own test.
+    fn surface(&self, dir: RenderDir, h: f64, coarse: &Coarse, sea: bool) -> [u8; 4] {
         let lat = self.field.paleolat(dir);
         let coast_km = f64::from(self.coast_km_at(dir));
         // The dryness raise (ruling R27), at the step the surface byte stores, so the generator
@@ -972,7 +975,9 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
             0.0
         };
         let ice = coarse.ice.max(snow).max(cap).clamp(0.0, 1.0);
-        let shore = if h > -SHORE_BAND_M && h <= SHORE_BAND_M {
+        // The sea's shore only: a coast's coarse cell, where its texel's water rule lets the sea
+        // stand. A low plain inland (Kanto's along the Tone) is no shore, however near sea level.
+        let shore = if sea && h > -SHORE_BAND_M && h <= SHORE_BAND_M {
             SURFACE_SHORE
         } else {
             0

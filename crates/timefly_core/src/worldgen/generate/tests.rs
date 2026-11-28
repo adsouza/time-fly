@@ -480,10 +480,8 @@ fn recent_adds_ice_delta() {
     let grid = generate(spec_at(centre, 0.021, 33, 17), &field);
     for (h, s) in grid.inner.elevation_m.iter().zip(&grid.inner.surface) {
         assert!(*h >= 1.0 && (h - 20.0).abs() < 10.0, "{h}");
-        assert_eq!(
-            s[3] & SURFACE_SHORE,
-            SURFACE_SHORE * u8::from((*h as f64) <= SHORE_BAND_M)
-        );
+        // No corner below sea level: no sea, so no shore, however low the plain.
+        assert_eq!(s[3] & SURFACE_SHORE, 0, "{h}");
     }
 }
 
@@ -645,6 +643,50 @@ fn octaves_stop_at_the_source_spacing() {
     assert!(apron.elevation_m.iter().all(|&h| h == 400.0));
     let inner = g.rows(FieldKind::Inner, 500..501);
     assert!(inner.elevation_m.iter().any(|&h| h != 400.0));
+}
+
+/// The shoreline band (sand on today's coasts, mats on the Barren era's) is the sea's: a low
+/// plain inland, however near sea level, is no shore (Kanto's lowlands read as sand bands along
+/// the Tone, bug shot 2026-11-27 16:29:55). A 3 m plain east of a sea at 30.05° E: the flag sits
+/// at the coast and nowhere 15 km or more inland.
+#[test]
+fn the_shore_flag_belongs_to_the_sea() {
+    let centre = dir(0.0, 30.0);
+    let field = FnField {
+        f: |d: RenderDir| if latlon(d).1 > 30.05 { 3.0 } else { -50.0 },
+        spacing_m: 1852.0,
+        koppen: None,
+    };
+    let grid = generate(spec_at(centre, 0.0, 257, 129), &field);
+    let coast_x = RegionFrame { center: centre }
+        .dir_to_local(dir(0.0, 30.05))
+        .expect("on the frame")
+        .0;
+    let f = &grid.inner;
+    let (mut inland_low, mut coastal_shore) = (0, 0);
+    for row in 0..f.res {
+        for col in 0..f.res {
+            let i = (row * f.res + col) as usize;
+            let (x, _) = f.local_of(row, col);
+            let (h, shore) = (f.elevation_m[i], f.surface[i][3] & SURFACE_SHORE != 0);
+            if x > coast_x + 15_000.0 {
+                assert!(
+                    !shore,
+                    "a shore {:.1} km inland, {h} m",
+                    (x - coast_x) / 1000.0
+                );
+                inland_low += usize::from(f64::from(h).abs() <= SHORE_BAND_M);
+            } else if h > 0.0 && x > coast_x && x < coast_x + 2_000.0 {
+                coastal_shore += usize::from(shore);
+            }
+        }
+    }
+    // The hazard: the inland plain lies within the band's heights.
+    assert!(inland_low > 1000, "{inland_low} low inland texels");
+    assert!(
+        coastal_shore > 50,
+        "{coastal_shore} shore texels at the coast"
+    );
 }
 
 #[test]
@@ -1161,15 +1203,27 @@ mod water {
             for x in &f.elevation_m {
                 x.to_le_bytes().into_iter().for_each(&mut eat);
             }
-            for s in &f.surface {
-                s.iter().copied().for_each(&mut eat);
+            for (s, &x) in f.surface.iter().zip(&f.elevation_m) {
+                // The shore bit as M3 set it (the height alone), so these goldens still pin
+                // every other byte; the test checks the bit itself against the sea.
+                let m3_shore = if m3_shore_band(x) { SURFACE_SHORE } else { 0 };
+                [s[0], s[1], s[2], (s[3] & !SURFACE_SHORE) | m3_shore]
+                    .into_iter()
+                    .for_each(&mut eat);
             }
         }
         h
     }
 
+    /// M3's shore rule: the height within [`SHORE_BAND_M`] of sea level.
+    fn m3_shore_band(h: f32) -> bool {
+        let h = f64::from(h);
+        h > -SHORE_BAND_M && h <= SHORE_BAND_M
+    }
+
     /// [`m3_hash`] of each fixture of `overlap_agreement` and `prep_in_steps_matches_new`, from
-    /// the generator at 273e20b (before any rivers code; 65259b5 gave the same values).
+    /// the generator at 273e20b (before any rivers code; 65259b5 gave the same values), the
+    /// shore bit hashed as M3 set it.
     const M3_GOLDEN: [(&str, u64); 8] = [
         ("prep deep", 0xcf7a_d1e5_75c8_6cc5),
         ("prep recent", 0x466a_35e7_a875_f082),
@@ -1267,7 +1321,7 @@ mod water {
 
     #[test]
     fn without_a_pass_the_terrain_is_m3s() {
-        let (mut sea, mut dry) = (0, 0);
+        let (mut sea, mut dry, mut shores) = (0, 0, 0);
         for ((label, grid, below), (golden_label, golden)) in
             m3_golden_regions().into_iter().zip(M3_GOLDEN)
         {
@@ -1285,8 +1339,19 @@ mod water {
                 .iter()
                 .chain(&grid.apron.water_level_m);
             let rivers = grid.inner.river.iter().chain(&grid.apron.river);
-            for (((&h, &level), river), below) in texels.zip(levels).zip(rivers).zip(below) {
+            let surfaces = grid.inner.surface.iter().chain(&grid.apron.surface);
+            for ((((&h, &level), river), below), surface) in
+                texels.zip(levels).zip(rivers).zip(below).zip(surfaces)
+            {
                 assert_eq!(*river, RIVER_NONE, "{label}");
+                // Without a pass the sea stands wherever a coastline corner is below sea
+                // level: the shore is M3's band there, and nowhere else.
+                assert_eq!(
+                    surface[3] & SURFACE_SHORE != 0,
+                    m3_shore_band(h) && below,
+                    "{label}: the shore at {h} m"
+                );
+                shores += usize::from(m3_shore_band(h) && !below);
                 if below {
                     assert_eq!(level.to_bits(), 0f32.to_bits(), "{label}: sea level");
                     sea += 1;
@@ -1297,6 +1362,8 @@ mod water {
             }
         }
         assert!(sea > 1000 && dry > 1000, "both cases: {sea} sea, {dry} dry");
+        // The hazard: texels M3 flagged as shore with no sea at their corners.
+        assert!(shores > 0, "{shores} inland band texels");
     }
 
     // ---- Synthetic eras. ----
