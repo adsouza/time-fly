@@ -1262,6 +1262,7 @@ struct Game<'w> {
 /// What the bench changes.
 #[derive(SystemParam)]
 struct Controls<'w> {
+    gpu_scope: ResMut<'w, GpuBenchmarkScope>,
     time: Option<ResMut<'w, GlobeTime>>,
     changes: MessageWriter<'w, TimeChanged>,
     exit: MessageWriter<'w, AppExit>,
@@ -1269,7 +1270,6 @@ struct Controls<'w> {
 
 /// Records this frame (after navigation decided it) and moves the script on.
 fn measure_journey(
-    mut scope: ResMut<GpuBenchmarkScope>,
     mut bench: ResMut<JourneyBench>,
     game: Game,
     mut controls: Controls,
@@ -1281,7 +1281,7 @@ fn measure_journey(
     let bench = &mut *bench;
     bench.passes.extend(passes.read().copied());
     bench.gpu = gpu.as_deref().cloned();
-    *scope = GpuBenchmarkScope::Unmeasured;
+    *controls.gpu_scope = GpuBenchmarkScope::Unmeasured;
     for frame in gpu_frames.read() {
         if let GpuBenchmarkScope::Journey(cycle) = frame.scope {
             bench.gpu_cycle.push(cycle);
@@ -1309,7 +1309,7 @@ fn measure_journey(
     if let Some(cycle) = bench.stage.cycle()
         && density == 0.0
     {
-        *scope = GpuBenchmarkScope::Journey(cycle);
+        *controls.gpu_scope = GpuBenchmarkScope::Journey(cycle);
     }
     if let Some(cycle) = bench.stage.cycle() {
         let frame = Frame {
