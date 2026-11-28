@@ -18,7 +18,7 @@ frame is tied to texel values. Images are in `defects/`.
 | A | Globe 250 Ma: dashed blue strokes, a line ending in a blob, slivers | Gaps between rigid plates show the ocean shell | Yes (globe code identical to `main`) | Diagnosed; fix proposed (skirts) |
 | B | Phoenix: dotted dark lines beside the river; Andes: dark-blue slivers beside the river | Dry `RIVER_NONE` taps leak a +1,000 m ribbon into a perched river's footprint edge | No (rivers milestone) | **Fixed**, tests RED → GREEN, renders before/after |
 | C | Phoenix: river breaks at a hook beside a dark pit; Sichuan: near-black pit | The course runs 3–6 km off its valley, past the corridor's reach; the bed forces a 400 m slot through the plateau, which the coarse mesh hides from afar | No (rivers milestone) | **Fixed**: deep-cut segments rerouted by least-cost path; tests, reality check, renders |
-| D | Kanto: tan bands along rivers and coast | The beach rule paints all land under ~9 m, not the coast | Yes (M2 rule, unchanged) | Diagnosed; fix proposed |
+| D | Kanto: tan bands along rivers and coast | The beach rule paints all land under ~9 m, not the coast | Yes (M2 rule, unchanged) | **Fixed**: the shore flag needs the sea; tests, render |
 | E | Kanto: small blocky lakes in the bands | Sea-level water in the Tone lowlands decided per hydro tap / lake-map cell | Mixed (DEM-sign rule) | Diagnosed; known follow-up |
 | F | Phoenix: teal blocky patches at the horizon | Mogollon Rim forest canopy colour on 1.85 km Köppen cells | Yes | Confirmed not water |
 | G | Slow rivers read maroon from altitude | `RIVER_SILTY` is a fixed brown, sRGB (0.36, 0.30, 0.20) | No (design choice) | Owner's call |
@@ -184,10 +184,20 @@ texels are under 15 m.
 
 **Before the milestone:** yes (the rule and `terrain.wesl` are unchanged since `main`).
 
-**Fix (proposed, not made):** gate the flag on coast distance. `surface()` already reads
-`coast_km_at`, but that comes from the 4.7 km apron mask, so a beach could still be up to ~5 km
-wide on a low plain; a beach a few hundred metres wide needs a fine (inner-field) coast distance,
-a second pass over the field.
+**Fix (commit on this branch, 2026-11-28).** The shore flag now also needs the sea: the texel's
+own water-rule test, a coarse (1.85 km) corner below sea level joined to the ocean (or, with
+no pass, any such corner). That test is a function of the direction, so every region agrees, and
+it already leaves out sub-zero lowlands the ocean does not reach. The beach is therefore about one
+coarse cell wide on a low coast and absent inland; Barren-era mats follow the same flag.
+`defects/kanto-beach-before-after.jpg` (the bug shot's pose): the bands along the Tone are gone,
+a narrow strip follows the Pacific and the bay, and a little sand rings the sea-level water
+inland where the sea test allows it.
+
+**Tests.** `the_shore_flag_belongs_to_the_sea` (a 3 m plain beside a sea: RED with a shore
+15.5 km inland; now none 15 km or more inland, the coast flagged). `without_a_pass_the_terrain_is_m3s`
+keeps its pre-rivers goldens by hashing the shore bit as M3 set it, and asserts the bit itself is
+M3's band where a coastline corner is below sea level and clear elsewhere (with texels of the
+second kind present). All 398 `timefly_core` tests pass; clippy is clean.
 
 Side note: the manifest's sea-level curve reads +8.96 m at 76 years and +7.72 m at 1 ka (0 at
 5 ka, −5.38 m at 7 ka). It does not move today's heights (the recent field is ETOPO plus the
