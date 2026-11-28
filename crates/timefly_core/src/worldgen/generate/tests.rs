@@ -1887,6 +1887,7 @@ mod water {
     /// the generator's rocks near the banks stand outside the drawn water in each fixture.
     #[test]
     fn placed_boulders_and_collars_lie_in_the_drawn_water() {
+        use crate::hydrology::params::MAX_BOULDERS;
         use crate::terrain::drawn::collar_wake_radii;
         let frame = RegionFrame {
             center: dir(20.0, 30.0),
@@ -1969,11 +1970,15 @@ mod water {
                     "{name}: only {hazard} rocks outside the drawn water"
                 );
             }
-            // Not too many lost: the blend band is a quarter of the square.
+            // Not too many lost: the blend band is a quarter of the square. Past MAX_BOULDERS
+            // the region keeps that many (whole clusters) whatever the fit does, so the 200 m
+            // river is judged against the cap, not against all it generated.
+            let considered = unplaced.len().min(MAX_BOULDERS as usize);
             assert!(
-                grid.boulders.len() * 3 > unplaced.len(),
-                "{name}: {} of {} kept",
+                grid.boulders.len() * 3 > considered,
+                "{name}: {} of {} kept ({} generated)",
                 grid.boulders.len(),
+                considered,
                 unplaced.len()
             );
             let mut collars = 0;
