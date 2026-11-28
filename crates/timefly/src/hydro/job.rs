@@ -349,15 +349,15 @@ async fn step_sliced<S: NodeSource, C: ClimateSource>(
     source: &S,
     climate: &C,
     table: &ClimateTable,
-    slice: &mut Slice,
+    slice: &mut Slice<impl Fn() -> Instant>,
     stepper: &mut Stepper,
 ) {
     loop {
         let before = prep.units_done();
         let from = prep.stage_name();
-        let t = Instant::now();
+        let t = slice.now();
         let done = prep.step(source, climate, table, stepper.units);
-        let spent = t.elapsed();
+        let spent = slice.now() - t;
         stepper.longest.observe(from, prep.stage_name(), spent);
         stepper.observe(prep.units_done() - before, spent);
         stepper.steps += 1;
@@ -372,8 +372,12 @@ async fn step_sliced<S: NodeSource, C: ClimateSource>(
     }
 }
 
-async fn run_sliced(inputs: HydroInputs, budget: SharedBudget) -> Result<PassOutput, String> {
-    let mut slice = Slice::new(budget.clone());
+async fn run_sliced(
+    inputs: HydroInputs,
+    budget: SharedBudget,
+    now: impl Fn() -> Instant + Sync,
+) -> Result<PassOutput, String> {
+    let mut slice = Slice::with_clock(budget.clone(), &now);
     let field = inputs.field()?;
     let (lattice, mode) = inputs.lattice();
     let source = SnapshotSource::new(
@@ -449,9 +453,17 @@ pub struct HydroRun {
 
 impl HydroRun {
     pub fn new(inputs: HydroInputs, budget: Duration) -> HydroRun {
+        Self::with_clock(inputs, budget, Instant::now)
+    }
+
+    fn with_clock(
+        inputs: HydroInputs,
+        budget: Duration,
+        now: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> HydroRun {
         let shared = SharedBudget::new(budget);
         HydroRun {
-            future: Mutex::new(Box::pin(run_sliced(inputs, shared.clone()))),
+            future: Mutex::new(Box::pin(run_sliced(inputs, shared.clone(), now))),
             base: budget,
             budget: shared,
         }
@@ -1138,36 +1150,34 @@ mod tests {
         assert!(inputs.climate.as_ref().is_some_and(|(_, w)| *w > 0.0));
         let expected = run_parallel(&inputs, &AtomicBool::new(false)).unwrap();
         let budget = Duration::from_millis(2);
-        let mut run = HydroRun::new(inputs, budget);
-        let mut slices = Vec::new();
+        // One clock tick per observation, including step start, step end, and the budget
+        // check. Only the run advances this clock, so time descheduled cannot extend a poll.
+        let tick = Duration::from_micros(250);
+        let ticks = Arc::new(AtomicU32::new(0));
+        let clock_ticks = ticks.clone();
+        let epoch = Instant::now();
+        let mut run = HydroRun::with_clock(inputs, budget, move || {
+            epoch + tick * clock_ticks.fetch_add(1, Ordering::Relaxed)
+        });
+        let mut polls = 0;
         let out = loop {
-            let t = std::time::Instant::now();
-            let done = run.poll_slice();
-            slices.push(t.elapsed());
-            if let Some(result) = done {
+            let before = ticks.load(Ordering::Relaxed);
+            let result = run.poll_slice();
+            polls += 1;
+            // The first observation starts the slice. A complete iteration costs three
+            // ticks. A pending poll must return at the first check at or beyond its budget.
+            let spent = tick * (ticks.load(Ordering::Relaxed) - before - 1);
+            assert!(spent < budget + 3 * tick, "poll {polls} spent {spent:?}");
+            if let Some(result) = result {
                 break result.unwrap();
             }
+            assert!(spent >= budget, "poll {polls} yielded early at {spent:?}");
         };
         assert_eq!(out.hydrology, expected.hydrology);
-        assert!(
-            !out.hydrology.rivers.nodes().is_empty(),
-            "a trivial fixture"
-        );
-        let longest = *slices.iter().max().unwrap();
-        println!(
-            "{} slices (run counted {}), longest {longest:?}, longest step {:?}, {} units",
-            slices.len(),
-            out.slices,
-            out.longest_step,
-            out.units
-        );
-        assert!(slices.len() > 3, "{slices:?}");
-        assert_eq!(out.slices as usize, slices.len());
-        // The slack covers the poll itself and the result's assembly in the last slice.
-        let bound = budget + out.longest_step + Duration::from_micros(500);
-        for (k, s) in slices.iter().enumerate() {
-            assert!(*s <= bound, "slice {k}: {s:?} > {bound:?}");
-        }
+        assert!(!out.hydrology.rivers.nodes().is_empty());
+        assert!(polls > 3);
+        assert_eq!(out.slices, polls);
+        assert_eq!(out.longest_step, tick);
         assert_eq!(out.units, expected.units);
     }
 

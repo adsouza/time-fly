@@ -2009,20 +2009,20 @@ fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// One frame of `passes` busy passes between `timer`'s marker passes, submitted; `wait` waits
-/// for the GPU after it. Returns the readings that came in.
+/// Submit a frame without harvesting it. Each element describes one busy pass and optionally
+/// records its end independently of the timer's marker passes.
 fn submit_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     timer: &mut timefly::diagnostics::gpu_time::GpuTimer,
     pipeline: &wgpu::RenderPipeline,
     view: &wgpu::TextureView,
-    passes: u32,
-    wait: bool,
-) -> (bool, Vec<Option<f32>>) {
+    queries: &wgpu::QuerySet,
+    pass_end_queries: &[Option<u32>],
+) -> bool {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    let timed = timer.begin(&mut encoder);
-    for _ in 0..passes {
+    timer.begin(&mut encoder);
+    for &stamp in pass_end_queries {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("busy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2035,100 +2035,65 @@ fn submit_frame(
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: stamp.map(|index| wgpu::RenderPassTimestampWrites {
+                query_set: queries,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(index),
+            }),
             occlusion_query_set: None,
             multiview_mask: None,
         });
         pass.set_pipeline(pipeline);
         pass.draw(0..3, 0..1);
     }
-    timer.end(
+    let timed = timer.end(
         &mut encoder,
         device,
         &[(view, wgpu::TextureFormat::Rgba8Unorm)],
     );
     queue.submit([encoder.finish()]);
     timer.submitted(queue);
-    let poll = if wait {
-        wgpu::PollType::wait_indefinitely()
-    } else {
-        wgpu::PollType::Poll
-    };
-    device.poll(poll).expect("poll");
-    (timed, timer.harvest())
+    timed
 }
 
-/// Frames timed by a fresh [`GpuTimer`](timefly::diagnostics::gpu_time::GpuTimer), each with
-/// `passes` busy passes, the busy target as the frame's output, each waiting for its work.
-/// A primer frame comes first (a frame with no read predecessor is dropped), and empty frames
-/// after until every reading is in. The readings, in frame order.
-fn timed_frames(
+/// Read the reference timestamps after the workload has completed.
+fn reference_timestamps(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    pipeline: &wgpu::RenderPipeline,
-    view: &wgpu::TextureView,
-    passes: &[u32],
-) -> Vec<f32> {
-    let mut timer =
-        timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
-    let mut readings = Vec::new();
-    // A frame's reading arrives with the frame after it (its resolve waits for its work).
-    let frames = std::iter::once(0)
-        .chain(passes.iter().copied())
-        .chain([0, 0]);
-    for (i, n) in frames.enumerate() {
-        let (timed, got) = submit_frame(device, queue, &mut timer, pipeline, view, n, true);
-        assert!(timed, "a free slot for frame {i}");
-        readings.extend(got);
-    }
-    assert_eq!(
-        readings.first(),
-        Some(&None),
-        "the primer has no predecessor"
-    );
-    readings
-        .into_iter()
-        .skip(1)
-        .take(passes.len())
-        .map(|r| r.expect("a valid reading: begin and end written, end after begin"))
-        .collect()
+    queries: &wgpu::QuerySet,
+) -> [u64; 4] {
+    let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("busy pass timestamps"),
+        size: 32,
+        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("busy pass readback"),
+        size: 32,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.resolve_query_set(queries, 0..4, &resolve, 0);
+    encoder.copy_buffer_to_buffer(&resolve, 0, &read, 0, 32);
+    queue.submit([encoder.finish()]);
+    read.slice(..).map_async(wgpu::MapMode::Read, |r| {
+        r.expect("reference timestamps map")
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    bytemuck::pod_read_unaligned(
+        &read
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped timestamps"),
+    )
 }
 
-/// `frames` frames of `passes` busy passes each, back to back (no wait), as when GPU-bound:
-/// frames that find no free slot go untimed. Then more of the same, waiting, until the readings
-/// are in. Every valid reading.
-fn back_to_back(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    pipeline: &wgpu::RenderPipeline,
-    view: &wgpu::TextureView,
-    passes: u32,
-    frames: usize,
-) -> (Vec<f32>, usize) {
-    let mut timer =
-        timefly::diagnostics::gpu_time::GpuTimer::new(device, queue.get_timestamp_period());
-    let mut readings = Vec::new();
-    let mut untimed = 0;
-    for i in 0..frames + 6 {
-        let (timed, got) = submit_frame(
-            device,
-            queue,
-            &mut timer,
-            pipeline,
-            view,
-            passes,
-            i >= frames,
-        );
-        untimed += usize::from(!timed);
-        readings.extend(got);
-    }
-    (readings.into_iter().flatten().collect(), untimed)
-}
-
-/// Rivers and lakes Task 10: the GPU frame time read from pass-level timestamps (one-pixel
-/// marker passes around the frame, `TIMESTAMP_QUERY` only) is positive, grows with the GPU work
-/// between them, and is not inflated when frames run back to back (on Apple silicon a marker
-/// pass with no dependency overlaps other passes).
+/// Check marker coverage, non-overlapping spans and recovery after an untimed frame using
+/// timestamp queries on the very same submissions as the timer.
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored"]
 fn the_gpu_frame_time_is_measured_on_this_gpu() {
@@ -2193,58 +2158,74 @@ fn the_gpu_frame_time_is_measured_on_this_gpu() {
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default());
-    println!(
-        "timestamp period {} ns",
-        GpuTimer::new(&device, queue.get_timestamp_period()).period_ns()
-    );
-    // Warm up (pipeline compile, clocks), then the median of three frames per pass count.
-    timed_frames(&device, &queue, &pipeline, &view, &[4; 3]);
-    let median = |passes: u32| {
-        let mut ms = timed_frames(&device, &queue, &pipeline, &view, &[passes; 3]);
-        ms.sort_by(f32::total_cmp);
-        println!("{passes} busy passes, waited: {ms:?} ms");
-        ms[1]
+    use timefly::diagnostics::gpu_time::RING;
+    let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+        label: Some("independent busy pass ends"),
+        ty: wgpu::QueryType::Timestamp,
+        count: 4,
+    });
+    let mut timer = GpuTimer::new(&device, queue.get_timestamp_period());
+    let submit = |t: &mut GpuTimer, stamps: &[Option<u32>]| {
+        submit_frame(&device, &queue, t, &pipeline, &view, &queries, stamps)
     };
-    let (none, one, four, sixteen) = (median(0), median(1), median(4), median(16));
-    println!("medians: 0 {none} ms, 1 {one} ms, 4 {four} ms, 16 {sixteen} ms");
+    let wait = || {
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+    };
+
+    // Query 0 precedes the primer's end. Wait so the next frame's work starts from idle.
+    assert!(submit(&mut timer, &[Some(0)]));
+    wait();
+    assert!(submit(
+        &mut timer,
+        &[Some(1), None, None, None, None, None, None, Some(2)]
+    ));
+    for _ in 2..RING {
+        assert!(submit(&mut timer, &[None; 4]));
+    }
+    // Withhold harvest even if every callback has finished. The ring is now full on any GPU.
+    assert!(!submit(&mut timer, &[Some(3)]));
+    wait();
+    // Resolve any slots that finished during the burst. This frame also has no free slot.
+    assert!(!submit(&mut timer, &[]));
+    wait();
+    let readings = timer.harvest();
+    assert_eq!(readings.len(), RING);
+    assert_eq!(readings[0], None);
+    let measured: Vec<f32> = readings[1..]
+        .iter()
+        .map(|r| r.expect("consecutive frames"))
+        .collect();
+    assert!(measured.iter().all(|ms| ms.is_finite() && *ms > 0.0));
+
+    let [primer, first, last, after] = reference_timestamps(&device, &queue, &queries);
+    assert!(0 < primer && primer <= first && first < last && last <= after);
+    let ms = |ticks: u64| ticks as f64 * f64::from(queue.get_timestamp_period()) / 1e6;
+    // The frame must cover the work between its own first and last busy pass ends.
     assert!(
-        (0.0..1.0).contains(&none),
-        "the timer's own passes: {none} ms"
+        measured[0] >= ms(last - first) as f32,
+        "{measured:?}, busy span {} ms",
+        ms(last - first)
     );
-    assert!(one > 0.0, "{one} ms");
-    // Close to linear in the work: the end waits for the last busy pass.
-    assert!(four > 3.0 * one, "4 passes {four} ms vs 1 pass {one} ms");
+    // Consecutive spans cannot double-count time. The first valid frame starts after
+    // the primer, and every valid frame ends before the untimed frame finishes.
+    let total: f64 = measured.iter().copied().map(f64::from).sum();
     assert!(
-        sixteen > 3.0 * four,
-        "16 passes {sixteen} ms vs 4 passes {four} ms"
+        total <= ms(after - primer) * (1.0 + f64::from(f32::EPSILON)),
+        "reported {total} ms in {} ms",
+        ms(after - primer)
     );
-    // Twenty frames back to back (review, fix round 1): when the ring runs out some frames go
-    // untimed, and a frame after an untimed one could start inside it and read up to double.
-    // Those are dropped, so no reading is: the worst stays with the median (a doubled reading
-    // is about 2×), and the median with the waited figure. That one only loosely: waited, the
-    // GPU idles between frames and may clock down (one run read 8.5 ms waited, 6.9 packed).
-    let (mut packed, untimed) = back_to_back(&device, &queue, &pipeline, &view, 4, 20);
-    packed.sort_by(f32::total_cmp);
-    let (mid, worst) = (packed[packed.len() / 2], packed[packed.len() - 1]);
-    println!(
-        "4 busy passes back to back: {} readings, {untimed} frames untimed, median {mid} ms, worst {worst} ms: {packed:?}",
-        packed.len()
-    );
-    // The test submits every frame at once (Bevy keeps a frame or two in flight), so most go
-    // untimed: the case under test, which must happen here.
-    assert!(
-        untimed > 0,
-        "every frame found a slot: no chain break was exercised"
-    );
-    assert!(packed.len() >= 6, "{} readings of 26 frames", packed.len());
-    assert!(
-        (mid - four).abs() <= 0.35 * four,
-        "back-to-back median {mid} ms vs waited {four} ms"
-    );
-    assert!(
-        worst <= 1.3 * mid,
-        "back-to-back worst {worst} ms vs their median {mid} ms"
-    );
+
+    // The first timed frame after the gap has no predecessor. Its end links the next one.
+    for _ in 0..3 {
+        assert!(submit(&mut timer, &[None]));
+        wait();
+    }
+    let resumed = timer.harvest();
+    assert_eq!(resumed.len(), 2);
+    assert_eq!(resumed[0], None);
+    assert!(resumed[1].is_some_and(|ms| ms.is_finite() && ms > 0.0));
 }
 
 const WATER: &str = include_str!("../assets/shaders/water.wesl");

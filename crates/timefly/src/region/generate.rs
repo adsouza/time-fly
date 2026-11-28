@@ -253,7 +253,8 @@ impl SharedBudget {
 }
 
 /// The time spent in the current slice, and the slices so far.
-pub(crate) struct Slice {
+pub(crate) struct Slice<N = fn() -> Instant> {
+    now: N,
     budget: SharedBudget,
     started: Instant,
     pub(crate) count: u32,
@@ -266,9 +267,17 @@ pub(crate) struct Slice {
 
 impl Slice {
     pub(crate) fn new(budget: SharedBudget) -> Slice {
+        Slice::with_clock(budget, Instant::now)
+    }
+}
+
+impl<N: Fn() -> Instant> Slice<N> {
+    pub(crate) fn with_clock(budget: SharedBudget, now: N) -> Self {
+        let started = now();
         Slice {
             budget,
-            started: Instant::now(),
+            now,
+            started,
             count: 1,
             longest: Duration::ZERO,
             total: Duration::ZERO,
@@ -276,9 +285,13 @@ impl Slice {
         }
     }
 
+    pub(crate) fn now(&self) -> Instant {
+        (self.now)()
+    }
+
     /// Counts the time spent so far in this slice towards the longest slice and the total.
     pub(crate) fn record(&mut self) -> Duration {
-        let spent = self.started.elapsed();
+        let spent = self.now() - self.started;
         self.longest = self.longest.max(spent);
         self.total = self.done + spent;
         spent
@@ -290,7 +303,7 @@ impl Slice {
         if spent >= self.budget.get() {
             self.done += spent;
             YieldOnce(false).await;
-            self.started = Instant::now();
+            self.started = self.now();
             self.count += 1;
         }
     }
