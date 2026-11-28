@@ -4,7 +4,7 @@
 //! - **Scene.** When an [`ActiveRegion`] appears, the plugin uploads its fields as six textures
 //!   (heights, surface codes and water, inner and apron), builds one grid mesh, one
 //!   [`TerrainMaterial`] and one patch buffer, and spawns the [`RegionCamera`] and the
-//!   [`TerrainSun`], then frees the grid's river texels, which only the GPU reads. A replaced
+//!   [`TerrainSun`], then compacts the grid's river footprint for flight. A replaced
 //!   region (a snapshot change, a hop) swaps the textures in place over four frames: the old
 //!   water released on the swap frame, the new water on the next, nothing on the third while
 //!   its staging drains, the heights and surface codes on the fourth
@@ -449,8 +449,8 @@ fn upload_heights(grid: &RegionGrid, images: &mut Assets<Image>) -> [Handle<Imag
     ]
 }
 
-/// Frees the grid's river texels once its water textures hold them (8 B a texel, 10 MiB at full
-/// size): no CPU code reads them (the fly's floor reads the levels). Only while the region
+/// After upload, the CPU keeps the packed river footprint needed by the flight floor.
+/// The full river texture can be released while the region
 /// holds the only reference, which it does from the region job until the scene adopts the grid;
 /// otherwise they stay.
 fn free_rivers(grid: &mut Arc<RegionGrid>) {

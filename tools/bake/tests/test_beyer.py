@@ -14,6 +14,7 @@ import threading
 import io
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -407,3 +408,69 @@ def test_climate_subcommand_passes_the_pinned_entry_and_flags(tmp_path, monkeypa
     assert seen["record_pins"] is False
     sources.write_text(json.dumps({"files": []}))
     assert cli.main(["climate", "--sources", str(sources), "--out", str(tmp_path / "o")]) == 1
+
+
+@pytest.mark.parametrize("case", ["endpoints", "oversize", "overbudget", "retry"])
+def test_range_requests_bound_response_and_retry_bytes(monkeypatch, case):
+    opened = []
+    reads = []
+
+    class Response(io.BytesIO):
+        status = 206
+        headers = {"Content-Range": "bytes 0-15/16" if case == "endpoints" else "bytes 0-7/16"}
+
+        def read(self, size=-1):
+            reads.append(size)
+            assert 0 < size <= 9
+            if case == "retry":
+                raise OSError("connection lost while reading")
+            return super().read(size)
+
+    class Opener:
+        def open(self, req, timeout):
+            opened.append(req)
+            return Response(b"x" * 16)
+
+    cap = {"overbudget": 7, "retry": 10}.get(case, 32)
+    rf = beyer.RangeFile("https://example.test/data", 16, block=8, cap_bytes=cap, opener=Opener())
+    monkeypatch.setattr(beyer.time, "sleep", lambda _: None)
+    error = beyer.FetchCapError if case in ("overbudget", "retry") else beyer.RangeError
+    with pytest.raises(error):
+        rf.read(1)
+    assert len(opened) == (0 if case == "overbudget" else 1)
+    assert reads == ([9] if case in ("retry", "oversize") else [])
+    assert rf.fetched <= cap
+
+
+def test_concurrent_bakes_publish_complete_manifests(beyer_server, tmp_path, monkeypatch):
+    # Both writers stage their manifests before either rename can finish.
+    barrier = threading.Barrier(2)
+    replace = Path.replace
+
+    def simultaneous_replace(path, target):
+        if target.name == "manifest.json":
+            barrier.wait(timeout=10)
+        return replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", simultaneous_replace)
+
+    def bake(age):
+        return beyer.bake_climate(
+            beyer_server.entry(ages_ka=[age]),
+            tmp_path,
+            opener=beyer_server.opener(),
+            record_pins=True,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        manifests = list(pool.map(bake, [0, 21]))
+    assert json.loads((tmp_path / "manifest.json").read_bytes()) in manifests
+    for manifest in manifests:
+        (entry,) = manifest["files"]
+        assert (
+            hashlib.sha256((tmp_path / entry["file"]).read_bytes()).hexdigest() == entry["sha256"]
+        )
+        _, grid = formats.read_tfgrid(tmp_path / entry["file"])
+        assert grid.shape == (180, 360, 2)
+        assert grid[0, 0, 0] == 89.5 - 0.25 * entry["age_ka"]
+    assert len(list(tmp_path.iterdir())) == 3

@@ -603,8 +603,7 @@ fn first_f32(app: &App, id: AssetId<Image>) -> f32 {
 }
 
 /// The hop's memory (follow-up): once the fields are on the GPU, the active grid lets its river
-/// texels go (8 B a texel, 10 MiB at full size). Nothing on the CPU reads them; the water
-/// textures hold them.
+/// texels go (8 B a texel, 10 MiB at full size). The flight floor keeps the packed footprint.
 #[test]
 fn the_active_grid_frees_its_rivers_once_uploaded() {
     for replaced in [false, true] {
@@ -617,9 +616,14 @@ fn the_active_grid_frees_its_rivers_once_uploaded() {
         }
         let grid = wet_grid(500.0);
         let (full, river) = (grid.bytes(), grid.inner.river.clone());
-        // The river texels go; one bit a texel stays (the river mask).
+        let wet_texels: usize = [&grid.inner, &grid.apron]
+            .iter()
+            .map(|f| (0..f.river.len()).filter(|&i| f.is_river(i)).count())
+            .sum();
+        // Each occupied texel keeps its geometry, each mask word its rank.
         let freed = (33 * 33 + 17 * 17) * 8
-            - 8 * ((33 * 33usize).div_ceil(64) + (17 * 17usize).div_ceil(64));
+            - 4 * wet_texels
+            - 12 * ((33 * 33usize).div_ceil(64) + (17 * 17usize).div_ceil(64));
         enter_owned(&mut app, grid);
         for _ in 0..3 {
             app.update();

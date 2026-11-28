@@ -514,7 +514,7 @@ fn blend_is_the_inner_field_inside_and_the_apron_outside() {
 }
 
 /// `f` at each texel of a field shaped like `like`.
-fn texels_of(like: &Field, f: impl Fn(f64, f64) -> f32) -> Vec<f32> {
+fn texels_of<T>(like: &Field, f: impl Fn(f64, f64) -> T) -> Vec<T> {
     (0..like.res)
         .flat_map(|row| (0..like.res).map(move |col| (row, col)))
         .map(|(row, col)| {
@@ -884,6 +884,27 @@ fn a_perched_river_draws_no_water_at_its_footprints_edge() {
     assert!(inside > 2, "points on the river: {inside}");
 }
 
+#[test]
+fn flight_floor_follows_the_drawn_perched_river_before_and_after_upload() {
+    use crate::worldgen::generate::water::encode_river;
+    let mut grid = test_grid();
+    let field = &mut grid.inner;
+    field.water_level_m = field.elevation_m.iter().map(|h| h + 80.0).collect();
+    field.river = texels_of(field, |x, _| {
+        let offset = x.clamp(-1000.0, 1000.0) as f32;
+        encode_river(11.0 - offset.abs(), 1.0, 0.0, offset)
+    });
+    for uploaded in [false, true] {
+        if uploaded {
+            grid.inner.free_rivers();
+        }
+        for (x, rise) in [(0.0, 80.0), (50.0, 0.0)] {
+            let ground = blended_height_m(&grid, x, 0.0);
+            assert!((blended_surface_m(&grid, x, 0.0) - ground - rise).abs() < 0.01);
+        }
+    }
+}
+
 /// The crossing guard's fallback (two rivers, or a sharp bend, in one cell) interpolates the
 /// taps' ribbons; a dry tap among them is outside the water, not [`RIBBON_NONE_M`] of it.
 #[test]
@@ -909,7 +930,7 @@ fn the_crossing_guard_keeps_dry_taps_dry() {
 }
 
 /// Once a grid's river texels are on the GPU the shell frees them (`Field::free_rivers`): the
-/// levels, and so the fly's floor, are unchanged, and `blended_water` reads no river.
+/// floor and water geometry survive, while the CPU flow vectors are released.
 #[test]
 fn a_grid_without_its_rivers_keeps_its_levels() {
     use crate::worldgen::generate::water::encode_river;
@@ -936,9 +957,13 @@ fn a_grid_without_its_rivers_keeps_its_levels() {
     grid.inner.free_rivers();
     grid.apron.free_rivers();
     assert!(grid.inner.river.is_empty() && grid.apron.river.is_empty());
-    // One bit a texel stays, telling rivers from standing water.
+    // The footprint and packed lookup survive the upload.
     let mask = 8 * (grid.inner.river_mask.len() + grid.apron.river_mask.len());
-    assert_eq!(before - grid.bytes(), freed - mask);
+    let packed: usize = [&grid.inner, &grid.apron]
+        .iter()
+        .map(|f| 4 * (f.river_starts.capacity() + f.river_geometry.capacity()))
+        .sum();
+    assert_eq!(before - grid.bytes(), freed - mask - packed);
     for (&(x, z), (surface, water)) in points.iter().zip(&kept) {
         assert_eq!(blended_surface_m(&grid, x, z), *surface, "({x}, {z})");
         let w = blended_water(&grid, x, z);
@@ -947,8 +972,7 @@ fn a_grid_without_its_rivers_keeps_its_levels() {
             (water.level_m, water.thickness_m)
         );
         assert_eq!(w.flow, [0.0, 0.0], "({x}, {z})");
-        let none = crate::hydrology::params::RIBBON_NONE_M as f32;
-        assert!(w.ribbon_m >= none - 1.0, "({x}, {z}): {w:?}");
+        assert_eq!(w.ribbon_m, water.ribbon_m);
     }
 }
 

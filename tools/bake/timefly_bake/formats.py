@@ -37,6 +37,11 @@ def _decompress(blob: bytes, size: int) -> bytes:
 @traced
 def write_tfgrid(path, kind: str, data: np.ndarray) -> None:
     """Write ``data`` (``(6, n, n, c)`` for ``cube``, ``(h, w, c)`` for ``latlon``) to ``path``."""
+    Path(path).write_bytes(encode_tfgrid(kind, data))
+
+
+def encode_tfgrid(kind: str, data: np.ndarray) -> bytes:
+    """Encode a grid as its header and compressed payload."""
     if kind not in _KINDS:
         raise ValueError(f"unknown grid kind {kind!r}")
     dt = np.dtype(data.dtype).newbyteorder("<")
@@ -56,7 +61,7 @@ def write_tfgrid(path, kind: str, data: np.ndarray) -> None:
     header = b"TFGRID01" + struct.pack(
         "<BBBBIII", _KINDS[kind], _DTYPES[dt][0], channels, 0, width, height, len(blob)
     )
-    Path(path).write_bytes(header + blob)
+    return header + blob
 
 
 @traced

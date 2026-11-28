@@ -2152,6 +2152,8 @@ mod water {
                 water_level_m: corners.iter().map(|x| x.water_level_m).collect(),
                 river: corners.iter().map(|x| x.river).collect(),
                 river_mask: Vec::new(),
+                river_starts: Vec::new(),
+                river_geometry: Vec::new(),
             };
             let grid = RegionGrid {
                 spec: *g.spec(),

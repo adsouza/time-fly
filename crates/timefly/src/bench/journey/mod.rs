@@ -99,7 +99,7 @@ use super::{
 use crate::args::RegionArg;
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
-use crate::diagnostics::gpu_time::{GpuFrameMeasured, GpuFrameTime};
+use crate::diagnostics::gpu_time::{GpuBenchmarkScope, GpuFrameMeasured, GpuFrameTime};
 use crate::fly_camera::FlyState;
 use crate::globe::GlobeRenderStatus;
 use crate::globe_flight::GlobeFlightState;
@@ -1162,6 +1162,7 @@ impl Plugin for JourneyBenchPlugin {
         app.insert_resource(JourneyBench::new(self.0.clone()))
             // Read whether or not the pass and the GPU timer run in this app.
             .add_message::<HydroPassFinished>()
+            .init_resource::<GpuBenchmarkScope>()
             .add_message::<GpuFrameMeasured>()
             .add_systems(
                 Update,
@@ -1268,6 +1269,7 @@ struct Controls<'w> {
 
 /// Records this frame (after navigation decided it) and moves the script on.
 fn measure_journey(
+    mut scope: ResMut<GpuBenchmarkScope>,
     mut bench: ResMut<JourneyBench>,
     game: Game,
     mut controls: Controls,
@@ -1279,7 +1281,13 @@ fn measure_journey(
     let bench = &mut *bench;
     bench.passes.extend(passes.read().copied());
     bench.gpu = gpu.as_deref().cloned();
-    let gpu_ms: Vec<f32> = gpu_frames.read().map(|m| m.ms).collect();
+    *scope = GpuBenchmarkScope::Unmeasured;
+    for frame in gpu_frames.read() {
+        if let GpuBenchmarkScope::Journey(cycle) = frame.scope {
+            bench.gpu_cycle.push(cycle);
+            bench.gpu_ms.push(frame.ms);
+        }
+    }
     let now = game.real.elapsed_secs_f64();
     let frame_ms = game.real.delta_secs() * 1000.0;
     let phase = game.nav.as_ref().map_or(NavPhase::Globe, |n| n.phase);
@@ -1301,8 +1309,7 @@ fn measure_journey(
     if let Some(cycle) = bench.stage.cycle()
         && density == 0.0
     {
-        bench.gpu_cycle.extend(gpu_ms.iter().map(|_| cycle));
-        bench.gpu_ms.extend(gpu_ms);
+        *scope = GpuBenchmarkScope::Journey(cycle);
     }
     if let Some(cycle) = bench.stage.cycle() {
         let frame = Frame {

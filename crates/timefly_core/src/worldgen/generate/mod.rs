@@ -163,6 +163,10 @@ pub struct Field {
     /// when it drops `river`, so readers still tell rivers from standing water
     /// ([`is_river`](Self::is_river)). Empty until then.
     pub river_mask: Vec<u64>,
+    /// First packed river in each mask word.
+    pub river_starts: Vec<u32>,
+    /// Ribbon and offset bits for the set bits of the mask, in texel order.
+    pub river_geometry: Vec<[u16; 2]>,
 }
 
 impl Field {
@@ -181,6 +185,8 @@ impl Field {
             water_level_m,
             river,
             river_mask: Vec::new(),
+            river_starts: Vec::new(),
+            river_geometry: Vec::new(),
         }
     }
 
@@ -188,16 +194,33 @@ impl Field {
         self.size_m / f64::from(self.res - 1)
     }
 
-    /// Drops the river texels (8 B a texel) once the shell has them on the GPU, keeping one bit
-    /// a texel for [`is_river`](Self::is_river). Readers then see [`RIVER_NONE`] everywhere
+    /// Drops the river texels (8 B a texel) once the shell has them on the GPU, keeping the packed footprint
+    /// for CPU water sampling. Readers then see [`RIVER_NONE`] everywhere
     /// ([`river_at`](Self::river_at)); the levels, and the fly's floor, are unchanged.
     pub fn free_rivers(&mut self) {
         if self.river.is_empty() {
             return;
         }
         let mut mask = vec![0u64; self.river.len().div_ceil(64)];
-        for i in (0..self.river.len()).filter(|&i| self.is_river(i)) {
-            mask[i / 64] |= 1 << (i % 64);
+        let mut count = 0;
+        self.river_starts = Vec::with_capacity(mask.len());
+        for (word, texels) in mask.iter_mut().zip(self.river.chunks(64)) {
+            self.river_starts.push(count);
+            for (bit, r) in texels.iter().enumerate() {
+                if r[0] != RIVER_NONE[0] || r[3] != RIVER_NONE[3] {
+                    *word |= 1 << bit;
+                }
+            }
+            count += word.count_ones();
+        }
+        self.river_geometry = Vec::with_capacity(count as usize);
+        for (word, texels) in mask.iter().zip(self.river.chunks(64)) {
+            let mut bits = *word;
+            while bits != 0 {
+                let r = texels[bits.trailing_zeros() as usize];
+                self.river_geometry.push([r[0], r[3]]);
+                bits &= bits - 1;
+            }
         }
         self.river_mask = mask;
         self.river = Vec::new();
@@ -219,6 +242,21 @@ impl Field {
     /// Texel `i`'s river bits: [`RIVER_NONE`] once [`free_rivers`](Self::free_rivers) ran.
     pub fn river_at(&self, i: usize) -> [u16; 4] {
         self.river.get(i).copied().unwrap_or(RIVER_NONE)
+    }
+
+    /// Water geometry for CPU sampling, with flow discarded after upload.
+    pub fn sampled_river(&self, i: usize) -> [u16; 4] {
+        if let Some(r) = self.river.get(i) {
+            return *r;
+        }
+        if !self.is_river(i) {
+            return RIVER_NONE;
+        }
+        let word = i / 64;
+        let below = (1u64 << (i % 64)) - 1;
+        let rank = (self.river_mask[word] & below).count_ones();
+        let [ribbon, offset] = self.river_geometry[(self.river_starts[word] + rank) as usize];
+        [ribbon, 0, 0, offset]
     }
 
     /// Local `(x, z)` metres of a texel.
@@ -274,6 +312,8 @@ impl RegionGrid {
                     + f.water_level_m.capacity() * 4
                     + f.river.capacity() * 8
                     + f.river_mask.capacity() * 8
+                    + f.river_starts.capacity() * 4
+                    + f.river_geometry.capacity() * 4
             })
             .sum::<usize>()
             + self.boulders.capacity() * std::mem::size_of::<Boulder>()
@@ -871,6 +911,8 @@ impl<'a, F: CoarseField> RegionGenerator<'a, F> {
                 water_level_m: Vec::with_capacity(total),
                 river: Vec::with_capacity(total),
                 river_mask: Vec::new(),
+                river_starts: Vec::new(),
+                river_geometry: Vec::new(),
             };
             for b in blocks {
                 field.elevation_m.extend(b.elevation_m);

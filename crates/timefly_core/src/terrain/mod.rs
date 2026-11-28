@@ -97,10 +97,14 @@ pub struct WaterSample {
 ///
 /// Standing water (Task 8b): where none of a field's four taps is a river texel (its bits other
 /// than [`RIVER_NONE`](crate::worldgen::generate::water::RIVER_NONE)'s ribbon and offset), the level is interpolated over the taps that are
-/// wet, `level − h > `[`DRY_BELOW_M`], alone ([`field_level`]): a lake's or the sea's flat
+/// wet, `level − h > `[`DRY_BELOW_M`], alone ([`taps_level`]): a lake's or the sea's flat
 /// level, not one dropping toward the dry texels' `h − NO_WATER_DROP_M`. The shoreline is then
 /// the terrain's own `h = L` contour. Rivers keep the plain blend.
 pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
+    sample_water(grid, x_m, z_m, blended_height_m(grid, x_m, z_m))
+}
+
+fn sample_water(grid: &RegionGrid, x_m: f64, z_m: f64, ground: f32) -> WaterSample {
     let s = blend_weight(grid, x_m, z_m);
     let read = |f: &Field| {
         let (t, fu, fv) = field_taps(f, x_m, z_m);
@@ -111,7 +115,7 @@ pub fn blended_water(grid: &RegionGrid, x_m: f64, z_m: f64) -> WaterSample {
     let level_m = mix(0);
     WaterSample {
         level_m,
-        thickness_m: level_m - blended_height_m(grid, x_m, z_m),
+        thickness_m: level_m - ground,
         ribbon_m: mix(1) - mix(2).abs(),
         flow: [mix(3), mix(4)],
     }
@@ -147,7 +151,7 @@ fn field_taps(f: &Field, x_m: f64, z_m: f64) -> ([TapTexel; 4], f32, f32) {
     let t = idx.map(|i| TapTexel {
         h_m: f.elevation_m[i],
         level_m: f.water_level_m[i],
-        river: decode_river(f.river_at(i)),
+        river: decode_river(f.sampled_river(i)),
         is_river: f.is_river(i),
     });
     (t, fu, fv)
@@ -221,15 +225,15 @@ fn bilerp(v: [f32; 4], fu: f32, fv: f32) -> f32 {
     top + (bottom - top) * fv
 }
 
-/// The drawn surface at local `(x, z)` metres: the higher of the ground ([`blended_height_m`])
-/// and the water ([`blended_water`]'s level, by the same [`field_level`] rule: standing water
-/// over its wet taps, rivers by the plain blend). The fly's floor; it reads the river mask, not
-/// the river texels, which are freed after the upload ([`Field::is_river`]).
+/// The flight floor follows the drawn water inside its ribbon and the terrain elsewhere.
 pub fn blended_surface_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
-    let s = blend_weight(grid, x_m, z_m);
-    let level = |f: &Field| field_level(f, x_m, z_m);
-    let (i, a) = (level(&grid.inner), level(&grid.apron));
-    blended_height_m(grid, x_m, z_m).max(i + (a - i) * s)
+    let ground = blended_height_m(grid, x_m, z_m);
+    let water = sample_water(grid, x_m, z_m, ground);
+    if water.ribbon_m >= 0.0 {
+        ground.max(water.level_m)
+    } else {
+        ground
+    }
 }
 
 /// One field's water level at local `(x, z)`: the bilinear level of [`sample_clamped`], except
@@ -243,12 +247,6 @@ pub fn blended_surface_m(grid: &RegionGrid, x_m: f64, z_m: f64) -> f32 {
 ///   `d > 0`.
 ///
 /// With every tap wet, or none, the plain bilinear level.
-fn field_level(f: &Field, x_m: f64, z_m: f64) -> f32 {
-    let (t, fu, fv) = field_taps(f, x_m, z_m);
-    taps_level(&t, fu, fv)
-}
-
-/// [`field_level`] from a field's four taps and weights.
 fn taps_level(t: &[TapTexel; 4], fu: f32, fv: f32) -> f32 {
     let plain = bilerp(t.map(|x| x.level_m), fu, fv);
     let wet = |x: &TapTexel| x.level_m - x.h_m > DRY_BELOW_M;

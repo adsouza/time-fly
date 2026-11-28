@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bevy::prelude::*;
+use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::renderer::{
     PendingCommandBuffers, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
 };
@@ -79,9 +80,21 @@ impl GpuFrameTime {
     }
 }
 
+/// Benchmark that owns the image extracted from this main-world frame.
+#[derive(Resource, ExtractResource, Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[extract_app(RenderApp)]
+pub enum GpuBenchmarkScope {
+    #[default]
+    Unmeasured,
+    Region(usize),
+    Journey(u32),
+}
+
 /// One frame's GPU time (ms), sent when its readback arrives.
 #[derive(Message, Copy, Clone, Debug, PartialEq)]
 pub struct GpuFrameMeasured {
+    pub frame: u64,
+    pub scope: GpuBenchmarkScope,
     pub ms: f32,
 }
 
@@ -323,6 +336,7 @@ pub struct GpuTimer {
     ends: [usize; RING],
     /// Each slot's frame number ([`begin`](Self::begin) calls so far, timed or not).
     frame_of: [u64; RING],
+    scope_of: [GpuBenchmarkScope; RING],
     frames: u64,
     /// The last reading's frame number and end timestamp.
     last_end: Option<(u64, u64)>,
@@ -390,6 +404,7 @@ impl GpuTimer {
             ring: ReadbackRing::default(),
             ends: [0; RING],
             frame_of: [0; RING],
+            scope_of: [GpuBenchmarkScope::Unmeasured; RING],
             frames: 0,
             last_end: None,
             period_ns,
@@ -441,6 +456,14 @@ impl GpuTimer {
     /// then (if a slot is free) records the begin pass. Returns whether anything was recorded
     /// into `encoder`.
     pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        self.begin_scoped(encoder, GpuBenchmarkScope::Unmeasured)
+    }
+
+    fn begin_scoped(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        scope: GpuBenchmarkScope,
+    ) -> bool {
         // A frame that began and was never submitted gives its slot back.
         if let Some(slot) = self.current.take() {
             self.ring.cancel(slot);
@@ -466,6 +489,7 @@ impl GpuTimer {
         };
         self.current = Some(slot);
         self.frame_of[slot] = self.frames;
+        self.scope_of[slot] = scope;
         self.timestamp_pass(
             encoder,
             &self.begin_target,
@@ -551,6 +575,13 @@ impl GpuTimer {
     /// The readings whose maps have finished, oldest first: `Some(ms)`, or `None` for a dropped
     /// one. Never waits.
     pub fn harvest(&mut self) -> Vec<Option<f32>> {
+        self.harvest_frames()
+            .into_iter()
+            .map(|r| r.map(|f| f.ms))
+            .collect()
+    }
+
+    fn harvest_frames(&mut self) -> Vec<Option<GpuFrameMeasured>> {
         let mut out = Vec::new();
         while let Some((slot, mapped)) = self.ring.pop_ready() {
             let reading = mapped.then(|| {
@@ -580,7 +611,11 @@ impl GpuTimer {
                 ms
             });
             self.ring.release(slot);
-            out.push(reading.flatten());
+            out.push(reading.flatten().map(|ms| GpuFrameMeasured {
+                ms,
+                frame: self.frame_of[slot],
+                scope: self.scope_of[slot],
+            }));
         }
         out
     }
@@ -653,17 +688,17 @@ fn timestamp_pipeline(
 
 /// Readings passed from the render world to the main world (`None` = dropped).
 #[derive(Resource, Clone, Default)]
-struct GpuTimeShared(Arc<Mutex<Vec<Option<f32>>>>);
+struct GpuTimeShared(Arc<Mutex<Vec<Option<GpuFrameMeasured>>>>);
 
 impl GpuTimeShared {
-    fn push(&self, readings: Vec<Option<f32>>) {
+    fn push(&self, readings: Vec<Option<GpuFrameMeasured>>) {
         if !readings.is_empty() {
             let mut shared = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             shared.extend(readings);
         }
     }
 
-    fn take(&self) -> Vec<Option<f32>> {
+    fn take(&self) -> Vec<Option<GpuFrameMeasured>> {
         std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
@@ -674,7 +709,9 @@ pub struct GpuTimePlugin;
 impl Plugin for GpuTimePlugin {
     fn build(&self, app: &mut App) {
         let shared = GpuTimeShared::default();
-        app.insert_resource(GpuFrameTime::unavailable())
+        app.init_resource::<GpuBenchmarkScope>()
+            .add_plugins(ExtractResourcePlugin::<GpuBenchmarkScope>::default())
+            .insert_resource(GpuFrameTime::unavailable())
             .insert_resource(shared.clone())
             .add_message::<GpuFrameMeasured>()
             .add_systems(PreUpdate, receive_gpu_times);
@@ -742,6 +779,7 @@ fn gpu_time_begin(
     timer: Option<ResMut<GpuTimer>>,
     device: Res<RenderDevice>,
     shared: Res<GpuTimeShared>,
+    scope: Res<GpuBenchmarkScope>,
     mut pending: ResMut<PendingCommandBuffers>,
 ) {
     let Some(mut timer) = timer else { return };
@@ -749,11 +787,11 @@ fn gpu_time_begin(
     // the browser runs them.
     #[cfg(not(target_arch = "wasm32"))]
     let _ = device.poll(wgpu::PollType::Poll);
-    shared.push(timer.harvest());
+    shared.push(timer.harvest_frames());
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("gpu time begin"),
     });
-    if timer.begin(&mut encoder) {
+    if timer.begin_scoped(&mut encoder, *scope) {
         pending.push_encoder(encoder, "gpu_time_begin");
     }
 }
@@ -794,9 +832,9 @@ fn receive_gpu_times(
 ) {
     for reading in shared.take() {
         match reading {
-            Some(ms) => {
-                time.last_ms = Some(ms);
-                measured.write(GpuFrameMeasured { ms });
+            Some(frame) => {
+                time.last_ms = Some(frame.ms);
+                measured.write(frame);
             }
             None => time.dropped += 1,
         }
@@ -974,18 +1012,29 @@ mod tests {
     fn readings_reach_the_main_world_in_order_and_drops_are_counted() {
         let mut app = App::new();
         app.add_plugins(GpuTimePlugin);
+        let first = GpuFrameMeasured {
+            frame: 8,
+            scope: GpuBenchmarkScope::Unmeasured,
+            ms: 4.0,
+        };
+        let second = GpuFrameMeasured {
+            frame: 10,
+            scope: GpuBenchmarkScope::Journey(0),
+            ms: 5.5,
+        };
+        app.insert_resource(GpuBenchmarkScope::Journey(1));
         app.world()
             .resource::<GpuTimeShared>()
-            .push(vec![Some(4.0), None, Some(5.5)]);
+            .push(vec![Some(first), None, Some(second)]);
         app.update();
         let time = app.world().resource::<GpuFrameTime>();
         assert_eq!((time.last_ms, time.dropped), (Some(5.5), 1));
-        let seen: Vec<f32> = app
+        let seen: Vec<_> = app
             .world()
             .resource::<Messages<GpuFrameMeasured>>()
             .iter_current_update_messages()
-            .map(|m| m.ms)
+            .copied()
             .collect();
-        assert_eq!(seen, [4.0, 5.5]);
+        assert_eq!(seen, [first, second]);
     }
 }

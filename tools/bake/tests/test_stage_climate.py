@@ -12,6 +12,8 @@ import hashlib
 import json
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
 from timefly_bake import beyer
@@ -34,7 +36,7 @@ def fake_bake(root: Path, ages) -> Path:
     root.mkdir(parents=True)
     files = []
     for age in ages:
-        blob = f"grid for {age} ka".encode()
+        blob = next(TINY.glob("bio_0ka.*.tfgrid")).read_bytes()
         sha = hashlib.sha256(blob).hexdigest()
         name = f"bio_{age:g}ka.{sha}.tfgrid"
         (root / name).write_bytes(blob)
@@ -103,3 +105,32 @@ def test_stages_the_committed_tiny_bake_with_its_own_count(tmp_path):
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "4"
     assert len(list((tmp_path / "climate").glob("bio_*.tfgrid"))) == 4
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "wrong_age", "swapped", "channels", "header"])
+def test_refuses_inconsistent_35_grid_bakes_before_staging(tmp_path, fault):
+    ages = beyer.climate_ages_ka()
+    if fault == "wrong_age":
+        ages[-1] = 121.0
+    source = fake_bake(tmp_path / "source", ages)
+    path = source / "manifest.json"
+    manifest = json.loads(path.read_bytes())
+    files = manifest["files"]
+    if fault == "duplicate":
+        manifest["ages_ka"] = [ages[0]] * 35
+        manifest["files"] = [files[0]] * 35
+    elif fault == "swapped":
+        files[0], files[1] = files[1], files[0]
+    elif fault == "channels":
+        manifest["grid"]["channels"].reverse()
+    elif fault == "header":
+        entry = files[0]
+        blob = bytearray((source / entry["file"]).read_bytes())
+        blob[10] = 1
+        digest = hashlib.sha256(blob).hexdigest()
+        entry.update(file=f"bio_0ka.{digest}.tfgrid", sha256=digest)
+        (source / entry["file"]).write_bytes(blob)
+    path.write_text(json.dumps(manifest))
+    dest = tmp_path / "dest"
+    assert stage(source, dest).returncode != 0
+    assert not dest.exists()

@@ -1291,3 +1291,38 @@ fn flight_intervals_belong_to_the_previous_clear_frame_and_route() {
     assert_eq!(bench.flight_ms, [31.0, 12.0]);
     assert_eq!(bench.flight_cycle, [0, 1]);
 }
+
+#[test]
+fn delayed_clear_gpu_frames_keep_their_origin_cycle() {
+    let mut app = App::new();
+    let mut bench = JourneyBench::new(JourneyBenchConfig::new(60, false));
+    bench.stage = Stage::Resting {
+        cycle: 1,
+        since: 0.0,
+    };
+    app.insert_resource(bench)
+        .init_resource::<Time<Real>>()
+        .init_resource::<GpuBenchmarkScope>()
+        .add_message::<HydroPassFinished>()
+        .add_message::<GpuFrameMeasured>()
+        .add_message::<TimeChanged>()
+        .add_systems(Update, measure_journey);
+    for (frame, scope) in [GpuBenchmarkScope::Journey(0), GpuBenchmarkScope::Unmeasured]
+        .into_iter()
+        .enumerate()
+    {
+        app.world_mut().write_message(GpuFrameMeasured {
+            frame: frame as u64,
+            scope,
+            ms: 6.0,
+        });
+    }
+    app.update();
+    let bench = app.world().resource::<JourneyBench>();
+    assert_eq!(bench.gpu_ms, [6.0]);
+    assert_eq!(bench.gpu_cycle, [0]);
+    assert_eq!(
+        *app.world().resource::<GpuBenchmarkScope>(),
+        GpuBenchmarkScope::Journey(1)
+    );
+}

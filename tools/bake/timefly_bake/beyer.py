@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -129,6 +130,10 @@ class RangeFile(io.RawIOBase):
             raise
 
     def _get(self, lo, hi):
+        expected = hi - lo + 1
+        remaining = self.cap_bytes - self.fetched
+        if expected > remaining:
+            raise FetchCapError(f"range needs {expected} bytes, only {remaining} left under the cap")
         headers = {"Range": f"bytes={lo}-{hi}", "User-Agent": _USER_AGENT}
         resp = self._open(self.url, headers)
         if _status(resp) in _REDIRECTS:
@@ -151,11 +156,19 @@ class RangeFile(io.RawIOBase):
                 raise RangeError(
                     f"Content-Range total {total} differs from the expected {self.size}"
                 )
-            data = resp.read()
-        if (got_lo, got_hi) != (lo, hi) or len(data) != hi - lo + 1:
-            raise RangeError(
-                f"asked for bytes {lo}-{hi}, got {got_lo}-{got_hi} ({len(data)} bytes)"
-            )
+            if (got_lo, got_hi) != (lo, hi):
+                raise RangeError(f"asked for bytes {lo}-{hi}, got {got_lo}-{got_hi}")
+            length = resp.headers.get("Content-Length")
+            if length is not None and length != str(expected):
+                raise RangeError(f"expected {expected} bytes, got Content-Length {length!r}")
+            # Bound even a chunked response. Reserve the read budget first so a transport
+            # failure after partial delivery cannot spend the same bytes again on retry.
+            limit = min(expected + int(length is None), remaining)
+            self.fetched += limit
+            data = resp.read(limit)
+            self.fetched -= limit - len(data)
+            if len(data) != expected:
+                raise RangeError(f"asked for bytes {lo}-{hi}, got {len(data)} bytes")
         return data
 
     def _fetch_run(self, first, last):
@@ -174,9 +187,6 @@ class RangeFile(io.RawIOBase):
                 self.retries += 1
                 time.sleep(0.5 * (attempt + 1))
         self.requests += 1
-        self.fetched += len(data)
-        if self.fetched > self.cap_bytes:
-            raise FetchCapError(f"fetched {self.fetched} bytes, past the cap of {self.cap_bytes}")
         for i in range(first, last + 1):
             self._cache[i] = data[(i - first) * self.block : (i - first + 1) * self.block]
             self._cache.move_to_end(i)
@@ -376,9 +386,10 @@ def _digest(array) -> str:
 def _publish(path: Path, blob: bytes) -> None:
     if path.is_file() and path.read_bytes() == blob:
         return
-    tmp = path.with_name(f".{path.name}.part")
-    tmp.write_bytes(blob)
-    tmp.replace(path)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging:
+        tmp = Path(staging) / path.name
+        tmp.write_bytes(blob)
+        tmp.replace(path)
 
 
 def _age_label(age: float) -> str:
@@ -431,10 +442,7 @@ def bake_climate(entry, out, opener=None, record_pins=False) -> dict:
     total = 0
     for i, age in enumerate(ages_ka.tolist()):
         grid = np.stack([low1[i], low12[i]], axis=-1).astype(np.float16)
-        tmp = out / f".bio_{i}.tmp"
-        formats.write_tfgrid(tmp, "latlon", grid)
-        blob = tmp.read_bytes()
-        tmp.unlink()
+        blob = formats.encode_tfgrid("latlon", grid)
         sha = hashlib.sha256(blob).hexdigest()
         name = f"bio_{_age_label(age)}ka.{sha}.tfgrid"
         _publish(out / name, blob)

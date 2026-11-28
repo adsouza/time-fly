@@ -67,7 +67,7 @@ use super::{
 use crate::args::RegionArg;
 use crate::data::GlobeData;
 use crate::diagnostics::SessionInfo;
-use crate::diagnostics::gpu_time::{GpuFrameMeasured, GpuFrameTime};
+use crate::diagnostics::gpu_time::{GpuBenchmarkScope, GpuFrameMeasured, GpuFrameTime};
 use crate::fly_camera::{FlyState, FlySystems};
 use crate::globe::GlobeRenderStatus;
 use crate::globe_flight::{GlobeFlightState, GlobeFlightSystems};
@@ -375,6 +375,7 @@ impl Plugin for RegionBenchPlugin {
         app.insert_resource(RegionBench::new(self.0.clone()))
             // Read whether or not the pass and the GPU timer run in this app.
             .add_message::<HydroPassFinished>()
+            .init_resource::<GpuBenchmarkScope>()
             .add_message::<GpuFrameMeasured>()
             .add_systems(Startup, banner::spawn_banner)
             .add_systems(
@@ -685,6 +686,7 @@ impl Controls<'_> {
 }
 
 fn drive_region_bench(
+    mut scope: ResMut<GpuBenchmarkScope>,
     mut bench: ResMut<RegionBench>,
     mut game: Game,
     mut controls: Controls,
@@ -693,7 +695,12 @@ fn drive_region_bench(
     let now = game.real.elapsed_secs_f64();
     let frame_ms = game.real.delta_secs() * 1000.0;
     let generated: Vec<RegionGenerated> = game.generated.read().copied().collect();
-    let gpu_ms: Vec<f32> = game.gpu_frames.read().map(|m| m.ms).collect();
+    *scope = GpuBenchmarkScope::Unmeasured;
+    for frame in game.gpu_frames.read() {
+        if let GpuBenchmarkScope::Region(region) = frame.scope {
+            bench.runs[region].gpu_ms.push(frame.ms);
+        }
+    }
     let bench = &mut *bench;
     bench.passes.extend(game.passes.read().copied());
     #[cfg(target_arch = "wasm32")]
@@ -797,7 +804,6 @@ fn drive_region_bench(
             bench.segment = banner::segment_at(script);
             let run = &mut bench.runs[region];
             run.flight_ms.push(frame_ms);
-            run.gpu_ms.extend(&gpu_ms);
             let segment = Segment::ALL
                 .iter()
                 .position(|s| *s == Segment::at(script.min(SCRIPT_SECS)))
@@ -942,6 +948,9 @@ fn drive_region_bench(
             }
         }
         Stage::Done => {}
+    }
+    if let Stage::Flying { region, .. } = bench.stage {
+        *scope = GpuBenchmarkScope::Region(region);
     }
 }
 
@@ -1476,6 +1485,13 @@ fn finish(
         .collect();
     pass &= bench.runs.iter().all(|r| r.pass);
     out.push(format!("regions (R14 frame rate): {}", regions.join(", ")));
+    for (spec, run) in bench.config.regions.iter().zip(&bench.runs) {
+        out.push(gpu_frame_line(
+            spec.name,
+            &run.gpu_ms,
+            gpu_available(game.gpu.as_deref()),
+        ));
+    }
     out.push(r11_line(bench));
     if bench.cycle_region().is_some() {
         out.push(cycle_region_load_line(bench));
@@ -1624,6 +1640,38 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_flight_gpu_readings_reach_their_region_after_leaving() {
+        let mut app = App::new();
+        app.insert_resource(RegionBench::new(RegionBenchConfig::new(60, false)))
+            .init_resource::<Time<Real>>()
+            .init_resource::<GpuBenchmarkScope>()
+            .add_message::<RegionGenerated>()
+            .add_message::<HydroPassFinished>()
+            .add_message::<GpuFrameMeasured>()
+            .add_message::<RegionRequested>()
+            .add_message::<RegionLeft>()
+            .add_systems(Update, drive_region_bench);
+        for (frame, scope) in [
+            GpuBenchmarkScope::Region(1),
+            GpuBenchmarkScope::Unmeasured,
+            GpuBenchmarkScope::Region(0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.world_mut().write_message(GpuFrameMeasured {
+                frame: frame as u64,
+                scope,
+                ms: frame as f32 + 5.0,
+            });
+        }
+        app.update();
+        let bench = app.world().resource::<RegionBench>();
+        assert_eq!(bench.runs[0].gpu_ms, [7.0]);
+        assert_eq!(bench.runs[1].gpu_ms, [5.0]);
+    }
 
     #[test]
     fn bench_cli_flags() {
