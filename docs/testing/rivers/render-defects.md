@@ -159,6 +159,12 @@ the straight link and curves down the real valley; the slot, its two black trenc
 smeared walls across the plateau are gone. The hook's corner stays: the upstream segment's
 corridor does not cut deep enough to be rerouted.
 
+**Sichuan (§14).** `defects/sichuan-reroute.jpg` (the §14 pose, 6 km, 45° down; top the
+committed render, bottom after): the near-black pit beside the Min and the orphan dash on the
+slope are gone. The course near the mountain front now swings west round a ridge before turning
+east, with a shadowed slope beside the bend; whether that bend follows the real Min needs the
+owner's eye (the texels there were not dumped).
+
 **Not measured:** region generation time in release (`time_a_river_dense_region`). A rerouted
 segment costs one path search like a joining segment (at most 4,096 lattice points); the debug
 replays generated the Phoenix region in 372 ms of preparation.
