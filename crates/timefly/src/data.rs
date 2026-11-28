@@ -556,6 +556,13 @@ struct GlobeLoad {
     manifest: Handle<GlobeManifest>,
 }
 
+/// Progress through the manifest's unique globe frame files, once the manifest is loaded.
+#[derive(Resource, Default, PartialEq, Eq)]
+pub(crate) struct GlobeFrameLoadProgress {
+    pub loaded: usize,
+    pub total: usize,
+}
+
 #[derive(Resource)]
 struct GlobeManifestPath(String);
 
@@ -579,6 +586,7 @@ impl Plugin for GlobeDataPlugin {
             .init_asset_loader::<GlobeManifestLoader>()
             .init_asset_loader::<TfgridLoader>()
             .add_logged_state::<GlobeLoadState>()
+            .init_resource::<GlobeFrameLoadProgress>()
             .insert_resource(GlobeManifestPath(self.manifest_path.clone()))
             .add_systems(Startup, start_globe_load)
             .add_systems(
@@ -612,6 +620,7 @@ fn poll_globe_load(
     server: Res<AssetServer>,
     mut manifests: ResMut<Assets<GlobeManifest>>,
     images: Res<Assets<Image>>,
+    mut progress: ResMut<GlobeFrameLoadProgress>,
     mut next: ResMut<NextState<GlobeLoadState>>,
     context: Option<ResMut<DiagnosticsContext>>,
 ) {
@@ -620,7 +629,19 @@ fn poll_globe_load(
         return;
     };
     let outcome = match load_progress(&own, &deps) {
-        LoadProgress::Waiting => return,
+        LoadProgress::Waiting => {
+            if let Some(manifest) = manifests.get(&load.manifest) {
+                progress.set_if_neq(GlobeFrameLoadProgress {
+                    loaded: manifest
+                        .images
+                        .iter()
+                        .filter(|h| server.is_loaded(*h))
+                        .count(),
+                    total: manifest.images.len(),
+                });
+            }
+            return;
+        }
         LoadProgress::ManifestFailed(e) => Err(describe_load_error(&path.0, &e)),
         LoadProgress::ImageFailed => Err(manifests
             .get(&load.manifest)

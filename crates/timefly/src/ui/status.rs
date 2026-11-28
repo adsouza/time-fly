@@ -1,11 +1,12 @@
-//! The loading and failure overlay: "Loading Earth's history..." until the first interactive
-//! globe frame, or what went wrong if the data fails to load or the renderer cannot start.
+//! Reports data loading and globe preparation until the first interactive frame, or shows
+//! what went wrong if the data fails to load or the renderer cannot start.
 //!
 //! Bevy's built-in font has ASCII glyphs only, so UI text uses three dots, not an ellipsis.
 
 use bevy::prelude::*;
 
 use super::{PANEL_COLOR, TEXT_COLOR};
+use crate::data::GlobeFrameLoadProgress;
 use crate::globe::GlobeRenderStatus;
 
 pub const LOADING_TEXT: &str = "Loading Earth's history...";
@@ -16,9 +17,8 @@ const FAILED_COLOR: Color = Color::srgb(1.0, 0.72, 0.62);
 /// What the overlay says for a render status; `None` hides it.
 pub fn status_message(status: &GlobeRenderStatus) -> Option<String> {
     match status {
-        GlobeRenderStatus::LoadingData | GlobeRenderStatus::PreparingGpu => {
-            Some(LOADING_TEXT.to_string())
-        }
+        GlobeRenderStatus::LoadingData => Some(LOADING_TEXT.to_string()),
+        GlobeRenderStatus::PreparingGpu => Some("Preparing the globe...".to_string()),
         GlobeRenderStatus::Interactive { .. } => None,
         GlobeRenderStatus::Failed(error) => Some(format!(
             "Time Fly could not show the globe.\n\n{error}\n\nThe session log has the details."
@@ -86,13 +86,20 @@ fn spawn_status(mut commands: Commands) {
 
 fn show_status(
     status: Res<GlobeRenderStatus>,
+    progress: Option<Res<GlobeFrameLoadProgress>>,
     mut overlays: Query<&mut Node, With<StatusOverlay>>,
     mut texts: Query<(&mut Text, &mut TextColor), With<StatusText>>,
 ) {
-    if !status.is_changed() {
+    if !status.is_changed() && !progress.as_ref().is_some_and(|p| p.is_changed()) {
         return;
     }
-    let message = status_message(&status);
+    let message = match progress.as_deref() {
+        Some(p) if *status == GlobeRenderStatus::LoadingData && p.total > 0 => Some(format!(
+            "{LOADING_TEXT}\n{} of {} globe files loaded",
+            p.loaded, p.total
+        )),
+        _ => status_message(&status),
+    };
     let display = if message.is_some() {
         Display::Flex
     } else {
@@ -126,7 +133,7 @@ mod tests {
         );
         assert_eq!(
             status_message(&GlobeRenderStatus::PreparingGpu).as_deref(),
-            Some(LOADING_TEXT)
+            Some("Preparing the globe...")
         );
         assert_eq!(
             status_message(&GlobeRenderStatus::Interactive { first_frame: 9 }),
@@ -134,6 +141,35 @@ mod tests {
         );
         let failed = status_message(&GlobeRenderStatus::Failed("no adapter".into())).unwrap();
         assert!(failed.contains("could not show the globe") && failed.contains("no adapter"));
+    }
+
+    #[test]
+    fn overlay_updates_as_globe_files_load() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GlobeFrameLoadProgress>()
+            .add_plugins(StatusUiPlugin);
+        let text = |app: &mut App| {
+            app.world_mut()
+                .query_filtered::<&Text, With<StatusText>>()
+                .single(app.world())
+                .unwrap()
+                .0
+                .clone()
+        };
+
+        app.update();
+        assert_eq!(text(&mut app), LOADING_TEXT);
+
+        for loaded in [0, 1, 2] {
+            *app.world_mut().resource_mut::<GlobeFrameLoadProgress>() =
+                GlobeFrameLoadProgress { loaded, total: 3 };
+            app.update();
+            assert_eq!(
+                text(&mut app),
+                format!("{LOADING_TEXT}\n{loaded} of 3 globe files loaded")
+            );
+        }
     }
 
     #[test]
