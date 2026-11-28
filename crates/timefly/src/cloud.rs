@@ -822,13 +822,14 @@ mod tests {
     /// mountains) stayed sharp in front of the gathering cloud and vanished only when it turned
     /// opaque: a visible cut. Checked at every frame's density of a 60 fps gather and a few
     /// more, for a ridge ahead and a valley wall beside a fly 150 m to 1 km up, and over the
-    /// globe at every swap altitude from 600 to 1,200 km.
+    /// globe from the flight floor through the dive altitude.
     #[test]
     fn the_cloud_covers_everything_but_the_fly_at_every_density() {
         use crate::fly_camera::{FlyState, region_chase_pose};
         use bevy::camera::CameraProjection;
+        use timefly_core::flight::altitudes::DIVE_ALTITUDE_KM;
         use timefly_core::flight::chase::globe_chase_pose;
-        use timefly_core::flight::globe::GlobeFlight;
+        use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, GlobeFlight};
         let aspect = 16.0 / 9.0;
         let mut failures = Vec::new();
         let mut hazard = 0;
@@ -904,9 +905,11 @@ mod tests {
         }
         // The globe (kilometres): a sphere, from every altitude a swap can happen at.
         let r = crate::globe::EARTH_RADIUS_KM as f32;
-        for alt in (600..=1_200).step_by(50) {
+        for sample in 0..=12 {
+            let alt = GLOBE_MIN_ALTITUDE_KM
+                + (DIVE_ALTITUDE_KM - GLOBE_MIN_ALTITUDE_KM) * f64::from(sample) / 12.0;
             let f = GlobeFlight {
-                altitude_km: f64::from(alt),
+                altitude_km: alt,
                 ..GlobeFlight::start(28.0, 86.9)
             };
             let pose = globe_chase_pose(&f, 0.0);

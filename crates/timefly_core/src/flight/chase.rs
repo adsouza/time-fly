@@ -39,6 +39,8 @@ pub const GLOBE_CHASE_MAX_ELEVATION_DEG: f64 = 75.0;
 /// The steepest the globe's chase may look (degrees below the fly's horizon): 5° short of
 /// straight down, so the camera's up (the fly's) stays well defined.
 pub const GLOBE_CHASE_MAX_LOOK_DEG: f64 = 85.0;
+/// Below this altitude the globe chase holds its close-up framing through the dive.
+const GLOBE_CHASE_NEAR_FRAMING_KM: f64 = 1_200.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChasePose {
@@ -105,18 +107,18 @@ pub fn chase_pose_with_elevation(
 }
 
 /// How far the globe chase's framing has gone from the dive's to the top's at `altitude_km`: 0
-/// at and below [`DIVE_ALTITUDE_KM`], 1 at [`GLOBE_MAX_ALTITUDE_KM`], smoothstep in
+/// at and below `GLOBE_CHASE_NEAR_FRAMING_KM`, 1 at [`GLOBE_MAX_ALTITUDE_KM`], smoothstep in
 /// `ln(altitude)` between (controller rulings, Task 4).
 fn globe_framing(altitude_km: f64) -> f64 {
     smoothstep(
-        DIVE_ALTITUDE_KM.ln(),
+        GLOBE_CHASE_NEAR_FRAMING_KM.ln(),
         GLOBE_MAX_ALTITUDE_KM.ln(),
         altitude_km.max(f64::MIN_POSITIVE).ln(),
     )
 }
 
 /// The globe chase's look-down pitch (degrees) at `altitude_km`: [`GLOBE_CHASE_DIVE_LOOK_DEG`]
-/// at and below [`DIVE_ALTITUDE_KM`], rising to [`CHASE_GLOBE_TOP_PITCH_DEG`] at
+/// at and below `GLOBE_CHASE_NEAR_FRAMING_KM`, rising to [`CHASE_GLOBE_TOP_PITCH_DEG`] at
 /// [`GLOBE_MAX_ALTITUDE_KM`], where it centres the whole globe ([`globe_framing`]).
 pub fn globe_look_pitch_deg(altitude_km: f64) -> f64 {
     let t = globe_framing(altitude_km);
@@ -371,7 +373,7 @@ mod tests {
         assert!(
             (globe_look_pitch_deg(GLOBE_MAX_ALTITUDE_KM) - CHASE_GLOBE_TOP_PITCH_DEG).abs() < 1e-12
         );
-        let (lo, hi) = (DIVE_ALTITUDE_KM.ln(), GLOBE_MAX_ALTITUDE_KM.ln());
+        let (lo, hi) = (GLOBE_CHASE_NEAR_FRAMING_KM.ln(), GLOBE_MAX_ALTITUDE_KM.ln());
         let mut prev = dive;
         for i in 1..100 {
             let alt = (lo + (hi - lo) * f64::from(i) / 100.0).exp();

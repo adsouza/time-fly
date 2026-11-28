@@ -550,6 +550,7 @@ fn frame(phase: NavPhase, i: &mut NavInputs) -> (NavPhase, Vec<NavAction>, f32, 
                         .max(timefly_core::flight::globe::GLOBE_MIN_ALTITUDE_KM);
                 }
             }
+            NavAction::SetGlobeAltitude { altitude_km } => i.globe_altitude_km = altitude_km,
             NavAction::LiftTo { height_m } => i.region_height_m = height_m,
             NavAction::ReturnToAgl { agl_m } => {
                 // As the shell eases it: at the M2 speed for its height, never past the target.
@@ -909,10 +910,10 @@ fn a_dive_damps_the_drift_only_in_the_opaque_cloud() {
     let target = everest();
     let d = diving(target);
     assert!(d.damps_dive_drift(DIVE_ALTITUDE_KM));
-    assert!(d.damps_dive_drift(DIVE_ALTITUDE_KM - 300.0));
+    assert!(d.damps_dive_drift(DIVE_ALTITUDE_KM - 100.0));
     assert!(!d.damps_dive_drift(DIVE_ALTITUDE_KM + 1.0));
-    assert!(!d.damps_dive_drift(2_000.0));
-    assert!(!NavPhase::Globe.damps_dive_drift(DIVE_ALTITUDE_KM - 300.0));
+    assert!(!d.damps_dive_drift(CLOUD_TOP_KM));
+    assert!(!NavPhase::Globe.damps_dive_drift(DIVE_ALTITUDE_KM - 100.0));
     // `off` km from the target along the ground, at `alt` km.
     let east = DVec3::Y.cross(target.0).normalize();
     let away = |off_km: f64, alt: f64| {
@@ -925,11 +926,12 @@ fn a_dive_damps_the_drift_only_in_the_opaque_cloud() {
         }
     };
     // Above the opaque cloud, flown off the dive point: the dive is off.
-    let (next, actions) = step_nav(d, &away(DIVE_LEAVE_KM + 1.0, 1_600.0));
+    let in_thin_cloud = (DIVE_ALTITUDE_KM + CLOUD_TOP_KM) / 2.0;
+    let (next, actions) = step_nav(d, &away(DIVE_LEAVE_KM + 1.0, in_thin_cloud));
     assert_eq!(next, NavPhase::Globe);
     assert_eq!(actions, [NavAction::CancelRequest]);
     // Still over it (a climb straight up), or waiting in the opaque cloud: the dive goes on.
-    let (next, _) = step_nav(d, &away(DIVE_LEAVE_KM - 1.0, 1_600.0));
+    let (next, _) = step_nav(d, &away(DIVE_LEAVE_KM - 1.0, in_thin_cloud));
     assert!(matches!(next, NavPhase::Diving { .. }), "{next:?}");
     let (next, _) = step_nav(d, &away(DIVE_LEAVE_KM + 1.0, DIVE_ALTITUDE_KM - 100.0));
     assert!(matches!(next, NavPhase::Diving { .. }), "{next:?}");
@@ -989,7 +991,7 @@ fn region_fly(centre: RenderDir, height_m: f32) -> NavInputs {
             region_height_m: height_m,
             region_fly: Some(fly),
             // The globe's fly where the dive left it, inside the cloud.
-            globe_altitude_km: 900.0,
+            globe_altitude_km: DIVE_ALTITUDE_KM - 100.0,
             time: YearsBp(21_000.0),
             ..inputs()
         },
@@ -1157,14 +1159,14 @@ fn the_climb_rises_by_the_height_above_the_ground() {
 }
 
 /// Fix round 1, minor 1: the dive swaps only after a frame drawn opaque. A boosted descent that
-/// crosses the dive altitude in one frame (from 1,264 km, drawn at 0.993) waits a frame.
+/// crosses the dive altitude in one frame from nearly opaque waits a frame.
 #[test]
 fn a_boosted_crossing_waits_for_a_frame_drawn_opaque() {
     let target = everest();
     let mut i = ready(
         target,
         NavInputs {
-            globe_altitude_km: 1_264.0,
+            globe_altitude_km: DIVE_ALTITUDE_KM + 0.05 * (CLOUD_TOP_KM - DIVE_ALTITUDE_KM),
             ..inputs()
         },
     );
@@ -1175,7 +1177,7 @@ fn a_boosted_crossing_waits_for_a_frame_drawn_opaque() {
         "{}",
         i.shown_density
     );
-    i.globe_altitude_km = 1_190.0;
+    i.globe_altitude_km = DIVE_ALTITUDE_KM - 10.0;
     let (next, actions, _, _) = frame(phase, &mut i);
     assert!(!actions.iter().any(is_swap), "{actions:?}");
     assert!(matches!(next, NavPhase::Diving { .. }));
@@ -1359,7 +1361,7 @@ fn no_swap_before_the_cloud_is_opaque() {
                 *i = ready(target, *i);
             }
             if (20..23).contains(&k) {
-                i.globe_altitude_km = DIVE_ALTITUDE_KM + 300.0;
+                i.globe_altitude_km = 1.25 * DIVE_ALTITUDE_KM;
             }
         });
         assert_eq!(end, NavPhase::Flying, "dt {dt}");

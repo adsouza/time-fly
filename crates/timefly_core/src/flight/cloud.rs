@@ -3,6 +3,9 @@
 use super::altitudes::*;
 use crate::globe::ELEVATION_EXAGGERATION;
 
+/// The altitude where relief reaches its close-up exaggeration.
+const GLOBE_EXAGGERATION_NEAR_KM: f64 = 2_500.0;
+
 /// Hermite smoothstep: 0 at/below `e0`, 1 at/above `e1`. Also valid for `e0 > e1` (falling edge).
 pub(crate) fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -24,10 +27,10 @@ pub fn region_density(height_m: f32) -> f32 {
 }
 
 /// Globe exaggeration: full at `GLOBE_EXAGGERATION_FULL_KM`+, `GLOBE_EXAGGERATION_AT_CLOUD` at
-/// `CLOUD_TOP_KM`-, smoothstep in `ln(altitude)` between.
+/// `GLOBE_EXAGGERATION_NEAR_KM` and below, smoothstep in `ln(altitude)` between.
 pub fn globe_exaggeration(altitude_km: f64) -> f64 {
     let t = smoothstep(
-        CLOUD_TOP_KM.ln(),
+        GLOBE_EXAGGERATION_NEAR_KM.ln(),
         GLOBE_EXAGGERATION_FULL_KM.ln(),
         altitude_km.max(f64::MIN_POSITIVE).ln(),
     );
@@ -76,7 +79,10 @@ mod tests {
             GLOBE_EXAGGERATION_AT_CLOUD
         );
         assert_eq!(globe_exaggeration(100.0), GLOBE_EXAGGERATION_AT_CLOUD);
-        let (lo, hi) = (CLOUD_TOP_KM.ln(), GLOBE_EXAGGERATION_FULL_KM.ln());
+        let (lo, hi) = (
+            GLOBE_EXAGGERATION_NEAR_KM.ln(),
+            GLOBE_EXAGGERATION_FULL_KM.ln(),
+        );
         let mut prev = GLOBE_EXAGGERATION_AT_CLOUD;
         for i in 1..=100 {
             let alt = (lo + (hi - lo) * i as f64 / 101.0).exp();

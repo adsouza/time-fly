@@ -1,5 +1,7 @@
 use bevy::math::{DVec3, Vec2, Vec3};
-use timefly_core::flight::altitudes::{DIVE_ALTITUDE_KM, HOP_ALTITUDE_M, REGION_EMERGE_TO_M};
+use timefly_core::flight::altitudes::{
+    CLOUD_TOP_KM, DIVE_ALTITUDE_KM, HOP_ALTITUDE_M, REGION_EMERGE_TO_M,
+};
 use timefly_core::flight::globe::{GlobeFlight, globe_fly_step};
 use timefly_core::geo::{RenderDir, geo_to_render, latlon_to_geo};
 
@@ -209,7 +211,7 @@ fn the_globe_keys_fly_to_the_region_and_descend_to_the_dive() {
         let east = DVec3::Y.cross(f.dir).normalize();
         GlobeFlight {
             heading: (east - f.dir * f.dir.dot(east)).normalize(),
-            altitude_km: 2_500.0,
+            altitude_km: CLOUD_TOP_KM,
             ..f
         }
     };

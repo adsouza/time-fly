@@ -781,6 +781,9 @@ fn apply_action(
                 }
             }
         }
+        NavAction::SetGlobeAltitude { altitude_km } => {
+            flies.flight.0.altitude_km = altitude_km;
+        }
         NavAction::Preload(era_dir) => {
             if let Some(region) = region {
                 out.requests.write(RegionRequested {

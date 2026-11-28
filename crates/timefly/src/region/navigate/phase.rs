@@ -49,8 +49,8 @@
 use bevy::math::{DVec2, DVec3, Vec2};
 use timefly_core::deep_time::YearsBp;
 use timefly_core::flight::altitudes::{
-    CLOUD_CLEAR_S, CLOUD_GATHER_S, CLOUD_TOP_KM, DIVE_ALTITUDE_KM, EMERGE_S, GLOBE_MAX_ALTITUDE_KM,
-    HOP_ALTITUDE_M, LIFT_LEAD_M, NEIGHBOUR_PAST_EDGE_M, REGION_CLOUD_BASE_M, REGION_EMERGE_TO_M,
+    CLOUD_CLEAR_S, CLOUD_GATHER_S, CLOUD_TOP_KM, DIVE_ALTITUDE_KM, EMERGE_S, HOP_ALTITUDE_M,
+    LIFT_LEAD_M, NEIGHBOUR_PAST_EDGE_M, REGION_CLOUD_BASE_M, REGION_EMERGE_TO_M,
 };
 use timefly_core::flight::cloud::{globe_density, region_density};
 use timefly_core::flight::globe::{GLOBE_MIN_ALTITUDE_KM, heading_to_region_yaw};
@@ -82,8 +82,7 @@ pub const DIVE_DRIFT_S: f64 = 1.5;
 /// A dive is called off once the fly, out of the opaque cloud (above [`DIVE_ALTITUDE_KM`]), is
 /// this far from its target along the ground (km) *(call)*: the swap puts the fly over the
 /// target, so a fly that flew off it would land in a region far from where it was; a descent
-/// then commits a new dive where it is. Out of the opaque cloud any flight covers this within
-/// a frame (the globe's speed there is about 1,000 km/s), and a climb straight up none of it.
+/// then commits a new dive where it is. A climb straight up leaves the target in place.
 pub const DIVE_LEAVE_KM: f64 = 10.0;
 
 /// Progress within this of the end counts as reaching it (frame times add up in `f32`).
@@ -637,9 +636,13 @@ pub enum NavAction {
         altitude_km: f64,
     },
     /// Move the fly on screen vertically at this speed (m/s) this frame: the descent inside the
-    /// cloud, the emergence, the climb.
+    /// cloud, the region emergence, the climb.
     EaseFly {
         vertical_mps: f32,
+    },
+    /// Set the globe fly's altitude along the emergence path to the cloud top.
+    SetGlobeAltitude {
+        altitude_km: f64,
     },
     /// Request the neighbour centred here, at the region's snapshot (a newer request replaces
     /// an older one).
@@ -798,23 +801,23 @@ pub fn region_yaw(centre: RenderDir, heading: DVec3) -> f32 {
     heading_to_region_yaw(basis.center, heading, basis.north, basis.east)
 }
 
-/// The fly's vertical speed while emerging into `world`, `elapsed_s` into the emergence (this
-/// frame's end), so it follows [`emerge_height_m`] down or [`emerge_altitude_km`] up. It never
-/// moves the fly the other way: a fly already below the profile in a region (a launch region's
-/// start pose) or above it over the globe stays where it is.
-fn emerge_speed_mps(world: World, elapsed_s: f32, i: &NavInputs) -> f32 {
+/// Follow the emergence profile down in a region and up on the globe. A fly already past the
+/// current point on the profile keeps its altitude.
+fn emerge_movement(world: World, elapsed_s: f32, i: &NavInputs) -> Option<NavAction> {
     if i.dt_s <= 0.0 {
-        return 0.0;
+        return None;
     }
     match world {
         World::Region => {
-            let h = i.region_height_m;
-            (emerge_height_m(elapsed_s).min(h) - h) / i.dt_s
+            let height_m = emerge_height_m(elapsed_s);
+            (height_m < i.region_height_m).then_some(NavAction::EaseFly {
+                vertical_mps: (height_m - i.region_height_m) / i.dt_s,
+            })
         }
         World::Globe => {
-            let a = i.globe_altitude_km;
-            let to = emerge_altitude_km(elapsed_s).clamp(a, GLOBE_MAX_ALTITUDE_KM.max(a));
-            ((to - a) * 1000.0 / f64::from(i.dt_s)) as f32
+            let altitude_km = emerge_altitude_km(elapsed_s);
+            (altitude_km > i.globe_altitude_km)
+                .then_some(NavAction::SetGlobeAltitude { altitude_km })
         }
     }
 }
@@ -942,10 +945,7 @@ pub fn step_nav(phase: NavPhase, i: &NavInputs) -> (NavPhase, Vec<NavAction>) {
             } else if world == World::Region && i.climb_key {
                 climb(i)
             } else {
-                let vertical_mps = emerge_speed_mps(world, elapsed_s, i);
-                if vertical_mps != 0.0 {
-                    actions.push(NavAction::EaseFly { vertical_mps });
-                }
+                actions.extend(emerge_movement(world, elapsed_s, i));
                 match world {
                     _ if elapsed_s < EMERGE_S as f32 => NavPhase::Emerging { world, elapsed_s },
                     World::Region => NavPhase::Flying,

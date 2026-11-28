@@ -27,6 +27,7 @@ use bevy::render::storage::ShaderBuffer;
 use bevy::render::view::{DebandDither, Tonemapping};
 use bevy::render::{Render, RenderApp, RenderSystems};
 use bevy::shader::ShaderCacheError;
+use timefly_core::flight::chase::globe_chase_pose;
 use timefly_core::globe::{DeepSampling, source_id_ranks};
 use timefly_core::surface::{FrameSelection, Timeline};
 use tracing::instrument;
@@ -37,6 +38,7 @@ use crate::creature::FLY_LAYER;
 use crate::data::{GlobeData, GlobeLoadError, GlobeLoadState};
 use crate::diagnostics::aspects::DiagnosticsAppExt;
 use crate::diagnostics::{DiagnosticsContext, FirstInteractiveFrame};
+use crate::globe_flight::{GlobeFlightState, GlobeLook};
 use crate::time::GlobeTime;
 use material::{
     AtmosphereMaterial, CompositeMaterial, GlobeParams, OceanMaterial, PlateMaterial,
@@ -57,12 +59,11 @@ pub const COMPOSITE_LAYER: usize = 3;
 /// Render layer of the atmosphere (the default layer, seen by every globe camera mode).
 pub const ATMOSPHERE_LAYER: usize = 0;
 
-/// Direction toward the sun at start-up: ahead of and above the initial view of longitude 0, a
-/// little to the east, so the terminator shows on the western limb *(call)*.
+/// Direction toward the globe's sun in the render frame.
 pub const SUN_DIRECTION: Vec3 = Vec3::new(0.55, 0.32, 0.77);
 /// Space behind the globe.
 pub const SPACE_COLOR: Color = Color::srgb(0.035, 0.04, 0.07);
-/// Distance of the default globe camera.
+/// Fallback distance for bridge cameras before syncing to the globe camera.
 pub const CAMERA_DISTANCE_KM: f32 = 3.0 * EARTH_RADIUS_KM as f32;
 
 /// Subdivisions of the ocean shell and atmosphere cube-spheres.
@@ -365,6 +366,8 @@ impl Plugin for GlobePlugin {
         .init_resource::<GlobeRenderStatus>()
         .init_resource::<GlobeDebugView>()
         .init_resource::<GlobeExaggeration>()
+        .init_resource::<GlobeFlightState>()
+        .init_resource::<GlobeLook>()
         .insert_resource(probe.clone())
         .add_systems(Startup, spawn_globe_camera)
         .add_systems(OnEnter(GlobeLoadState::Ready), spawn_globe)
@@ -403,10 +406,16 @@ fn globe_camera_active(cameras: Query<&Camera, With<GlobeCamera>>) -> bool {
     cameras.is_empty() || cameras.iter().any(|c| c.is_active)
 }
 
-fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamera>>) {
+fn spawn_globe_camera(
+    mut commands: Commands,
+    cameras: Query<(), With<GlobeCamera>>,
+    flight: Res<GlobeFlightState>,
+    look: Res<GlobeLook>,
+) {
     if !cameras.is_empty() {
         return;
     }
+    let pose = globe_chase_pose(&flight.0, look.offset_deg);
     commands.spawn((
         Name::new("Globe camera"),
         GlobeCamera,
@@ -420,7 +429,8 @@ fn spawn_globe_camera(mut commands: Commands, cameras: Query<(), With<GlobeCamer
         },
         Tonemapping::None,
         DebandDither::Disabled,
-        Transform::from_xyz(0.0, 0.0, CAMERA_DISTANCE_KM).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(pose.eye.as_vec3())
+            .looking_at(pose.target.as_vec3(), pose.up.as_vec3()),
         globe_view_layers(RECENT_LAYER),
         // The game UI draws over the globe (the bridge cameras render offscreen).
         IsDefaultUiCamera,
@@ -1065,6 +1075,8 @@ mod tests {
     fn the_globe_camera_has_no_clusters() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
+            .init_resource::<GlobeFlightState>()
+            .init_resource::<GlobeLook>()
             .add_systems(Startup, spawn_globe_camera);
         app.update();
         crate::clusters::assert_no_clusters(app.world_mut());

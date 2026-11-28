@@ -5,8 +5,9 @@ use crate::globe::EARTH_RADIUS_KM;
 pub const GLOBE_MAX_CAMERA_DISTANCE_KM: f64 = 3.0 * EARTH_RADIUS_KM;
 pub const GLOBE_MAX_ALTITUDE_KM: f64 = 1.3 * EARTH_RADIUS_KM;
 pub const GLOBE_START_ALTITUDE_KM: f64 = GLOBE_MAX_ALTITUDE_KM;
-pub const CLOUD_TOP_KM: f64 = 2_500.0;
-pub const DIVE_ALTITUDE_KM: f64 = 1_200.0;
+/// The globe stays clear through a camera distance of 1.15 Earth radii, at every chase angle.
+pub const CLOUD_TOP_KM: f64 = 630.0;
+pub const DIVE_ALTITUDE_KM: f64 = 300.0;
 pub const GLOBE_EXAGGERATION_FULL_KM: f64 = 6_000.0;
 pub const GLOBE_EXAGGERATION_AT_CLOUD: f64 = 2.0;
 pub const REGION_CLOUD_BASE_M: f64 = 300_000.0;

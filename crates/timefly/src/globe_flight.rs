@@ -75,7 +75,6 @@ pub const GLOBE_FAR_KM: f32 = (GLOBE_MAX_CAMERA_DISTANCE_KM + 2.0 * EARTH_RADIUS
 pub struct GlobeFlightState(pub GlobeFlight);
 
 impl Default for GlobeFlightState {
-    /// M1's start: over latitude 0, longitude 0, at the top altitude, heading north.
     fn default() -> Self {
         GlobeFlightState(GlobeFlight::start(0.0, 0.0))
     }
@@ -87,6 +86,16 @@ impl Default for GlobeFlightState {
 #[derive(Resource, Copy, Clone, Debug, Default, PartialEq)]
 pub struct GlobeLook {
     pub offset_deg: f64,
+}
+
+/// Opening chase pose calibrated to a camera at 2.75 Earth radii with Hainan Island
+/// (19.2° N, 109.7° E) at screen centre. The northbound fly starts a little north of the island.
+pub(crate) fn opening_globe_flight() -> (GlobeFlightState, GlobeLook) {
+    let flight = GlobeFlight {
+        altitude_km: 7_537.36,
+        ..GlobeFlight::start(21.302_997, 109.7)
+    };
+    (GlobeFlightState(flight), GlobeLook { offset_deg: 1.43 })
 }
 
 /// Globe flight's systems: [`GlobeFlightSystems::Step`] turns input into
@@ -426,12 +435,15 @@ mod tests {
     use bevy::camera::CameraProjection;
     use bevy::time::TimeUpdateStrategy;
     use timefly_core::flight::altitudes::{
-        CHASE_GLOBE_TOP_PITCH_DEG, DIVE_ALTITUDE_KM, FLY_SCREEN_FRACTION, GLOBE_MAX_ALTITUDE_KM,
+        CHASE_GLOBE_TOP_PITCH_DEG, CLOUD_TOP_KM, DIVE_ALTITUDE_KM, FLY_SCREEN_FRACTION,
+        GLOBE_MAX_ALTITUDE_KM,
     };
     use timefly_core::flight::chase::{
         GLOBE_CHASE_MAX_ELEVATION_DEG, globe_chase_elevation_deg, globe_fly_below_centre_deg,
         globe_look_pitch_deg,
     };
+    use timefly_core::flight::cloud::globe_density;
+    use timefly_core::geo::{geo_to_render, latlon_to_geo};
 
     use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 
@@ -710,8 +722,32 @@ mod tests {
     }
 
     #[test]
+    fn the_opening_view_centres_hainan_at_two_and_three_quarter_radii() {
+        for aspect in [16.0 / 9.0, 9.0 / 16.0] {
+            let (mut app, cam) = app(aspect);
+            let (flight, look) = opening_globe_flight();
+            app.insert_resource(flight).insert_resource(look);
+            app.update();
+
+            let t = camera(&app, cam);
+            let p = perspective(&app, cam);
+            let eye = t.translation.as_dvec3();
+            assert!((eye.length() / EARTH_RADIUS_KM - 2.75).abs() < 1e-6);
+            let hainan = geo_to_render(latlon_to_geo(19.2, 109.7)).0 * EARTH_RADIUS_KM;
+            let (point, ahead) = ndc(&t, &p, hainan);
+            assert!(ahead && point.truncate().length() < 1e-5, "{point}");
+
+            let forward = t.forward().as_vec3().as_dvec3();
+            let centre_angle = forward.angle_between(-eye);
+            let globe_radius = (EARTH_RADIUS_KM / eye.length()).asin();
+            let short_axis_half_fov = f64::from(PerspectiveProjection::default().fov) / 2.0;
+            assert!(centre_angle + globe_radius < short_axis_half_fov);
+        }
+    }
+
+    #[test]
     fn the_whole_globe_is_in_frame_at_the_top() {
-        // Owner, M3 Task 14 ("A: globe centred"): at the start altitude (the top) the whole
+        // Owner, M3 Task 14 ("A: globe centred"): at the maximum altitude the whole
         // globe's outline is inside the view, 16:9 and 9:16, nearly centred, and the fly is in
         // view over the globe's upper part, the eye behind it.
         for aspect in [16.0 / 9.0, 9.0 / 16.0] {
@@ -790,6 +826,30 @@ mod tests {
         // Not over the UI.
         app.insert_resource(PointerOverUi(true));
         assert_eq!(scroll(&mut app, MouseScrollUnit::Line, 3.0), b);
+    }
+
+    #[test]
+    fn scrolling_can_reach_one_point_one_five_radii_before_the_cloud() {
+        let (mut app, cam) = app(16.0 / 9.0);
+        app.init_resource::<AccumulatedMouseScroll>();
+        set_flight(&mut app, at(750.0));
+        app.update();
+        let close_distance_km = 1.15 * EARTH_RADIUS_KM;
+        assert!(f64::from(camera(&app, cam).translation.length()) > close_distance_km);
+
+        let mut scroll = app.world_mut().resource_mut::<AccumulatedMouseScroll>();
+        scroll.unit = MouseScrollUnit::Line;
+        scroll.delta = Vec2::Y;
+        app.update();
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseScroll>()
+            .delta = Vec2::ZERO;
+        run(&mut app, 60);
+
+        let altitude_km = flight(&app).altitude_km;
+        assert!(altitude_km >= CLOUD_TOP_KM);
+        assert_eq!(globe_density(altitude_km), 0.0);
+        assert!(f64::from(camera(&app, cam).translation.length()) <= close_distance_km);
     }
 
     #[test]
@@ -1126,13 +1186,12 @@ mod tests {
     }
 
     /// Fix round 1, minor 2: held forward and boosted through a 3 s (native) generation, a fly
-    /// waiting in the cloud drifts no faster than 5 % of the M2 speed at its height, not the
-    /// 2,400 km it would cover on the globe.
+    /// waiting in the cloud drifts at most 5 % of the M2 speed at its height.
     #[test]
     fn diving_holds_the_fly_over_the_dive_point() {
         use crate::fly_camera::fly_speed;
         use bevy::state::app::StatesPlugin;
-        for alt in [600.0, 900.0, DIVE_ALTITUDE_KM, 2_000.0] {
+        for alt in [GLOBE_MIN_ALTITUDE_KM, DIVE_ALTITUDE_KM, CLOUD_TOP_KM] {
             for boost in [false, true] {
                 let full = SPEED_PER_ALTITUDE
                     * alt
@@ -1161,7 +1220,7 @@ mod tests {
             since_s: 0.0,
             started: true,
         };
-        let start = at(1_100.0);
+        let start = at(DIVE_ALTITUDE_KM - 100.0);
         set_flight(&mut app, start);
         app.update();
         let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
@@ -1179,7 +1238,7 @@ mod tests {
             );
             last = f;
         }
-        let km = start.dir.angle_between(last.dir) * (EARTH_RADIUS_KM + 1_100.0);
+        let km = start.dir.angle_between(last.dir) * (EARTH_RADIUS_KM + start.altitude_km);
         assert!(km < 2.0, "drifted {km} km");
     }
 
@@ -1198,7 +1257,7 @@ mod tests {
             since_s: 0.0,
             started: true,
         };
-        let alt = 2_000.0;
+        let alt = (DIVE_ALTITUDE_KM + CLOUD_TOP_KM) / 2.0;
         set_flight(&mut app, at(alt));
         app.update();
         app.world_mut()
@@ -1220,7 +1279,7 @@ mod tests {
         app.add_plugins(StatesPlugin)
             .init_state::<RegionState>()
             .init_resource::<Navigation>();
-        set_flight(&mut app, at(1_100.0));
+        set_flight(&mut app, at(DIVE_ALTITUDE_KM - 100.0));
         app.update();
         app.world_mut()
             .resource_mut::<NextState<RegionState>>()

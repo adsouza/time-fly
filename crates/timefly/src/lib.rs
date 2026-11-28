@@ -45,7 +45,7 @@ use data::GlobeDataPlugin;
 use diagnostics::{DiagnosticsPlugin, Session};
 use fly_camera::FlyCameraPlugin;
 use globe::GlobePlugin;
-use globe_flight::GlobeFlightPlugin;
+use globe_flight::{GlobeFlightPlugin, opening_globe_flight};
 use hydro::HydroPlugin;
 use region::RegionPlugin;
 use region::launch::LaunchRegion;
@@ -153,6 +153,8 @@ pub fn app(session: &Session) -> App {
         ui::bug_shot::repro_window(&mut args, pose);
     }
     let mut app = App::new();
+    let (flight, look) = opening_globe_flight();
+    app.insert_resource(flight).insert_resource(look);
     // Before `DefaultPlugins`: `LogPlugin` takes its layers from the diagnostics resources.
     app.add_plugins(DiagnosticsPlugin::new(session));
     // A plain launch reopens the window where the player left it (`window_memory`).
